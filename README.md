@@ -128,7 +128,8 @@ end-to-end access on GPFS.
                      │  IoBackend /        │
                      │  DecodeBackend      │  (trait adapters —
                      │  (boxed async       │   access core
-                     │   futures)          │   stays backend-                      └──────────┬──────────┘   agnostic)
+                     │   futures)          │   stays backend-                     
+                     └──────────┬──────────┘   agnostic)
                                 │
              ┌──────────────────┴──────────────────────┐
              ▼                                         ▼
