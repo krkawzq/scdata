@@ -28,3 +28,4 @@ rust/**/target/
 
 # OS / editor
 .DS_Store
+docs/

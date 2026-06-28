@@ -7,6 +7,7 @@ name = "scdata"
 version = "0.1.0"
 description = "Single-cell data storage, compression, and loading toolkit with a Rust core"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "numcodecs>=0.13.1",
@@ -16,6 +17,7 @@ dependencies = [
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
