@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[oc]
+*$py.class
+*.so
+*.pyd
+build/
+dist/
+wheels/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+
+# Local outputs
+outputs/
+*.bak
+*.bak/
+
+# Rust
+target/
+rust/**/target/
+
+# OS / editor
+.DS_Store

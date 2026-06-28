@@ -1,0 +1,46 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "scdata"
+version = "0.1.0"
+description = "Single-cell data storage, compression, and loading toolkit with a Rust core"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numcodecs>=0.13.1",
+    "numpy>=2.2.6",
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.optional-dependencies]
+# anndata/zarr bridge: only needed for anndata interop tests and round-trip
+# validation. The core io/data modules use neither at runtime.
+anndata = [
+    "anndata>=0.11.4",
+    "zarr>=2.18.3",
+]
+dev = [
+    "maturin>=1.8,<2",
+    "pytest>=8.0",
+    "ruff>=0.12",
+    "h5py>=3.11.0",
+    "anndata>=0.11.4",
+    "zarr>=2.18.3",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+manifest-path = "rust/scdata/Cargo.toml"
+module-name = "scdata._scdata"
+python-source = "."
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
