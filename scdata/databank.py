@@ -54,13 +54,14 @@ chosen backend's config.
 
 from __future__ import annotations
 
+from collections.abc import Iterable as IterableABC
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from os import PathLike, fspath
-from typing import Any, Iterable, Iterator, Literal, TypeVar, get_type_hints
+from typing import Any, Iterable, Iterator, Literal, Mapping, TypeVar, get_type_hints, overload
 
 from .data._cell import CellAccess, CellBatch, CellData, _as_cell_index
-from .data._dataset import Dataset, DenseDataset, DType, SparseDataset
+from .data._dataset import Dataset, DatasetCollection, DenseDataset, DType, SparseDataset
 from .data._prefetch import PrefetchBatches, PrefetchIterator
 from ._scdata import (
     _AccessConfig,
@@ -663,18 +664,46 @@ class ScDataBank:
 
     # -- registration --------------------------------------------------------
 
-    def register(self, dataset: Dataset) -> DatasetId:
-        """Register a parsed dataset and return its handle.
+    @overload
+    def register(self, dataset: Dataset) -> DatasetId: ...
+
+    @overload
+    def register(self, dataset: Iterable[Dataset]) -> list[DatasetId]: ...
+
+    def register(self, dataset: Dataset | Iterable[Dataset]) -> DatasetId | list[DatasetId]:
+        """Register parsed dataset metadata and return databank handles.
 
         The dataset's :attr:`~scdata.data.DenseDataset.store_root` supplies the
         filesystem path the Rust databank opens, so a dataset produced by
         :func:`scdata.io.launch` carries everything the bank needs.  Dense and
         CSR-sparse datasets dispatch to the matching Rust entry point by type.
+        Passing an iterable of datasets registers them in order and returns a
+        ``list[DatasetId]``.
 
         For datasets assembled without ``store_root`` (e.g. by hand in tests),
         use :meth:`register_dense` / :meth:`register_sparse_csr` and pass the
         store path explicitly.
         """
+        if not isinstance(dataset, (DenseDataset, SparseDataset)):
+            if isinstance(dataset, IterableABC) and not isinstance(
+                dataset, (str, bytes, bytearray)
+            ):
+                return self._register_many(dataset)
+            raise TypeError(f"unsupported dataset type: {type(dataset).__name__}")
+        return self._register_from_dataset(dataset)
+
+    def _register_many(self, datasets: Iterable[Dataset]) -> list[DatasetId]:
+        registered: list[DatasetId] = []
+        try:
+            for dataset in datasets:
+                registered.append(self._register_from_dataset(dataset))
+        except Exception:
+            for did in reversed(registered):
+                self.unregister(did)
+            raise
+        return registered
+
+    def _register_from_dataset(self, dataset: Dataset) -> DatasetId:
         if not isinstance(dataset, (DenseDataset, SparseDataset)):
             raise TypeError(f"unsupported dataset type: {type(dataset).__name__}")
         store_root = dataset.store_root
@@ -712,6 +741,31 @@ class ScDataBank:
         if isinstance(ds, SparseDataset):
             return self.register_sparse_csr(ds, store_path)
         raise TypeError(f"unsupported dataset type: {type(ds).__name__}")
+
+    def register_all(self, datasets: DatasetCollection) -> dict[str, DatasetId]:
+        """Register ``X`` and all layers from a :class:`DatasetCollection`.
+
+        Returns a mapping keyed by matrix path: ``"X"`` and
+        ``"layers/<name>"``.  If any layer fails to register, all datasets
+        registered by this call are unregistered before re-raising.
+        """
+        if not isinstance(datasets, DatasetCollection):
+            raise TypeError(f"unsupported dataset collection type: {type(datasets).__name__}")
+        registered: dict[str, DatasetId] = {}
+        try:
+            for key, dataset in datasets.items():
+                registered[key] = self.register(dataset)
+        except Exception:
+            for did in reversed(tuple(registered.values())):
+                self.unregister(did)
+            raise
+        return registered
+
+    def unregister_all(self, ids: Mapping[str, DatasetId] | Iterable[DatasetId]) -> None:
+        """Unregister multiple dataset ids, ignoring no ids."""
+        values = ids.values() if isinstance(ids, Mapping) else ids
+        for did in tuple(values):
+            self.unregister(did)
 
     def unregister(self, id: DatasetId) -> None:
         """Unregister a dataset, releasing its file handles and gene refs."""

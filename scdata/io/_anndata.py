@@ -19,7 +19,7 @@ Three X layouts are supported at write time: ``dense2d`` (standard 2D,
 anndata-readable), ``dense1d`` (flattened, cell-aligned), ``sparse`` (CSR,
 optionally cell-aligned via rectilinear).
 
-Chunk sizing follows zarr conventions: ``chunks`` may be a list/tuple (used
+Chunk sizing follows zarr conventions: ``chunk_size`` may be a list/tuple (used
 verbatim as the zarr ``chunks`` tuple) or an int (the per-chunk element
 count, broadcast across dimensions — a multi-dimensional array takes the
 ``ndim``-th root so each chunk holds roughly that many elements).
@@ -43,14 +43,17 @@ if TYPE_CHECKING:
 __all__ = ["write_zarr", "read_zarr"]
 
 _XFormat = Literal["dense2d", "dense1d", "sparse"]
+_LayerFormat = Literal["preserve", "auto", "dense2d", "dense1d", "sparse"]
 _Store = Literal["zip", "dir"]
 
-# scdata marker stored in the X array/group ``attributes`` so :func:`read_zarr`
-# can recover the layout without guessing from shape.
+# scdata marker stored in matrix array/group ``attributes`` so :func:`read_zarr`
+# can recover the layout without guessing from shape.  ``scdata-x`` is the
+# legacy spelling; new stores write both for compatibility.
+_SCDATA_MATRIX_ATTR = "scdata-matrix"
 _SCDATA_X_ATTR = "scdata-x"
 _SCDATA_SHAPE_2D = "scdata-shape-2d"
 
-# Default chunk element count when ``chunks`` is an int.
+# Default chunk element count when ``chunk_size`` is an int.
 _DEFAULT_CHUNK_ELEMENTS = 1_000_000
 
 
@@ -64,7 +67,8 @@ def write_zarr(
     path: str | os.PathLike[str],
     *,
     format: _XFormat = "dense2d",
-    chunks: int | list[int] | tuple[int, ...] = _DEFAULT_CHUNK_ELEMENTS,
+    layer_format: _LayerFormat = "preserve",
+    chunk_size: int | list[int] | tuple[int, ...] = _DEFAULT_CHUNK_ELEMENTS,
     align_cells: bool = True,
     store: _Store = "zip",
 ) -> Path:
@@ -82,7 +86,13 @@ def write_zarr(
     format:
         X layout — ``"dense2d"`` (standard 2D), ``"dense1d"`` (flattened 1D,
         cell-aligned chunking), or ``"sparse"`` (CSR, optionally cell-aligned).
-    chunks:
+    layer_format:
+        Layer layout.  ``"preserve"`` writes dense layers as standard 2D arrays
+        and sparse layers as CSR.  ``"auto"`` writes sparse layers as CSR and
+        dense layers as ``dense1d`` when ``align_cells`` is true.  Explicit
+        ``"dense2d"``, ``"dense1d"``, or ``"sparse"`` applies that layout to
+        every layer.
+    chunk_size:
         Chunk shape.  A list/tuple is used verbatim as the zarr ``chunks``
         tuple; an int is the per-chunk element count, broadcast across
         dimensions (multi-dimensional arrays take the ``ndim``-th root).
@@ -126,13 +136,18 @@ def write_zarr(
             write_elem(g, "obsp", dict(adata.obsp))
         if adata.varp:
             write_elem(g, "varp", dict(adata.varp))
-        if adata.layers:
-            write_elem(g, "layers", dict(adata.layers))
         write_elem(g, "uns", dict(adata.uns))
         if adata.raw is not None:
             write_elem(g, "raw", adata.raw)
 
-        _write_x(g, adata, format=format, chunks=chunks, align_cells=align_cells)
+        _write_x(g, adata, format=format, chunk_size=chunk_size, align_cells=align_cells)
+        _write_layers(
+            g,
+            adata,
+            layer_format=layer_format,
+            chunk_size=chunk_size,
+            align_cells=align_cells,
+        )
 
         if store == "zip":
             _zip_store(zstore, root)
@@ -155,54 +170,148 @@ def _write_x(
     adata: "AnnData",
     *,
     format: _XFormat,
-    chunks: int | list[int] | tuple[int, ...],
+    chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
 ) -> None:
     """Write the X array/group in the requested layout."""
+    _write_matrix(
+        g,
+        "X",
+        adata.X,
+        n_obs=adata.n_obs,
+        n_var=adata.n_vars,
+        format=format,
+        chunk_size=chunk_size,
+        align_cells=align_cells,
+    )
+
+
+def _write_layers(
+    g: Any,
+    adata: "AnnData",
+    *,
+    layer_format: _LayerFormat,
+    chunk_size: int | list[int] | tuple[int, ...],
+    align_cells: bool,
+) -> None:
+    """Write all AnnData layers using the same scdata matrix layouts as X."""
+    if not adata.layers:
+        return
+    layers = g.require_group("layers")
+    layers.attrs.update({"encoding-type": "dict", "encoding-version": "0.1.0"})
+    for raw_name, matrix in dict(adata.layers).items():
+        name = _validate_layer_name(raw_name)
+        fmt = _resolve_layer_format(matrix, layer_format, align_cells=align_cells)
+        _write_matrix(
+            layers,
+            name,
+            matrix,
+            n_obs=adata.n_obs,
+            n_var=adata.n_vars,
+            format=fmt,
+            chunk_size=chunk_size,
+            align_cells=align_cells,
+        )
+
+
+def _write_matrix(
+    g: Any,
+    name: str,
+    matrix: Any,
+    *,
+    n_obs: int,
+    n_var: int,
+    format: _XFormat,
+    chunk_size: int | list[int] | tuple[int, ...],
+    align_cells: bool,
+) -> None:
+    """Write one dense or CSR matrix under ``g[name]`` in a scdata layout."""
     from scipy import sparse as _sparse
 
-    # ``adata.X`` is a wide anndata union (dense / sparse / backed / None);
+    # ``AnnData.X`` / layers are wide unions (dense / sparse / backed / None);
     # treat it as Any here — scipy's issparse is not a TypeGuard, so the
     # sparse-only toarray()/tocsr() calls below would otherwise be rejected.
-    X: Any = adata.X
-    n_obs, n_var = adata.n_obs, adata.n_vars
+    if matrix is None:
+        raise StoreError(f"matrix {name!r} is None")
+    _validate_matrix_shape(matrix, n_obs, n_var, name)
 
     if format == "dense2d":
-        dense = X.toarray() if _sparse.issparse(X) else np.asarray(X)
-        chunk_shape = _resolve_chunks_2d(chunks, n_obs, n_var)
+        dense = matrix.toarray() if _sparse.issparse(matrix) else np.asarray(matrix)
+        chunk_shape = _resolve_chunk_size_2d(chunk_size, n_obs, n_var)
         _create_dense_array(
             g,
-            "X",
+            name,
             dense,
             chunk_shape,
-            attrs={
-                "encoding-type": "array",
-                "encoding-version": "0.2.0",
-                _SCDATA_X_ATTR: "dense2d",
-                _SCDATA_SHAPE_2D: [n_obs, n_var],
-            },
+            attrs=_matrix_attrs("dense2d", n_obs, n_var),
         )
     elif format == "dense1d":
-        dense = X.toarray() if _sparse.issparse(X) else np.asarray(X)
+        dense = matrix.toarray() if _sparse.issparse(matrix) else np.asarray(matrix)
         flat = np.ascontiguousarray(dense).reshape(-1)
-        chunk_shape = _resolve_chunks_1d(chunks, n_var, align_cells)
+        chunk_shape = _resolve_chunk_size_1d(chunk_size, n_var, align_cells)
         _create_dense_array(
             g,
-            "X",
+            name,
             flat,
             chunk_shape,
-            attrs={
-                "encoding-type": "array",
-                "encoding-version": "0.2.0",
-                _SCDATA_X_ATTR: "dense1d",
-                _SCDATA_SHAPE_2D: [n_obs, n_var],
-            },
+            attrs=_matrix_attrs("dense1d", n_obs, n_var),
         )
     elif format == "sparse":
-        csr = X.tocsr() if not _sparse.isspmatrix_csr(X) else X
-        _write_csr_group(g, "X", csr, chunks=chunks, align_cells=align_cells)
+        csr = matrix.tocsr() if not _sparse.isspmatrix_csr(matrix) else matrix
+        _write_csr_group(g, name, csr, chunk_size=chunk_size, align_cells=align_cells)
     else:  # pragma: no cover - Literal exhausts the cases
         raise StoreError(f"unsupported X format: {format!r}")
+
+
+def _matrix_attrs(kind: str, n_obs: int, n_var: int) -> dict[str, Any]:
+    return {
+        "encoding-type": "array",
+        "encoding-version": "0.2.0",
+        _SCDATA_MATRIX_ATTR: kind,
+        _SCDATA_X_ATTR: kind,
+        _SCDATA_SHAPE_2D: [int(n_obs), int(n_var)],
+    }
+
+
+def _validate_layer_name(name: object) -> str:
+    if not isinstance(name, str) or not name:
+        raise StoreError(f"layer names must be non-empty strings, got {name!r}")
+    if "/" in name:
+        raise StoreError(f"nested layer names are unsupported: {name!r}")
+    return name
+
+
+def _matrix_shape(matrix: Any) -> tuple[int, int]:
+    shape = getattr(matrix, "shape", None)
+    if shape is None:
+        shape = np.asarray(matrix).shape
+    if len(shape) != 2:
+        raise StoreError(f"matrix must be 2D, got shape {tuple(shape)!r}")
+    return int(shape[0]), int(shape[1])
+
+
+def _validate_matrix_shape(matrix: Any, n_obs: int, n_var: int, context: str) -> None:
+    shape = _matrix_shape(matrix)
+    expected = (int(n_obs), int(n_var))
+    if shape != expected:
+        raise StoreError(f"matrix {context!r} has shape {shape}, expected {expected}")
+
+
+def _resolve_layer_format(
+    matrix: Any,
+    layer_format: _LayerFormat,
+    *,
+    align_cells: bool,
+) -> _XFormat:
+    from scipy import sparse as _sparse
+
+    if layer_format == "preserve":
+        return "sparse" if _sparse.issparse(matrix) else "dense2d"
+    if layer_format == "auto":
+        return "sparse" if _sparse.issparse(matrix) else ("dense1d" if align_cells else "dense2d")
+    if layer_format in ("dense2d", "dense1d", "sparse"):
+        return layer_format
+    raise StoreError(f"unsupported layer_format {layer_format!r}")
 
 
 def _create_dense_array(
@@ -235,7 +344,7 @@ def _write_csr_group(
     name: str,
     csr: Any,
     *,
-    chunks: int | list[int] | tuple[int, ...],
+    chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
 ) -> None:
     """Write a CSR matrix as an anndata-compatible v3 group.
@@ -252,6 +361,7 @@ def _write_csr_group(
             "encoding-type": "csr_matrix",
             "encoding-version": "0.1.0",
             "shape": [int(csr.shape[0]), int(csr.shape[1])],
+            _SCDATA_MATRIX_ATTR: "sparse",
             _SCDATA_X_ATTR: "sparse",
         }
     )
@@ -272,11 +382,11 @@ def _write_csr_group(
     )
 
     if align_cells:
-        boundaries = _aligned_cell_boundaries(indptr, _resolve_sparse_chunk_target(chunks))
+        boundaries = _aligned_cell_boundaries(indptr, _resolve_sparse_chunk_target(chunk_size))
         _write_rectilinear_array(sub, "indices", indices, boundaries, csr.indices.dtype)
         _write_rectilinear_array(sub, "data", data, boundaries, csr.data.dtype)
     else:
-        nnz_chunks = _resolve_chunks_1d(chunks, 1, align_cells=False)
+        nnz_chunks = _resolve_chunk_size_1d(chunk_size, 1, align_cells=False)
         _create_dense_array(
             sub,
             "indices",
@@ -299,16 +409,16 @@ def _write_csr_group(
         )
 
 
-def _resolve_sparse_chunk_target(chunks: int | list[int] | tuple[int, ...]) -> int:
-    """Resolve ``chunks`` to the target nnz count for cell-aligned CSR chunks."""
-    if isinstance(chunks, (list, tuple)):
-        if len(chunks) != 1:
-            raise StoreError(f"sparse chunks list must have 1 entry, got {len(chunks)}")
-        target = int(chunks[0])
+def _resolve_sparse_chunk_target(chunk_size: int | list[int] | tuple[int, ...]) -> int:
+    """Resolve ``chunk_size`` to the target nnz count for cell-aligned CSR chunks."""
+    if isinstance(chunk_size, (list, tuple)):
+        if len(chunk_size) != 1:
+            raise StoreError(f"sparse chunk_size list must have 1 entry, got {len(chunk_size)}")
+        target = int(chunk_size[0])
     else:
-        target = int(chunks)
+        target = int(chunk_size)
     if target <= 0:
-        raise StoreError(f"sparse chunks int must be positive, got {target}")
+        raise StoreError(f"sparse chunk_size int must be positive, got {target}")
     return target
 
 
@@ -360,6 +470,7 @@ def _write_rectilinear_array(
     attrs = {
         "encoding-type": "array",
         "encoding-version": "0.2.0",
+        _SCDATA_MATRIX_ATTR: "sparse-vlen",
         _SCDATA_X_ATTR: "sparse-vlen",
     }
     zarray = _v3_array_json(
@@ -393,41 +504,41 @@ def _write_rectilinear_array(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_chunks_2d(
-    chunks: int | list[int] | tuple[int, ...],
+def _resolve_chunk_size_2d(
+    chunk_size: int | list[int] | tuple[int, ...],
     n_obs: int,
     n_var: int,
 ) -> tuple[int, ...]:
-    """Resolve ``chunks`` for a 2D dense X.
+    """Resolve ``chunk_size`` for a 2D dense X.
 
     A list/tuple is used verbatim.  An int is the per-chunk element count;
     the array takes the square root per dimension (so a chunk holds roughly
     ``int`` elements), capped to the axis length.
     """
-    if isinstance(chunks, (list, tuple)):
-        if len(chunks) != 2:
-            raise StoreError(f"dense2d chunks list must have 2 entries, got {len(chunks)}")
-        return (int(chunks[0]), int(chunks[1]))
-    return _broadcast_int_chunks(int(chunks), 2, (n_obs, n_var))
+    if isinstance(chunk_size, (list, tuple)):
+        if len(chunk_size) != 2:
+            raise StoreError(f"dense2d chunk_size list must have 2 entries, got {len(chunk_size)}")
+        return (int(chunk_size[0]), int(chunk_size[1]))
+    return _broadcast_int_chunk_size(int(chunk_size), 2, (n_obs, n_var))
 
 
-def _resolve_chunks_1d(
-    chunks: int | list[int] | tuple[int, ...],
+def _resolve_chunk_size_1d(
+    chunk_size: int | list[int] | tuple[int, ...],
     gene_count: int,
     align_cells: bool,
 ) -> tuple[int]:
-    """Resolve ``chunks`` for a 1D (flattened) X.
+    """Resolve ``chunk_size`` for a 1D (flattened) X.
 
     A list/tuple is used verbatim (length 1).  An int is the per-chunk element
     count.  When ``align_cells`` is true the chunk length is rounded up to a
     multiple of ``gene_count`` so every chunk holds whole cells.
     """
-    if isinstance(chunks, (list, tuple)):
-        if len(chunks) != 1:
-            raise StoreError(f"dense1d chunks list must have 1 entry, got {len(chunks)}")
-        size = int(chunks[0])
+    if isinstance(chunk_size, (list, tuple)):
+        if len(chunk_size) != 1:
+            raise StoreError(f"dense1d chunk_size list must have 1 entry, got {len(chunk_size)}")
+        size = int(chunk_size[0])
     else:
-        size = int(chunks)
+        size = int(chunk_size)
     if align_cells and gene_count > 0:
         size = _ceil_div(size, gene_count) * gene_count
         if size <= 0:
@@ -435,7 +546,7 @@ def _resolve_chunks_1d(
     return (size,)
 
 
-def _broadcast_int_chunks(
+def _broadcast_int_chunk_size(
     target: int,
     ndim: int,
     shape: tuple[int, ...],
@@ -446,7 +557,7 @@ def _broadcast_int_chunks(
     root, rounded up, capped to the axis length.
     """
     if target <= 0:
-        raise StoreError(f"chunks int must be positive, got {target}")
+        raise StoreError(f"chunk_size int must be positive, got {target}")
     per_axis = max(1, round(target ** (1.0 / ndim)))
     return tuple(min(per_axis, max(1, s)) for s in shape)
 
@@ -613,13 +724,12 @@ def read_zarr(path: str | os.PathLike[str]) -> "AnnData":
     _enable_rectilinear()
     f = _open_store_for_read(path)
 
-    x_attrs = _read_x_attrs(f)
-    x_kind = x_attrs.get(_SCDATA_X_ATTR)
-
     def callback(read_func: Any, elem_name: str, elem: Any, *, iospec: Any) -> Any:
         name = elem_name.lstrip("/")
-        if name == "X" and x_kind in ("dense1d", "sparse", "sparse-vlen"):
-            return _read_x_scdata(f, x_kind, x_attrs)
+        attrs = _node_attrs(elem)
+        kind = _matrix_kind(attrs)
+        if _is_matrix_root(name) and kind in ("dense1d", "sparse", "sparse-vlen"):
+            return _read_matrix_scdata(f, name, kind, attrs)
         if iospec.encoding_type == "anndata" or elem_name.endswith("/"):
             # ``read_dispatched`` returns the anndata ``RWAble`` union; the
             # values are passed straight into the AnnData constructor, whose
@@ -640,35 +750,48 @@ def read_zarr(path: str | os.PathLike[str]) -> "AnnData":
     return cast("AnnData", read_dispatched(f, callback=callback))
 
 
-def _read_x_attrs(f: Any) -> dict[str, Any]:
-    """Read the X node's attributes (encoding-type, scdata markers)."""
-    return dict(f["X"].attrs)
+def _node_attrs(elem: Any) -> dict[str, Any]:
+    attrs = getattr(elem, "attrs", None)
+    if attrs is None:
+        return {}
+    return dict(attrs)
 
 
-def _read_x_scdata(f: Any, x_kind: str, attrs: dict[str, Any]) -> np.ndarray:
-    """Read a scdata-extended X (dense1d reshape or rectilinear CSR rebuild)."""
-    if x_kind == "dense1d":
+def _matrix_kind(attrs: dict[str, Any]) -> Any:
+    return attrs.get(_SCDATA_MATRIX_ATTR) or attrs.get(_SCDATA_X_ATTR)
+
+
+def _is_matrix_root(name: str) -> bool:
+    if name == "X":
+        return True
+    parts = name.split("/")
+    return len(parts) == 2 and parts[0] == "layers" and bool(parts[1])
+
+
+def _read_matrix_scdata(f: Any, matrix_key: str, kind: str, attrs: dict[str, Any]) -> Any:
+    """Read a scdata-extended matrix (dense1d reshape or CSR rebuild)."""
+    if kind == "dense1d":
         from anndata._io.specs import read_elem
 
         shape2d = attrs.get(_SCDATA_SHAPE_2D)
-        flat = read_elem(f["X"])
+        flat = read_elem(f[matrix_key])
         if shape2d is None:
-            raise StoreError("dense1d X missing scdata-shape-2d attribute")
+            raise StoreError(f"dense1d {matrix_key} missing scdata-shape-2d attribute")
         return np.asarray(flat).reshape(int(shape2d[0]), int(shape2d[1]))
-    if x_kind in ("sparse", "sparse-vlen"):
-        return _read_csr(f)
-    raise StoreError(f"unsupported scdata X kind: {x_kind!r}")
+    if kind in ("sparse", "sparse-vlen"):
+        return _read_csr(f, matrix_key)
+    raise StoreError(f"unsupported scdata matrix kind: {kind!r}")
 
 
-def _read_csr(f: Any) -> Any:
+def _read_csr(f: Any, matrix_key: str) -> Any:
     """Rebuild a CSR matrix, reading rectilinear chunks where needed."""
     from scipy import sparse
 
-    x = f["X"]
+    x = f[matrix_key]
     shape = list(x.attrs.get("shape", []))
-    indptr = _read_sub_array(f, "X/indptr")
-    indices = _read_sub_array(f, "X/indices")
-    data = _read_sub_array(f, "X/data")
+    indptr = _read_sub_array(f, f"{matrix_key}/indptr")
+    indices = _read_sub_array(f, f"{matrix_key}/indices")
+    data = _read_sub_array(f, f"{matrix_key}/data")
     n_obs = int(shape[0]) if len(shape) >= 1 else int(indptr.shape[0]) - 1
     n_var = int(shape[1]) if len(shape) >= 2 else 0
     return sparse.csr_matrix(
@@ -688,7 +811,7 @@ def _read_sub_array(f: Any, key: str) -> np.ndarray:
 
     node = f[key]
     attrs = dict(node.attrs)
-    if attrs.get(_SCDATA_X_ATTR) != "sparse-vlen":
+    if _matrix_kind(attrs) != "sparse-vlen":
         return np.asarray(read_elem(node))
 
     store = node.store

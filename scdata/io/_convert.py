@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Mapping
 
-from scdata.io._anndata import _DEFAULT_CHUNK_ELEMENTS, write_zarr
+from scdata.io._anndata import _DEFAULT_CHUNK_ELEMENTS, _LayerFormat, write_zarr
 from scdata.io._launch import StoreError
 
 if TYPE_CHECKING:
@@ -86,13 +86,16 @@ class AnnDataZarrZipConverter:
 
     ``format="auto"`` writes sparse ``X`` as CSR and dense ``X`` as
     ``dense1d`` so whole-cell access stays aligned by default.  Pass
-    ``format="dense2d"`` for the standard anndata dense layout.
+    ``format="dense2d"`` for the standard anndata dense layout.  Layers are
+    written with ``layer_format``; the default preserves dense vs sparse
+    storage while making both registerable by scdata.
     """
 
     smart: bool = True
     format: _XFormat = "auto"
-    chunks: int | list[int] | tuple[int, ...] = _DEFAULT_CHUNK_ELEMENTS
+    chunk_size: int | list[int] | tuple[int, ...] = _DEFAULT_CHUNK_ELEMENTS
     align_cells: bool = True
+    layer_format: _LayerFormat = "preserve"
     output_dir: str | os.PathLike[str] | None = None
     overwrite: bool = True
     read_kwargs: Mapping[str, Any] = field(default_factory=dict)
@@ -117,8 +120,9 @@ class AnnDataZarrZipConverter:
         *,
         read_format: _ReadFormat | str | None = None,
         format: _XFormat | None = None,
-        chunks: int | list[int] | tuple[int, ...] | None = None,
+        chunk_size: int | list[int] | tuple[int, ...] | None = None,
         align_cells: bool | None = None,
+        layer_format: _LayerFormat | None = None,
         read_kwargs: Mapping[str, Any] | None = None,
         overwrite: bool | None = None,
     ) -> Path:
@@ -145,7 +149,8 @@ class AnnDataZarrZipConverter:
             adata,
             out,
             format=resolved_format,
-            chunks=self.chunks if chunks is None else chunks,
+            layer_format=self.layer_format if layer_format is None else layer_format,
+            chunk_size=self.chunk_size if chunk_size is None else chunk_size,
             align_cells=self.align_cells if align_cells is None else align_cells,
             store="zip",
         )

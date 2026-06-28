@@ -10,7 +10,7 @@ of information the Rust :class:`DataBank` consumes from a store:
 * the codec pipeline as raw numcodecs-compatible JSON,
 * normalized chunk sources: a local file path plus ``(offset, length)`` for
   each encoded chunk, whether the original store was a directory, zip archive,
-  or legacy concatenated payload.
+  or another single-file backing source.
 
 The dataset layer does not open files or decode numeric chunks.  It only keeps
 metadata and chunk addresses so the Rust databank can construct arrays and
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -42,6 +42,7 @@ __all__ = [
     "DenseDataset",
     "SparseDataset",
     "Dataset",
+    "DatasetCollection",
     "DataError",
     "DtypeParseError",
     "CodecConfigError",
@@ -80,7 +81,7 @@ class ArrayOrder(str, Enum):
         if isinstance(value, ArrayOrder):
             return value
         if value is None:
-            # zarr v2 defaults to C order when ``order`` is absent.
+            # zarr metadata defaults to C order when ``order`` is absent.
             return cls.C
         text = str(value).strip().upper()
         if text == "C":
@@ -93,8 +94,8 @@ class ArrayOrder(str, Enum):
 class DType(Enum):
     """Element dtype, mirrors the Rust ``DType`` enum (``databank/array.rs``).
 
-    Rust supports a fixed set of numeric dtypes.  zarr v2 dtype strings are
-    endianness-prefixed (``<f4``, ``|u8``, ``>i4``); scdata stores are always
+    Rust supports a fixed set of numeric dtypes.  NumPy/zarr dtype strings may
+    be endianness-prefixed (``<f4``, ``|u8``, ``>i4``); scdata stores are always
     little-endian on disk, so ``<``, ``=`` and ``|`` are accepted.  ``>`` is
     rejected instead of silently byte-swapping metadata the Rust reader cannot
     decode as written.
@@ -132,7 +133,7 @@ class DType(Enum):
 
     @classmethod
     def parse(cls, dtype: object) -> "DType":
-        """Parse a zarr v2 dtype field into a :class:`DType`.
+        """Parse a NumPy/zarr dtype field into a :class:`DType`.
 
         Accepts the standard zarr forms:
 
@@ -268,7 +269,7 @@ class CodecPipeline:
         filters: object | None,
         compressor: object | None,
     ) -> "CodecPipeline":
-        """Build from the ``filters`` / ``compressor`` fields of a ``.zarray``."""
+        """Build from zarr/numcodecs ``filters`` and ``compressor`` metadata."""
         if filters is None:
             filter_list: tuple[dict[str, Any], ...] = ()
         elif isinstance(filters, list):
@@ -283,7 +284,7 @@ class CodecPipeline:
         return not self.filters and self.compressor is None
 
     def to_zarr(self) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
-        """Return the ``(filters, compressor)`` pair as it appears in ``.zarray``."""
+        """Return the ``(filters, compressor)`` metadata pair."""
         filters = [dict(f) for f in self.filters] if self.filters else None
         compressor = dict(self.compressor) if self.compressor is not None else None
         return filters, compressor
@@ -297,7 +298,7 @@ def _coerce_config_dict(value: object) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class ChunkLocation:
-    """Location of one encoded chunk inside the payload file.
+    """Location of one encoded chunk inside a backing file.
 
     Mirrors Rust ``FileChunkLocation { offset: u64, len: usize }``.  Chunks
     are ordered by C-order (row-major) logical chunk index; the Rust array
@@ -340,10 +341,10 @@ class ArrayMeta:
 
     Two chunk stores are supported, selected by :attr:`store_kind`:
 
-    * ``"file"`` — every encoded chunk is concatenated into one payload file
-      (the legacy scdata v2 layout).  :attr:`payload_path` is the logical zarr
-      key; :attr:`payload_file_path`, when set by :func:`scdata.io.launch`, is
-      the actual local file Rust should open.  :attr:`chunk_offsets` /
+    * ``"file"`` — every encoded chunk is addressed by byte range inside one
+      backing file.  :attr:`payload_path` is the logical key;
+      :attr:`payload_file_path`, when set by :func:`scdata.io.launch`, is the
+      actual local file Rust should open.  :attr:`chunk_offsets` /
       :attr:`chunk_lengths` give each encoded chunk's byte range.
     * ``"dir"`` — each chunk has its own logical zarr key.  Directory stores
       use one filesystem file per chunk; zip stores use the zip archive file
@@ -351,9 +352,9 @@ class ArrayMeta:
       logical keys, while :attr:`chunk_file_paths` optionally carries the local
       file path Rust should open for each chunk.
 
-    Regular v2 payload chunks are cropped at edge chunks; standard zarr v3
-    chunks are padded.  Python only describes locations and grid metadata here;
-    Rust derives the decoded size per chunk from the array grid.
+    Standard zarr v3 chunks are padded at array edges.  Python only describes
+    locations and grid metadata here; Rust derives the decoded size per chunk
+    from the array grid.
     """
 
     shape: tuple[int, ...]
@@ -900,3 +901,68 @@ class SparseDataset:
 
 Dataset = DenseDataset | SparseDataset
 """Union type for a parsed dataset, returned by :mod:`scdata.io._launch`."""
+
+
+@dataclass(frozen=True)
+class DatasetCollection:
+    """All matrix datasets parsed from one AnnData-style store.
+
+    ``x`` is the primary ``X`` matrix.  ``layers`` maps AnnData layer names
+    (for example ``"counts"``) to the same single-matrix dataset types that the
+    databank already registers.  Item lookup accepts both full matrix keys
+    (``"X"``, ``"layers/counts"``) and layer-name shorthand (``"counts"``).
+    """
+
+    x: Dataset
+    layers: Mapping[str, Dataset] = field(default_factory=dict)
+    store_root: str = ""
+
+    def __post_init__(self) -> None:
+        normalized = dict(self.layers)
+        for name, dataset in normalized.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"layer names must be non-empty strings, got {name!r}")
+            if "/" in name:
+                raise ValueError(f"nested layer names are unsupported: {name!r}")
+            if not isinstance(dataset, (DenseDataset, SparseDataset)):
+                raise TypeError(
+                    f"layer {name!r} has unsupported dataset type {type(dataset).__name__}"
+                )
+            if dataset.num_cells != self.x.num_cells:
+                raise ValueError(
+                    f"layer {name!r} has {dataset.num_cells} cells, expected {self.x.num_cells}"
+                )
+            if dataset.num_genes != self.x.num_genes:
+                raise ValueError(
+                    f"layer {name!r} has {dataset.num_genes} genes, expected {self.x.num_genes}"
+                )
+            if tuple(dataset.gene_names) != tuple(self.x.gene_names):
+                raise ValueError(f"layer {name!r} gene names differ from X")
+        object.__setattr__(self, "layers", normalized)
+
+    def __getitem__(self, key: str) -> Dataset:
+        if key == "X":
+            return self.x
+        if key.startswith("layers/"):
+            name = key[len("layers/") :]
+            if not name:
+                raise KeyError(key)
+            return self.layers[name]
+        return self.layers[key]
+
+    def __contains__(self, key: object) -> bool:
+        if not isinstance(key, str):
+            return False
+        if key == "X":
+            return True
+        if key.startswith("layers/"):
+            return key[len("layers/") :] in self.layers
+        return key in self.layers
+
+    def keys(self) -> tuple[str, ...]:
+        return ("X", *(f"layers/{name}" for name in self.layers))
+
+    def items(self) -> Iterator[tuple[str, Dataset]]:
+        yield "X", self.x
+        for name, dataset in self.layers.items():
+            yield f"layers/{name}", dataset

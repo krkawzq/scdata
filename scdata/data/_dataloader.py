@@ -92,9 +92,9 @@ def _identity_sc_collate(batch: ScDataBatch) -> ScDataBatch:
 
 def _to_int(value: int | np.integer[Any] | object, context: str) -> int:
     if hasattr(value, "item"):
-        value = value.item() # type: ignore
+        value = value.item()  # type: ignore
     try:
-        return int(value) # type: ignore
+        return int(value)  # type: ignore
     except (TypeError, ValueError) as err:
         raise TypeError(f"{context} must be an integer, got {value!r}") from err
 
@@ -120,7 +120,7 @@ def _parse_sample(
         return _to_int(file_id, "file_id"), _to_int(cell_id, "cell_id")
 
     if hasattr(sample, "tolist"):
-        sample = sample.tolist() # type: ignore
+        sample = sample.tolist()  # type: ignore
     try:
         file_id, cell_id = sample  # type: ignore[misc]
     except (TypeError, ValueError) as err:

@@ -21,14 +21,6 @@ __version__: str
 def kernel_name() -> str: ...
 def kernel_version() -> str: ...
 def _zip_stored_offsets(path: str, header_offsets: list[int]) -> list[int]: ...
-def _decode_index_payload(
-    payload: bytes,
-    offsets: NDArray[np.uint64],
-    lengths: NDArray[np.uint64],
-    dtype: DType,
-    codec: Any,
-    count: int,
-) -> NDArray[np.uint64]: ...
 def _decode_index_chunks(
     chunks: Iterable[bytes],
     dtype: DType,

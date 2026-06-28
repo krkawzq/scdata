@@ -3,7 +3,7 @@
 These dataclasses are the Python view of what the Rust databank consumes and
 produces.  They are produced by :mod:`scdata.io` when reading a store and
 carry every field Rust needs (shape, chunk_shape, dtype, codec pipeline,
-payload chunk index) without depending on the Rust extension at runtime.
+chunk locations) without depending on the Rust extension at runtime.
 
 The :mod:`scdata.data._cell` and :mod:`scdata.data._prefetch` modules add the
 request/result carriers for the access and streaming-prefetch paths — also
@@ -25,6 +25,7 @@ from scdata.data._dataset import (
     DenseDataset,
     DType,
     Dataset,
+    DatasetCollection,
     DataError,
     DtypeParseError,
     CodecConfigError,
@@ -40,6 +41,7 @@ __all__ = [
     "DenseDataset",
     "DType",
     "Dataset",
+    "DatasetCollection",
     "DataError",
     "DtypeParseError",
     "CodecConfigError",

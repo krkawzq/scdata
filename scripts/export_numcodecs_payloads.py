@@ -152,13 +152,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-bytes-list", action="append")
     parser.add_argument("--block-bytes", type=bench.parse_size, default=bench.parse_size("8MiB"))
     parser.add_argument("--block-bytes-list", action="append")
-    parser.add_argument("--min-sample-per-dataset", type=bench.parse_size, default=bench.parse_size("4MiB"))
-    parser.add_argument("--min-dataset-bytes", type=bench.parse_size, default=bench.parse_size("1MiB"))
+    parser.add_argument(
+        "--min-sample-per-dataset", type=bench.parse_size, default=bench.parse_size("4MiB")
+    )
+    parser.add_argument(
+        "--min-dataset-bytes", type=bench.parse_size, default=bench.parse_size("1MiB")
+    )
     parser.add_argument("--max-datasets", type=int, default=12)
-    parser.add_argument("--selection", choices=["largest", "stratified", "all"], default="stratified")
+    parser.add_argument(
+        "--selection", choices=["largest", "stratified", "all"], default="stratified"
+    )
     parser.add_argument("--dataset", action="append")
     parser.add_argument("--exclude-dataset", action="append")
-    parser.add_argument("--profile", choices=["quick", "default", "broad", "all"], default="default")
+    parser.add_argument(
+        "--profile", choices=["quick", "default", "broad", "all"], default="default"
+    )
     parser.add_argument("--profile-list", action="append")
     parser.add_argument("--blosc-shuffle", action="append")
     parser.add_argument("--only-codec", action="append")
@@ -207,7 +215,10 @@ def export_run(
     )
 
     algorithms: list[dict[str, Any]] = []
-    print(f"exporting {run.run_id}: {bench.human_bytes(raw_bytes)} in {len(chunks)} chunks", flush=True)
+    print(
+        f"exporting {run.run_id}: {bench.human_bytes(raw_bytes)} in {len(chunks)} chunks",
+        flush=True,
+    )
     for codec in codecs:
         print(f"  encoding {codec.name} ...", flush=True)
         encoded_path = encoded_dir / f"{safe_name(codec.name)}.bin"

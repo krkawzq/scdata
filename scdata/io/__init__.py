@@ -13,14 +13,16 @@ from __future__ import annotations
 
 from scdata.io._anndata import read_zarr, write_zarr
 from scdata.io._convert import AnnDataZarrZipConverter
-from scdata.io._launch import Store, StoreError, launch, launch_store
+from scdata.io._launch import Store, StoreError, launch, launch_all, launch_store, launch_store_all
 
 __all__ = [
     "AnnDataZarrZipConverter",
     "Store",
     "StoreError",
     "launch",
+    "launch_all",
     "launch_store",
+    "launch_store_all",
     "read_zarr",
     "write_zarr",
 ]

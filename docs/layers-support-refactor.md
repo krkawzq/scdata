@@ -16,8 +16,7 @@ dataset;Python IO 层负责把 `X` 和 `layers/<name>` 都解析成同一种
    `X` 和 `layers/<name>`。
 5. `ScDataBank` 继续按 `DatasetId` 工作;layer 注册后就是另一个
    dataset id。Rust core 不需要知道 layer 名称。
-6. 老 store 继续可读;没有 scdata chunk index 的 legacy v2 layer 不强行支持
-   Rust 注册。
+6. `launch` 只支持 zarr v3 store;早期自定义 payload store 已完全废弃。
 
 ## 2. 当前问题
 
@@ -28,10 +27,9 @@ dataset;Python IO 层负责把 `X` 和 `layers/<name>` 都解析成同一种
 - `launch(path) -> Dataset`
 - `launch_store(store, store_root="") -> Dataset`
 
-内部 `_launch_v3` 和 `_launch_v2` 都硬编码检查和解析 `X`:
+内部 `_launch_v3` 硬编码检查和解析 `X`:
 
 - v3: `X/zarr.json`
-- v2: `X/.zarray` 或 `X/.zgroup`
 
 这意味着即使 store 中有 `layers/counts`,Python 也没有 API 能把它解析成
 `DenseDataset` / `SparseDataset`。
@@ -44,7 +42,7 @@ dataset;Python IO 层负责把 `X` 和 `layers/<name>` 都解析成同一种
 if adata.layers:
     write_elem(g, "layers", dict(adata.layers))
 
-_write_x(g, adata, format=format, chunks=chunks, align_cells=align_cells)
+_write_x(g, adata, format=format, chunk_size=chunk_size, align_cells=align_cells)
 ```
 
 `X` 走 scdata 自己的 `_write_x`,layers 走 anndata 原生 writer。因此:
@@ -243,17 +241,10 @@ layer 支持有两种选择:
 
 ### 5.1 拆出 matrix 级解析函数
 
-把 `_launch_v3` / `_launch_v2` 中的 `X` 硬编码拆成:
+把 `_launch_v3` 中的 `X` 硬编码拆成:
 
 ```python
 def _launch_v3_matrix(
-    store: Store,
-    matrix_key: str,
-    gene_names: tuple[str, ...],
-    store_root: str,
-) -> Dataset: ...
-
-def _launch_v2_matrix(
     store: Store,
     matrix_key: str,
     gene_names: tuple[str, ...],
@@ -271,15 +262,6 @@ v3 逻辑:
 - dense 复用 `_v3_build_dense_dataset`;
 - sparse 复用 `_v3_build_sparse_dataset`。
 
-v2 逻辑:
-
-- dense: `matrix_key/.zarray`;
-- sparse: `matrix_key/.zgroup`;
-- encoding 复用 `_detect_x_encoding`,但函数应重命名为
-  `_detect_matrix_encoding`;
-- v2 layer 必须是 scdata-written array/group,也就是数组 `.zattrs["scdata"]`
-  chunk index 存在。普通 anndata v2 layer 不能注册给 Rust。
-
 ### 5.2 枚举 layers
 
 使用现有 `Store.list_keys(prefix)`。
@@ -292,16 +274,6 @@ def _v3_layer_names(store: Store) -> tuple[str, ...]:
         return ()
     keys = store.list_keys("layers")
     # direct child with layers/<name>/zarr.json
-```
-
-v2:
-
-```python
-def _v2_layer_names(store: Store) -> tuple[str, ...]:
-    if not store.exists("layers/.zgroup"):
-        return ()
-    keys = store.list_keys("layers")
-    # direct child with layers/<name>/.zarray or layers/<name>/.zgroup
 ```
 
 只枚举 direct child。writer 应拒绝 layer name 中包含 `/`,避免 nested layer
@@ -324,7 +296,7 @@ def launch_all(path):
 
 `launch_store_all`:
 
-1. 检查 root 是 v3 或 v2;
+1. 检查 root 是 v3;
 2. 读取 `var` gene names 一次;
 3. 解析 `X`;
 4. 枚举 layers;
@@ -349,7 +321,7 @@ def _write_matrix(
     n_obs: int,
     n_var: int,
     format: _MatrixFormat,
-    chunks: int | list[int] | tuple[int, ...],
+    chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
 ) -> None: ...
 ```
@@ -357,7 +329,7 @@ def _write_matrix(
 `_write_x` 可以变成薄 wrapper:
 
 ```python
-def _write_x(g, adata, *, format, chunks, align_cells):
+def _write_x(g, adata, *, format, chunk_size, align_cells):
     _write_matrix(g, "X", adata.X, n_obs=adata.n_obs, n_var=adata.n_vars, ...)
 ```
 
@@ -580,14 +552,12 @@ def unregister_all(self, ids: Mapping[str, DatasetId]) -> None: ...
 8. layer gene 数不等于 `var` 报错;
 9. layer cell 数不等于 `X` 时,`launch_all` 报错。
 
-### 9.3 legacy v2
+### 9.3 legacy store removal
 
-用现有 v2 test factories 构造:
-
-1. 把 scdata dense `X` 复制/移动到 `layers/counts`;
-2. `launch(root, layer="counts")` 能解析;
-3. 普通 anndata v2 layer 没有 `.zattrs["scdata"]` 时,报错应说明
-   `not a scdata-written store` 或 `missing scdata chunk index`。
+1. 早期自定义 payload store 不再解析;
+2. 只有 `.zgroup`、没有根 `zarr.json` 的 store 应报 `not a zarr v3 store`;
+3. 测试夹具不得再手写旧 payload store,所有正向读写测试都通过
+   `write_zarr` 生成 zarr v3 store。
 
 ### 9.4 error paths
 

@@ -57,8 +57,7 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_INPUT = Path(
-    "/mnt/shared-storage-user/dnacoding/wangzhongqi/Code/Project/PRISM/data/"
-    "tahoe_dmso_control.h5ad"
+    "/mnt/shared-storage-user/dnacoding/wangzhongqi/Code/Project/PRISM/data/tahoe_dmso_control.h5ad"
 )
 DEFAULT_OUTPUT_DIR = Path("outputs/bench_compression")
 
@@ -214,8 +213,7 @@ class BloscByItemsize(CodecAdapter):
         self.name = f"blosc.{cname}.{suffix}"
         self.family = "blosc"
         self.notes = (
-            "Blosc with dtype-aware typesize; auto shuffle matches Zarr "
-            "BloscCodec evolution"
+            "Blosc with dtype-aware typesize; auto shuffle matches Zarr BloscCodec evolution"
         )
         self._cache: dict[tuple[int, int], Blosc] = {}
 
@@ -380,6 +378,7 @@ def configure_threads(threads: int) -> None:
 def collect_dataset_infos(path: Path) -> list[DatasetInfo]:
     infos: list[DatasetInfo] = []
     with h5py.File(path, "r") as h5:
+
         def visit(name: str, obj: Any) -> None:
             if not isinstance(obj, h5py.Dataset) or obj.shape is None:
                 return
@@ -484,7 +483,9 @@ def sample_positions(n_units: int, block_units: int, n_blocks: int, seed: int) -
     return sorted(positions)
 
 
-def read_dataset_block(ds: h5py.Dataset, offset: int, block_units: int) -> np.ndarray[Any, np.dtype[Any]]:
+def read_dataset_block(
+    ds: h5py.Dataset, offset: int, block_units: int
+) -> np.ndarray[Any, np.dtype[Any]]:
     if len(ds.shape) == 1:
         return np.asarray(ds[offset : offset + block_units])
     return np.asarray(ds[offset : offset + block_units, ...])
@@ -1073,9 +1074,7 @@ def build_run_matrix(
         profile_values,
     ):
         run_id = (
-            f"sample-{size_slug(sample_bytes)}_"
-            f"block-{size_slug(block_bytes)}_"
-            f"profile-{profile}"
+            f"sample-{size_slug(sample_bytes)}_block-{size_slug(block_bytes)}_profile-{profile}"
         )
         runs.append(
             RunConfig(
@@ -1219,7 +1218,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-sample-per-dataset", type=parse_size, default=parse_size("4MiB"))
     parser.add_argument("--min-dataset-bytes", type=parse_size, default=parse_size("1MiB"))
     parser.add_argument("--max-datasets", type=int, default=12)
-    parser.add_argument("--selection", choices=["largest", "stratified", "all"], default="stratified")
+    parser.add_argument(
+        "--selection", choices=["largest", "stratified", "all"], default="stratified"
+    )
     parser.add_argument(
         "--dataset",
         action="append",
@@ -1230,7 +1231,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Dataset glob to exclude. Can be repeated or comma-separated.",
     )
-    parser.add_argument("--profile", choices=["quick", "default", "broad", "all"], default="default")
+    parser.add_argument(
+        "--profile", choices=["quick", "default", "broad", "all"], default="default"
+    )
     parser.add_argument(
         "--profile-list",
         action="append",
@@ -1254,19 +1257,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Codec glob to exclude.",
     )
-    parser.add_argument("--include-optional", action="store_true", help="Try optional PCodec/ZFPY codecs.")
+    parser.add_argument(
+        "--include-optional", action="store_true", help="Try optional PCodec/ZFPY codecs."
+    )
     parser.add_argument("--skip-slow", action="store_true", help="Skip BZ2/LZMA families.")
-    parser.add_argument("--no-baseline", action="store_true", help="Drop uncompressed copy baseline.")
+    parser.add_argument(
+        "--no-baseline", action="store_true", help="Drop uncompressed copy baseline."
+    )
     parser.add_argument("--threads", type=int, default=1, help="Blosc threads. Default: 1.")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--verify", choices=["none", "first", "all"], default="all")
     parser.add_argument("--decode-order", choices=["sequential", "random"], default="sequential")
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--sort", choices=["decode", "ratio", "compress", "name", "input"], default="decode")
+    parser.add_argument(
+        "--sort", choices=["decode", "ratio", "compress", "name", "input"], default="decode"
+    )
     parser.add_argument("--list-datasets", action="store_true")
     parser.add_argument("--list-codecs", action="store_true")
-    parser.add_argument("--list-runs", action="store_true", help="Print the expanded scan matrix and exit.")
+    parser.add_argument(
+        "--list-runs", action="store_true", help="Print the expanded scan matrix and exit."
+    )
     return parser
 
 
@@ -1527,7 +1538,9 @@ def main(argv: list[str] | None = None) -> int:
     matrix_run_rows: list[dict[str, Any]] = []
     matrix_runs: list[dict[str, Any]] = []
     for run in runs:
-        run_output_dir = args.output_dir if len(runs) == 1 else args.output_dir / "runs" / run.run_id
+        run_output_dir = (
+            args.output_dir if len(runs) == 1 else args.output_dir / "runs" / run.run_id
+        )
         payload, paths = run_benchmark_once(
             args=args,
             run=run,

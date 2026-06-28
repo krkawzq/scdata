@@ -288,12 +288,12 @@ def test_array_meta_file_source_path_and_offset_base():
         chunk_shape=(2,),
         dtype=DType.F32,
         chunks=(ChunkLocation(offset=0, length=8), ChunkLocation(offset=8, length=8)),
-        payload_path="X/payload.bin",
+        payload_path="X/chunks.data",
         payload_file_path="/tmp/store.zarr.zip",
         chunk_offset_base=128,
     )
 
-    assert meta.payload_path == "X/payload.bin"
+    assert meta.payload_path == "X/chunks.data"
     assert meta.payload_file_path == "/tmp/store.zarr.zip"
     assert tuple((c.offset, c.length) for c in meta.chunks) == ((128, 8), (136, 8))
 
