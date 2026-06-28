@@ -201,7 +201,10 @@ pub fn env_i32(name: &str) -> Option<i32> {
 
 pub fn env_flag(name: &str) -> bool {
     match std::env::var(name) {
-        Ok(value) => !matches!(value.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no" | "off"),
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
         Err(_) => false,
     }
 }

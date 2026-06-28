@@ -23,12 +23,16 @@ except ModuleNotFoundError as exc:
         return __version__
 
 
-# Pure-Python modules: store metadata parsing and dataset types.  These do
-# not depend on the Rust extension and are always importable, so the store
-# format can be read (and written) even before the Rust core is bound.
+# Pure-Python modules: store metadata parsing, dataset types, and the cell
+# access / batch carriers.  These do not depend on the Rust extension and are
+# always importable, so the store format can be read (and the data types used)
+# even before the Rust core is bound.
 from scdata.data import (  # noqa: E402
     ArrayMeta,
     ArrayOrder,
+    CellAccess,
+    CellBatch,
+    CellData,
     ChunkLocation,
     CodecPipeline,
     DataError,
@@ -39,10 +43,20 @@ from scdata.data import (  # noqa: E402
     CodecConfigError,
     SparseDataset,
 )
-from scdata.io import Store, StoreError, convert_anndata_zarr, launch, launch_store, write_anndata  # noqa: E402
+from scdata.io import (  # noqa: E402
+    AnnDataZarrZipConverter,
+    Store,
+    StoreError,
+    launch,
+    launch_store,
+    read_zarr,
+    write_zarr,
+)
 
 # Pythonic DataBank wrapper + config dataclasses (re-exported verbatim from the
-# Rust extension).  When the extension is missing, ``ScDataBank`` raises on use.
+# Rust extension).  When the extension is missing, the Rust-backed names raise
+# on use; the pure-Python ``CellAccess`` / ``CellBatch`` / ``CellData`` above
+# remain usable regardless.
 try:
     from scdata.databank import (
         AccessConfig,
@@ -55,7 +69,6 @@ try:
         FillConfig,
         IoConfig,
         MissingGenePolicy,
-        PrefetchedBatch,
         ScheduledAccessConfig,
         ScheduledPrefetchConfig,
         ScDataBank,
@@ -63,19 +76,20 @@ try:
         UringConfig,
     )
 except ModuleNotFoundError:
+
     def _missing(name: str):
         def _raise(*args: object, **kwargs: object) -> None:
             raise RuntimeError(
                 f"{name} requires the scdata Rust extension. Install the package "
                 "with `maturin develop` or `uv pip install -e .`."
             ) from _MISSING_EXTENSION_ERROR
+
         return _raise
 
     ScDataBank = _missing("ScDataBank")  # type: ignore[assignment, misc]
     DataBankConfig = _missing("DataBankConfig")  # type: ignore[assignment, misc]
     DatasetId = _missing("DatasetId")  # type: ignore[assignment, misc]
     MissingGenePolicy = _missing("MissingGenePolicy")  # type: ignore[assignment, misc]
-    PrefetchedBatch = _missing("PrefetchedBatch")  # type: ignore[assignment, misc]
     DataBankError = RuntimeError  # type: ignore[assignment, misc]
     IoConfig = _missing("IoConfig")  # type: ignore[assignment, misc]
     UringConfig = _missing("UringConfig")  # type: ignore[assignment, misc]
@@ -94,7 +108,6 @@ __all__ = [
     "kernel_version",
     # databank (Rust-backed, Pythonic wrapper)
     "ScDataBank",
-    "PrefetchedBatch",
     "DataBankError",
     "DatasetId",
     "MissingGenePolicy",
@@ -109,14 +122,10 @@ __all__ = [
     "FillConfig",
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
-    # io
-    "Store",
-    "StoreError",
-    "convert_anndata_zarr",
-    "launch",
-    "launch_store",
-    "write_anndata",
-    # data
+    # data (pure Python — usable with or without the Rust extension)
+    "CellAccess",
+    "CellBatch",
+    "CellData",
     "ArrayMeta",
     "ArrayOrder",
     "ChunkLocation",
@@ -128,65 +137,12 @@ __all__ = [
     "DType",
     "Dataset",
     "SparseDataset",
-]
-
-
-# Pure-Python modules: store metadata parsing and dataset types.  These do
-# not depend on the Rust extension and are always importable, so the store
-# format can be read (and written) even before the Rust core is bound.
-from scdata.data import (  # noqa: E402
-    ArrayMeta,
-    ArrayOrder,
-    ChunkLocation,
-    CodecPipeline,
-    DataError,
-    DenseDataset,
-    DType,
-    Dataset,
-    DtypeParseError,
-    CodecConfigError,
-    SparseDataset,
-)
-from scdata.io import Store, StoreError, convert_anndata_zarr, launch, launch_store, write_anndata  # noqa: E402
-
-__all__ = [
-    "__version__",
-    "kernel_name",
-    "kernel_version",
-    # databank (Rust-backed, Pythonic wrapper)
-    "ScDataBank",
-    "PrefetchedBatch",
-    "DataBankError",
-    "DatasetId",
-    "MissingGenePolicy",
-    "DataBankConfig",
-    "IoConfig",
-    "UringConfig",
-    "ThreadedConfig",
-    "BaseIoConfig",
-    "DecodePoolConfig",
-    "AccessConfig",
-    "AccessCpuConfig",
-    "FillConfig",
-    "ScheduledAccessConfig",
-    "ScheduledPrefetchConfig",
     # io
+    "AnnDataZarrZipConverter",
     "Store",
     "StoreError",
-    "convert_anndata_zarr",
     "launch",
     "launch_store",
-    "write_anndata",
-    # data
-    "ArrayMeta",
-    "ArrayOrder",
-    "ChunkLocation",
-    "CodecPipeline",
-    "DataError",
-    "DtypeParseError",
-    "CodecConfigError",
-    "DenseDataset",
-    "DType",
-    "Dataset",
-    "SparseDataset",
+    "read_zarr",
+    "write_zarr",
 ]

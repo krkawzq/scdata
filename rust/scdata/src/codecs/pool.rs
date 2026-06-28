@@ -8,6 +8,7 @@ use std::thread;
 
 use tokio::sync::oneshot;
 
+use super::runner::DecodeRunner;
 use super::{CodecError, CodecResult, CodecSpec, SharedCodec};
 
 /// Worker-pool settings for chunk decoding.
@@ -75,7 +76,18 @@ pub struct DecodeRequest {
     pub codec: SharedCodec,
     pub encoded: Arc<[u8]>,
     pub expected_size: Option<usize>,
-    pub output: Option<Vec<u8>>,
+    pub output: DecodeOutput,
+}
+
+/// Output ownership strategy for a decode request.
+#[derive(Debug)]
+pub enum DecodeOutput {
+    /// Allocate a fresh decoded output on the worker.
+    Allocate,
+    /// Reuse the vector's current initialized length as writable output.
+    ReuseInitialized(Vec<u8>),
+    /// Reuse the vector's capacity as writable output when the decoded size is known.
+    ReuseCapacity(Vec<u8>),
 }
 
 impl DecodeRequest {
@@ -84,7 +96,7 @@ impl DecodeRequest {
             codec,
             encoded: encoded.into(),
             expected_size: None,
-            output: None,
+            output: DecodeOutput::Allocate,
         }
     }
 
@@ -97,15 +109,23 @@ impl DecodeRequest {
         self
     }
 
-    /// Provide caller-owned output memory for the worker to fill.
+    /// Provide initialized caller-owned output memory for the worker to fill.
+    ///
+    /// Only the vector's current length is writable. Decoding fails instead of
+    /// growing this buffer behind the caller's back.
+    pub fn with_reuse_initialized_output(mut self, output: Vec<u8>) -> Self {
+        self.output = DecodeOutput::ReuseInitialized(output);
+        self
+    }
+
+    /// Provide caller-owned output capacity for the worker to fill.
     ///
     /// When the final decoded size is known, the vector's capacity is used as
-    /// writable memory so callers can pass `Vec::with_capacity(size)` without
-    /// zero-filling. Without an exact size hint, the vector's current length is
-    /// the writable view. Decoding never reallocates this buffer behind the
-    /// caller's back.
-    pub fn with_output_buffer(mut self, output: Vec<u8>) -> Self {
-        self.output = Some(output);
+    /// writable memory so callers can pass `Vec::with_capacity(size)`. Codecs
+    /// that do not provide an internal capacity-safe path will initialize the
+    /// writable range before decoding.
+    pub fn with_reuse_capacity_output(mut self, output: Vec<u8>) -> Self {
+        self.output = DecodeOutput::ReuseCapacity(output);
         self
     }
 }
@@ -266,8 +286,13 @@ fn complete_work(work: DecodeWork) {
         output,
     } = work.request;
     let result = panic::catch_unwind(AssertUnwindSafe(|| match output {
-        Some(output) => codec.decode_to_vec(&encoded, output, expected_size),
-        None => codec.decode(&encoded, expected_size),
+        DecodeOutput::Allocate => DecodeRunner::decode(codec.as_ref(), &encoded, expected_size),
+        DecodeOutput::ReuseInitialized(output) => {
+            DecodeRunner::decode_to_initialized_vec(codec.as_ref(), &encoded, output, expected_size)
+        }
+        DecodeOutput::ReuseCapacity(output) => {
+            DecodeRunner::decode_to_capacity_vec(codec.as_ref(), &encoded, output, expected_size)
+        }
     }))
     .unwrap_or_else(|_| {
         Err(CodecError::WorkerPanic {
@@ -279,10 +304,11 @@ fn complete_work(work: DecodeWork) {
 }
 
 fn resolve_cpu_affinity(config: &DecodePoolConfig) -> CodecResult<Vec<usize>> {
+    let Some(requested_cpus) = &config.cpus else {
+        return Ok(Vec::new());
+    };
+
     let Some(core_ids) = core_affinity::get_core_ids() else {
-        if config.cpus.is_none() {
-            return Ok(Vec::new());
-        }
         return Err(CodecError::InvalidConfig(
             "CPU affinity requested but core ids are unavailable".to_string(),
         ));
@@ -293,21 +319,15 @@ fn resolve_cpu_affinity(config: &DecodePoolConfig) -> CodecResult<Vec<usize>> {
         .map(|core_id| core_id.id)
         .collect::<BTreeSet<_>>();
 
-    let cpus = match &config.cpus {
-        Some(cpus) => {
-            for cpu in cpus {
-                if !available.contains(cpu) {
-                    return Err(CodecError::InvalidConfig(format!(
-                        "CPU id {cpu} is not available"
-                    )));
-                }
-            }
-            cpus.clone()
+    for cpu in requested_cpus {
+        if !available.contains(cpu) {
+            return Err(CodecError::InvalidConfig(format!(
+                "CPU id {cpu} is not available"
+            )));
         }
-        None => core_ids.into_iter().map(|core_id| core_id.id).collect(),
-    };
+    }
 
-    Ok(cpus)
+    Ok(requested_cpus.clone())
 }
 
 fn pin_current_thread(cpu: usize) {
@@ -340,6 +360,15 @@ mod tests {
             ..DecodePoolConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_without_cpus_does_not_request_affinity() {
+        let config = DecodePoolConfig::default();
+        assert_eq!(
+            resolve_cpu_affinity(&config).expect("resolve default affinity"),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
@@ -389,7 +418,7 @@ mod tests {
         let output_ptr = output.as_ptr();
         let request = DecodeRequest::new(codec, b"abcdef".to_vec())
             .with_expected_size(6)
-            .with_output_buffer(output);
+            .with_reuse_initialized_output(output);
 
         let decoded = pool
             .submit(request)
@@ -409,7 +438,7 @@ mod tests {
         let output_ptr = output.as_ptr();
         let request = DecodeRequest::new(codec, b"abcdef".to_vec())
             .with_expected_size(6)
-            .with_output_buffer(output);
+            .with_reuse_capacity_output(output);
 
         let decoded = pool
             .submit(request)

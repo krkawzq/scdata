@@ -52,7 +52,9 @@ impl DecodeOrder {
         match value {
             "sequential" => Ok(Self::Sequential),
             "random" => Ok(Self::Random),
-            other => Err(format!("invalid --decode-order `{other}` (sequential|random)")),
+            other => Err(format!(
+                "invalid --decode-order `{other}` (sequential|random)"
+            )),
         }
     }
 }
@@ -117,8 +119,13 @@ pub struct LoadedRun {
 }
 
 /// Bench one run and write per-run CSV + JSON outputs into `output_dir`.
-pub fn bench_run(run: &LoadedRun, args: &ManifestBenchArgs, output_dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(output_dir).map_err(|err| format!("create {}: {err}", output_dir.display()))?;
+pub fn bench_run(
+    run: &LoadedRun,
+    args: &ManifestBenchArgs,
+    output_dir: &Path,
+) -> Result<(), String> {
+    fs::create_dir_all(output_dir)
+        .map_err(|err| format!("create {}: {err}", output_dir.display()))?;
     let raw_bytes: usize = run.chunks.iter().map(|chunk| chunk.raw_len).sum();
     println!(
         "rust decode {}: {:.2} MiB in {} chunks, {} codecs",
@@ -163,7 +170,8 @@ pub fn bench_matrix(
     args: &ManifestBenchArgs,
     output_dir: &Path,
 ) -> Result<(), String> {
-    fs::create_dir_all(output_dir).map_err(|err| format!("create {}: {err}", output_dir.display()))?;
+    fs::create_dir_all(output_dir)
+        .map_err(|err| format!("create {}: {err}", output_dir.display()))?;
     let mut all_rows: Vec<(BTreeMap<String, String>, BenchRow)> = Vec::new();
     let mut run_rows: Vec<Vec<String>> = Vec::new();
 
@@ -211,11 +219,7 @@ pub fn bench_matrix(
         ]);
     }
 
-    write_summary_csv(
-        &output_dir.join("matrix_summary.csv"),
-        &[],
-        Some(&all_rows),
-    )?;
+    write_summary_csv(&output_dir.join("matrix_summary.csv"), &[], Some(&all_rows))?;
     write_matrix_runs_csv(&output_dir.join("matrix_runs.csv"), &run_rows)?;
     let matrix_json = json!({
         "implementation": "rust",
@@ -291,15 +295,17 @@ fn load_manifest_value(manifest: &Value, base_dir: &Path) -> Result<LoadedRun, S
             .unwrap_or("")
             .to_string();
         let status = algorithm.get("status").and_then(Value::as_str);
-        let config = algorithm.get("codec_config").filter(|value| !value.is_null());
+        let config = algorithm
+            .get("codec_config")
+            .filter(|value| !value.is_null());
 
         if status != Some("ok") || config.is_none() {
             continue; // skip non-ok / configless entries
         }
         let spec = CodecSpec::from_json_value(config.unwrap()).map_err(|err| err.to_string())?;
         let encoded_file = PathBuf::from(string_field(algorithm, "encoded_file")?);
-        let encoded =
-            fs::read(&encoded_file).map_err(|err| format!("read {}: {err}", encoded_file.display()))?;
+        let encoded = fs::read(&encoded_file)
+            .map_err(|err| format!("read {}: {err}", encoded_file.display()))?;
         let records = parse_records(array_field(algorithm, "records")?)?;
         if records.len() != chunks.len() {
             return Err(format!(
@@ -493,9 +499,19 @@ fn verify_case(
     if verify == VerifyMode::None {
         return Ok(());
     }
-    let limit = if verify == VerifyMode::First { 1 } else { chunks.len() };
+    let limit = if verify == VerifyMode::First {
+        1
+    } else {
+        chunks.len()
+    };
     for idx in 0..limit {
-        let written = decode_one(codec, &chunks[idx], &records[idx], &mut buffers[idx], encoded)?;
+        let written = decode_one(
+            codec,
+            &chunks[idx],
+            &records[idx],
+            &mut buffers[idx],
+            encoded,
+        )?;
         let raw_end = chunks[idx]
             .raw_offset
             .checked_add(chunks[idx].raw_len)
@@ -523,7 +539,13 @@ fn decode_pass(
         DecodeOrder::Random => shuffle_indices(chunks.len(), seed),
     };
     for idx in indices {
-        total_out += decode_one(codec, &chunks[idx], &records[idx], &mut buffers[idx], encoded)?;
+        total_out += decode_one(
+            codec,
+            &chunks[idx],
+            &records[idx],
+            &mut buffers[idx],
+            encoded,
+        )?;
     }
     Ok((started.elapsed().as_secs_f64(), total_out))
 }
@@ -669,7 +691,13 @@ fn write_summary_csv(
 ) -> Result<(), String> {
     let mut text = String::new();
     let prefix_headers = if matrix_rows.is_some() {
-        vec!["run_id", "sample_bytes", "block_bytes", "profile", "output_dir"]
+        vec![
+            "run_id",
+            "sample_bytes",
+            "block_bytes",
+            "profile",
+            "output_dir",
+        ]
     } else {
         Vec::new()
     };

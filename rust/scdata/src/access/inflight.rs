@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use super::scheduler::ChunkKey;
+use super::key::ChunkKey;
 
 #[derive(Debug)]
 struct InflightEntry {

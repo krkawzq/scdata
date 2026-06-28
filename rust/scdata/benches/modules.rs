@@ -13,6 +13,7 @@ mod support;
 
 use std::fs::{File, OpenOptions};
 use std::io::Cursor;
+#[cfg(feature = "uring")]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -35,8 +36,7 @@ use _scdata::databank::{
 #[cfg(feature = "uring")]
 use _scdata::iopool::UringConfig;
 use _scdata::iopool::{
-    BaseIoConfig, FileId, IoCommand, IoConfig, IoOutput, IoPool, OpKind, RequestKey,
-    ThreadedConfig,
+    BaseIoConfig, FileId, IoCommand, IoConfig, IoOutput, IoPool, OpKind, RequestKey, ThreadedConfig,
 };
 use support::backends::{CodecDecode, SliceIo};
 use support::chunks::{
@@ -139,11 +139,13 @@ fn bench_codecs(config: BenchConfig) {
         },
     );
     bench(config, "codecs/codec_from_json_str", 20_000, None, || {
-        Arc::as_ptr(&codec_from_json_str(codec_json).expect("codec from json")) as *const () as usize
+        Arc::as_ptr(&codec_from_json_str(codec_json).expect("codec from json")) as *const ()
+            as usize
     });
     bench(config, "codecs/codec_from_spec", 50_000, None, || {
-        Arc::as_ptr(&codec_from_spec(&CodecSpec::Zstd(ZstdCodecConfig::default()))) as *const ()
-            as usize
+        Arc::as_ptr(&codec_from_spec(&CodecSpec::Zstd(
+            ZstdCodecConfig::default(),
+        ))) as *const () as usize
     });
     bench(
         config,
@@ -287,18 +289,30 @@ fn bench_codecs(config: BenchConfig) {
     }
 
     // CodecPipeline surface: empty/identity, json-array construction, length.
-    bench(config, "codecs/pipeline_empty_identity", 5_000, None, || {
-        let pipeline = CodecPipeline::new(Vec::new());
-        let is_empty = pipeline.is_empty();
-        let len = pipeline.len();
-        let decoded = pipeline.decode(b"abcdef", Some(6)).expect("identity");
-        usize::from(is_empty) ^ len ^ decoded.len()
-    });
-    bench(config, "codecs/pipeline_from_json_array_str", 10_000, None, || {
-        CodecPipeline::from_json_array_str(pipeline_json)
-            .expect("pipeline from json")
-            .len()
-    });
+    bench(
+        config,
+        "codecs/pipeline_empty_identity",
+        5_000,
+        None,
+        || {
+            let pipeline = CodecPipeline::new(Vec::new());
+            let is_empty = pipeline.is_empty();
+            let len = pipeline.len();
+            let decoded = pipeline.decode(b"abcdef", Some(6)).expect("identity");
+            usize::from(is_empty) ^ len ^ decoded.len()
+        },
+    );
+    bench(
+        config,
+        "codecs/pipeline_from_json_array_str",
+        10_000,
+        None,
+        || {
+            CodecPipeline::from_json_array_str(pipeline_json)
+                .expect("pipeline from json")
+                .len()
+        },
+    );
 
     // Zarr v2 pipelines: build from JSON values, JSON strings, and specs, then
     // decode a raw -> crc32 -> zstd payload.
@@ -309,10 +323,12 @@ fn bench_codecs(config: BenchConfig) {
             .expect("compressor json");
     let zarr_v2_inner = crc32_encode(&raw);
     let zarr_v2_encoded = zstd::encode_all(Cursor::new(&zarr_v2_inner), 3).expect("zstd encode");
-    let zarr_v2_pipeline_values =
-        CodecPipeline::from_zarr_v2_json_values(Some(&zarr_v2_filters_json), Some(&zarr_v2_compressor_json))
-            .expect("zarr v2 pipeline")
-            .into_shared();
+    let zarr_v2_pipeline_values = CodecPipeline::from_zarr_v2_json_values(
+        Some(&zarr_v2_filters_json),
+        Some(&zarr_v2_compressor_json),
+    )
+    .expect("zarr v2 pipeline")
+    .into_shared();
     let zarr_v2_pipeline_json =
         codec_pipeline_from_zarr_v2_json_str(Some(r#"[{"id":"crc32"}]"#), Some(codec_json))
             .expect("zarr v2 json pipeline");
@@ -349,7 +365,9 @@ fn bench_codecs(config: BenchConfig) {
         matches!(err, CodecError::Unsupported { .. }) as usize
     });
     bench(config, "codecs/error_size_mismatch", 50_000, None, || {
-        let err = UncompressedCodec.decode(b"abcdef", Some(5)).expect_err("size mismatch");
+        let err = UncompressedCodec
+            .decode(b"abcdef", Some(5))
+            .expect_err("size mismatch");
         matches!(err, CodecError::SizeMismatch { .. }) as usize
     });
     let mut bad_crc = crc32_encode(&raw_64k);
@@ -358,9 +376,13 @@ fn bench_codecs(config: BenchConfig) {
         let err = crc32.decode(&bad_crc, None).expect_err("crc mismatch");
         matches!(err, CodecError::Decode { .. }) as usize
     });
-    bench(config, "codecs/build_unsupported_codec", 100_000, None, || {
-        UnsupportedCodec::new("mystery").name().len()
-    });
+    bench(
+        config,
+        "codecs/build_unsupported_codec",
+        100_000,
+        None,
+        || UnsupportedCodec::new("mystery").name().len(),
+    );
 
     // Isolation micro-benches for the owned-buffer regression: same zstd 64k
     // payload, three codec entry points, no pool. Locates whether the cost is
@@ -454,7 +476,7 @@ fn bench_decode_pool(config: BenchConfig) {
         || {
             let request = DecodeRequest::new(Arc::clone(&none_codec), Arc::clone(&raw))
                 .with_expected_size(raw.len())
-                .with_output_buffer(Vec::with_capacity(raw.len()));
+                .with_reuse_capacity_output(Vec::with_capacity(raw.len()));
             let decoded = pool
                 .submit(request)
                 .expect("submit decode")
@@ -485,9 +507,11 @@ fn bench_decode_pool(config: BenchConfig) {
         2048,
         Some(raw.len()),
         || {
-            let request =
-                DecodeRequest::from_spec(&CodecSpec::Zstd(ZstdCodecConfig::default()), Arc::clone(&zstd_encoded))
-                    .with_expected_size(raw.len());
+            let request = DecodeRequest::from_spec(
+                &CodecSpec::Zstd(ZstdCodecConfig::default()),
+                Arc::clone(&zstd_encoded),
+            )
+            .with_expected_size(raw.len());
             let decoded = pool
                 .submit(request)
                 .expect("submit decode")
@@ -520,7 +544,7 @@ fn bench_decode_pool(config: BenchConfig) {
         || {
             let request = DecodeRequest::new(Arc::clone(&zstd_codec), Arc::clone(&zstd_encoded))
                 .with_expected_size(raw.len())
-                .with_output_buffer(Vec::with_capacity(raw.len()));
+                .with_reuse_capacity_output(Vec::with_capacity(raw.len()));
             let decoded = pool
                 .submit(request)
                 .expect("submit decode")
@@ -540,7 +564,7 @@ fn bench_decode_pool(config: BenchConfig) {
         || {
             let request = DecodeRequest::new(Arc::clone(&zstd_codec), Arc::clone(&zstd_encoded))
                 .with_expected_size(raw.len())
-                .with_output_buffer(vec![0u8; raw.len()]);
+                .with_reuse_initialized_output(vec![0u8; raw.len()]);
             let decoded = pool
                 .submit(request)
                 .expect("submit decode")
@@ -559,7 +583,7 @@ fn bench_decode_pool(config: BenchConfig) {
         || {
             let request = DecodeRequest::new(Arc::clone(&none_codec), Arc::clone(&raw))
                 .with_expected_size(raw.len())
-                .with_output_buffer(Vec::with_capacity(raw.len()));
+                .with_reuse_capacity_output(Vec::with_capacity(raw.len()));
             let decoded = pool
                 .submit(request)
                 .expect("submit decode")
@@ -618,7 +642,7 @@ fn bench_decode_pool(config: BenchConfig) {
         || {
             let request = DecodeRequest::new(Arc::clone(&zstd_codec), Arc::clone(&zstd_encoded_1m))
                 .with_expected_size(raw_1m.len())
-                .with_output_buffer(Vec::with_capacity(raw_1m.len()));
+                .with_reuse_capacity_output(Vec::with_capacity(raw_1m.len()));
             let decoded = pool
                 .submit(request)
                 .expect("submit decode")
@@ -629,27 +653,43 @@ fn bench_decode_pool(config: BenchConfig) {
     );
 
     // Config validation: valid path and the three reject paths.
-    bench(config, "codecs/decode_pool_config_validate_ok", 20_000, None, || {
-        DecodePoolConfig::default()
-            .validate()
-            .is_ok() as usize
-    });
-    bench(config, "codecs/decode_pool_config_validate_err", 20_000, None, || {
-        let mut bad = DecodePoolConfig::default();
-        bad.num_workers = 0;
-        let r1 = bad.validate().is_err();
-        bad.num_workers = 1;
-        bad.queue_capacity = 0;
-        let r2 = bad.validate().is_err();
-        bad.queue_capacity = 1;
-        bad.cpus = Some(Vec::new());
-        let r3 = bad.validate().is_err();
-        usize::from(r1) + usize::from(r2) + usize::from(r3)
-    });
-    bench(config, "codecs/decode_pool_config_accessors", 50_000, None, || {
-        let config = DecodePoolConfig::default();
-        config.worker_count() ^ config.queue_capacity()
-    });
+    bench(
+        config,
+        "codecs/decode_pool_config_validate_ok",
+        20_000,
+        None,
+        || DecodePoolConfig::default().validate().is_ok() as usize,
+    );
+    bench(
+        config,
+        "codecs/decode_pool_config_validate_err",
+        20_000,
+        None,
+        || {
+            let mut bad = DecodePoolConfig {
+                num_workers: 0,
+                ..Default::default()
+            };
+            let r1 = bad.validate().is_err();
+            bad.num_workers = 1;
+            bad.queue_capacity = 0;
+            let r2 = bad.validate().is_err();
+            bad.queue_capacity = 1;
+            bad.cpus = Some(Vec::new());
+            let r3 = bad.validate().is_err();
+            usize::from(r1) + usize::from(r2) + usize::from(r3)
+        },
+    );
+    bench(
+        config,
+        "codecs/decode_pool_config_accessors",
+        50_000,
+        None,
+        || {
+            let config = DecodePoolConfig::default();
+            config.worker_count() ^ config.queue_capacity()
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -758,72 +798,50 @@ fn bench_iopool(config: BenchConfig) {
                 .expect("write output")
         },
     );
-    bench(
-        config,
-        "iopool/threaded_sync_all",
-        1024,
-        None,
-        || {
-            let out = pool
-                .submit(IoCommand::sync_all(rw_file, 0))
-                .expect("submit sync_all")
-                .blocking_recv()
-                .expect("sync_all");
-            usize::from(matches!(out, IoOutput::SyncAll))
-        },
-    );
-    bench(
-        config,
-        "iopool/threaded_sync_data",
-        1024,
-        None,
-        || {
-            let out = pool
-                .submit(IoCommand::sync_data(rw_file, 0))
-                .expect("submit sync_data")
-                .blocking_recv()
-                .expect("sync_data");
-            usize::from(matches!(out, IoOutput::SyncData))
-        },
-    );
+    bench(config, "iopool/threaded_sync_all", 1024, None, || {
+        let out = pool
+            .submit(IoCommand::sync_all(rw_file, 0))
+            .expect("submit sync_all")
+            .blocking_recv()
+            .expect("sync_all");
+        usize::from(matches!(out, IoOutput::SyncAll))
+    });
+    bench(config, "iopool/threaded_sync_data", 1024, None, || {
+        let out = pool
+            .submit(IoCommand::sync_data(rw_file, 0))
+            .expect("submit sync_data")
+            .blocking_recv()
+            .expect("sync_data");
+        usize::from(matches!(out, IoOutput::SyncData))
+    });
     pool.unregister_file(rw_file).expect("unregister rw file");
 
     // truncate on a dedicated small file so it never disturbs the read path.
-    let trunc_path = support::bench_data_dir().join(format!("iopool-trunc-{}.bin", std::process::id()));
+    let trunc_path =
+        support::bench_data_dir().join(format!("iopool-trunc-{}.bin", std::process::id()));
     std::fs::write(&trunc_path, &data[..1024 * 64]).expect("write trunc file");
     let trunc_file = pool
         .register_readwrite_file(&trunc_path)
         .expect("register trunc file");
-    bench(
-        config,
-        "iopool/threaded_truncate",
-        1024,
-        None,
-        || {
-            let out = pool
-                .submit(IoCommand::truncate(trunc_file, 1024, 0))
-                .expect("submit truncate")
-                .blocking_recv()
-                .expect("truncate");
-            usize::from(matches!(out, IoOutput::Truncate))
-        },
-    );
-    bench(
-        config,
-        "iopool/threaded_metadata",
-        4096,
-        None,
-        || {
-            pool.submit(IoCommand::metadata(file, 0))
-                .expect("submit metadata")
-                .blocking_recv()
-                .expect("metadata")
-                .metadata()
-                .expect("metadata output")
-                .len as usize
-        },
-    );
-    pool.unregister_file(trunc_file).expect("unregister trunc file");
+    bench(config, "iopool/threaded_truncate", 1024, None, || {
+        let out = pool
+            .submit(IoCommand::truncate(trunc_file, 1024, 0))
+            .expect("submit truncate")
+            .blocking_recv()
+            .expect("truncate");
+        usize::from(matches!(out, IoOutput::Truncate))
+    });
+    bench(config, "iopool/threaded_metadata", 4096, None, || {
+        pool.submit(IoCommand::metadata(file, 0))
+            .expect("submit metadata")
+            .blocking_recv()
+            .expect("metadata")
+            .metadata()
+            .expect("metadata output")
+            .len as usize
+    });
+    pool.unregister_file(trunc_file)
+        .expect("unregister trunc file");
     let _ = std::fs::remove_file(trunc_path);
 
     pool.unregister_file(file).expect("unregister file");
@@ -864,17 +882,11 @@ fn bench_iopool(config: BenchConfig) {
 
     // Register lifecycle: register_file (rw-or-ro fallback), register_file_with_options,
     // register_existing_file, and try_unregister_file.
-    bench(
-        config,
-        "iopool/register_file_cycle",
-        1024,
-        None,
-        || {
-            let id = pool.register_file(&path).expect("register_file");
-            pool.unregister_file(id).expect("unregister");
-            id
-        },
-    );
+    bench(config, "iopool/register_file_cycle", 1024, None, || {
+        let id = pool.register_file(&path).expect("register_file");
+        pool.unregister_file(id).expect("unregister");
+        id
+    });
     bench(
         config,
         "iopool/register_file_with_options_cycle",
@@ -904,44 +916,52 @@ fn bench_iopool(config: BenchConfig) {
             id
         },
     );
-    bench(
-        config,
-        "iopool/try_unregister_file",
-        1024,
-        None,
-        || {
-            let id = pool
-                .register_readonly_file(&path)
-                .expect("register");
-            pool.try_unregister_file(id).is_ok() as usize
-        },
-    );
+    bench(config, "iopool/try_unregister_file", 1024, None, || {
+        let id = pool.register_readonly_file(&path).expect("register");
+        pool.try_unregister_file(id).is_ok() as usize
+    });
 
     // Lightweight command introspection: priority() and dedup_key().
-    bench(config, "iopool/cmd_priority_dedup_key", 100_000, None, || {
-        let read = IoCommand::read(file, 128, 4096, 2);
-        let write = IoCommand::write(file, 0, Vec::new(), 1);
-        let trunc = IoCommand::truncate(file, 0, 0);
-        let read_key = read.dedup_key().map(|k| key_bits(&k)).unwrap_or(0);
-        let write_key = write.dedup_key().is_some() as usize;
-        let trunc_key = trunc.dedup_key().is_some() as usize;
-        read.priority() ^ read_key ^ write_key ^ trunc_key
-    });
+    bench(
+        config,
+        "iopool/cmd_priority_dedup_key",
+        100_000,
+        None,
+        || {
+            let read = IoCommand::read(file, 128, 4096, 2);
+            let write = IoCommand::write(file, 0, Vec::new(), 1);
+            let trunc = IoCommand::truncate(file, 0, 0);
+            let read_key = read.dedup_key().map(|k| key_bits(&k)).unwrap_or(0);
+            let write_key = write.dedup_key().is_some() as usize;
+            let trunc_key = trunc.dedup_key().is_some() as usize;
+            read.priority() ^ read_key ^ write_key ^ trunc_key
+        },
+    );
 
     // Config validation surface.
     bench(config, "iopool/base_config_validate", 50_000, None, || {
         BaseIoConfig::default().validate().is_ok() as usize
     });
-    bench(config, "iopool/threaded_config_validate", 50_000, None, || {
-        ThreadedConfig::default().validate().is_ok() as usize
-    });
-    bench(config, "iopool/io_config_kind_base_validate", 20_000, None, || {
-        let config = IoConfig::Threaded(ThreadedConfig::default());
-        let kind = matches!(config.kind(), _scdata::iopool::BackendKind::Threaded);
-        let base_ok = config.base().validate().is_ok();
-        let validate_ok = config.validate().is_ok();
-        usize::from(kind) + usize::from(base_ok) + usize::from(validate_ok)
-    });
+    bench(
+        config,
+        "iopool/threaded_config_validate",
+        50_000,
+        None,
+        || ThreadedConfig::default().validate().is_ok() as usize,
+    );
+    bench(
+        config,
+        "iopool/io_config_kind_base_validate",
+        20_000,
+        None,
+        || {
+            let config = IoConfig::Threaded(ThreadedConfig::default());
+            let kind = matches!(config.kind(), _scdata::iopool::BackendKind::Threaded);
+            let base_ok = config.base().validate().is_ok();
+            let validate_ok = config.validate().is_ok();
+            usize::from(kind) + usize::from(base_ok) + usize::from(validate_ok)
+        },
+    );
 
     #[cfg(feature = "uring")]
     {
@@ -953,11 +973,14 @@ fn bench_iopool(config: BenchConfig) {
 
 #[allow(deprecated)]
 fn key_bits(key: &RequestKey) -> usize {
-    key.file ^ key.offset as usize ^ key.len ^ match key.kind {
-        OpKind::Read => 1,
-        OpKind::Write => 2,
-        OpKind::Fsync => 3,
-    }
+    key.file
+        ^ key.offset as usize
+        ^ key.len
+        ^ match key.kind {
+            OpKind::Read => 1,
+            OpKind::Write => 2,
+            OpKind::Fsync => 3,
+        }
 }
 
 fn bench_read_size(
@@ -1248,8 +1271,10 @@ fn bench_access(config: BenchConfig) {
         AccessConfig::default().validate().is_ok() as usize
     });
     bench(config, "access/config_validate_err", 10_000, None, || {
-        let mut bad = AccessConfig::default();
-        bad.queue_capacity = 0;
+        let mut bad = AccessConfig {
+            queue_capacity: 0,
+            ..Default::default()
+        };
         let r1 = bad.validate().is_err();
         bad.queue_capacity = 1;
         bad.scheduler_shards = 0;
@@ -1348,6 +1373,8 @@ fn bench_databank(config: BenchConfig) {
                 order: ArrayOrder::C,
                 codec: ArrayCodecMeta::Uncompressed,
                 chunks: ChunkStoreMeta::Memory { chunks },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register dense dataset");
@@ -1383,6 +1410,8 @@ fn bench_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Memory {
                     chunks: zstd_chunks,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register zstd dense dataset");
@@ -1402,17 +1431,18 @@ fn bench_databank(config: BenchConfig) {
     );
 
     // Zarr v2 codec metadata (filters=[crc32], compressor=zstd) on dense2d.
-    let zarr_v2_chunks: Vec<Arc<[u8]>> = make_dense_u32_chunks(cells, genes, chunk_rows, chunk_cols)
-        .into_iter()
-        .map(|raw| {
-            let filtered = crc32_encode(&raw);
-            Arc::from(
-                zstd::encode_all(Cursor::new(&filtered), 3)
-                    .expect("zstd encode")
-                    .into_boxed_slice(),
-            )
-        })
-        .collect();
+    let zarr_v2_chunks: Vec<Arc<[u8]>> =
+        make_dense_u32_chunks(cells, genes, chunk_rows, chunk_cols)
+            .into_iter()
+            .map(|raw| {
+                let filtered = crc32_encode(&raw);
+                Arc::from(
+                    zstd::encode_all(Cursor::new(&filtered), 3)
+                        .expect("zstd encode")
+                        .into_boxed_slice(),
+                )
+            })
+            .collect();
     let zarr_v2_id = bank
         .register_dense_2d(Dense2DMeta {
             gene_names: (0..genes).map(|idx| format!("gene_{idx}")).collect(),
@@ -1429,6 +1459,8 @@ fn bench_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Memory {
                     chunks: zarr_v2_chunks,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register zarr v2 dense dataset");
@@ -1441,10 +1473,9 @@ fn bench_databank(config: BenchConfig) {
         || {
             bank.access_cells(zarr_v2_id, &selected, &mut zarr_v2_out, None)
                 .expect("access cells");
-            zarr_v2_out
-                .iter()
-                .step_by(257)
-                .fold(0usize, |acc, value| acc ^ usize::try_from(*value).unwrap_or(0))
+            zarr_v2_out.iter().step_by(257).fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
         },
     );
 
@@ -1465,6 +1496,8 @@ fn bench_databank(config: BenchConfig) {
                 order: ArrayOrder::C,
                 codec: ArrayCodecMeta::Uncompressed,
                 chunks: ChunkStoreMeta::Memory { chunks: d1_chunks },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register dense1d dataset");
@@ -1505,6 +1538,8 @@ fn bench_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Memory {
                     chunks: vec![indices_chunk],
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             data: ArrayMeta {
                 shape: vec![nnz],
@@ -1516,6 +1551,8 @@ fn bench_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Memory {
                     chunks: vec![data_chunk],
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             index_dtype: DType::U32,
             num_cells: csr_cells,
@@ -1572,6 +1609,8 @@ fn bench_databank(config: BenchConfig) {
                     path: fo_path.clone(),
                     locations: fo_locations,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register fileoffset dense dataset");
@@ -1607,6 +1646,8 @@ fn bench_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Directory {
                     locations: dir_locations,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register directory dense dataset");
@@ -1646,10 +1687,9 @@ fn bench_databank(config: BenchConfig) {
                 MissingGenePolicy::Zero,
             )
             .expect("access by gene names");
-            by_out
-                .iter()
-                .step_by(131)
-                .fold(0usize, |acc, value| acc ^ usize::try_from(*value).unwrap_or(0))
+            by_out.iter().step_by(131).fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
         },
     );
     // MissingGenePolicy::Error on a present selection must succeed.
@@ -1668,10 +1708,9 @@ fn bench_databank(config: BenchConfig) {
                 MissingGenePolicy::Error,
             )
             .expect("access by gene names error");
-            by_out
-                .iter()
-                .step_by(131)
-                .fold(0usize, |acc, value| acc ^ usize::try_from(*value).unwrap_or(0))
+            by_out.iter().step_by(131).fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
         },
     );
 
@@ -1722,13 +1761,9 @@ fn bench_databank(config: BenchConfig) {
     );
 
     // dataset_genes: borrow gene-name views.
-    bench(
-        config,
-        "databank/dataset_genes_len",
-        10_000,
-        None,
-        || bank.dataset_genes(id).expect("dataset genes").len(),
-    );
+    bench(config, "databank/dataset_genes_len", 10_000, None, || {
+        bank.dataset_genes(id).expect("dataset genes").len()
+    });
     let _genes_view: &[GeneNameView] = bank.dataset_genes(id).expect("dataset genes");
     let _ = _genes_view;
 
@@ -1755,6 +1790,8 @@ fn bench_databank(config: BenchConfig) {
                         chunks: ChunkStoreMeta::Memory {
                             chunks: (*cycle_chunks).clone(),
                         },
+                        variable_chunks: false,
+                        chunk_boundaries: None,
                     },
                 })
                 .expect("register_dense alias");
@@ -1779,12 +1816,20 @@ fn bench_databank(config: BenchConfig) {
     bench(config, "databank/config_validate", 10_000, None, || {
         DataBankConfig::default().validate().is_ok() as usize
     });
-    bench(config, "databank/fill_config_validate", 20_000, None, || {
-        FillConfig::default().validate().is_ok() as usize
-    });
-    bench(config, "databank/scheduled_prefetch_config_validate", 20_000, None, || {
-        ScheduledPrefetchConfig::default().validate().is_ok() as usize
-    });
+    bench(
+        config,
+        "databank/fill_config_validate",
+        20_000,
+        None,
+        || FillConfig::default().validate().is_ok() as usize,
+    );
+    bench(
+        config,
+        "databank/scheduled_prefetch_config_validate",
+        20_000,
+        None,
+        || ScheduledPrefetchConfig::default().validate().is_ok() as usize,
+    );
 
     let _ = std::fs::remove_file(fo_path);
 }
@@ -1833,6 +1878,8 @@ fn bench_typed_dense2d<T: DataValue>(config: BenchConfig, dtype: DType, label: &
                 order: ArrayOrder::C,
                 codec: ArrayCodecMeta::Uncompressed,
                 chunks: ChunkStoreMeta::Memory { chunks },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register typed dense dataset");
@@ -1849,7 +1896,10 @@ fn bench_typed_dense2d<T: DataValue>(config: BenchConfig, dtype: DType, label: &
             let bytes = unsafe {
                 std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * item_size)
             };
-            bytes.iter().step_by(64).fold(0usize, |acc, byte| acc ^ *byte as usize)
+            bytes
+                .iter()
+                .step_by(64)
+                .fold(0usize, |acc, byte| acc ^ *byte as usize)
         },
     );
 }
@@ -1895,13 +1945,9 @@ fn bench_data_pipeline(config: BenchConfig) {
         let encoded = encode_for_spec(spec, &raw);
         let codec = spec.build();
         let label = format!("data/roundtrip_{}_{}", name, profile.label());
-        bench(
-            config,
-            &label,
-            64,
-            Some(raw.len()),
-            || decode_into_checksum(&codec, &encoded, raw.len()),
-        );
+        bench(config, &label, 64, Some(raw.len()), || {
+            decode_into_checksum(&codec, &encoded, raw.len())
+        });
     }
 
     // PRNG throughput baseline (splitmix64).
@@ -1956,6 +2002,8 @@ fn bench_missing_rate(config: BenchConfig) {
                     order: ArrayOrder::C,
                     codec: ArrayCodecMeta::Uncompressed,
                     chunks: ChunkStoreMeta::Memory { chunks },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register dense2d missing-rate dataset");
@@ -1967,10 +2015,11 @@ fn bench_missing_rate(config: BenchConfig) {
             128,
             Some(out.len() * item_size),
             || {
-                bank.access_cells(id, &selected, &mut out, None).expect("access");
-                out.iter().step_by(131).fold(0usize, |acc, v| {
-                    acc ^ usize::try_from(*v).unwrap_or(0)
-                })
+                bank.access_cells(id, &selected, &mut out, None)
+                    .expect("access");
+                out.iter()
+                    .step_by(131)
+                    .fold(0usize, |acc, v| acc ^ usize::try_from(*v).unwrap_or(0))
             },
         );
 
@@ -1994,6 +2043,8 @@ fn bench_missing_rate(config: BenchConfig) {
                     chunks: ChunkStoreMeta::Memory {
                         chunks: vec![indices_chunk],
                     },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
                 data: ArrayMeta {
                     shape: vec![cells * nnz_per_cell],
@@ -2005,6 +2056,8 @@ fn bench_missing_rate(config: BenchConfig) {
                     chunks: ChunkStoreMeta::Memory {
                         chunks: vec![data_chunk],
                     },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
                 index_dtype: DType::U32,
                 num_cells: cells,
@@ -2056,6 +2109,8 @@ fn bench_scale_sweep(config: BenchConfig) {
                     order: ArrayOrder::C,
                     codec: ArrayCodecMeta::Uncompressed,
                     chunks: ChunkStoreMeta::Memory { chunks },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register scale dataset");
@@ -2066,10 +2121,11 @@ fn bench_scale_sweep(config: BenchConfig) {
             128,
             Some(out.len() * 4),
             || {
-                bank.access_cells(id, &selected, &mut out, None).expect("access");
-                out.iter().step_by(257).fold(0usize, |acc, v| {
-                    acc ^ usize::try_from(*v).unwrap_or(0)
-                })
+                bank.access_cells(id, &selected, &mut out, None)
+                    .expect("access");
+                out.iter()
+                    .step_by(257)
+                    .fold(0usize, |acc, v| acc ^ usize::try_from(*v).unwrap_or(0))
             },
         );
     }
@@ -2091,6 +2147,8 @@ fn bench_scale_sweep(config: BenchConfig) {
                     order: ArrayOrder::C,
                     codec: ArrayCodecMeta::Uncompressed,
                     chunks: ChunkStoreMeta::Memory { chunks },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register cell-scale dataset");
@@ -2103,9 +2161,9 @@ fn bench_scale_sweep(config: BenchConfig) {
             Some(out.len() * 4),
             || {
                 bank.access_cells(id, &sel, &mut out, None).expect("access");
-                out.iter().step_by(257).fold(0usize, |acc, v| {
-                    acc ^ usize::try_from(*v).unwrap_or(0)
-                })
+                out.iter()
+                    .step_by(257)
+                    .fold(0usize, |acc, v| acc ^ usize::try_from(*v).unwrap_or(0))
             },
         );
     }
@@ -2128,6 +2186,8 @@ fn bench_scale_sweep(config: BenchConfig) {
                     order: ArrayOrder::C,
                     codec: ArrayCodecMeta::Uncompressed,
                     chunks: ChunkStoreMeta::Memory { chunks },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register gene-scale dataset");
@@ -2140,9 +2200,9 @@ fn bench_scale_sweep(config: BenchConfig) {
             Some(out.len() * 4),
             || {
                 bank.access_cells(id, &sel, &mut out, None).expect("access");
-                out.iter().step_by(257).fold(0usize, |acc, v| {
-                    acc ^ usize::try_from(*v).unwrap_or(0)
-                })
+                out.iter()
+                    .step_by(257)
+                    .fold(0usize, |acc, v| acc ^ usize::try_from(*v).unwrap_or(0))
             },
         );
     }
@@ -2169,7 +2229,10 @@ fn bench_scenario_matrix(config: BenchConfig) {
             "zstd",
             ArrayCodecMeta::CodecJson(r#"{"id":"zstd","level":3}"#.to_string()),
         ),
-        ("lz4", ArrayCodecMeta::CodecJson(r#"{"id":"lz4"}"#.to_string())),
+        (
+            "lz4",
+            ArrayCodecMeta::CodecJson(r#"{"id":"lz4"}"#.to_string()),
+        ),
     ];
 
     for &missing in &[0u32, 500] {
@@ -2215,6 +2278,8 @@ fn bench_scenario_matrix(config: BenchConfig) {
                         order: ArrayOrder::C,
                         codec: codec_meta.clone(),
                         chunks: ChunkStoreMeta::Memory { chunks },
+                        variable_chunks: false,
+                        chunk_boundaries: None,
                     },
                 })
                 .expect("register scenario dataset");
@@ -2225,10 +2290,11 @@ fn bench_scenario_matrix(config: BenchConfig) {
                 96,
                 Some(out.len() * item_size),
                 || {
-                    bank.access_cells(id, &selected, &mut out, None).expect("access");
-                    out.iter().step_by(131).fold(0usize, |acc, v| {
-                        acc ^ usize::try_from(*v).unwrap_or(0)
-                    })
+                    bank.access_cells(id, &selected, &mut out, None)
+                        .expect("access");
+                    out.iter()
+                        .step_by(131)
+                        .fold(0usize, |acc, v| acc ^ usize::try_from(*v).unwrap_or(0))
                 },
             );
         }
@@ -2266,6 +2332,8 @@ fn bench_scenario_matrix(config: BenchConfig) {
                         path: fo_path.clone(),
                         locations,
                     },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register scenario file dataset");
@@ -2278,9 +2346,10 @@ fn bench_scenario_matrix(config: BenchConfig) {
             || {
                 bank.access_cells(fo_id, &selected, &mut fo_out, None)
                     .expect("access");
-                fo_out.iter().step_by(131).fold(0usize, |acc, v| {
-                    acc ^ usize::try_from(*v).unwrap_or(0)
-                })
+                fo_out
+                    .iter()
+                    .step_by(131)
+                    .fold(0usize, |acc, v| acc ^ usize::try_from(*v).unwrap_or(0))
             },
         );
         let _ = std::fs::remove_file(&fo_path);

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use super::scheduler::{ChunkKey, DecodeKey};
+use super::key::{ChunkKey, DecodeKey};
 use crate::codecs::SharedCodec;
 
 /// The representation currently stored for one chunk.

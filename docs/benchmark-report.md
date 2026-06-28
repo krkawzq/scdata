@@ -98,13 +98,10 @@ CSR slice 与 dense output 字节口径;同时增加消费端 `next()` 等待分
     IO/decode 阻塞,但保留 databank 的 batch plan、chunk grouping、projection/scatter 开销。
   - `blocking_*_file_*` bench 是未开启 prefetch 的同步 direct access reference,会把每次调用等待
     IO/decode 的时间算进去;它不代表 scheduled/prefetch 场景下的模块吞吐上限。
-  - `databank/fullchain_scheduled_prefetch_*` 是全链路压力测试,用 `FileOffset` 单大文件 +
-    `DataBank::prefetch_cells_scheduled`。输出同时给:
-    `requested_io_mib_s`(按 batch 请求的完整 chunk 字节估算)、`miss_io_mib_s`(按配置的 chunk miss
-    估算需要真实触盘的 chunk 字节)、`slice_mib_s`(实际 CSR cell 非零值片段字节)、
-    `output_mib_s`(处理后的 dense cell buffer 字节)和 `kcells_s`。20G IO 目标应看
-    物理 IO 计数或 cold miss chunk 字节口径,不是 output buffer 吞吐;当前 buffered 文件路径可能受
-    OS/GPFS cache 影响,需要配合 direct-read 诊断解释。
+  - `databank/fullchain_scheduled_prefetch` 是全链路压力测试,用 `FileOffset` CSR 文件 +
+    `DataBank::prefetch_cells_scheduled`。输出给 `output_mib_s`、`slice_mib_s`、
+    `encoded_file_mib` 和 `wait_ns_*`。20G IO 目标应结合 `encoded_file_mib`、冷读设置和
+    外部物理 IO 计数解释,不是只看 output buffer 吞吐。
 
 ---
 
@@ -560,49 +557,48 @@ databank scatter/project 或 codecs 模块存在 P0 性能问题。
 
 ### 9.1 scheduled prefetch cells 全链路压测(已补)
 
-新增 bench:`databank/fullchain_scheduled_prefetch_csr_file_unc`。
-启用方式:`SCDATA_ONLY_FULLCHAIN_PREFETCH=1 SCDATA_FULLCHAIN_PREFETCH=1 cargo bench ... --bench stress`。
+bench 目标:`rust/scdata/benches/fullchain.rs`。
+启用方式:`SCDATA_FULLCHAIN_PREFETCH=1 cargo bench ... --bench fullchain`。
 
 覆盖能力:
-- 一个 `FileOffset` 单大文件,避免很多小文件元数据开销。
-- `SCDATA_FULLCHAIN_FILE_MIB` 控制文件大小;`SCDATA_FULLCHAIN_DIR` 可指定大盘目录。
-- `SCDATA_FULLCHAIN_CODEC` 控制 chunk codec:`uncompressed`(默认)、`lz4`、`zstd`。
-- `SCDATA_FULLCHAIN_REPEAT_ENCODED_CHUNK=1` 复用一个高熵 encoded chunk 内容生成大文件;
-  每个 chunk 仍有独立 file offset,用于快速构造 256GiB 级别压力文件。
+- `FileOffset` CSR 数据集,路径是 `DataBank::prefetch_cells_scheduled::<f32, _>`。
+- `SCDATA_FULLCHAIN_FILE_MIB` 在未显式设置 `SCDATA_FULLCHAIN_BATCHES` 时估算 batch 数,用于控制生成数据规模;
+  `SCDATA_FULLCHAIN_DIR` 可指定大盘目录。
+- `SCDATA_FULLCHAIN_CODEC` 控制 chunk codec:`raw`/`uncompressed`、`lz4`(默认)、`zstd`、`crc32`。
+- `SCDATA_FULLCHAIN_REPEAT_ENCODED_CHUNK=1` 复用同尺寸 encoded chunk,每个 chunk 仍有独立 file offset。
 - `SCDATA_FULLCHAIN_IO_BACKEND` 控制 IO backend:`threaded`(默认)或 `uring`。
 - `SCDATA_FULLCHAIN_URING_DRIVERS` / `URING_ENTRIES` / `URING_REGISTERED_FILES`
   控制 io_uring driver 数、ring depth 和 fixed-file slots。
-- `SCDATA_FULLCHAIN_CHUNKS_PER_BATCH` 控制每个 batch 命中多少 unique chunk。
-- `SCDATA_FULLCHAIN_CHUNK_MISS_PERMILLE` 控制跨 batch chunk miss 概率(0=全复用,1000=全 miss)。
-- `SCDATA_FULLCHAIN_BATCH_CELLS` 控制 batch cell 数。
-- `SCDATA_FULLCHAIN_DATABANK_PREFETCH_STEP` 控制 databank batch ring 深度。
+- `SCDATA_FULLCHAIN_CHUNKS_PER_BATCH` 控制目标 batch chunk 数;未设置 `SCDATA_FULLCHAIN_CHUNK_NNZ`
+  时用它反推 chunk 长度。
+- `SCDATA_FULLCHAIN_CHUNK_MISS_PERMILLE` 控制 batch cell window 的 miss 概率(0=全复用,1000=全 miss)。
+- `SCDATA_FULLCHAIN_BATCH_CELLS`、`GENES`、`NNZ_PER_CELL`、`CHUNK_NNZ` 控制 CSR 形状。
+- `SCDATA_FULLCHAIN_DATABANK_PREFETCH_STEP` 控制 databank batch ring 深度;旧名
+  `SCDATA_FULLCHAIN_PREFETCH_STEP` 仍兼容。
 - `SCDATA_FULLCHAIN_ACCESS_PREFETCH_STEP` / `ACCESS_DECODE_AHEAD` / `ACCESS_READY_AHEAD`
   控制 access scheduled lookahead。
 - `SCDATA_FULLCHAIN_IO_WORKERS` / `IO_SHARDS` / `IO_INFLIGHT`、`SCHEDULER_SHARDS`、
-  `DECODE_WORKERS`、`FILL_WORKERS` 控制下游线程池。
+  `ACCESS_CPU_WORKERS`、`DECODE_WORKERS`、`FILL_WORKERS` 控制下游线程池。
 - `SCDATA_FULLCHAIN_LABEL` 写入日志,用于标记 baseline/bg_cpu/bg_io 等场景。
+- `SCDATA_FULLCHAIN_WARMUP_BATCHES` 控制 fullchain warmup 轮数。
 - `SCDATA_FULLCHAIN_BG_CPU_THREADS` 启动后台 CPU busy-loop 线程。
 - `SCDATA_FULLCHAIN_BG_IO_READERS` 启动后台随机读线程;默认读取单独的 background 大文件。
 - `SCDATA_FULLCHAIN_BG_IO_FILE_MIB` 控制 background IO 文件大小。
 - `SCDATA_FULLCHAIN_BG_IO_READ_KIB` 控制每次 background read 大小。
-- `SCDATA_FULLCHAIN_BG_IO_SAME_FILE=1` 改为对数据集文件施加 background read。
-- `SCDATA_FULLCHAIN_BG_IO_DROP_CACHE=1` 让 background reader 周期性 `DONTNEED`,用于更强冷读干扰。
+- `SCDATA_FULLCHAIN_BG_IO_SAME_FILE=1` 改为对数据集 data 文件施加 background random read。
+- `SCDATA_FULLCHAIN_BG_IO_DROP_CACHE=1` 让 background reader 每次 read 后调用 `DONTNEED`,用于更强冷读干扰。
+- `SCDATA_FULLCHAIN_MATRIX=1` 启用轻量配置矩阵。默认矩阵是
+  `raw,lz4,zstd` × 可用 IO backend × `baseline,bg_cpu,bg_io,bg_cpu_io`;
+  可用 `SCDATA_FULLCHAIN_MATRIX_CODECS` / `MATRIX_BACKENDS` / `MATRIX_BACKGROUNDS` 缩小集合。
 
 输出字段:
-- `requested_io_mib_s`:按请求命中的完整 **encoded chunk** 字节估算的 IO 吞吐。
-- `miss_io_mib_s`:按配置 miss chunk 估算的真实触盘 encoded chunk 字节。
-- `decoded_chunk_mib_s`:这些 encoded chunk 解码后的原始 chunk 字节吞吐。
-- `slice_mib_s`:实际 CSR cell 非零值片段吞吐,等于 `batch_cells * nnz_per_cell * (index+data 字长)`。
-- `output_mib_s`:处理后的 dense cell buffer 吞吐。
-- `kcells_s`:cell batch 消费速度。
-- `encoded_file_mib`:实际文件 encoded 字节,压缩场景下可能小于 `SCDATA_FULLCHAIN_FILE_MIB`。
-- `next_wait_total_ms` / `next_wait_share_pct`:消费端阻塞在 `prefetch.next()` 上的总时间及占比。
-  当前 `PrefetchCells::next()` 只从 databank completed queue pop;这个指标表示 completed queue
-  为空时等待后台 databank producer 的时间。
-- `next_wait_first_us` / `p50_us` / `p95_us` / `p99_us` / `max_us`:`prefetch.next()` 可见延迟分位数。
-- `next_wait_over_1ms` / `over_10ms`:明显气泡次数。
-- `batch_process_total_ms`:消费端拿到 batch 后做 checksum 的时间,用于区分消费侧开销。
-- `bg_cpu_threads` / `bg_io_readers` / `bg_checksum`:background 场景元信息,`bg_checksum` 防止线程被优化掉。
+- `label`:当前运行标签;矩阵模式下自动写成 `codec-backend-background`。
+- `throughput_mib_s` / `output_mib_s`:处理后的 dense cell buffer 吞吐。
+- `slice_mib_s`:实际 CSR cell 非零值片段吞吐,等于 `cells * nnz_per_cell * (index+data 字长)`。
+- `encoded_file_mib`:本次生成的 indices/data encoded 文件总大小。
+- `wait_ns_p50/p99/p999/max`:消费者在 `PrefetchCells::next()` 上等待 batch 完成的时间分位数。
+- `kops`:batch 消费速度。
+- `bg_sum`:background 线程 checksum/读取字节折叠值,防止线程被优化掉。
 
 实测机器:`ms-0628-121735-73258904-8rgr5.wangzhongqi.ailab-dnacoding.pod@h.pjlab.org.cn`。
 
@@ -646,7 +642,7 @@ databank scatter/project 或 codecs 模块存在 P0 性能问题。
 
 结论:
 - bench 已经能按生产调用方式测 scheduled prefetch cells 的全链路吞吐,并区分 IO 字节与输出字节。
-- `next_wait_*` 指标现在用于判断 completed queue 是否被 drain 空;如果 consumer loop 几乎不做
+- `wait_ns_*` 指标现在用于判断 completed queue 是否被 drain 空;如果 consumer loop 几乎不做
   计算,它仍会等待 producer,这不再代表 `next()` 自己同步执行 databank plan/scatter。
 - 当前新 CPU 机器上,冷/准冷文件 full-chain requested IO 在 9.8-10.8GiB/s;继续加 IO 线程没有提升。
 - 同文件 `dd iflag=direct` 顺序读约 1.2GB/s,说明该 worker/GPFS 的真实冷读带宽波动很大;
@@ -670,8 +666,8 @@ databank no-block 压测目标。
 - 在本地 NVMe 或确认有 >20GiB/s 顺序 direct read 的存储上重跑,确认 databank/access 是否能吃满。
 - databank scheduled prefetch 已改为后台 producer + completed queue;后续 full-chain bench 需要增加
   consumer-side 模拟处理时间/队列 occupancy 指标,才能判断 Python dataloader 层是否完全隐藏延迟。
-- 用 `SCDATA_FULLCHAIN_BG_*` 固定跑 baseline / bg_cpu / bg_io / bg_cpu_io 矩阵,比较
-  `next_wait_p99_us`、`next_wait_max_us` 和 `kcells_s`。
+- 用 `SCDATA_FULLCHAIN_MATRIX=1` 固定跑 baseline / bg_cpu / bg_io / bg_cpu_io 矩阵,比较
+  `wait_ns_p99`、`wait_ns_max` 和 `kops`。
 
 ### 9.3 iopool O_DIRECT / 本地 NVMe
 
@@ -718,10 +714,8 @@ export CARGO_NET_OFFLINE=true
 cd /mnt/shared-storage-user/dnacoding/wangzhongqi/Code/Project/scdata
 
 CARGO_TARGET_DIR=target/fullchain-ms0628 \
-SCDATA_ONLY_FULLCHAIN_PREFETCH=1 \
 SCDATA_FULLCHAIN_PREFETCH=1 \
 SCDATA_FULLCHAIN_FILE_MIB=16384 \
-SCDATA_FULLCHAIN_BATCHES=128 \
 SCDATA_FULLCHAIN_WARMUP_BATCHES=2 \
 SCDATA_FULLCHAIN_BATCH_CELLS=1024 \
 SCDATA_FULLCHAIN_CHUNKS_PER_BATCH=256 \
@@ -740,11 +734,26 @@ SCDATA_FULLCHAIN_SCHEDULER_SHARDS=8 \
 SCDATA_FULLCHAIN_ACCESS_CPU_WORKERS=8 \
 SCDATA_FULLCHAIN_DECODE_WORKERS=8 \
 SCDATA_FULLCHAIN_FILL_WORKERS=4 \
-cargo bench --manifest-path rust/scdata/Cargo.toml --bench stress
+cargo bench --manifest-path rust/scdata/Cargo.toml --bench fullchain
 ```
 
 可选:`SCDATA_FULLCHAIN_DIR=<large-disk-dir>` 指定大文件目录;默认写入
 `rust/scdata/target/bench-data`。
+
+要一次跑覆盖矩阵,把第一行的启用变量替换为:
+
+```sh
+SCDATA_FULLCHAIN_MATRIX=1
+```
+
+默认矩阵是 `raw,lz4,zstd` × 可用 IO backend × `baseline,bg_cpu,bg_io,bg_cpu_io`。
+可以用逗号分隔列表缩小:
+
+```sh
+SCDATA_FULLCHAIN_MATRIX_CODECS=lz4,zstd
+SCDATA_FULLCHAIN_MATRIX_BACKENDS=threaded
+SCDATA_FULLCHAIN_MATRIX_BACKGROUNDS=baseline,bg_io
+```
 
 常用场景只需要在上述命令前追加这些变量:
 

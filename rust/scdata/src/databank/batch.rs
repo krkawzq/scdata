@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
@@ -10,12 +12,12 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use crate::access::{
-    AccessHandle, AccessItem, AccessRequest, ChunkKey, PrefetchCancel, ScheduledAccess,
-    ScheduledAccessConfig,
+    AccessHandle, AccessItem, AccessRequest, ChunkKey, PrefetchCancel, RangeCopy, ScheduledAccess,
+    ScheduledAccessConfig, SliceSpec,
 };
 use crate::codecs::{CodecError, SharedCodec};
 
-use super::array::{chunk_ref, Array, ChunkRef, ChunkStore, DType, DataValue};
+use super::array::{Array, Chunk, ChunkRef, ChunkSource, DType, DataValue};
 use super::compute::{ComputeJob, DataBankComputePool};
 use super::config::ScheduledPrefetchConfig;
 use super::dataset::{Dataset, Dense1DDataset, Dense2DDataset, SparseCsrDataset};
@@ -26,6 +28,11 @@ use super::plan::{self, ByteRange, DenseSegment, RangeSegment, SparseRowSpan};
 type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 type FastHashSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
 const GENE_NOT_SELECTED: usize = usize::MAX;
+
+#[inline]
+fn row_count_for_width(len: usize, width: usize) -> usize {
+    len.checked_div(width).unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MissingGenePolicy {
@@ -604,11 +611,7 @@ fn access_dense_segments<T: DataValue>(
     let output_bytes = out.len().checked_mul(mem::size_of::<T>()).ok_or_else(|| {
         DataBankError::InvalidConfig("dense output byte length overflow".to_string())
     })?;
-    let output_rows = if num_genes == 0 {
-        0
-    } else {
-        out.len() / num_genes
-    };
+    let output_rows = row_count_for_width(out.len(), num_genes);
     if compute.should_parallelize(output_rows, output_bytes) {
         let loaded_groups = load_dense_groups_for_parallel(access, access_config, &groups)?;
         if try_scatter_dense_rows_parallel(
@@ -651,11 +654,7 @@ fn access_dense_segments_projected<T: DataValue>(
     let output_bytes = out.len().checked_mul(mem::size_of::<T>()).ok_or_else(|| {
         DataBankError::InvalidConfig("dense output byte length overflow".to_string())
     })?;
-    let output_rows = if output_genes == 0 {
-        0
-    } else {
-        out.len() / output_genes
-    };
+    let output_rows = row_count_for_width(out.len(), output_genes);
     if compute.should_parallelize(output_rows, output_bytes) {
         let loaded_groups = load_dense_groups_for_parallel(access, access_config, &groups)?;
         if try_scatter_dense_rows_parallel(
@@ -1048,15 +1047,23 @@ enum SparseGroupSource {
         bytes: Arc<[u8]>,
         codec: SharedCodec,
         expected_size: usize,
+        decoded: bool,
     },
 }
 
 #[derive(Debug, Clone)]
 struct SparseReadGroup {
     source: SparseGroupSource,
-    slice: Option<Vec<usize>>,
+    slice: SliceSpec,
+    slice_ranges: Vec<RangeCopy>,
     parts: Vec<usize>,
     bytes: usize,
+}
+
+impl SparseReadGroup {
+    fn finalize_slice(&mut self) {
+        self.slice = SliceSpec::from_ranges(std::mem::take(&mut self.slice_ranges));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1071,6 +1078,7 @@ enum SparseGroupKey {
         len: usize,
         codec: usize,
         expected_size: usize,
+        decoded: bool,
     },
 }
 
@@ -1097,15 +1105,15 @@ fn plan_sparse_batch_with_value_size(
             DataBankError::IndptrInvalid("CSR row range end overflows usize".to_string())
         })?;
         index_piece_capacity = index_piece_capacity.saturating_add(plan::range_piece_count(
+            &dataset.indices,
             row.start,
             end,
-            dataset.indices.chunk_shape[0],
-        ));
+        )?);
         data_piece_capacity = data_piece_capacity.saturating_add(plan::range_piece_count(
+            &dataset.data,
             row.start,
             end,
-            dataset.data.chunk_shape[0],
-        ));
+        )?);
     }
 
     let mut index_builder = SparsePieceGroupBuilder::with_capacity(index_piece_capacity);
@@ -1255,33 +1263,22 @@ where
         )));
     }
 
-    let chunk_len = array.chunk_shape[0];
-    let mut pos = start;
-    while pos < end {
-        let chunk_index = pos / chunk_len;
-        let in_chunk = pos % chunk_len;
-        let chunk_start = chunk_index.checked_mul(chunk_len).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR chunk start overflow".to_string())
-        })?;
-        let physical_chunk_len = chunk_len.min(array.shape[0] - chunk_start);
-        let elements = (end - pos).min(physical_chunk_len - in_chunk);
-        let byte_start = in_chunk.checked_mul(item_size).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR range byte start overflow".to_string())
-        })?;
-        let bytes = elements.checked_mul(item_size).ok_or_else(|| {
+    for range in plan::plan_1d_range(array, start, end)? {
+        let bytes = range.source.len();
+        let expected_bytes = range.elements.checked_mul(item_size).ok_or_else(|| {
             DataBankError::InvalidArrayMeta("CSR range byte length overflow".to_string())
         })?;
-        let byte_end = byte_start.checked_add(bytes).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR range byte end overflow".to_string())
-        })?;
-
+        if bytes != expected_bytes {
+            return Err(DataBankError::InvalidArrayMeta(format!(
+                "CSR planned range has {bytes} bytes, expected {expected_bytes}"
+            )));
+        }
         push(PlannedRangePiece {
-            chunk: chunk_ref(array, chunk_index)?,
-            source: ByteRange::new(byte_start, byte_end)?,
-            elements,
+            chunk: range.chunk,
+            source: range.source,
+            elements: range.elements,
             bytes,
         })?;
-        pos += elements;
     }
     Ok(())
 }
@@ -1310,7 +1307,8 @@ impl SparsePieceGroupBuilder {
             self.by_key.insert(key, group_index);
             self.groups.push(SparseReadGroup {
                 source: sparse_group_source(&piece.chunk),
-                slice: None,
+                slice: SliceSpec::Full,
+                slice_ranges: Vec::new(),
                 parts: Vec::new(),
                 bytes: 0,
             });
@@ -1325,7 +1323,10 @@ impl SparsePieceGroupBuilder {
         Ok(())
     }
 
-    fn finish(self) -> (Vec<SparseReadPiece>, Vec<SparseReadGroup>) {
+    fn finish(mut self) -> (Vec<SparseReadPiece>, Vec<SparseReadGroup>) {
+        for group in &mut self.groups {
+            group.finalize_slice();
+        }
         (self.pieces, self.groups)
     }
 }
@@ -1341,11 +1342,13 @@ fn sparse_group_key(chunk: &ChunkRef) -> SparseGroupKey {
             bytes,
             codec,
             expected_size,
+            decoded,
         } => SparseGroupKey::Memory {
             ptr: bytes.as_ptr() as usize,
             len: bytes.len(),
             codec: codec_id(codec),
             expected_size: *expected_size,
+            decoded: *decoded,
         },
     }
 }
@@ -1354,17 +1357,19 @@ fn sparse_group_source(chunk: &ChunkRef) -> SparseGroupSource {
     match chunk {
         ChunkRef::AccessItem(item) => {
             let mut item = item.clone();
-            item.slice = None;
+            item.slice = SliceSpec::Full;
             SparseGroupSource::AccessItem(item)
         }
         ChunkRef::Memory {
             bytes,
             codec,
             expected_size,
+            decoded,
         } => SparseGroupSource::Memory {
             bytes: Arc::clone(bytes),
             codec: Arc::clone(codec),
             expected_size: *expected_size,
+            decoded: *decoded,
         },
     }
 }
@@ -1382,9 +1387,8 @@ fn append_sparse_group_slice(
     }
     let output_offset = group.bytes;
     group
-        .slice
-        .get_or_insert_with(Vec::new)
-        .extend_from_slice(&[output_offset, source.start, source.end]);
+        .slice_ranges
+        .push(RangeCopy::new(output_offset, source.start, source.end));
     group.bytes = group.bytes.checked_add(bytes).ok_or_else(|| {
         DataBankError::InvalidArrayMeta("CSR grouped read byte length overflow".to_string())
     })?;
@@ -1428,11 +1432,13 @@ fn load_sparse_group(access: &AccessHandle, group: &SparseReadGroup) -> DataBank
             bytes,
             codec,
             expected_size,
+            decoded,
         } => load_memory_group(
             bytes.as_ref(),
             codec,
             *expected_size,
-            group.slice.as_deref(),
+            *decoded,
+            &group.slice,
         ),
     }
 }
@@ -1495,11 +1501,7 @@ fn access_sparse_file_groups_checked<T: DataValue>(
         copy_sparse_group_to_index_buffer(&plan.index_pieces, group, &bytes, &mut index_bytes)?;
     }
 
-    let output_rows = if dataset.num_genes == 0 {
-        0
-    } else {
-        out.len() / dataset.num_genes
-    };
+    let output_rows = row_count_for_width(out.len(), dataset.num_genes);
     let output_bytes = out.len().checked_mul(mem::size_of::<T>()).ok_or_else(|| {
         DataBankError::InvalidConfig("sparse output byte length overflow".to_string())
     })?;
@@ -1589,11 +1591,7 @@ unsafe fn access_sparse_file_groups_unchecked<T: DataValue>(
         copy_sparse_group_to_index_buffer(&plan.index_pieces, group, &bytes, &mut index_bytes)?;
     }
 
-    let output_rows = if dataset.num_genes == 0 {
-        0
-    } else {
-        out.len() / dataset.num_genes
-    };
+    let output_rows = row_count_for_width(out.len(), dataset.num_genes);
     let output_bytes = out.len().checked_mul(mem::size_of::<T>()).ok_or_else(|| {
         DataBankError::InvalidConfig("sparse output byte length overflow".to_string())
     })?;
@@ -1738,11 +1736,12 @@ fn try_copy_sparse_memory_identity_group_to_index_buffer(
         bytes,
         codec,
         expected_size,
+        decoded,
     } = &group.source
     else {
         return Ok(false);
     };
-    if !codec.is_identity() {
+    if !(*decoded || codec.is_identity()) {
         return Ok(false);
     }
     if bytes.len() != *expected_size {
@@ -1806,11 +1805,7 @@ fn load_sparse_data_groups_and_scatter_checked<T: DataValue>(
     }
     // Box once; both scatter paths borrow from this shared arc.
     let index_bytes: Arc<[u8]> = Arc::from(index_bytes.into_boxed_slice());
-    let output_rows = if dataset.num_genes == 0 {
-        0
-    } else {
-        out.len() / dataset.num_genes
-    };
+    let output_rows = row_count_for_width(out.len(), dataset.num_genes);
     let output_bytes = out.len().checked_mul(mem::size_of::<T>()).ok_or_else(|| {
         DataBankError::InvalidConfig("sparse output byte length overflow".to_string())
     })?;
@@ -1999,21 +1994,19 @@ unsafe fn try_scatter_sparse_single_memory_chunk_unchecked<T: DataValue>(
 }
 
 fn single_memory_identity_chunk_bytes(array: &Array) -> DataBankResult<Option<&[u8]>> {
-    if !array.codec.is_identity() {
+    let Some(chunks) = array.memory_chunks() else {
+        return Ok(None);
+    };
+    let [chunk] = chunks else {
+        return Ok(None);
+    };
+    let ChunkSource::Memory { bytes, decoded } = &chunk.source else {
+        return Ok(None);
+    };
+    if !(*decoded || array.codec.is_identity()) {
         return Ok(None);
     }
-    let ChunkStore::Memory { chunks } = &array.chunks else {
-        return Ok(None);
-    };
-    let [bytes] = chunks.as_slice() else {
-        return Ok(None);
-    };
-    let expected_size = array
-        .shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .and_then(|items| items.checked_mul(array.dtype.item_size()))
-        .ok_or_else(|| DataBankError::InvalidArrayMeta("array byte size overflow".to_string()))?;
+    let expected_size = chunk.decoded_bytes;
     if bytes.len() != expected_size {
         return Err(CodecError::SizeMismatch {
             codec: array.codec.name().to_string(),
@@ -2028,7 +2021,7 @@ fn single_memory_identity_chunk_bytes(array: &Array) -> DataBankResult<Option<&[
 #[derive(Clone, Copy)]
 struct MemoryIdentity1DChunks<'a> {
     array: &'a Array,
-    chunks: &'a [Arc<[u8]>],
+    chunks: &'a [Chunk],
     chunk_len: usize,
     len: usize,
     item_size: usize,
@@ -2036,38 +2029,43 @@ struct MemoryIdentity1DChunks<'a> {
 
 impl<'a> MemoryIdentity1DChunks<'a> {
     fn from_array(array: &'a Array) -> DataBankResult<Option<Self>> {
-        if !array.codec.is_identity() {
-            return Ok(None);
-        }
-        let ChunkStore::Memory { chunks } = &array.chunks else {
+        let Some(chunks) = array.memory_chunks() else {
             return Ok(None);
         };
+        let chunks_are_decoded = chunks
+            .iter()
+            .all(|chunk| matches!(&chunk.source, ChunkSource::Memory { decoded: true, .. }));
+        if !(array.codec.is_identity() || chunks_are_decoded) {
+            return Ok(None);
+        }
         let [len] = array.shape.as_slice() else {
             return Err(DataBankError::InvalidArrayMeta(format!(
                 "1D direct memory path requires 1D array, got shape {:?}",
                 array.shape
             )));
         };
-        let [chunk_len] = array.chunk_shape.as_slice() else {
-            return Err(DataBankError::InvalidArrayMeta(format!(
-                "1D direct memory path requires 1D chunks, got {:?}",
-                array.chunk_shape
-            )));
+        let Some(chunk_len) = array.regular_1d_chunk_len() else {
+            return Ok(None);
         };
         Ok(Some(Self {
             array,
-            chunks: chunks.as_slice(),
-            chunk_len: *chunk_len,
+            chunks,
+            chunk_len,
             len: *len,
             item_size: array.dtype.item_size(),
         }))
     }
 
     fn chunk_bytes(self, chunk_index: usize) -> DataBankResult<&'a [u8]> {
-        let Some(bytes) = self.chunks.get(chunk_index) else {
+        let Some(chunk) = self.chunks.get(chunk_index) else {
             return Err(DataBankError::InvalidArrayMeta(format!(
                 "1D memory chunk index {chunk_index} is out of range"
             )));
+        };
+        let ChunkSource::Memory { bytes, .. } = &chunk.source else {
+            return Err(DataBankError::InvalidArrayMeta(
+                "non-memory chunk reached memory direct path".to_string(),
+            ));
         };
         let expected_size = self.expected_chunk_bytes(chunk_index)?;
         if bytes.len() != expected_size {
@@ -2091,10 +2089,13 @@ impl<'a> MemoryIdentity1DChunks<'a> {
                 self.len
             )));
         }
-        self.physical_chunk_len_at_start(chunk_start)?
-            .checked_mul(self.item_size)
+        self.chunks
+            .get(chunk_index)
+            .map(|chunk| chunk.decoded_bytes)
             .ok_or_else(|| {
-                DataBankError::InvalidArrayMeta("1D memory chunk byte size overflow".to_string())
+                DataBankError::InvalidArrayMeta(format!(
+                    "1D memory chunk index {chunk_index} is out of range"
+                ))
             })
     }
 
@@ -2645,11 +2646,7 @@ fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue>(
     }
 
     let output_genes = gene_axis.output_genes(dataset.num_genes);
-    let output_rows = if output_genes == 0 {
-        0
-    } else {
-        out.len() / output_genes
-    };
+    let output_rows = row_count_for_width(out.len(), output_genes);
     let output_bytes = out.len().checked_mul(mem::size_of::<T>()).ok_or_else(|| {
         DataBankError::InvalidConfig("sparse output byte length overflow".to_string())
     })?;
@@ -2757,11 +2754,7 @@ unsafe fn load_sparse_data_groups_and_scatter_unchecked<T: DataValue>(
     }
     // Box once; both scatter paths borrow from this shared arc.
     let index_bytes: Arc<[u8]> = Arc::from(index_bytes.into_boxed_slice());
-    let output_rows = if dataset.num_genes == 0 {
-        0
-    } else {
-        out.len() / dataset.num_genes
-    };
+    let output_rows = row_count_for_width(out.len(), dataset.num_genes);
     let output_bytes = out.len().checked_mul(mem::size_of::<T>()).ok_or_else(|| {
         DataBankError::InvalidConfig("sparse output byte length overflow".to_string())
     })?;
@@ -3293,6 +3286,9 @@ where
     let out_ptr = out_addr as *mut T;
 
     for output_row in row_start..row_end {
+        let row_piece_indices = row_pieces.get(output_row).ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("CSR row piece index is out of range".to_string())
+        })?;
         let row_base = output_row.checked_mul(output_genes).ok_or_else(|| {
             DataBankError::InvalidConfig("sparse output row overflow".to_string())
         })?;
@@ -3309,7 +3305,7 @@ where
         // ranges. This task only creates row slices inside its assigned range.
         let row_out =
             unsafe { std::slice::from_raw_parts_mut(out_ptr.add(row_base), output_genes) };
-        for &piece_index in &row_pieces[output_row] {
+        for &piece_index in row_piece_indices {
             let piece = pieces.get(piece_index).ok_or_else(|| {
                 DataBankError::InvalidArrayMeta("CSR row piece index is invalid".to_string())
             })?;
@@ -3498,11 +3494,12 @@ fn try_scatter_sparse_memory_identity_data_group_checked<T: DataValue>(
         bytes,
         codec,
         expected_size,
+        decoded,
     } = &group.source
     else {
         return Ok(false);
     };
-    if !codec.is_identity() {
+    if !(*decoded || codec.is_identity()) {
         return Ok(false);
     }
     if bytes.len() != *expected_size {
@@ -3826,11 +3823,12 @@ fn try_scatter_sparse_memory_identity_data_group_projected_checked<T: DataValue>
         bytes,
         codec,
         expected_size,
+        decoded,
     } = &group.source
     else {
         return Ok(false);
     };
-    if !codec.is_identity() {
+    if !(*decoded || codec.is_identity()) {
         return Ok(false);
     }
     if bytes.len() != *expected_size {
@@ -4172,11 +4170,12 @@ unsafe fn try_scatter_sparse_memory_identity_data_group_unchecked<T: DataValue>(
         bytes,
         codec,
         expected_size,
+        decoded,
     } = &group.source
     else {
         return Ok(false);
     };
-    if !codec.is_identity() {
+    if !(*decoded || codec.is_identity()) {
         return Ok(false);
     }
     if bytes.len() != *expected_size {
@@ -4549,15 +4548,23 @@ enum DenseGroupSource {
         bytes: Arc<[u8]>,
         codec: SharedCodec,
         expected_size: usize,
+        decoded: bool,
     },
 }
 
 #[derive(Debug, Clone)]
 struct DenseReadGroup {
     source: DenseGroupSource,
-    slice: Option<Vec<usize>>,
+    slice: SliceSpec,
+    slice_ranges: Vec<RangeCopy>,
     parts: Vec<DenseGroupPart>,
     bytes: usize,
+}
+
+impl DenseReadGroup {
+    fn finalize_slice(&mut self) {
+        self.slice = SliceSpec::from_ranges(std::mem::take(&mut self.slice_ranges));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4585,6 +4592,7 @@ enum DenseGroupKey {
         len: usize,
         codec: usize,
         expected_size: usize,
+        decoded: bool,
     },
 }
 
@@ -4601,7 +4609,8 @@ fn group_dense_segments(segments: &[DenseSegment]) -> DataBankResult<Vec<DenseRe
             by_key.insert(key, group_index);
             groups.push(DenseReadGroup {
                 source: dense_group_source(&segment.chunk),
-                slice: None,
+                slice: SliceSpec::Full,
+                slice_ranges: Vec::new(),
                 parts: Vec::new(),
                 bytes: 0,
             });
@@ -4618,6 +4627,9 @@ fn group_dense_segments(segments: &[DenseSegment]) -> DataBankResult<Vec<DenseRe
         });
     }
 
+    for group in &mut groups {
+        group.finalize_slice();
+    }
     Ok(groups)
 }
 
@@ -4632,11 +4644,13 @@ fn dense_group_key(chunk: &ChunkRef) -> DenseGroupKey {
             bytes,
             codec,
             expected_size,
+            decoded,
         } => DenseGroupKey::Memory {
             ptr: bytes.as_ptr() as usize,
             len: bytes.len(),
             codec: codec_id(codec),
             expected_size: *expected_size,
+            decoded: *decoded,
         },
     }
 }
@@ -4645,17 +4659,19 @@ fn dense_group_source(chunk: &ChunkRef) -> DenseGroupSource {
     match chunk {
         ChunkRef::AccessItem(item) => {
             let mut item = item.clone();
-            item.slice = None;
+            item.slice = SliceSpec::Full;
             DenseGroupSource::AccessItem(item)
         }
         ChunkRef::Memory {
             bytes,
             codec,
             expected_size,
+            decoded,
         } => DenseGroupSource::Memory {
             bytes: Arc::clone(bytes),
             codec: Arc::clone(codec),
             expected_size: *expected_size,
+            decoded: *decoded,
         },
     }
 }
@@ -4673,9 +4689,8 @@ fn append_group_slice(
     }
     let output_offset = group.bytes;
     group
-        .slice
-        .get_or_insert_with(Vec::new)
-        .extend_from_slice(&[output_offset, source.start, source.end]);
+        .slice_ranges
+        .push(RangeCopy::new(output_offset, source.start, source.end));
     group.bytes = group.bytes.checked_add(bytes).ok_or_else(|| {
         DataBankError::InvalidArrayMeta("dense grouped read byte length overflow".to_string())
     })?;
@@ -4719,11 +4734,13 @@ fn load_dense_group(access: &AccessHandle, group: &DenseReadGroup) -> DataBankRe
             bytes,
             codec,
             expected_size,
+            decoded,
         } => load_memory_group(
             bytes.as_ref(),
             codec,
             *expected_size,
-            group.slice.as_deref(),
+            *decoded,
+            &group.slice,
         ),
     }
 }
@@ -4797,8 +4814,9 @@ fn load_dense_group_for_parallel(
             bytes,
             codec,
             expected_size,
+            decoded,
         } => {
-            if codec.is_identity() {
+            if *decoded || codec.is_identity() {
                 if bytes.len() != *expected_size {
                     return Err(CodecError::SizeMismatch {
                         codec: codec.name().to_string(),
@@ -4836,11 +4854,12 @@ fn try_scatter_dense_memory_identity_group<T: DataValue>(
         bytes,
         codec,
         expected_size,
+        decoded,
     } = &group.source
     else {
         return Ok(false);
     };
-    if !codec.is_identity() {
+    if !(*decoded || codec.is_identity()) {
         return Ok(false);
     }
     if bytes.len() != *expected_size {
@@ -4868,11 +4887,12 @@ fn try_scatter_dense_memory_identity_group_projected<T: DataValue>(
         bytes,
         codec,
         expected_size,
+        decoded,
     } = &group.source
     else {
         return Ok(false);
     };
-    if !codec.is_identity() {
+    if !(*decoded || codec.is_identity()) {
         return Ok(false);
     }
     if bytes.len() != *expected_size {
@@ -5478,9 +5498,10 @@ fn load_memory_group(
     bytes: &[u8],
     codec: &SharedCodec,
     expected_size: usize,
-    slice: Option<&[usize]>,
+    decoded: bool,
+    slice: &SliceSpec,
 ) -> DataBankResult<Vec<u8>> {
-    if codec.is_identity() {
+    if decoded || codec.is_identity() {
         if bytes.len() != expected_size {
             return Err(CodecError::SizeMismatch {
                 codec: codec.name().to_string(),
@@ -5496,56 +5517,40 @@ fn load_memory_group(
     copy_slices(&decoded, slice)
 }
 
-fn copy_slices(data: &[u8], slice: Option<&[usize]>) -> DataBankResult<Vec<u8>> {
-    let Some(slice) = slice else {
+fn copy_slices(data: &[u8], slice: &SliceSpec) -> DataBankResult<Vec<u8>> {
+    let plan = slice.plan(data.len())?;
+    let Some(ranges) = plan.ranges() else {
         return Ok(data.to_vec());
     };
-    let output_len = validate_access_slice(data.len(), slice)?;
 
-    let mut out = vec![0; output_len];
-    for triple in slice.chunks_exact(3) {
-        let off = triple[0];
-        let start = triple[1];
-        let end = triple[2];
-        out[off..off + (end - start)].copy_from_slice(&data[start..end]);
+    if ranges_are_packed(ranges, plan.output_len) {
+        let mut out = Vec::with_capacity(plan.output_len);
+        for range in ranges {
+            out.extend_from_slice(&data[range.src_start..range.src_end]);
+        }
+        return Ok(out);
+    }
+
+    let mut out = vec![0; plan.output_len];
+    for range in ranges {
+        out[range.dst_offset..range.dst_offset + range.len()]
+            .copy_from_slice(&data[range.src_start..range.src_end]);
     }
     Ok(out)
 }
 
-fn validate_access_slice(data_len: usize, slice: &[usize]) -> DataBankResult<usize> {
-    if slice.len() % 3 != 0 {
-        return Err(DataBankError::Access(
-            crate::access::AccessError::InvalidSlice(
-                "slice length must be a multiple of 3".to_string(),
-            ),
-        ));
-    }
-
-    let mut output_len = 0usize;
-    for triple in slice.chunks_exact(3) {
-        let off = triple[0];
-        let start = triple[1];
-        let end = triple[2];
-        if start > end {
-            return Err(DataBankError::Access(
-                crate::access::AccessError::InvalidSlice(format!("invalid range [{start}, {end})")),
-            ));
+fn ranges_are_packed(ranges: &[RangeCopy], output_len: usize) -> bool {
+    let mut cursor = 0usize;
+    for range in ranges {
+        if range.dst_offset != cursor {
+            return false;
         }
-        if end > data_len {
-            return Err(DataBankError::Access(
-                crate::access::AccessError::InvalidSlice(format!(
-                    "invalid range [{start}, {end}) for {data_len} bytes"
-                )),
-            ));
-        }
-        let out_end = off.checked_add(end - start).ok_or_else(|| {
-            DataBankError::Access(crate::access::AccessError::InvalidSlice(
-                "slice output length overflow".to_string(),
-            ))
-        })?;
-        output_len = output_len.max(out_end);
+        let Some(next) = cursor.checked_add(range.len()) else {
+            return false;
+        };
+        cursor = next;
     }
-    Ok(output_len)
+    cursor == output_len
 }
 
 fn collect_prefetch_key(keys: &mut FastHashSet<ChunkKey>, chunk: &ChunkRef) {
@@ -5852,9 +5857,7 @@ where
                 Ok(Some(result)) => result,
                 Ok(None) => break,
                 Err(_) => {
-                    let _ = self
-                        .tx
-                        .send(Err(DataBankError::PrefetchProducerPanic));
+                    let _ = self.tx.send(Err(DataBankError::PrefetchProducerPanic));
                     break;
                 }
             };
@@ -6095,13 +6098,7 @@ where
         if self.gene_axis.projection().is_some() {
             self.scatter_sparse_prefetch_projected_data(dataset, &plan, index_bytes, &mut buffer)?;
         } else {
-            self.scatter_sparse_prefetch_data(
-                dataset,
-                &plan,
-                index_bytes,
-                scheduled,
-                &mut buffer,
-            )?;
+            self.scatter_sparse_prefetch_data(dataset, &plan, index_bytes, scheduled, &mut buffer)?;
         }
 
         Ok(PrefetchedBatch {
@@ -6166,11 +6163,7 @@ where
     where
         J: Iterator<Item = AccessItem>,
     {
-        let output_rows = if dataset.num_genes == 0 {
-            0
-        } else {
-            buffer.len() / dataset.num_genes
-        };
+        let output_rows = row_count_for_width(buffer.len(), dataset.num_genes);
         let output_bytes = buffer
             .len()
             .checked_mul(mem::size_of::<T>())
@@ -6424,13 +6417,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use super::super::array::{Array, ChunkStore};
+    use super::super::array::{Array, ArrayGrid, Chunk, ChunkSource, EdgeChunkLayout};
     use super::super::dataset::{Dataset, SparseCsrDataset};
+    use crate::access::SliceSpec;
     use crate::codecs::{ChunkCodec, CodecError, CodecResult, SharedCodec, UncompressedCodec};
     use crate::databank::{
         ArrayCodecMeta, ArrayMeta, ArrayOrder, ChunkStoreMeta, DType, DataBank, DataBankConfig,
-        Dense1DMeta, Dense2DMeta, FileChunkLocation, MissingGenePolicy, PrefetchedBatch,
-        ScheduledPrefetchConfig, SparseCsrDatasetMeta,
+        Dense1DMeta, Dense2DMeta, DirectoryChunkLocationMeta, FileChunkLocation, MissingGenePolicy,
+        PrefetchedBatch, ScheduledPrefetchConfig, SparseCsrDatasetMeta,
     };
 
     static FILE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -6486,23 +6480,49 @@ mod tests {
         bytes.into()
     }
 
+    /// Encode ``values`` as little-endian bytes, zero-padded to ``chunk_len``
+    /// elements — standard zarr edge-chunk layout (every decoded chunk is
+    /// exactly ``chunk_len`` elements; trailing padding is never read because
+    /// the CSR indptr bounds the logical range).
+    fn padded_u32_bytes(values: &[u32], chunk_len: usize) -> Arc<[u8]> {
+        let mut bytes = vec![0u8; chunk_len * std::mem::size_of::<u32>()];
+        for (i, value) in values.iter().enumerate() {
+            let offset = i * std::mem::size_of::<u32>();
+            bytes[offset..offset + std::mem::size_of::<u32>()]
+                .copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes.into()
+    }
+
     #[test]
     fn memory_none_group_copies_raw_slices_directly() {
         let codec: SharedCodec = Arc::new(UncompressedCodec);
         let bytes = b"abcdefghijkl";
+        let slice = SliceSpec::from_triples(vec![0, 2, 5, 3, 8, 11]).expect("slice spec");
 
-        let sliced =
-            super::load_memory_group(bytes, &codec, bytes.len(), Some(&[0, 2, 5, 3, 8, 11]))
-                .expect("slice raw none codec");
+        let sliced = super::load_memory_group(bytes, &codec, bytes.len(), false, &slice)
+            .expect("slice raw none codec");
 
         assert_eq!(sliced, b"cdeijk");
+    }
+
+    #[test]
+    fn memory_none_group_preserves_sparse_slice_gaps() {
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let bytes = b"abcdefghijkl";
+        let slice = SliceSpec::from_triples(vec![2, 2, 5]).expect("slice spec");
+
+        let sliced = super::load_memory_group(bytes, &codec, bytes.len(), false, &slice)
+            .expect("slice raw none codec");
+
+        assert_eq!(sliced, b"\0\0cde");
     }
 
     #[test]
     fn memory_none_group_preserves_size_mismatch_error() {
         let codec: SharedCodec = Arc::new(UncompressedCodec);
 
-        let err = super::load_memory_group(b"abc", &codec, 4, None)
+        let err = super::load_memory_group(b"abc", &codec, 4, false, &SliceSpec::Full)
             .expect_err("size mismatch should be surfaced");
 
         assert!(matches!(
@@ -6513,6 +6533,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn zero_length_file_chunk_reads_as_zero_fill_without_opening_path() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let (path, locations) = write_chunk_file(vec![arc_u32_bytes(&[11, 22])]);
+        let missing_path = path.with_extension("missing");
+        assert!(!missing_path.exists());
+
+        let id = bank
+            .register_dense_2d(Dense2DMeta {
+                gene_names: vec!["g0".to_string(), "g1".to_string()],
+                data: ArrayMeta {
+                    shape: vec![2, 2],
+                    chunk_shape: vec![1, 2],
+                    chunk_grid_shape: vec![2, 1],
+                    dtype: DType::U32,
+                    order: ArrayOrder::C,
+                    codec: ArrayCodecMeta::Uncompressed,
+                    chunks: ChunkStoreMeta::Directory {
+                        locations: vec![
+                            DirectoryChunkLocationMeta {
+                                path,
+                                offset: locations[0].offset,
+                                len: locations[0].len,
+                            },
+                            DirectoryChunkLocationMeta {
+                                path: missing_path,
+                                offset: 0,
+                                len: 0,
+                            },
+                        ],
+                    },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
+                },
+            })
+            .expect("register dense with missing chunk");
+
+        let mut out = vec![99u32; 4];
+        bank.access_cells(id, &[0, 1], &mut out, None)
+            .expect("access dense with missing chunk");
+
+        assert_eq!(out, vec![11, 22, 0, 0]);
     }
 
     #[test]
@@ -6531,6 +6595,8 @@ mod tests {
                     chunks: ChunkStoreMeta::Memory {
                         chunks: vec![arc_u32_bytes(&[1, 2, 3, 4, 999]), arc_u32_bytes(&[5, 6])],
                     },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register dense 1d");
@@ -6566,6 +6632,8 @@ mod tests {
                     chunks: ChunkStoreMeta::Memory {
                         chunks: vec![arc_u32_bytes(&[1])],
                     },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect_err("empty gene name should fail");
@@ -6582,8 +6650,8 @@ mod tests {
         let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
         let id = register_dense_2d_file(&mut bank, 2, 2, 1);
         let file_id = match bank.registry.get(id).expect("dataset") {
-            Dataset::Dense2D(dataset) => match &dataset.data.chunks {
-                ChunkStore::FileOffset { file, .. } => file.id,
+            Dataset::Dense2D(dataset) => match &dataset.data.chunks[0].source {
+                ChunkSource::File { file, .. } => file.id,
                 _ => panic!("expected file-backed dense dataset"),
             },
             _ => panic!("expected dense dataset"),
@@ -6637,10 +6705,13 @@ mod tests {
             .register_sparse_csr(SparseCsrDatasetMeta {
                 gene_names: (0..5).map(|idx| format!("g{idx}")).collect(),
                 indptr: vec![0, 2, 5, 6],
-                indices: u32_array_meta(vec![arc_u32_bytes(&[1, 3, 0, 4]), arc_u32_bytes(&[2, 3])]),
+                indices: u32_array_meta(vec![
+                    padded_u32_bytes(&[1, 3, 0, 4], 4),
+                    padded_u32_bytes(&[2, 3], 4),
+                ]),
                 data: u32_array_meta(vec![
-                    arc_u32_bytes(&[10, 30, 100, 400]),
-                    arc_u32_bytes(&[200, 3000]),
+                    padded_u32_bytes(&[10, 30, 100, 400], 4),
+                    padded_u32_bytes(&[200, 3000], 4),
                 ]),
                 index_dtype: DType::U32,
                 num_cells: 3,
@@ -6714,6 +6785,8 @@ mod tests {
                     chunks: ChunkStoreMeta::Memory {
                         chunks: vec![arc_u64_bytes(&[0, 2, 5]), arc_u64_bytes(&[1, 3, 4])],
                     },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
                 data: ArrayMeta {
                     shape: vec![6],
@@ -6729,6 +6802,8 @@ mod tests {
                             arc_f32_bytes(&[30.0, 40.0]),
                         ],
                     },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
                 index_dtype: DType::U64,
                 num_cells: 2,
@@ -6953,10 +7028,13 @@ mod tests {
             .register_sparse_csr(SparseCsrDatasetMeta {
                 gene_names: (0..5).map(|idx| format!("g{idx}")).collect(),
                 indptr: vec![0, 2, 5, 6],
-                indices: u32_array_meta(vec![arc_u32_bytes(&[1, 3, 0, 4]), arc_u32_bytes(&[2, 3])]),
+                indices: u32_array_meta(vec![
+                    padded_u32_bytes(&[1, 3, 0, 4], 4),
+                    padded_u32_bytes(&[2, 3], 4),
+                ]),
                 data: u32_array_meta(vec![
-                    arc_u32_bytes(&[10, 30, 100, 400]),
-                    arc_u32_bytes(&[200, 3000]),
+                    padded_u32_bytes(&[10, 30, 100, 400], 4),
+                    padded_u32_bytes(&[200, 3000], 4),
                 ]),
                 index_dtype: DType::U32,
                 num_cells: 3,
@@ -7233,6 +7311,8 @@ mod tests {
         }
     }
 
+    impl crate::codecs::sealed::Sealed for CountingCodec {}
+
     impl ChunkCodec for CountingCodec {
         fn name(&self) -> &str {
             "counting"
@@ -7285,30 +7365,17 @@ mod tests {
         let genes = bank.interner.intern_dataset(&gene_names);
         let indices_chunks = chunk_u32_values(&indices, chunk_len);
         let data_chunks = chunk_u32_values(&data, chunk_len);
-        let chunk_grid_shape = vec![nnz.div_ceil(chunk_len)];
         let dataset = SparseCsrDataset {
             genes,
             indptr,
-            indices: Array {
-                shape: vec![nnz],
-                chunk_shape: vec![chunk_len],
-                chunk_grid_shape: chunk_grid_shape.clone(),
-                dtype: DType::U32,
-                codec: Arc::clone(&codec),
-                chunks: ChunkStore::Memory {
-                    chunks: indices_chunks,
-                },
-            },
-            data: Array {
-                shape: vec![nnz],
-                chunk_shape: vec![chunk_len],
-                chunk_grid_shape,
-                dtype: DType::U32,
-                codec,
-                chunks: ChunkStore::Memory {
-                    chunks: data_chunks,
-                },
-            },
+            indices: counted_memory_array(
+                nnz,
+                chunk_len,
+                DType::U32,
+                Arc::clone(&codec),
+                indices_chunks,
+            ),
+            data: counted_memory_array(nnz, chunk_len, DType::U32, codec, data_chunks),
             index_dtype: DType::U32,
             num_cells,
             num_genes,
@@ -7321,16 +7388,107 @@ mod tests {
     }
 
     fn chunk_u32_values(values: &[u32], chunk_len: usize) -> Vec<Arc<[u8]>> {
+        // Edge chunks padded to ``chunk_len`` (zero fill value) — standard zarr
+        // edge-chunk layout: every decoded chunk is exactly ``chunk_len``
+        // elements.
         values
             .chunks(chunk_len)
             .map(|chunk| {
-                let mut bytes = Vec::with_capacity(std::mem::size_of_val(chunk));
-                for value in chunk {
-                    bytes.extend_from_slice(&value.to_ne_bytes());
+                let mut bytes = vec![0u8; chunk_len * std::mem::size_of::<u32>()];
+                for (i, value) in chunk.iter().enumerate() {
+                    let offset = i * std::mem::size_of::<u32>();
+                    bytes[offset..offset + std::mem::size_of::<u32>()]
+                        .copy_from_slice(&value.to_ne_bytes());
                 }
                 Arc::from(bytes.into_boxed_slice())
             })
             .collect()
+    }
+
+    fn counted_memory_array(
+        len: usize,
+        chunk_len: usize,
+        dtype: DType,
+        codec: SharedCodec,
+        raw_chunks: Vec<Arc<[u8]>>,
+    ) -> Array {
+        let grid_shape = vec![len.div_ceil(chunk_len)];
+        let decoded_bytes = chunk_len * dtype.item_size();
+        Array {
+            shape: vec![len],
+            dtype,
+            codec,
+            grid: ArrayGrid::Regular {
+                chunk_shape: vec![chunk_len],
+                grid_shape,
+                edge: EdgeChunkLayout::Padded,
+            },
+            chunks: raw_chunks
+                .into_iter()
+                .map(|bytes| Chunk {
+                    source: ChunkSource::Memory {
+                        bytes,
+                        decoded: false,
+                    },
+                    decoded_bytes,
+                })
+                .collect(),
+            files: Vec::new(),
+        }
+    }
+
+    fn counted_decoded_memory_array(
+        len: usize,
+        chunk_len: usize,
+        dtype: DType,
+        raw_chunks: Vec<Arc<[u8]>>,
+    ) -> (Array, Arc<AtomicUsize>) {
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let codec: SharedCodec = Arc::new(CountingCodec {
+            decodes: Arc::clone(&decodes),
+        });
+        let mut array = counted_memory_array(len, chunk_len, dtype, codec, raw_chunks);
+        for chunk in &mut array.chunks {
+            let ChunkSource::Memory { decoded, .. } = &mut chunk.source else {
+                unreachable!("counted_memory_array only creates memory chunks");
+            };
+            *decoded = true;
+        }
+        (array, decodes)
+    }
+
+    #[test]
+    fn decoded_single_memory_chunk_accepts_non_identity_codec_without_decode() {
+        let bytes = arc_u32_bytes(&[1, 2, 3, 4]);
+        let (array, decodes) =
+            counted_decoded_memory_array(4, 4, DType::U32, vec![Arc::clone(&bytes)]);
+
+        let raw = super::single_memory_identity_chunk_bytes(&array)
+            .expect("single decoded chunk")
+            .expect("direct memory chunk");
+
+        assert_eq!(raw, bytes.as_ref());
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn decoded_memory_1d_chunks_accept_non_identity_codec_without_decode() {
+        let chunk0 = arc_u32_bytes(&[1, 2, 3, 4]);
+        let chunk1 = arc_u32_bytes(&[5, 6, 0, 0]);
+        let (array, decodes) = counted_decoded_memory_array(
+            6,
+            4,
+            DType::U32,
+            vec![Arc::clone(&chunk0), Arc::clone(&chunk1)],
+        );
+
+        let chunks = super::MemoryIdentity1DChunks::from_array(&array)
+            .expect("decoded memory chunks")
+            .expect("direct 1D chunks");
+
+        assert_eq!(chunks.chunk_bytes(0).expect("chunk 0"), chunk0.as_ref());
+        assert_eq!(chunks.chunk_bytes(1).expect("chunk 1"), chunk1.as_ref());
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
     }
 
     fn expected_counted_csr_rows(
@@ -7368,14 +7526,18 @@ mod tests {
         let grid_rows = num_cells.div_ceil(chunk_rows);
         let mut chunks = Vec::new();
         for chunk_row in 0..grid_rows {
-            let mut bytes = Vec::new();
+            // Padded to full chunk_rows*chunk_cols (zero fill value) to match
+            // standard zarr edge-chunk layout.
+            let mut bytes = vec![0u8; chunk_rows * chunk_cols * std::mem::size_of::<u32>()];
             for local_row in 0..chunk_rows {
                 let cell = chunk_row * chunk_rows + local_row;
                 if cell >= num_cells {
                     break;
                 }
                 for gene in 0..num_genes {
-                    bytes.extend_from_slice(&((cell * 100 + gene) as u32).to_ne_bytes());
+                    let offset = (local_row * chunk_cols + gene) * std::mem::size_of::<u32>();
+                    bytes[offset..offset + std::mem::size_of::<u32>()]
+                        .copy_from_slice(&((cell * 100 + gene) as u32).to_ne_bytes());
                 }
             }
             chunks.push(Arc::from(bytes.into_boxed_slice()));
@@ -7392,6 +7554,8 @@ mod tests {
                     order: ArrayOrder::C,
                     codec: ArrayCodecMeta::Uncompressed,
                     chunks: ChunkStoreMeta::FileOffset { path, locations },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register dense 2d file");
@@ -7410,16 +7574,26 @@ mod tests {
         let mut chunks = Vec::with_capacity(grid_rows * grid_cols);
         for chunk_row in 0..grid_rows {
             let row_start = chunk_row * chunk_rows;
-            let rows = chunk_rows.min(num_cells - row_start);
             for chunk_col in 0..grid_cols {
                 let col_start = chunk_col * chunk_cols;
-                let cols = chunk_cols.min(num_genes - col_start);
-                let mut bytes = Vec::with_capacity(rows * cols * std::mem::size_of::<u32>());
-                for local_row in 0..rows {
+                // Chunks are stored padded to the full ``chunk_shape`` with a
+                // zero fill value, matching standard zarr edge-chunk layout
+                // (the decoded buffer is always chunk_rows*chunk_cols elements).
+                let mut bytes = vec![0u8; chunk_rows * chunk_cols * std::mem::size_of::<u32>()];
+                for local_row in 0..chunk_rows {
                     let cell = row_start + local_row;
-                    for local_col in 0..cols {
+                    if cell >= num_cells {
+                        break;
+                    }
+                    for local_col in 0..chunk_cols {
                         let gene = col_start + local_col;
-                        bytes.extend_from_slice(&dense_value(cell, gene).to_ne_bytes());
+                        if gene >= num_genes {
+                            break;
+                        }
+                        let offset =
+                            (local_row * chunk_cols + local_col) * std::mem::size_of::<u32>();
+                        bytes[offset..offset + std::mem::size_of::<u32>()]
+                            .copy_from_slice(&dense_value(cell, gene).to_ne_bytes());
                     }
                 }
                 chunks.push(Arc::from(bytes.into_boxed_slice()));
@@ -7436,6 +7610,8 @@ mod tests {
                 order: ArrayOrder::C,
                 codec: ArrayCodecMeta::Uncompressed,
                 chunks: ChunkStoreMeta::Memory { chunks },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register dense 2d memory")
@@ -7473,6 +7649,8 @@ mod tests {
                     path: indices_path,
                     locations: indices_locations,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             data: ArrayMeta {
                 shape: vec![6],
@@ -7485,6 +7663,8 @@ mod tests {
                     path: data_path,
                     locations: data_locations,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             index_dtype: DType::U32,
             num_cells: 3,
@@ -7502,6 +7682,8 @@ mod tests {
             order: ArrayOrder::C,
             codec: ArrayCodecMeta::Uncompressed,
             chunks: ChunkStoreMeta::Memory { chunks },
+            variable_chunks: false,
+            chunk_boundaries: None,
         }
     }
 }

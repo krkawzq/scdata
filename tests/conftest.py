@@ -65,6 +65,10 @@ def encode_chunk(raw: bytes, codec_config: dict[str, Any] | None) -> bytes:
         return raw
     codec = get_codec(dict(codec_config))
     out = codec.encode(np.frombuffer(raw, dtype=np.uint8))
+    # numcodecs' Codec.encode is typed as Optional[Buffer] but never returns
+    # None for a successful encode; narrow it so the bytes() / memoryview()
+    # calls below are not flagged on the Optional branch.
+    assert out is not None
     return memoryview(out).tobytes() if not isinstance(out, bytes) else out
 
 
@@ -72,10 +76,13 @@ def encode_vlen_chunk(strings: list[str], codec_config: dict[str, Any] | None) -
     """Encode an object string array chunk: VLenUTF8 then optional compressor."""
     vlen = get_codec(dict(VLEN_UTF8))
     data = vlen.encode(np.asarray(strings, dtype=object))
+    # See encode_chunk: Codec.encode is typed Optional but never returns None.
+    assert data is not None
     data = data.tobytes() if hasattr(data, "tobytes") else bytes(data)
     if codec_config:
         comp = get_codec(dict(codec_config))
         out = comp.encode(np.frombuffer(data, dtype=np.uint8))
+        assert out is not None
         data = memoryview(out).tobytes() if not isinstance(out, bytes) else out
     return data
 

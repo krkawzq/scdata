@@ -6,18 +6,23 @@
 //! each shard keeps cache, in-flight, and memory-budget transitions lock-free
 //! while independent chunk keys can scale across scheduler threads.
 
+mod backend;
 mod cache;
-mod callback;
 mod cpu;
 mod error;
 mod inflight;
+mod key;
 mod membudget;
+mod scheduled;
 mod scheduler;
+mod slice;
 
-pub use callback::{DecodeBackend, DecodeTask, FileRef, IoBackend, IoTask};
+pub use backend::{DecodeBackend, DecodeTask, FileRef, IoBackend, IoTask};
 pub use cpu::AccessCpuConfig;
 pub use error::{AccessError, AccessResult};
+pub use key::ChunkKey;
 pub use scheduler::{
-    AccessConfig, AccessHandle, AccessItem, AccessRequest, AccessScheduler, ChunkKey,
-    PrefetchCancel, PrefetchRequest, ScheduledAccess, ScheduledAccessConfig,
+    AccessConfig, AccessHandle, AccessItem, AccessRequest, AccessScheduler, PrefetchCancel,
+    PrefetchRequest, ScheduledAccess, ScheduledAccessConfig,
 };
+pub use slice::{RangeCopy, SliceSpec};

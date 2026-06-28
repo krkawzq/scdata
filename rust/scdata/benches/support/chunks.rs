@@ -14,6 +14,8 @@ use _scdata::databank::{DirectoryChunkLocationMeta, FileChunkLocation};
 
 use super::codecs::crc32_encode;
 
+pub type CsrU32F32Chunks = (Vec<u64>, Vec<Arc<[u8]>>, Vec<Arc<[u8]>>);
+
 /// Dense2D chunks in C order: outer loop over row-chunks, inner over col-chunks,
 /// each chunk row-major `[chunk_rows, chunk_cols]` of `u32`.
 pub fn make_dense_u32_chunks(
@@ -118,7 +120,7 @@ pub fn make_csr_u32_f32_chunked_raw(
     genes: usize,
     nnz_per_cell: usize,
     chunk_len: usize,
-) -> (Vec<u64>, Vec<Arc<[u8]>>, Vec<Arc<[u8]>>) {
+) -> CsrU32F32Chunks {
     let nnz = cells * nnz_per_cell;
     let mut indptr = Vec::with_capacity(cells + 1);
     let mut indices = Vec::with_capacity(nnz);
@@ -144,7 +146,7 @@ pub fn make_csr_u32_f32_chunks_lz4(
     genes: usize,
     nnz_per_cell: usize,
     chunk_len: usize,
-) -> (Vec<u64>, Vec<Arc<[u8]>>, Vec<Arc<[u8]>>) {
+) -> CsrU32F32Chunks {
     let nnz = cells * nnz_per_cell;
     let mut indptr = Vec::with_capacity(cells + 1);
     let mut indices = Vec::with_capacity(nnz);
@@ -302,6 +304,7 @@ pub fn write_dense_u32_directory(
         std::fs::write(&path, chunk).expect("write dir chunk");
         locations.push(DirectoryChunkLocationMeta {
             path,
+            offset: 0,
             len: chunk.len(),
         });
     }

@@ -5,27 +5,33 @@ These types are the Python-side view of a scdata store produced by
 than mirroring the Rust structs field-for-field, but they carry every piece
 of information the Rust :class:`DataBank` consumes from a store:
 
-* logical ``shape`` and ``chunk_shape`` (chunk alignment is enforced at write
-  time so a single cell never spans two chunks),
+* logical ``shape`` / ``chunk_shape`` plus optional rectilinear boundaries,
 * the element dtype (mapped to the Rust ``DType`` enum),
-* the codec pipeline as raw numcodecs JSON (``filters`` + ``compressor``),
-  which Rust rebuilds via ``codec_pipeline_from_zarr_v2_json_str``,
-* the chunk store as a single concatenated payload file plus a per-chunk
-  ``(offset, length)`` index table (Rust ``ChunkStoreMeta::FileOffset``).
+* the codec pipeline as raw numcodecs-compatible JSON,
+* normalized chunk sources: a local file path plus ``(offset, length)`` for
+  each encoded chunk, whether the original store was a directory, zip archive,
+  or legacy concatenated payload.
 
-The store carries standard zarr v2 metadata (``.zarray`` / ``.zgroup`` /
-``.zattrs``), but chunk *data* lives in a single concatenated payload file
-rather than one file per chunk — scdata reads it directly via the Rust
-io_uring path.  Whether anndata can read chunk data back depends on the write
-path also emitting standard per-chunk files; that is a write-path decision,
-not yet implemented.
+The dataset layer does not open files or decode numeric chunks.  It only keeps
+metadata and chunk addresses so the Rust databank can construct arrays and
+datasets without knowing which upstream container produced them.
+
+FFI note: the per-chunk index and the CSR ``indptr`` are stored as contiguous
+``uint64`` numpy arrays so the Rust binding can borrow them zero-copy via
+``PyReadonlyArray1::<u64>`` instead of walking a Python tuple element by
+element.  Tuple views (``ArrayMeta.chunks`` / ``SparseDataset.indptr`` as a
+tuple) are still available as derived properties for readability and for any
+caller that has not switched to the numpy path.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any
+from typing import Any, Iterable, Literal, Mapping, Sequence
+
+import numpy as np
+from numpy.typing import NDArray
 
 __all__ = [
     "ArrayOrder",
@@ -70,7 +76,7 @@ class ArrayOrder(str, Enum):
     C = "C"
 
     @classmethod
-    def parse(cls, value: Any) -> "ArrayOrder":
+    def parse(cls, value: object) -> "ArrayOrder":
         if isinstance(value, ArrayOrder):
             return value
         if value is None:
@@ -80,9 +86,7 @@ class ArrayOrder(str, Enum):
         if text == "C":
             return cls.C
         if text == "F":
-            raise DtypeParseError(
-                "F-order arrays are unsupported (scdata stores are C-order)"
-            )
+            raise DtypeParseError("F-order arrays are unsupported (scdata stores are C-order)")
         raise DtypeParseError(f"unsupported array order: {value!r}")
 
 
@@ -127,7 +131,7 @@ class DType(Enum):
         return self in (DType.I32, DType.U32, DType.I64, DType.U64)
 
     @classmethod
-    def parse(cls, dtype: Any) -> "DType":
+    def parse(cls, dtype: object) -> "DType":
         """Parse a zarr v2 dtype field into a :class:`DType`.
 
         Accepts the standard zarr forms:
@@ -149,8 +153,6 @@ class DType(Enum):
     @classmethod
     def from_numpy(cls, dtype: Any) -> "DType":
         """Map a numpy dtype object to a :class:`DType`."""
-        import numpy as np
-
         np_dtype = np.dtype(dtype)
         kind = np_dtype.kind
         size = np_dtype.itemsize
@@ -182,7 +184,7 @@ class DType(Enum):
                 raise DtypeParseError(f"unsupported numpy dtype: {np_dtype}")
 
 
-def _extract_base_dtype(dtype: Any) -> str:
+def _extract_base_dtype(dtype: object) -> str:
     """Return the base type string from a zarr dtype field."""
     if isinstance(dtype, str):
         return dtype
@@ -263,8 +265,8 @@ class CodecPipeline:
     @classmethod
     def from_zarr(
         cls,
-        filters: Any | None,
-        compressor: Any | None,
+        filters: object | None,
+        compressor: object | None,
     ) -> "CodecPipeline":
         """Build from the ``filters`` / ``compressor`` fields of a ``.zarray``."""
         if filters is None:
@@ -272,9 +274,7 @@ class CodecPipeline:
         elif isinstance(filters, list):
             filter_list = tuple(_coerce_config_dict(f) for f in filters)
         else:
-            raise CodecConfigError(
-                f"filters must be a list, got {type(filters).__name__}"
-            )
+            raise CodecConfigError(f"filters must be a list, got {type(filters).__name__}")
         compressor_dict = _coerce_config_dict(compressor) if compressor is not None else None
         return cls(filters=filter_list, compressor=compressor_dict)
 
@@ -289,12 +289,10 @@ class CodecPipeline:
         return filters, compressor
 
 
-def _coerce_config_dict(value: Any) -> dict[str, Any]:
+def _coerce_config_dict(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
-    raise CodecConfigError(
-        f"codec config must be a JSON object, got {type(value).__name__}"
-    )
+    raise CodecConfigError(f"codec config must be a JSON object, got {type(value).__name__}")
 
 
 @dataclass(frozen=True)
@@ -302,9 +300,8 @@ class ChunkLocation:
     """Location of one encoded chunk inside the payload file.
 
     Mirrors Rust ``FileChunkLocation { offset: u64, len: usize }``.  Chunks
-    are ordered by C-order (row-major) logical chunk index; edge chunks are
-    stored cropped to their logical extent (no padding), matching Rust's
-    ``linear_chunk_expected_size`` semantics.
+    are ordered by C-order (row-major) logical chunk index; the Rust array
+    layer derives decoded size from the normalized grid/chunk metadata.
     """
 
     offset: int
@@ -317,13 +314,46 @@ class ChunkLocation:
             raise ValueError(f"chunk length must be non-negative, got {self.length}")
 
 
+def _as_u64_array(value: object, name: str) -> NDArray[np.uint64]:
+    """Coerce a chunk index / indptr input into a contiguous 1D ``uint64`` array.
+
+    Accepts a numpy array (any integer dtype) or any iterable of ints.  The
+    result is always C-contiguous ``uint64`` so the Rust binding can borrow it
+    zero-copy.  ``uint64`` matches Rust ``FileChunkLocation::offset`` /
+    ``indptr: Vec<u64>``; values are range-checked because a negative Python
+    int silently reinterprets as a huge unsigned value otherwise.
+    """
+    arr = np.asarray(value, dtype=np.int64)
+    if arr.ndim != 1:
+        raise ValueError(f"{name} must be 1D, got {arr.ndim}D")
+    if arr.size and arr.min() < 0:
+        raise ValueError(f"{name} values must be non-negative")
+    arr = arr.astype(np.uint64, copy=False)
+    if not arr.flags["C_CONTIGUOUS"]:
+        arr = np.ascontiguousarray(arr)
+    return arr
+
+
 @dataclass(frozen=True)
 class ArrayMeta:
-    """Metadata for a single zarr array backed by a concatenated payload file.
+    """Metadata for a single zarr array and how its chunks are stored.
 
-    This is the Python view of Rust ``ArrayMeta`` + ``ChunkStoreMeta::FileOffset``.
-    The payload file holds every encoded chunk concatenated in C-order logical
-    chunk index; ``chunks`` gives the ``(offset, length)`` of each chunk.
+    Two chunk stores are supported, selected by :attr:`store_kind`:
+
+    * ``"file"`` — every encoded chunk is concatenated into one payload file
+      (the legacy scdata v2 layout).  :attr:`payload_path` is the logical zarr
+      key; :attr:`payload_file_path`, when set by :func:`scdata.io.launch`, is
+      the actual local file Rust should open.  :attr:`chunk_offsets` /
+      :attr:`chunk_lengths` give each encoded chunk's byte range.
+    * ``"dir"`` — each chunk has its own logical zarr key.  Directory stores
+      use one filesystem file per chunk; zip stores use the zip archive file
+      plus a physical byte offset for each entry.  :attr:`chunk_paths` keeps the
+      logical keys, while :attr:`chunk_file_paths` optionally carries the local
+      file path Rust should open for each chunk.
+
+    Regular v2 payload chunks are cropped at edge chunks; standard zarr v3
+    chunks are padded.  Python only describes locations and grid metadata here;
+    Rust derives the decoded size per chunk from the array grid.
     """
 
     shape: tuple[int, ...]
@@ -332,7 +362,38 @@ class ArrayMeta:
     order: ArrayOrder = ArrayOrder.C
     codec: CodecPipeline = field(default_factory=CodecPipeline)
     payload_path: str = ""
-    chunks: tuple[ChunkLocation, ...] = ()
+    #: Actual local file for ``payload_path``.  Empty means the Rust binding
+    #: joins ``store_path / payload_path`` for backwards-compatible manual
+    #: datasets.
+    payload_file_path: str = ""
+    store_kind: Literal["file", "dir"] = "file"
+    #: Whether chunks have variable (per-chunk) decoded sizes (zarr v3
+    #: rectilinear chunk grids).  False for regular grids; true for scdata's
+    #: cell-aligned CSR layout.
+    variable_chunks: bool = False
+    #: Explicit rectilinear chunk boundaries, one tuple per axis.  Regular
+    #: grids leave this empty.
+    chunk_boundaries: tuple[tuple[int, ...], ...] = ()
+    #: One store-root-relative path per chunk (``store_kind="dir"`` only).
+    chunk_paths: tuple[str, ...] = ()
+    #: Actual local file per chunk.  Empty means the Rust binding joins
+    #: ``store_path / chunk_paths[i]``; zip stores set every entry to the archive
+    #: path and use :attr:`chunk_offsets` for the in-archive byte offset.
+    chunk_file_paths: tuple[str, ...] = ()
+    # ``compare=False``: numpy arrays are not hashable and elementwise equality
+    # does not yield a bool, so they are excluded from the dataclass-generated
+    # ``__eq__`` / ``__hash__``.  Equality is still well-defined via the other
+    # fields, and these objects are never used as dict keys in practice.
+    chunk_offsets: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.uint64),
+        compare=False,
+        repr=False,
+    )
+    chunk_lengths: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.uint64),
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if len(self.shape) != len(self.chunk_shape):
@@ -345,10 +406,178 @@ class ArrayMeta:
             raise ValueError(f"shape must be positive, got {self.shape}")
         if any(c <= 0 for c in self.chunk_shape):
             raise ValueError(f"chunk_shape must be positive, got {self.chunk_shape}")
-        if len(self.chunks) != self.num_chunks:
-            raise ValueError(
-                f"chunks count {len(self.chunks)} != chunk grid size {self.num_chunks}"
-            )
+        if self.store_kind not in ("file", "dir"):
+            raise ValueError(f"store_kind must be 'file' or 'dir', got {self.store_kind!r}")
+        boundaries = tuple(tuple(int(x) for x in axis) for axis in self.chunk_boundaries)
+        if boundaries:
+            if not self.variable_chunks:
+                raise ValueError("chunk_boundaries require variable_chunks=True")
+            if len(boundaries) != len(self.shape):
+                raise ValueError(
+                    f"chunk_boundaries rank {len(boundaries)} != shape rank {len(self.shape)}"
+                )
+            for axis, (bounds, dim) in enumerate(zip(boundaries, self.shape)):
+                if len(bounds) < 2:
+                    raise ValueError(f"chunk_boundaries[{axis}] must contain at least two entries")
+                if bounds[0] != 0:
+                    raise ValueError(f"chunk_boundaries[{axis}] must start at 0")
+                if bounds[-1] != dim:
+                    raise ValueError(
+                        f"chunk_boundaries[{axis}] final boundary {bounds[-1]} != shape {dim}"
+                    )
+                if any(a > b for a, b in zip(bounds, bounds[1:])):
+                    raise ValueError(f"chunk_boundaries[{axis}] must be monotonic")
+            object.__setattr__(self, "chunk_boundaries", boundaries)
+
+        lengths = _as_u64_array(self.chunk_lengths, "chunk_lengths")
+        object.__setattr__(self, "chunk_lengths", lengths)
+
+        if self.store_kind == "file":
+            offsets = _as_u64_array(self.chunk_offsets, "chunk_offsets")
+            if offsets.shape[0] != lengths.shape[0]:
+                raise ValueError(
+                    f"chunk_offsets length {offsets.shape[0]} != "
+                    f"chunk_lengths length {lengths.shape[0]}"
+                )
+            if offsets.shape[0] != self.num_chunks:
+                raise ValueError(
+                    f"chunks count {offsets.shape[0]} != chunk grid size {self.num_chunks}"
+                )
+            # scdata writes chunks concatenated in C-order, so offsets are
+            # strictly non-decreasing.  This catches a mis-ordered index before
+            # it reaches Rust, where an out-of-order read would silently fetch
+            # the wrong bytes.  ``diff`` is done on a signed view: on ``uint64``
+            # a decreasing pair would wrap to a huge positive value and silently
+            # pass the check.
+            if offsets.shape[0] >= 2 and np.any(np.diff(offsets.view(np.int64)) < 0):
+                raise ValueError("chunk offsets must be monotonically non-decreasing")
+            object.__setattr__(self, "chunk_offsets", offsets)
+            object.__setattr__(self, "chunk_paths", ())
+            object.__setattr__(self, "chunk_file_paths", ())
+        else:  # "dir"
+            paths = tuple(self.chunk_paths)
+            if len(paths) != self.num_chunks:
+                raise ValueError(
+                    f"chunk_paths count {len(paths)} != chunk grid size {self.num_chunks}"
+                )
+            if lengths.shape[0] != self.num_chunks:
+                raise ValueError(
+                    f"chunk_lengths count {lengths.shape[0]} != chunk grid size {self.num_chunks}"
+                )
+            # Per-chunk byte offset within each chunk's file.  Always 0 for a
+            # directory store (one file per chunk); for a ``.zarr.zip`` store
+            # this is the chunk's physical offset inside the zip archive, so
+            # the Rust reader preads the chunk directly out of the zip file.
+            offsets = _as_u64_array(self.chunk_offsets, "chunk_offsets")
+            if offsets.shape[0] != self.num_chunks:
+                offsets = np.zeros(self.num_chunks, dtype=np.uint64)
+            file_paths = tuple(self.chunk_file_paths)
+            if file_paths and len(file_paths) != self.num_chunks:
+                raise ValueError(
+                    f"chunk_file_paths count {len(file_paths)} != chunk grid size {self.num_chunks}"
+                )
+            object.__setattr__(self, "chunk_paths", paths)
+            object.__setattr__(self, "chunk_file_paths", file_paths)
+            object.__setattr__(self, "chunk_offsets", offsets)
+
+    @classmethod
+    def from_chunks(
+        cls,
+        *,
+        shape: tuple[int, ...],
+        chunk_shape: tuple[int, ...],
+        dtype: DType,
+        chunks: Iterable[ChunkLocation],
+        order: ArrayOrder = ArrayOrder.C,
+        codec: CodecPipeline | None = None,
+        payload_path: str = "",
+        payload_file_path: str = "",
+        chunk_offset_base: int = 0,
+    ) -> "ArrayMeta":
+        """Build a ``store_kind="file"`` :class:`ArrayMeta` from chunk locations.
+
+        Convenience for callers that already hold ``(offset, length)`` pairs —
+        the io layer and tests historically pass ``chunks=`` this way.  The
+        pairs are copied into two contiguous ``uint64`` arrays once; afterwards
+        the tuple form is available via the :attr:`chunks` property.
+        """
+        chunk_list = tuple(chunks)
+        count = len(chunk_list)
+        offsets = np.empty(count, dtype=np.uint64)
+        lengths = np.empty(count, dtype=np.uint64)
+        for i, loc in enumerate(chunk_list):
+            offsets[i] = loc.offset + chunk_offset_base
+            lengths[i] = loc.length
+        return cls(
+            shape=shape,
+            chunk_shape=chunk_shape,
+            dtype=dtype,
+            order=order,
+            codec=codec if codec is not None else CodecPipeline(),
+            payload_path=payload_path,
+            payload_file_path=payload_file_path,
+            store_kind="file",
+            chunk_offsets=offsets,
+            chunk_lengths=lengths,
+        )
+
+    @classmethod
+    def from_directory(
+        cls,
+        *,
+        shape: tuple[int, ...],
+        chunk_shape: tuple[int, ...],
+        dtype: DType,
+        chunk_paths: Iterable[str],
+        chunk_lengths: Iterable[int],
+        order: ArrayOrder = ArrayOrder.C,
+        codec: CodecPipeline | None = None,
+        variable_chunks: bool = False,
+        chunk_boundaries: Iterable[Iterable[int]] | None = None,
+        chunk_offsets: Iterable[int] | None = None,
+        chunk_file_paths: Iterable[str] | None = None,
+    ) -> "ArrayMeta":
+        """Build a ``store_kind="dir"`` :class:`ArrayMeta` from per-chunk files.
+
+        ``chunk_paths`` / ``chunk_lengths`` are one entry per chunk, ordered by
+        C-order logical chunk index (the order zarr stores chunk files for a
+        regular chunk grid).  Each path is relative to the store root; the
+        databank joins it with the dataset's :attr:`store_root` at register
+        time.
+
+        ``chunk_offsets`` is the byte offset of each chunk within its file:
+        always 0 for a directory store (one file per chunk), or the chunk's
+        physical offset inside a ``.zarr.zip`` archive so the Rust reader
+        preads the chunk directly out of the zip.  Defaults to all-zeros.
+
+        ``chunk_file_paths`` is optional and normally filled by
+        :func:`scdata.io.launch`.  When omitted, the Rust binding joins
+        ``store_path`` with ``chunk_paths``.  Zip stores set it to the zip file
+        path for every chunk.
+
+        ``variable_chunks=True`` marks a zarr v3 rectilinear chunk grid
+        (scdata's cell-aligned CSR layout).  Pass ``chunk_boundaries`` so Rust
+        can map coordinates to chunks and compute each decoded chunk size.
+        """
+        return cls(
+            shape=shape,
+            chunk_shape=chunk_shape,
+            dtype=dtype,
+            order=order,
+            codec=codec if codec is not None else CodecPipeline(),
+            payload_path="",
+            store_kind="dir",
+            variable_chunks=variable_chunks,
+            chunk_boundaries=tuple(tuple(axis) for axis in chunk_boundaries)
+            if chunk_boundaries is not None
+            else (),
+            chunk_paths=tuple(chunk_paths),
+            chunk_file_paths=tuple(chunk_file_paths) if chunk_file_paths is not None else (),
+            chunk_lengths=np.asarray(tuple(chunk_lengths), dtype=np.uint64),
+            chunk_offsets=np.asarray(tuple(chunk_offsets), dtype=np.uint64)
+            if chunk_offsets is not None
+            else np.empty(0, dtype=np.uint64),
+        )
 
     @property
     def ndim(self) -> int:
@@ -357,6 +586,8 @@ class ArrayMeta:
     @property
     def chunk_grid_shape(self) -> tuple[int, ...]:
         """Number of chunks along each axis: ``ceil(shape / chunk_shape)``."""
+        if self.chunk_boundaries:
+            return tuple(len(axis) - 1 for axis in self.chunk_boundaries)
         return tuple(_ceil_div(s, c) for s, c in zip(self.shape, self.chunk_shape))
 
     @property
@@ -370,9 +601,102 @@ class ArrayMeta:
     def item_size(self) -> int:
         return self.dtype.item_size
 
+    @property
+    def chunks(self) -> tuple[ChunkLocation, ...]:
+        """Chunk locations as a tuple.
+
+        For ``store_kind="file"`` offsets are relative to the file Rust opens
+        unless :attr:`payload_file_path` points at a zip archive, in which case
+        they are physical archive offsets.  For ``store_kind="dir"`` offsets
+        are 0 for directory stores and physical archive offsets for zip stores.
+        """
+        if self.chunk_lengths.shape[0] == 0:
+            return ()
+        offsets = self.chunk_offsets.tolist()
+        lengths = self.chunk_lengths.tolist()
+        return tuple(ChunkLocation(offset=o, length=length) for o, length in zip(offsets, lengths))
+
 
 def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
+
+
+def _validate_unique_gene_names(gene_names: tuple[str, ...]) -> None:
+    """Reject duplicate *non-empty* gene names.
+
+    ``access_cells_by_gene_names`` resolves requested names to column indices
+    via the gene table; a non-empty duplicate would make the result ambiguous.
+    The empty string is exempt: an empty name marks an anonymous (unmapped)
+    column, of which there may legitimately be several after
+    :meth:`DenseDataset.align_genes`.  Catching duplicates at construction is
+    cheaper and clearer than a Rust-side error mid-read.
+    """
+    seen: set[str] = set()
+    for name in gene_names:
+        if not name:
+            continue
+        if name in seen:
+            raise ValueError(f"gene_names must be unique, duplicate: {name!r}")
+        seen.add(name)
+
+
+def _align_gene_names(
+    gene_names: tuple[str, ...],
+    mapping: Mapping[str, str],
+    default: str = "",
+    *,
+    keep: Literal["never", "first", "last"] = "never",
+) -> tuple[str, ...]:
+    """Standardize gene names through a symbol→canonical mapping.
+
+    Each name is replaced by ``mapping[name]`` when present, otherwise by
+    ``default`` (empty string by default).  The result has the same length and
+    column order as the input — only the *names* change, never the data layout.
+
+    ``keep`` controls what happens when two source columns map to the same
+    *non-empty* canonical name (e.g. ``GAPDH`` and ``gapdh`` both mapping to
+    ``GAPDH``), matching mainstream dedup conventions:
+
+    * ``"never"`` (default) — raise :class:`ValueError`.  The downstream
+      databank caches gene names and resolves ``access_cells_by_gene_names``
+      requests against them; a non-empty duplicate would make a column
+      ambiguous, so duplicates are rejected unless the caller explicitly
+      chooses a resolution.
+    * ``"first"`` — keep the canonical name on its first occurrence; later
+      duplicates are treated as *unmapped* and fall back to ``default``.
+    * ``"last"`` — keep the canonical name on its last occurrence; earlier
+      duplicates fall back to ``default``.
+
+    The ``default`` value (typically ``""``) is always exempt and may appear
+    many times — unmapped columns are intentionally anonymous, not addressable.
+    """
+    aligned: list[str] = [mapping.get(name, default) for name in gene_names]
+
+    # Indices of each non-empty canonical name, in encounter order.
+    positions: dict[str, list[int]] = {}
+    for i, canonical in enumerate(aligned):
+        if canonical == default:
+            continue
+        positions.setdefault(canonical, []).append(i)
+
+    for canonical, idxs in positions.items():
+        if len(idxs) <= 1:
+            continue
+        if keep == "never":
+            src = gene_names[idxs[0]]
+            raise ValueError(
+                f"align_genes maps {src!r} onto {canonical!r}, "
+                f"already produced by another column (keep='never')"
+            )
+        if keep == "first":
+            keep_idx = idxs[0]
+        else:  # "last"
+            keep_idx = idxs[-1]
+        for i in idxs:
+            if i != keep_idx:
+                aligned[i] = default
+
+    return tuple(aligned)
 
 
 @dataclass(frozen=True)
@@ -388,6 +712,14 @@ class DenseDataset:
     data: ArrayMeta
     num_cells: int
     num_genes: int
+    #: Filesystem path of the store root holding ``data.payload_path``.
+    #:
+    #: Set by :func:`scdata.io.launch` so a dataset carries everything the
+    #: Rust databank needs to open the store — the bank's ``register`` reads
+    #: it from here rather than taking a second path argument.  Empty when the
+    #: dataset was assembled by hand (tests); callers then pass ``store_path``
+    #: explicitly to ``register_dense`` / ``register_sparse_csr``.
+    store_root: str = ""
 
     def __post_init__(self) -> None:
         if self.num_cells <= 0:
@@ -398,6 +730,7 @@ class DenseDataset:
             raise ValueError(
                 f"gene_names count {len(self.gene_names)} != num_genes {self.num_genes}"
             )
+        _validate_unique_gene_names(self.gene_names)
         elements = 1
         for s in self.data.shape:
             elements *= s
@@ -407,25 +740,73 @@ class DenseDataset:
                 f"num_cells*num_genes = {self.num_cells * self.num_genes}"
             )
 
+    @property
+    def kind(self) -> str:
+        """Canonical dataset kind: ``"dense"``."""
+        return "dense"
+
+    @property
+    def ndim(self) -> int:
+        return self.data.ndim
+
+    @property
+    def num_chunks(self) -> int:
+        return self.data.num_chunks
+
+    @property
+    def item_size(self) -> int:
+        return self.data.item_size
+
+    def align_genes(
+        self,
+        mapping: Mapping[str, str],
+        default: str = "",
+        *,
+        keep: Literal["never", "first", "last"] = "never",
+    ) -> "DenseDataset":
+        """Return a copy with gene names standardized through ``mapping``.
+
+        See :func:`_align_gene_names` for the rules: each name is replaced by
+        ``mapping[name]`` (or ``default`` when absent), the column count and
+        order are unchanged, and non-empty canonical-name collisions are
+        resolved per ``keep`` (``"never"`` raises, ``"first"`` / ``"last"``
+        demote the loser to ``default``).  Standardizing names here lets the
+        databank cache one canonical gene table and resolve later
+        ``access_cells_by_gene_names`` requests against a single naming scheme
+        across datasets.
+        """
+        return replace(
+            self,
+            gene_names=_align_gene_names(self.gene_names, mapping, default, keep=keep),
+        )
+
 
 @dataclass(frozen=True)
 class SparseDataset:
     """A CSR sparse single-cell matrix.
 
     Mirrors Rust ``SparseCsrDataset``: ``indptr`` is the length-``num_cells+1``
-    CSR offset array (kept in memory, not chunked); ``indices`` and ``data``
-    are 1D zarr arrays of length ``nnz``, chunked along the nnz axis.  Chunk
-    alignment at write time keeps each cell's ``nnz`` run within a single
-    chunk pair so a cell never spans two index/data chunk pairs.
+    CSR offset array (kept in memory, not chunked), stored as a contiguous
+    ``uint64`` numpy array for zero-copy borrowing by the Rust binding;
+    ``indices`` and ``data`` are 1D zarr arrays of length ``nnz``, chunked
+    along the nnz axis.  Chunk alignment at write time keeps each cell's
+    ``nnz`` run within a single chunk pair so a cell never spans two
+    index/data chunk pairs.
     """
 
     gene_names: tuple[str, ...]
-    indptr: tuple[int, ...]
+    # ``__post_init__`` coerces this to a contiguous ``uint64`` ndarray via
+    # ``_as_u64_array`` (which accepts any iterable of ints), so a plain tuple
+    # is accepted at construction — the declared union reflects that.
+    indptr: np.ndarray | Sequence[int]
     indices: ArrayMeta
     data: ArrayMeta
     index_dtype: DType
     num_cells: int
     num_genes: int
+    #: Filesystem path of the store root holding the ``indices`` / ``data``
+    #: payload files.  See :attr:`DenseDataset.store_root`.
+    store_root: str = ""
 
     def __post_init__(self) -> None:
         if self.num_cells <= 0:
@@ -436,31 +817,29 @@ class SparseDataset:
             raise ValueError(
                 f"gene_names count {len(self.gene_names)} != num_genes {self.num_genes}"
             )
-        if len(self.indptr) != self.num_cells + 1:
-            raise ValueError(
-                f"indptr length {len(self.indptr)} != num_cells+1 {self.num_cells + 1}"
-            )
+        _validate_unique_gene_names(self.gene_names)
+
+        indptr = _as_u64_array(self.indptr, "indptr")
+        if indptr.shape[0] != self.num_cells + 1:
+            raise ValueError(f"indptr length {indptr.shape[0]} != num_cells+1 {self.num_cells + 1}")
+        if indptr.shape[0] > 0 and int(indptr[0]) != 0:
+            raise ValueError(f"indptr must start at 0, got {int(indptr[0])}")
+        if indptr.shape[0] >= 2 and np.any(np.diff(indptr.view(np.int64)) < 0):
+            raise ValueError("indptr must be monotonically non-decreasing")
+        object.__setattr__(self, "indptr", indptr)
+
         if not self.index_dtype.is_csr_index:
-            raise ValueError(
-                f"index_dtype {self.index_dtype!r} is not a valid CSR index dtype"
-            )
+            raise ValueError(f"index_dtype {self.index_dtype!r} is not a valid CSR index dtype")
         if self.indices.ndim != 1 or self.data.ndim != 1:
             raise ValueError("sparse indices and data arrays must be 1D")
-        if self.indptr[0] != 0:
-            raise ValueError(f"indptr must start at 0, got {self.indptr[0]}")
-        if any(v < 0 for v in self.indptr):
-            raise ValueError("indptr values must be non-negative")
-        if any(
-            self.indptr[i] > self.indptr[i + 1] for i in range(len(self.indptr) - 1)
-        ):
-            raise ValueError("indptr must be monotonically non-decreasing")
+
+        nnz = int(indptr[-1]) if indptr.shape[0] > 0 else 0
         indices_len = 1
         for s in self.indices.shape:
             indices_len *= s
         data_len = 1
         for s in self.data.shape:
             data_len *= s
-        nnz = int(self.indptr[-1]) if self.indptr else 0
         if indices_len != nnz:
             raise ValueError(f"indices length {indices_len} != nnz {nnz}")
         if data_len != nnz:
@@ -469,6 +848,54 @@ class SparseDataset:
             raise ValueError(
                 f"indices dtype {self.indices.dtype!r} != index_dtype {self.index_dtype!r}"
             )
+
+    @property
+    def kind(self) -> str:
+        """Canonical dataset kind: ``"sparse-csr"``."""
+        return "sparse-csr"
+
+    @property
+    def nnz(self) -> int:
+        """Number of stored nonzeros: ``indptr[-1]``."""
+        return int(self.indptr[-1]) if len(self.indptr) > 0 else 0
+
+    @property
+    def ndim(self) -> int:
+        """A CSR matrix is conceptually 2D ``[cells, genes]``."""
+        return 2
+
+    @property
+    def num_chunks(self) -> int:
+        """Chunk count of the ``indices`` array (``data`` is chunked identically)."""
+        return self.indices.num_chunks
+
+    @property
+    def item_size(self) -> int:
+        """Element size of the stored ``data`` values."""
+        return self.data.item_size
+
+    def align_genes(
+        self,
+        mapping: Mapping[str, str],
+        default: str = "",
+        *,
+        keep: Literal["never", "first", "last"] = "never",
+    ) -> "SparseDataset":
+        """Return a copy with gene names standardized through ``mapping``.
+
+        See :func:`_align_gene_names` for the rules: each name is replaced by
+        ``mapping[name]`` (or ``default`` when absent), the column count and
+        order are unchanged, and non-empty canonical-name collisions are
+        resolved per ``keep`` (``"never"`` raises, ``"first"`` / ``"last"``
+        demote the loser to ``default``).  Standardizing names here lets the
+        databank cache one canonical gene table and resolve later
+        ``access_cells_by_gene_names`` requests against a single naming scheme
+        across datasets.
+        """
+        return replace(
+            self,
+            gene_names=_align_gene_names(self.gene_names, mapping, default, keep=keep),
+        )
 
 
 Dataset = DenseDataset | SparseDataset

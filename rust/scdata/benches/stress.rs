@@ -13,6 +13,7 @@ mod support;
 
 use std::hint::black_box;
 use std::io::Cursor;
+#[cfg(feature = "uring")]
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -443,7 +444,8 @@ fn stress_iopool(config: BenchConfig) {
                 },
             );
         }
-        pool.unregister_file(trunc_file).expect("unregister trunc file");
+        pool.unregister_file(trunc_file)
+            .expect("unregister trunc file");
         let _ = std::fs::remove_file(trunc_path);
 
         support::bench(
@@ -939,6 +941,8 @@ fn stress_databank(config: BenchConfig) {
                     order: ArrayOrder::C,
                     codec: codec.clone(),
                     chunks: store.clone(),
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register dense dataset");
@@ -997,6 +1001,8 @@ fn stress_databank(config: BenchConfig) {
                 order: ArrayOrder::C,
                 codec: ArrayCodecMeta::Uncompressed,
                 chunks: ChunkStoreMeta::Memory { chunks: d1_chunks },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
         })
         .expect("register dense1d");
@@ -1038,6 +1044,8 @@ fn stress_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Memory {
                     chunks: vec![indices_chunk],
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             data: ArrayMeta {
                 shape: vec![csr_nnz],
@@ -1049,6 +1057,8 @@ fn stress_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Memory {
                     chunks: vec![data_chunk],
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             index_dtype: DType::U32,
             num_cells: csr_cells,
@@ -1207,6 +1217,8 @@ fn stress_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Memory {
                     chunks: csr_nb_indices_chunks,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             data: ArrayMeta {
                 shape: vec![csr_nb_nnz],
@@ -1218,6 +1230,8 @@ fn stress_databank(config: BenchConfig) {
                 chunks: ChunkStoreMeta::Memory {
                     chunks: csr_nb_data_chunks,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             index_dtype: DType::U32,
             num_cells: csr_nb_cells,
@@ -1324,6 +1338,8 @@ fn stress_databank(config: BenchConfig) {
                     path: csr_lz4_indices_path,
                     locations: csr_lz4_indices_locations,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             data: ArrayMeta {
                 shape: vec![csr_lz4_nnz],
@@ -1336,6 +1352,8 @@ fn stress_databank(config: BenchConfig) {
                     path: csr_lz4_data_path,
                     locations: csr_lz4_data_locations,
                 },
+                variable_chunks: false,
+                chunk_boundaries: None,
             },
             index_dtype: DType::U32,
             num_cells: csr_lz4_cells,
@@ -1426,6 +1444,8 @@ fn stress_databank(config: BenchConfig) {
                         chunks: ChunkStoreMeta::Memory {
                             chunks: mem_chunks.clone(),
                         },
+                        variable_chunks: false,
+                        chunk_boundaries: None,
                     },
                 })
                 .expect("register");
@@ -1453,7 +1473,14 @@ fn stress_databank(config: BenchConfig) {
         chunk_rows,
         chunk_cols,
     );
-    stress_databank_mt_owned(config, mem_chunks.clone(), cells, genes, chunk_rows, chunk_cols);
+    stress_databank_mt_owned(
+        config,
+        mem_chunks.clone(),
+        cells,
+        genes,
+        chunk_rows,
+        chunk_cols,
+    );
 
     // --- scatter-focused: large output to isolate databank-side scatter
     // (copy decoded bytes into caller `out`). This runs on the caller thread,
@@ -1478,6 +1505,8 @@ fn stress_databank(config: BenchConfig) {
                     order: ArrayOrder::C,
                     codec: ArrayCodecMeta::Uncompressed,
                     chunks: ChunkStoreMeta::Memory { chunks: s_chunks },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register scatter dataset");
@@ -1516,6 +1545,8 @@ fn stress_databank(config: BenchConfig) {
                     chunks: ChunkStoreMeta::Memory {
                         chunks: s_zstd_chunks,
                     },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
                 },
             })
             .expect("register scatter zstd dataset");
@@ -1581,6 +1612,8 @@ fn stress_databank_mt_instances(
                                 chunks: ChunkStoreMeta::Memory {
                                     chunks: (*chunks).clone(),
                                 },
+                                variable_chunks: false,
+                                chunk_boundaries: None,
                             },
                         })
                         .expect("register");
@@ -1663,6 +1696,8 @@ fn stress_databank_mt_by_gene_names(
                                 chunks: ChunkStoreMeta::Memory {
                                     chunks: (*chunks).clone(),
                                 },
+                                variable_chunks: false,
+                                chunk_boundaries: None,
                             },
                         })
                         .expect("register");
@@ -1749,6 +1784,8 @@ fn stress_databank_mt_owned(
                                 chunks: ChunkStoreMeta::Memory {
                                     chunks: (*chunks).clone(),
                                 },
+                                variable_chunks: false,
+                                chunk_boundaries: None,
                             },
                         })
                         .expect("register");
@@ -1756,8 +1793,7 @@ fn stress_databank_mt_owned(
                     let t0 = Instant::now();
                     let mut sum = 0usize;
                     for _ in 0..per_thread {
-                        let out: Vec<u32> =
-                            bank.access_cells_owned(id, &selected).expect("owned");
+                        let out: Vec<u32> = bank.access_cells_owned(id, &selected).expect("owned");
                         sum ^= out[0] as usize ^ out.len();
                     }
                     (sum, t0.elapsed())
@@ -1855,8 +1891,7 @@ fn stress_missing_rate(config: BenchConfig) {
                 })
                 .collect(),
         );
-        let selected: Arc<Vec<usize>> =
-            Arc::new((0..16).map(|i| i * 7 % cells).collect());
+        let selected: Arc<Vec<usize>> = Arc::new((0..16).map(|i| i * 7 % cells).collect());
         let bytes_per_op = selected.len() * genes * item_size;
         for &threads in [2usize, 4, 8].iter() {
             let per_thread = (config.iterations(64) / threads).max(1);
@@ -1883,6 +1918,8 @@ fn stress_missing_rate(config: BenchConfig) {
                                     chunks: ChunkStoreMeta::Memory {
                                         chunks: (*chunks).clone(),
                                     },
+                                    variable_chunks: false,
+                                    chunk_boundaries: None,
                                 },
                             })
                             .expect("register");
@@ -1891,7 +1928,8 @@ fn stress_missing_rate(config: BenchConfig) {
                         let t0 = Instant::now();
                         let mut sum = 0usize;
                         for _ in 0..per_thread {
-                            bank.access_cells(id, &selected, &mut out, None).expect("access");
+                            bank.access_cells(id, &selected, &mut out, None)
+                                .expect("access");
                             sum ^= out
                                 .iter()
                                 .step_by(131)
@@ -1945,7 +1983,10 @@ fn stress_scale(config: BenchConfig) {
             let encoded = Arc::clone(&encoded);
             stress_mt(
                 config,
-                &format!("scale/MT_decode_zstd_{}/t{threads}", support::data::fmt_bytes(raw_len)),
+                &format!(
+                    "scale/MT_decode_zstd_{}/t{threads}",
+                    support::data::fmt_bytes(raw_len)
+                ),
                 threads,
                 192,
                 Some(raw_len),

@@ -1,247 +1,778 @@
-"""AnnData zarr bridge for scdata stores.
+"""anndata <-> scdata zarr v3 bridge.
 
-AnnData writes a normal zarr v2 tree: each array chunk is a separate file
-(``X/0.0``, ``X/data/0``, ``var/_index/0``, ...).  scdata keeps AnnData's zarr
-metadata but replaces the chunk-file fanout for Rust-facing arrays with one
-``payload.bin`` plus ``.zattrs["scdata"]`` offset/length metadata.
+scdata stores are plain zarr v3 trees (one ``zarr.json`` per node, standard
+per-chunk files), produced by :func:`write_zarr` and read back by
+:func:`read_zarr`.  Staying inside the zarr v3 standard means a store written
+for the Rust databank is also readable by stock ``anndata.read_zarr`` — with
+two deliberate, spec-legal extensions:
 
-This module owns that conversion.  It deliberately keeps imports light:
-``anndata`` is only needed by :func:`write_anndata`; converting an already
-written zarr directory is plain JSON and filesystem IO.
+* ``dense1d`` X — a flattened 1D ``[cells * genes]`` array chunked so a cell
+  never spans two chunks.  The shape is not one anndata's ``AnnData``
+  constructor accepts, so :func:`read_zarr` reshapes it to 2D on read.
+* cell-aligned CSR — ``data`` / ``indices`` use a zarr v3 **rectilinear**
+  chunk grid whose edges are CSR row boundaries, so each cell's nonzero run
+  lives in one chunk.  Rectilinear is standard v3 (the metadata stores the
+  full per-chunk edge list) but experimental in zarr, so read/write set
+  ``zarr.config['array.rectilinear_chunks'] = True``.
+
+Three X layouts are supported at write time: ``dense2d`` (standard 2D,
+anndata-readable), ``dense1d`` (flattened, cell-aligned), ``sparse`` (CSR,
+optionally cell-aligned via rectilinear).
+
+Chunk sizing follows zarr conventions: ``chunks`` may be a list/tuple (used
+verbatim as the zarr ``chunks`` tuple) or an int (the per-chunk element
+count, broadcast across dimensions — a multi-dimensional array takes the
+``ndim``-th root so each chunk holds roughly that many elements).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
+import zipfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from scdata.io._launch import (
-    StoreError,
-    _expect_object,
-    _expect_zarr_v2,
-    _normalize_x_encoding,
-    _parse_chunk_shape,
-    _parse_shape,
-)
+import numpy as np
 
-__all__ = ["convert_anndata_zarr", "write_anndata"]
+from scdata.io._launch import StoreError
+
+if TYPE_CHECKING:
+    from anndata import AnnData
+
+__all__ = ["write_zarr", "read_zarr"]
+
+_XFormat = Literal["dense2d", "dense1d", "sparse"]
+_Store = Literal["zip", "dir"]
+
+# scdata marker stored in the X array/group ``attributes`` so :func:`read_zarr`
+# can recover the layout without guessing from shape.
+_SCDATA_X_ATTR = "scdata-x"
+_SCDATA_SHAPE_2D = "scdata-shape-2d"
+
+# Default chunk element count when ``chunks`` is an int.
+_DEFAULT_CHUNK_ELEMENTS = 1_000_000
 
 
-def write_anndata(
-    adata: Any,
+# ---------------------------------------------------------------------------
+# public write
+# ---------------------------------------------------------------------------
+
+
+def write_zarr(
+    adata: "AnnData",
     path: str | os.PathLike[str],
     *,
-    chunks: tuple[int, ...] | None = None,
-    convert_strings_to_categoricals: bool = True,
-    overwrite: bool = True,
-    keep_zarr_chunks: bool = False,
+    format: _XFormat = "dense2d",
+    chunks: int | list[int] | tuple[int, ...] = _DEFAULT_CHUNK_ELEMENTS,
+    align_cells: bool = True,
+    store: _Store = "zip",
 ) -> Path:
-    """Write an :class:`anndata.AnnData` object as a scdata zarr directory.
+    """Write an :class:`anndata.AnnData` as a scdata zarr v3 store.
 
-    The first step delegates to ``adata.write_zarr`` so AnnData controls its own
-    dataframe, CSR, string-array and encoding metadata.  The second step
-    rewrites only the arrays the Rust databank needs into scdata's concatenated
-    payload layout.
+    Parameters
+    ----------
+    adata:
+        AnnData object to write.  ``X`` may be dense or CSR sparse; for
+        ``format="sparse"`` a dense ``X`` is converted to CSR.
+    path:
+        Destination path.  For ``store="zip"`` this is the ``.zarr.zip`` file
+        (created/overwritten); for ``store="dir"`` it is the zarr directory.
+        No suffix is appended — the caller picks the name.
+    format:
+        X layout — ``"dense2d"`` (standard 2D), ``"dense1d"`` (flattened 1D,
+        cell-aligned chunking), or ``"sparse"`` (CSR, optionally cell-aligned).
+    chunks:
+        Chunk shape.  A list/tuple is used verbatim as the zarr ``chunks``
+        tuple; an int is the per-chunk element count, broadcast across
+        dimensions (multi-dimensional arrays take the ``ndim``-th root).
+    align_cells:
+        When true, grow each chunk along the cell axis until it holds a whole
+        number of cells, so a cell never spans two chunks.  Silently ignored
+        for ``dense2d`` (whose cell axis is already chunk-aligned).  For
+        ``sparse`` this produces a rectilinear (variable-length) chunk grid
+        aligned to CSR row boundaries.
+    store:
+        ``"zip"`` (default) writes a ``ZIP_STORED`` archive; ``"dir"`` writes
+        a directory tree.
     """
+    import zarr
+    from anndata._io.specs import write_elem
+    from zarr.storage import MemoryStore
+
+    _enable_rectilinear()
+
     root = Path(os.fspath(path))
-    if root.exists():
-        if not overwrite:
-            raise StoreError(f"output path already exists: {root}")
-        if root.is_dir() and not root.is_symlink():
-            shutil.rmtree(root)
+    _erase_destination(root, store)
+    if store == "zip":
+        zstore = MemoryStore()
+    else:
+        zstore = _make_zarr_store(root, store)
+
+    try:
+        g = zarr.open_group(zstore, mode="w", zarr_format=3)
+        g.attrs["encoding-type"] = "anndata"
+        g.attrs["encoding-version"] = "0.1.0"
+
+        # Everything except X is written by anndata's own element writers, so
+        # obs/var/uns/obsm/... are byte-identical to ``anndata.write_zarr``.
+        write_elem(g, "obs", adata.obs)
+        write_elem(g, "var", adata.var)
+        if adata.obsm:
+            write_elem(g, "obsm", dict(adata.obsm))
+        if adata.varm:
+            write_elem(g, "varm", dict(adata.varm))
+        if adata.obsp:
+            write_elem(g, "obsp", dict(adata.obsp))
+        if adata.varp:
+            write_elem(g, "varp", dict(adata.varp))
+        if adata.layers:
+            write_elem(g, "layers", dict(adata.layers))
+        write_elem(g, "uns", dict(adata.uns))
+        if adata.raw is not None:
+            write_elem(g, "raw", adata.raw)
+
+        _write_x(g, adata, format=format, chunks=chunks, align_cells=align_cells)
+
+        if store == "zip":
+            _zip_store(zstore, root)
         else:
-            root.unlink()
-
-    adata.write_zarr(
-        root,
-        chunks=chunks,
-        convert_strings_to_categoricals=convert_strings_to_categoricals,
-    )
-    return convert_anndata_zarr(root, keep_zarr_chunks=keep_zarr_chunks)
-
-
-def convert_anndata_zarr(
-    path: str | os.PathLike[str],
-    *,
-    array_keys: tuple[str, ...] | None = None,
-    keep_zarr_chunks: bool = False,
-    payload_name: str = "payload.bin",
-) -> Path:
-    """Convert a filesystem AnnData zarr v2 store to scdata's payload layout.
-
-    By default this converts ``X`` (dense) or ``X/data`` / ``X/indices`` /
-    ``X/indptr`` (CSR), plus the AnnData-selected ``var`` index array.  Other
-    AnnData groups are left untouched.
-    """
-    root = Path(os.fspath(path))
-    if not root.is_dir():
-        raise StoreError(f"AnnData zarr store must be a directory: {root}")
-    _expect_zarr_v2(_expect_object(_read_json(root / ".zgroup"), ".zgroup"), ".zgroup")
-
-    keys = array_keys if array_keys is not None else _default_array_keys(root)
-    for key in keys:
-        _convert_array(root, key, payload_name=payload_name, keep_zarr_chunks=keep_zarr_chunks)
-
-    # AnnData writes consolidated metadata.  It is stale after we add scdata
-    # attrs and optionally remove chunk files, so drop it instead of leaving a
-    # misleading cache for zarr readers.
-    zmetadata = root / ".zmetadata"
-    if zmetadata.exists():
-        zmetadata.unlink()
+            zarr.consolidate_metadata(g.store)
+    finally:
+        close = getattr(zstore, "close", None)
+        if close is not None:
+            close()
     return root
 
 
-def _default_array_keys(root: Path) -> tuple[str, ...]:
-    keys: list[str] = []
-
-    x_key = root / "X"
-    if (x_key / ".zarray").exists():
-        keys.append("X")
-    elif (x_key / ".zgroup").exists():
-        zattrs = _expect_object(_read_json(x_key / ".zattrs"), "X/.zattrs")
-        encoding = _normalize_x_encoding(zattrs.get("encoding-type"))
-        if encoding == "CSR":
-            keys.extend(["X/data", "X/indices", "X/indptr"])
-        elif encoding == "CSC":
-            raise StoreError("scdata does not write CSC matrices; convert AnnData.X to CSR")
-        else:
-            raise StoreError(f"unsupported AnnData X encoding-type: {zattrs.get('encoding-type')!r}")
-    else:
-        raise StoreError("AnnData zarr store has no X array or group")
-
-    keys.append(_dataframe_index_array_key(root, "var"))
-    return tuple(dict.fromkeys(keys))
+# ---------------------------------------------------------------------------
+# X writers
+# ---------------------------------------------------------------------------
 
 
-def _dataframe_index_array_key(root: Path, group_key: str) -> str:
-    group = root / group_key
-    if not (group / ".zgroup").exists():
-        raise StoreError(f"AnnData zarr store has no {group_key!r} group")
-
-    candidates: list[str] = []
-    zattrs_path = group / ".zattrs"
-    if zattrs_path.exists():
-        zattrs = _expect_object(_read_json(zattrs_path), f"{group_key}/.zattrs")
-        index_name = zattrs.get("_index")
-        if isinstance(index_name, str) and index_name:
-            candidates.append(index_name)
-    candidates.extend(["_index", "index"])
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if (group / candidate / ".zarray").exists():
-            return f"{group_key}/{candidate}"
-    raise StoreError(f"cannot find {group_key} index array")
-
-
-def _convert_array(
-    root: Path,
-    key: str,
+def _write_x(
+    g: Any,
+    adata: "AnnData",
     *,
-    payload_name: str,
-    keep_zarr_chunks: bool,
+    format: _XFormat,
+    chunks: int | list[int] | tuple[int, ...],
+    align_cells: bool,
 ) -> None:
-    array_dir = root.joinpath(*key.split("/"))
-    zarray_path = array_dir / ".zarray"
-    zattrs_path = array_dir / ".zattrs"
-    if not zarray_path.exists():
-        raise StoreError(f"{key}: missing .zarray")
+    """Write the X array/group in the requested layout."""
+    from scipy import sparse as _sparse
 
-    meta = _expect_object(_read_json(zarray_path), f"{key}/.zarray")
-    _expect_zarr_v2(meta, f"{key}/.zarray")
-    shape = _parse_shape(meta.get("shape"), f"{key}/.zarray")
-    chunks = _parse_chunk_shape(meta.get("chunks"), f"{key}/.zarray")
-    if len(shape) != len(chunks):
-        raise StoreError(f"{key}: shape rank {len(shape)} != chunks rank {len(chunks)}")
-    if len(shape) == 0:
-        raise StoreError(f"{key}: scalar zarr arrays are not valid scdata arrays")
+    # ``adata.X`` is a wide anndata union (dense / sparse / backed / None);
+    # treat it as Any here — scipy's issparse is not a TypeGuard, so the
+    # sparse-only toarray()/tocsr() calls below would otherwise be rejected.
+    X: Any = adata.X
+    n_obs, n_var = adata.n_obs, adata.n_vars
 
-    chunk_keys = tuple(_chunk_key(coord, meta.get("dimension_separator", ".")) for coord in _chunk_coords(shape, chunks))
-    chunk_paths = tuple(_chunk_path(array_dir, chunk_key) for chunk_key in chunk_keys)
-    missing = [p for p in chunk_paths if not p.is_file()]
-
-    zattrs = _expect_object(_read_json(zattrs_path), f"{key}/.zattrs") if zattrs_path.exists() else {}
-    existing_scdata = zattrs.get("scdata")
-    if missing:
-        payload_path = array_dir / payload_name
-        if len(missing) == len(chunk_paths) and isinstance(existing_scdata, dict) and payload_path.exists():
-            return
-        shown = ", ".join(str(p.relative_to(root)) for p in missing[:3])
-        suffix = "" if len(missing) <= 3 else f" and {len(missing) - 3} more"
-        raise StoreError(f"{key}: missing zarr chunk file(s): {shown}{suffix}")
-
-    payload = bytearray()
-    offsets: list[int] = []
-    lengths: list[int] = []
-    for chunk_file in chunk_paths:
-        data = chunk_file.read_bytes()
-        offsets.append(len(payload))
-        lengths.append(len(data))
-        payload.extend(data)
-
-    (array_dir / payload_name).write_bytes(payload)
-    zattrs["scdata"] = {"payload": payload_name, "offsets": offsets, "lengths": lengths}
-    _write_json(zattrs_path, zattrs)
-
-    if not keep_zarr_chunks:
-        for chunk_file in chunk_paths:
-            chunk_file.unlink()
-        _prune_empty_dirs(array_dir)
-
-
-def _chunk_coords(shape: tuple[int, ...], chunks: tuple[int, ...]):
-    grid = tuple(_ceil_div(s, c) for s, c in zip(shape, chunks))
-    total = 1
-    for g in grid:
-        total *= g
-    for linear in range(total):
-        coord = [0] * len(grid)
-        x = linear
-        for axis in range(len(grid) - 1, -1, -1):
-            coord[axis] = x % grid[axis]
-            x //= grid[axis]
-        yield tuple(coord)
+    if format == "dense2d":
+        dense = X.toarray() if _sparse.issparse(X) else np.asarray(X)
+        chunk_shape = _resolve_chunks_2d(chunks, n_obs, n_var)
+        _create_dense_array(
+            g,
+            "X",
+            dense,
+            chunk_shape,
+            attrs={
+                "encoding-type": "array",
+                "encoding-version": "0.2.0",
+                _SCDATA_X_ATTR: "dense2d",
+                _SCDATA_SHAPE_2D: [n_obs, n_var],
+            },
+        )
+    elif format == "dense1d":
+        dense = X.toarray() if _sparse.issparse(X) else np.asarray(X)
+        flat = np.ascontiguousarray(dense).reshape(-1)
+        chunk_shape = _resolve_chunks_1d(chunks, n_var, align_cells)
+        _create_dense_array(
+            g,
+            "X",
+            flat,
+            chunk_shape,
+            attrs={
+                "encoding-type": "array",
+                "encoding-version": "0.2.0",
+                _SCDATA_X_ATTR: "dense1d",
+                _SCDATA_SHAPE_2D: [n_obs, n_var],
+            },
+        )
+    elif format == "sparse":
+        csr = X.tocsr() if not _sparse.isspmatrix_csr(X) else X
+        _write_csr_group(g, "X", csr, chunks=chunks, align_cells=align_cells)
+    else:  # pragma: no cover - Literal exhausts the cases
+        raise StoreError(f"unsupported X format: {format!r}")
 
 
-def _chunk_key(coord: tuple[int, ...], separator: Any) -> str:
-    sep = "." if separator is None else str(separator)
-    if sep not in (".", "/"):
-        raise StoreError(f"unsupported zarr dimension_separator: {separator!r}")
-    return sep.join(str(c) for c in coord)
+def _create_dense_array(
+    g: Any,
+    name: str,
+    data: np.ndarray,
+    chunk_shape: tuple[int, ...],
+    *,
+    attrs: dict[str, Any],
+) -> None:
+    """Create a v3 dense array with the scdata default codec pipeline."""
+    from zarr.codecs import BytesCodec
+
+    arr = g.create_array(
+        name,
+        shape=data.shape,
+        dtype=data.dtype,
+        chunks=chunk_shape,
+        filters=(),
+        serializer=BytesCodec(endian="little"),
+        compressors="auto",
+        fill_value=_fill_value_for(data.dtype),
+    )
+    arr.attrs.update(attrs)
+    arr[...] = data
 
 
-def _chunk_path(array_dir: Path, chunk_key: str) -> Path:
-    return array_dir.joinpath(*chunk_key.split("/"))
+def _write_csr_group(
+    g: Any,
+    name: str,
+    csr: Any,
+    *,
+    chunks: int | list[int] | tuple[int, ...],
+    align_cells: bool,
+) -> None:
+    """Write a CSR matrix as an anndata-compatible v3 group.
+
+    ``indptr`` is always a single-chunk 1D array (small, read once).
+    ``data`` / ``indices`` are 1D arrays of length ``nnz``.  With
+    ``align_cells=True`` they use a rectilinear chunk grid whose edges are CSR
+    row boundaries (``indptr`` values), so each cell's nonzero run lives in
+    one chunk; with ``align_cells=False`` they use a regular chunk grid.
+    """
+    sub = g.require_group(name)
+    sub.attrs.update(
+        {
+            "encoding-type": "csr_matrix",
+            "encoding-version": "0.1.0",
+            "shape": [int(csr.shape[0]), int(csr.shape[1])],
+            _SCDATA_X_ATTR: "sparse",
+        }
+    )
+
+    indptr = np.asarray(csr.indptr)
+    indices = np.asarray(csr.indices)
+    data = np.asarray(csr.data)
+
+    _create_dense_array(
+        sub,
+        "indptr",
+        indptr,
+        (indptr.shape[0],),
+        attrs={
+            "encoding-type": "array",
+            "encoding-version": "0.2.0",
+        },
+    )
+
+    if align_cells:
+        boundaries = _aligned_cell_boundaries(indptr, _resolve_sparse_chunk_target(chunks))
+        _write_rectilinear_array(sub, "indices", indices, boundaries, csr.indices.dtype)
+        _write_rectilinear_array(sub, "data", data, boundaries, csr.data.dtype)
+    else:
+        nnz_chunks = _resolve_chunks_1d(chunks, 1, align_cells=False)
+        _create_dense_array(
+            sub,
+            "indices",
+            indices,
+            nnz_chunks,
+            attrs={
+                "encoding-type": "array",
+                "encoding-version": "0.2.0",
+            },
+        )
+        _create_dense_array(
+            sub,
+            "data",
+            data,
+            nnz_chunks,
+            attrs={
+                "encoding-type": "array",
+                "encoding-version": "0.2.0",
+            },
+        )
+
+
+def _resolve_sparse_chunk_target(chunks: int | list[int] | tuple[int, ...]) -> int:
+    """Resolve ``chunks`` to the target nnz count for cell-aligned CSR chunks."""
+    if isinstance(chunks, (list, tuple)):
+        if len(chunks) != 1:
+            raise StoreError(f"sparse chunks list must have 1 entry, got {len(chunks)}")
+        target = int(chunks[0])
+    else:
+        target = int(chunks)
+    if target <= 0:
+        raise StoreError(f"sparse chunks int must be positive, got {target}")
+    return target
+
+
+def _aligned_cell_boundaries(indptr: np.ndarray, target: int) -> list[int]:
+    """CSR nnz offsets that align chunks to whole cells.
+
+    Walks cells left to right, accumulating a chunk until it holds at least
+    ``target`` nnz (or the end), then starts a new chunk.  Every boundary is
+    an ``indptr`` value, so each chunk contains a whole number of cells; the
+    last boundary is ``indptr[-1]`` (== nnz).
+    """
+    n = indptr.shape[0] - 1
+    if n <= 0:
+        return [0, 0]
+    boundaries = [int(indptr[0])]
+    start_cell = 0
+    while start_cell < n:
+        cell = start_cell
+        while cell < n and (int(indptr[cell]) - int(indptr[start_cell])) < target:
+            cell += 1
+        if cell == start_cell:  # one cell already exceeds target — take it alone
+            cell = start_cell + 1
+        boundaries.append(int(indptr[cell]))
+        start_cell = cell
+    if boundaries[-1] != int(indptr[-1]):
+        boundaries.append(int(indptr[-1]))
+    return boundaries
+
+
+def _write_rectilinear_array(
+    g: Any,
+    name: str,
+    values: np.ndarray,
+    boundaries: list[int],
+    dtype: Any,
+) -> None:
+    """Write a 1D array with a rectilinear (variable-length) chunk grid.
+
+    Each ``[boundaries[i], boundaries[i+1])`` slice becomes one chunk file.
+    The ``zarr.json`` declares a rectilinear chunk grid with the explicit edge
+    list, so the on-disk layout is standard zarr v3 (readable by zarr/anndata
+    with ``array.rectilinear_chunks`` enabled).  We write the metadata and
+    chunk files by hand because zarr's ``create_array`` only accepts regular
+    chunk grids.
+    """
+    runs = [boundaries[i + 1] - boundaries[i] for i in range(len(boundaries) - 1)]
+    total = int(values.shape[0])
+    np_dtype = np.dtype(dtype)
+    attrs = {
+        "encoding-type": "array",
+        "encoding-version": "0.2.0",
+        _SCDATA_X_ATTR: "sparse-vlen",
+    }
+    zarray = _v3_array_json(
+        shape=[total],
+        data_type=_v3_dtype_name(np_dtype),
+        chunk_grid={
+            "name": "rectilinear",
+            "configuration": {
+                "kind": "inline",
+                "chunk_shapes": [runs],
+            },
+        },
+        codecs=_v3_bytes_codecs(np_dtype),
+        fill_value=_fill_value_for(np_dtype),
+        attrs=attrs,
+    )
+    _write_v3_node(g, name, zarray, is_group=False)
+    # Write one chunk file per run, keyed by the default chunk-key encoding
+    # for a 1D grid: c/<i>.
+    store = g.store
+    base = _group_store_key(g, f"{name}/c")
+    for i, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+        if end <= start:
+            continue
+        chunk_bytes = np.ascontiguousarray(values[start:end]).astype(np_dtype, copy=False).tobytes()
+        _store_set_bytes(store, f"{base}/{i}", chunk_bytes)
+
+
+# ---------------------------------------------------------------------------
+# chunk shape resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_chunks_2d(
+    chunks: int | list[int] | tuple[int, ...],
+    n_obs: int,
+    n_var: int,
+) -> tuple[int, ...]:
+    """Resolve ``chunks`` for a 2D dense X.
+
+    A list/tuple is used verbatim.  An int is the per-chunk element count;
+    the array takes the square root per dimension (so a chunk holds roughly
+    ``int`` elements), capped to the axis length.
+    """
+    if isinstance(chunks, (list, tuple)):
+        if len(chunks) != 2:
+            raise StoreError(f"dense2d chunks list must have 2 entries, got {len(chunks)}")
+        return (int(chunks[0]), int(chunks[1]))
+    return _broadcast_int_chunks(int(chunks), 2, (n_obs, n_var))
+
+
+def _resolve_chunks_1d(
+    chunks: int | list[int] | tuple[int, ...],
+    gene_count: int,
+    align_cells: bool,
+) -> tuple[int]:
+    """Resolve ``chunks`` for a 1D (flattened) X.
+
+    A list/tuple is used verbatim (length 1).  An int is the per-chunk element
+    count.  When ``align_cells`` is true the chunk length is rounded up to a
+    multiple of ``gene_count`` so every chunk holds whole cells.
+    """
+    if isinstance(chunks, (list, tuple)):
+        if len(chunks) != 1:
+            raise StoreError(f"dense1d chunks list must have 1 entry, got {len(chunks)}")
+        size = int(chunks[0])
+    else:
+        size = int(chunks)
+    if align_cells and gene_count > 0:
+        size = _ceil_div(size, gene_count) * gene_count
+        if size <= 0:
+            size = gene_count
+    return (size,)
+
+
+def _broadcast_int_chunks(
+    target: int,
+    ndim: int,
+    shape: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Broadcast an int chunk-target to a per-axis chunk shape.
+
+    The int is the desired elements per chunk; each axis gets the ``ndim``-th
+    root, rounded up, capped to the axis length.
+    """
+    if target <= 0:
+        raise StoreError(f"chunks int must be positive, got {target}")
+    per_axis = max(1, round(target ** (1.0 / ndim)))
+    return tuple(min(per_axis, max(1, s)) for s in shape)
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
 
 
-def _read_json(path: Path) -> Any:
+def _fill_value_for(dtype: Any) -> Any:
+    """Return the zarr v3 fill value for a numpy dtype (0 for numeric)."""
+    np_dt = np.dtype(dtype)
+    if np_dt.kind == "f":
+        return 0.0
+    if np_dt.kind == "b":
+        return False
+    if np_dt.kind in ("i", "u"):
+        return 0
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# v3 metadata + store helpers
+# ---------------------------------------------------------------------------
+
+
+def _enable_rectilinear() -> None:
+    """Enable zarr's experimental rectilinear chunk grids (write + read)."""
+    import zarr
+
+    zarr.config.set({"array.rectilinear_chunks": True})
+
+
+def _v3_dtype_name(np_dtype: np.dtype) -> str:
+    """Map a numpy dtype to a zarr v3 ``data_type`` string."""
+    kind, size = np_dtype.kind, np_dtype.itemsize
+    if kind == "f":
+        return {2: "float16", 4: "float32", 8: "float64"}[size]
+    if kind == "i":
+        return {1: "int8", 2: "int16", 4: "int32", 8: "int64"}[size]
+    if kind == "u":
+        return {1: "uint8", 2: "uint16", 4: "uint32", 8: "uint64"}[size]
+    if kind == "b":
+        return "bool"
+    raise StoreError(f"unsupported numpy dtype for v3 write: {np_dtype}")
+
+
+def _default_v3_codecs(np_dtype: np.dtype) -> list[dict[str, Any]]:
+    """The codec pipeline anndata/zarr writes by default for a numeric dtype."""
+    return _v3_bytes_codecs(np_dtype) + [
+        {"name": "zstd", "configuration": {"level": 0, "checksum": False}}
+    ]
+
+
+def _v3_bytes_codecs(np_dtype: np.dtype) -> list[dict[str, Any]]:
+    """The v3 ArrayBytes serializer for raw little-endian numeric chunks."""
+    serializer = {"name": "bytes"}
+    if np_dtype.itemsize > 1:
+        serializer = {"name": "bytes", "configuration": {"endian": "little"}}
+    return [serializer]
+
+
+def _v3_array_json(
+    *,
+    shape: list[int],
+    data_type: str,
+    chunk_grid: dict[str, Any],
+    codecs: list[dict[str, Any]],
+    fill_value: Any,
+    attrs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a v3 array ``zarr.json`` dict."""
+    return {
+        "shape": shape,
+        "data_type": data_type,
+        "chunk_grid": chunk_grid,
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": fill_value,
+        "codecs": codecs,
+        "attributes": attrs,
+        "zarr_format": 3,
+        "node_type": "array",
+        "storage_transformers": [],
+    }
+
+
+def _write_v3_node(g: Any, name: str, meta: dict[str, Any], *, is_group: bool) -> None:
+    """Write a raw v3 ``zarr.json`` for a node under ``g``.
+
+    Used for nodes zarr's high-level API cannot create (rectilinear arrays).
+    The node must not already exist.
+    """
+    store = g.store
+    key = _group_store_key(g, f"{name}/zarr.json")
+    _store_set_bytes(store, key, (json.dumps(meta) + "\n").encode("utf-8"))
+
+
+def _group_store_key(g: Any, key: str) -> str:
+    """Return a store-root-relative key for ``key`` under group ``g``."""
+    group_path = str(getattr(g, "path", "") or "").strip("/")
+    return f"{group_path}/{key}" if group_path else key
+
+
+def _make_zarr_store(root: Path, store: _Store) -> Any:
+    if store == "zip":
+        raise StoreError("internal error: zip writes must use a memory store")
+    if store == "dir":
+        return str(root)
+    raise StoreError(f"unsupported store kind: {store!r}")
+
+
+def _zip_store(store: Any, target: Path) -> None:
+    """Pack an in-memory zarr store as a ZIP_STORED archive."""
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise StoreError(f"missing metadata entry: {path}")
-    except json.JSONDecodeError as err:
-        raise StoreError(f"invalid JSON in {path}: {err}") from err
-    except OSError as err:
-        raise StoreError(f"cannot read {path}: {err}") from err
-
-
-def _write_json(path: Path, value: dict[str, Any]) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def _prune_empty_dirs(root: Path) -> None:
-    for path in sorted((p for p in root.rglob("*") if p.is_dir()), reverse=True):
+        with zipfile.ZipFile(tmp, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for key in sorted(_store_list(store)):
+                zf.writestr(key, _store_get_bytes(store, key))
+        os.replace(tmp, target)
+    finally:
         try:
-            path.rmdir()
-        except OSError:
+            tmp.unlink()
+        except FileNotFoundError:
             pass
+
+
+def _erase_destination(root: Path, store: _Store) -> None:
+    """Create or erase the destination before opening a fresh store."""
+    if store == "zip":
+        if root.is_dir():
+            raise StoreError(f"zip output path is a directory: {root}")
+        root.parent.mkdir(parents=True, exist_ok=True)
+    else:  # dir
+        import shutil
+
+        if root.exists():
+            if root.is_dir() and not root.is_symlink():
+                shutil.rmtree(root)
+            else:
+                root.unlink()
+        root.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# public read
+# ---------------------------------------------------------------------------
+
+
+def read_zarr(path: str | os.PathLike[str]) -> "AnnData":
+    """Read a scdata zarr v3 store into an :class:`anndata.AnnData`.
+
+    Stock ``anndata.read_zarr`` reads ``dense2d`` and regular-grid ``sparse``
+    stores directly; this function additionally handles scdata's two
+    extensions — the ``dense1d`` flattened X (reshaped to 2D on read) and the
+    rectilinear cell-aligned CSR layout (read chunk-by-chunk).
+    """
+    import anndata as ad
+    from anndata._io.specs import read_elem
+    from anndata.experimental import read_dispatched
+
+    _enable_rectilinear()
+    f = _open_store_for_read(path)
+
+    x_attrs = _read_x_attrs(f)
+    x_kind = x_attrs.get(_SCDATA_X_ATTR)
+
+    def callback(read_func: Any, elem_name: str, elem: Any, *, iospec: Any) -> Any:
+        name = elem_name.lstrip("/")
+        if name == "X" and x_kind in ("dense1d", "sparse", "sparse-vlen"):
+            return _read_x_scdata(f, x_kind, x_attrs)
+        if iospec.encoding_type == "anndata" or elem_name.endswith("/"):
+            # ``read_dispatched`` returns the anndata ``RWAble`` union; the
+            # values are passed straight into the AnnData constructor, whose
+            # own kwargs accept them at runtime.  Annotate as ``dict[str, Any]``
+            # so pyright does not flag each RWAble member against the ctor.
+            kwargs: dict[str, Any] = {
+                k: read_dispatched(v, callback=callback)
+                for k, v in dict(elem).items()
+                if not k.startswith("raw.")
+            }
+            return ad.AnnData(**kwargs)
+        if elem_name.startswith("/raw."):
+            return None
+        if elem_name in {"/obs", "/var"}:
+            return read_elem(elem)
+        return read_func(elem)
+
+    return cast("AnnData", read_dispatched(f, callback=callback))
+
+
+def _read_x_attrs(f: Any) -> dict[str, Any]:
+    """Read the X node's attributes (encoding-type, scdata markers)."""
+    return dict(f["X"].attrs)
+
+
+def _read_x_scdata(f: Any, x_kind: str, attrs: dict[str, Any]) -> np.ndarray:
+    """Read a scdata-extended X (dense1d reshape or rectilinear CSR rebuild)."""
+    if x_kind == "dense1d":
+        from anndata._io.specs import read_elem
+
+        shape2d = attrs.get(_SCDATA_SHAPE_2D)
+        flat = read_elem(f["X"])
+        if shape2d is None:
+            raise StoreError("dense1d X missing scdata-shape-2d attribute")
+        return np.asarray(flat).reshape(int(shape2d[0]), int(shape2d[1]))
+    if x_kind in ("sparse", "sparse-vlen"):
+        return _read_csr(f)
+    raise StoreError(f"unsupported scdata X kind: {x_kind!r}")
+
+
+def _read_csr(f: Any) -> Any:
+    """Rebuild a CSR matrix, reading rectilinear chunks where needed."""
+    from scipy import sparse
+
+    x = f["X"]
+    shape = list(x.attrs.get("shape", []))
+    indptr = _read_sub_array(f, "X/indptr")
+    indices = _read_sub_array(f, "X/indices")
+    data = _read_sub_array(f, "X/data")
+    n_obs = int(shape[0]) if len(shape) >= 1 else int(indptr.shape[0]) - 1
+    n_var = int(shape[1]) if len(shape) >= 2 else 0
+    return sparse.csr_matrix(
+        (np.asarray(data), np.asarray(indices), np.asarray(indptr)),
+        shape=(n_obs, n_var),
+    )
+
+
+def _read_sub_array(f: Any, key: str) -> np.ndarray:
+    """Read a 1D sub-array of X (indptr/indices/data).
+
+    Regular-grid arrays go through ``read_elem``; rectilinear (``sparse-vlen``)
+    arrays are rebuilt by concatenating chunk files in grid order, since
+    zarr's regular-grid math would misread a variable-length grid.
+    """
+    from anndata._io.specs import read_elem
+
+    node = f[key]
+    attrs = dict(node.attrs)
+    if attrs.get(_SCDATA_X_ATTR) != "sparse-vlen":
+        return np.asarray(read_elem(node))
+
+    store = node.store
+    prefix = f"{key}/c/"
+    keys = sorted(
+        _store_list(store, prefix),
+        key=lambda k: int(k[len(prefix) :].split("/")[0]),
+    )
+    parts: list[bytes] = []
+    for k in keys:
+        parts.append(_store_get_bytes(store, k))
+    buf = b"".join(parts)
+    return np.frombuffer(buf, dtype=node.dtype).copy()
+
+
+def _store_set_bytes(store: Any, key: str, value: bytes) -> None:
+    """Write raw bytes through either zarr v3's async store API or old mapping stores."""
+    set_async = getattr(store, "set", None)
+    if set_async is None:
+        store[key] = value
+        return
+
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    buffer = default_buffer_prototype().buffer.from_bytes(value)
+    sync(set_async(key, buffer))
+
+
+def _store_get_bytes(store: Any, key: str) -> bytes:
+    """Read raw bytes through either zarr v3's async store API or old mapping stores."""
+    get_async = getattr(store, "get", None)
+    if get_async is None:
+        raw = store[key]
+        return bytes(raw) if isinstance(raw, memoryview) else raw
+
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    raw = sync(get_async(key, default_buffer_prototype()))
+    if raw is None:
+        raise KeyError(key)
+    if hasattr(raw, "to_bytes"):
+        return raw.to_bytes()
+    return bytes(raw) if isinstance(raw, memoryview) else raw
+
+
+def _store_list(store: Any, prefix: str = "") -> list[str]:
+    """List the keys in a zarr store (directory or ZipStore)."""
+    list_prefix = getattr(store, "list_prefix", None)
+    if list_prefix is not None:
+        import inspect
+
+        from zarr.core.sync import collect_aiterator, sync
+
+        keys = collect_aiterator(list_prefix(prefix))
+        # ``collect_aiterator`` is typed as ``tuple & Awaitable``; ``sync``
+        # expects a Coroutine.  The awaitable branch is the coroutine form.
+        return list(sync(cast(Any, keys)) if inspect.isawaitable(keys) else keys)
+
+    list_all = getattr(store, "list", None)
+    if list_all is not None:
+        import inspect
+
+        from zarr.core.sync import collect_aiterator, sync
+
+        collected = collect_aiterator(list_all())
+        keys = list(sync(cast(Any, collected)) if inspect.isawaitable(collected) else collected)
+        return [k for k in keys if k.startswith(prefix)]
+
+    try:
+        keys = list(store.keys())
+    except Exception:
+        keys = [k for k in store]
+    return [k for k in keys if k.startswith(prefix)]
+
+
+def _open_store_for_read(path: str | os.PathLike[str]) -> Any:
+    """Open a zarr v3 store for reading (directory or ``.zarr.zip``)."""
+    import zarr
+    from zarr.storage import ZipStore
+
+    p = Path(os.fspath(path))
+    if p.is_file():
+        store = ZipStore(str(p), mode="r")
+        return zarr.open_group(store, mode="r")
+    return zarr.open(str(p), mode="r")

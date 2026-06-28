@@ -20,38 +20,41 @@
 //! verbatim numcodecs filter/compressor JSON) — exactly the form Rust
 //! ``Array::from_meta`` rebuilds the pipeline from.
 //!
-//! ``payload_path`` on a Python ``ArrayMeta`` is a key *relative to the store
-//! root* (e.g. ``X/payload.bin``), not a filesystem path.  The register entry
-//! points therefore take an explicit ``store_path`` (the ``.zarr`` directory)
-//! and join it with each payload key.  ZIP stores are not supported by this
-//! binding yet: their payload lives inside an archive, not on the filesystem.
+//! Python ``ArrayMeta`` keeps zarr logical keys (``payload_path`` /
+//! ``chunk_paths``) and may also carry resolved local source files
+//! (``payload_file_path`` / ``chunk_file_paths``).  When those source paths are
+//! present, the binding passes them directly to Rust with the provided offsets;
+//! otherwise it falls back to the legacy ``store_path / key`` join.  This lets
+//! directory and ZIP_STORED stores share the same Rust file/off/len abstraction.
 //!
 //! Cell access dispatches on dtype: `access_cells_owned::<T>` is generic in
 //! Rust, but pyo3 cannot lift that generic across the GIL, so each numeric
 //! dtype has its own call arm (`access_cells_dispatch`).  The Rust core
-//! allocates and fills a `Vec<T>`, which `PyArray1::from_slice` moves into a
-//! contiguous numpy array — no extra copy.  `f16` reinterprets the opaque
+//! allocates and fills a `Vec<T>`, which is handed directly to numpy through
+//! `IntoPyArray` so the return path does not copy the decoded buffer.  `f16`
+//! reinterprets the opaque
 //! `F16Bits` bits as numpy `float16`; `bf16` has no numpy dtype, so its raw
 //! bit pattern is returned as `uint16` for the caller to view as bfloat16.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
+use numpy::{IntoPyArray, PyReadonlyArray1};
 use pyo3::create_exception;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyString;
+use pyo3::types::PyBytes;
 
-use numpy::PyArray1;
-
+use crate::access::{AccessConfig, AccessCpuConfig, ScheduledAccessConfig};
+use crate::codecs::{codec_pipeline_from_zarr_v2_json_str, DecodePoolConfig, SharedCodec};
 use crate::databank::DataBankError as RustDataBankError;
 use crate::databank::{
-    ArrayCodecMeta, ArrayMeta, ArrayOrder, Bf16Bits, ChunkStoreMeta, DType, DataBank as RustDataBank,
-    DataBankConfig, DataBankResult, DatasetId, Dense1DMeta, Dense2DMeta, F16Bits, FileChunkLocation,
-    GeneNameView, MissingGenePolicy, PrefetchCells, PrefetchedBatch, ScheduledPrefetchConfig,
-    SparseCsrDatasetMeta,
+    ArrayCodecMeta, ArrayMeta, ArrayOrder, Bf16Bits, ChunkStoreMeta, DType,
+    DataBank as RustDataBank, DataBankConfig, DataBankResult, DatasetId, Dense1DMeta, Dense2DMeta,
+    DirectoryChunkLocationMeta, F16Bits, FileChunkLocation, GeneNameView, MissingGenePolicy,
+    PrefetchCells, ScheduledPrefetchConfig, SparseCsrDatasetMeta,
 };
-use crate::codecs::DecodePoolConfig;
-use crate::access::{AccessConfig, AccessCpuConfig, ScheduledAccessConfig};
 use crate::iopool::{BaseIoConfig, IoConfig, ThreadedConfig, UringConfig};
 
 create_exception!(_scdata, DataBankError, pyo3::exceptions::PyRuntimeError);
@@ -79,8 +82,95 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyScheduledAccessConfig>()?;
     m.add_class::<PyScheduledPrefetchConfig>()?;
     m.add_class::<PyPrefetchCells>()?;
+    m.add_function(wrap_pyfunction!(_zip_stored_offsets, m)?)?;
+    m.add_function(wrap_pyfunction!(_decode_index_payload, m)?)?;
+    m.add_function(wrap_pyfunction!(_decode_index_chunks, m)?)?;
     m.add("DataBankError", m.py().get_type::<DataBankError>())?;
     Ok(())
+}
+
+#[pyfunction]
+fn _zip_stored_offsets(path: String, header_offsets: Vec<u64>) -> PyResult<Vec<u64>> {
+    let mut file = File::open(&path)
+        .map_err(|err| PyOSError::new_err(format!("cannot open zip archive {path}: {err}")))?;
+    let mut out = Vec::with_capacity(header_offsets.len());
+    let mut header = [0u8; 30];
+    for offset in header_offsets {
+        file.seek(SeekFrom::Start(offset)).map_err(|err| {
+            PyOSError::new_err(format!("cannot seek zip local header at {offset}: {err}"))
+        })?;
+        file.read_exact(&mut header).map_err(|err| {
+            PyOSError::new_err(format!("cannot read zip local header at {offset}: {err}"))
+        })?;
+        if &header[..4] != b"PK\x03\x04" {
+            return Err(PyValueError::new_err(format!(
+                "invalid zip local header at {offset}"
+            )));
+        }
+        let filename_len = u16::from_le_bytes([header[26], header[27]]) as u64;
+        let extra_len = u16::from_le_bytes([header[28], header[29]]) as u64;
+        out.push(offset + 30 + filename_len + extra_len);
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+fn _decode_index_payload(
+    py: Python<'_>,
+    payload: Bound<'_, PyBytes>,
+    offsets: Bound<'_, PyAny>,
+    lengths: Bound<'_, PyAny>,
+    dtype: Bound<'_, PyAny>,
+    codec: Bound<'_, PyAny>,
+    count: usize,
+) -> PyResult<PyObject> {
+    let offsets = extract_u64_vec(&offsets, "offsets")?;
+    let lengths = extract_u64_vec(&lengths, "lengths")?;
+    if offsets.len() != lengths.len() {
+        return Err(PyValueError::new_err(format!(
+            "offsets length {} != lengths length {}",
+            offsets.len(),
+            lengths.len()
+        )));
+    }
+    let dtype = extract_dtype(&dtype)?;
+    let codec = build_shared_codec(py, &codec)?;
+    let payload = payload.as_bytes();
+    let mut out = Vec::new();
+    for (offset, len) in offsets.into_iter().zip(lengths) {
+        let start = u64_to_usize(offset, "offsets")?;
+        let len = u64_to_usize(len, "lengths")?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| PyValueError::new_err("index chunk byte range overflows usize"))?;
+        let raw = payload.get(start..end).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "index chunk range [{start}, {end}) exceeds payload size {}",
+                payload.len()
+            ))
+        })?;
+        decode_index_chunk_into(raw, dtype, codec.as_ref(), &mut out)?;
+    }
+    finalize_index_output(py, out, count, false)
+}
+
+#[pyfunction]
+fn _decode_index_chunks(
+    py: Python<'_>,
+    chunks: Bound<'_, PyAny>,
+    dtype: Bound<'_, PyAny>,
+    codec: Bound<'_, PyAny>,
+    count: usize,
+) -> PyResult<PyObject> {
+    let dtype = extract_dtype(&dtype)?;
+    let codec = build_shared_codec(py, &codec)?;
+    let mut out = Vec::new();
+    for item in chunks.try_iter()? {
+        let item = item?;
+        let raw = item.downcast::<PyBytes>()?;
+        decode_index_chunk_into(raw.as_bytes(), dtype, codec.as_ref(), &mut out)?;
+    }
+    finalize_index_output(py, out, count, true)
 }
 
 // ===========================================================================
@@ -134,11 +224,14 @@ impl PyDatasetId {
     }
 
     fn __repr__(&self) -> String {
-        format!("DatasetId(slot={}, generation={})", self.slot, self.generation)
+        format!(
+            "DatasetId(slot={}, generation={})",
+            self.slot, self.generation
+        )
     }
 
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
-        other.extract::<PyDatasetId>().map_or(false, |o| *self == o)
+        other.extract::<PyDatasetId>().is_ok_and(|o| *self == o)
     }
 
     fn __hash__(&self) -> u64 {
@@ -161,20 +254,30 @@ struct PyMissingGenePolicy {
 #[pymethods]
 impl PyMissingGenePolicy {
     #[classattr]
+    #[allow(non_snake_case)]
     fn ZERO() -> Self {
-        Self { inner: MissingGenePolicy::Zero }
+        Self {
+            inner: MissingGenePolicy::Zero,
+        }
     }
 
     #[classattr]
+    #[allow(non_snake_case)]
     fn ERROR() -> Self {
-        Self { inner: MissingGenePolicy::Error }
+        Self {
+            inner: MissingGenePolicy::Error,
+        }
     }
 
     #[new]
     fn new(policy: &str) -> PyResult<Self> {
         match policy.to_ascii_lowercase().as_str() {
-            "zero" => Ok(Self { inner: MissingGenePolicy::Zero }),
-            "error" => Ok(Self { inner: MissingGenePolicy::Error }),
+            "zero" => Ok(Self {
+                inner: MissingGenePolicy::Zero,
+            }),
+            "error" => Ok(Self {
+                inner: MissingGenePolicy::Error,
+            }),
             other => Err(PyValueError::new_err(format!(
                 "unknown MissingGenePolicy {other:?}; use 'zero' or 'error'"
             ))),
@@ -208,19 +311,48 @@ struct PyBaseIoConfig {
 impl PyBaseIoConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: BaseIoConfig::default() }
+        Self {
+            inner: BaseIoConfig::default(),
+        }
     }
-    #[getter] fn get_max_in_flight(&self) -> usize { self.inner.max_in_flight }
-    #[setter] fn set_max_in_flight(&mut self, value: usize) { self.inner.max_in_flight = value; }
-    #[getter] fn get_priority_levels(&self) -> usize { self.inner.priority_levels }
-    #[setter] fn set_priority_levels(&mut self, value: usize) { self.inner.priority_levels = value; }
-    #[getter] fn get_queue_shards(&self) -> usize { self.inner.queue_shards }
-    #[setter] fn set_queue_shards(&mut self, value: usize) { self.inner.queue_shards = value; }
-    #[getter] fn get_assume_non_overlapping_reads(&self) -> bool { self.inner.assume_non_overlapping_reads }
-    #[setter] fn set_assume_non_overlapping_reads(&mut self, value: bool) { self.inner.assume_non_overlapping_reads = value; }
+    #[getter]
+    fn get_max_in_flight(&self) -> usize {
+        self.inner.max_in_flight
+    }
+    #[setter]
+    fn set_max_in_flight(&mut self, value: usize) {
+        self.inner.max_in_flight = value;
+    }
+    #[getter]
+    fn get_priority_levels(&self) -> usize {
+        self.inner.priority_levels
+    }
+    #[setter]
+    fn set_priority_levels(&mut self, value: usize) {
+        self.inner.priority_levels = value;
+    }
+    #[getter]
+    fn get_queue_shards(&self) -> usize {
+        self.inner.queue_shards
+    }
+    #[setter]
+    fn set_queue_shards(&mut self, value: usize) {
+        self.inner.queue_shards = value;
+    }
+    #[getter]
+    fn get_assume_non_overlapping_reads(&self) -> bool {
+        self.inner.assume_non_overlapping_reads
+    }
+    #[setter]
+    fn set_assume_non_overlapping_reads(&mut self, value: bool) {
+        self.inner.assume_non_overlapping_reads = value;
+    }
 
     fn __repr__(&self) -> String {
-        format!("BaseIoConfig(max_in_flight={}, queue_shards={})", self.inner.max_in_flight, self.inner.queue_shards)
+        format!(
+            "BaseIoConfig(max_in_flight={}, queue_shards={})",
+            self.inner.max_in_flight, self.inner.queue_shards
+        )
     }
 }
 
@@ -234,20 +366,60 @@ struct PyUringConfig {
 impl PyUringConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: UringConfig::default() }
+        Self {
+            inner: UringConfig::default(),
+        }
     }
-    #[getter] fn get_base(&self) -> PyBaseIoConfig { PyBaseIoConfig { inner: self.inner.base.clone() } }
-    #[setter] fn set_base(&mut self, value: PyBaseIoConfig) { self.inner.base = value.inner; }
-    #[getter] fn get_entries(&self) -> u32 { self.inner.entries }
-    #[setter] fn set_entries(&mut self, value: u32) { self.inner.entries = value; }
-    #[getter] fn get_drivers(&self) -> usize { self.inner.drivers }
-    #[setter] fn set_drivers(&mut self, value: usize) { self.inner.drivers = value; }
-    #[getter] fn get_iowq_bounded_workers(&self) -> u32 { self.inner.iowq_bounded_workers }
-    #[setter] fn set_iowq_bounded_workers(&mut self, value: u32) { self.inner.iowq_bounded_workers = value; }
-    #[getter] fn get_iowq_unbounded_workers(&self) -> u32 { self.inner.iowq_unbounded_workers }
-    #[setter] fn set_iowq_unbounded_workers(&mut self, value: u32) { self.inner.iowq_unbounded_workers = value; }
-    #[getter] fn get_registered_files(&self) -> u32 { self.inner.registered_files }
-    #[setter] fn set_registered_files(&mut self, value: u32) { self.inner.registered_files = value; }
+    #[getter]
+    fn get_base(&self) -> PyBaseIoConfig {
+        PyBaseIoConfig {
+            inner: self.inner.base.clone(),
+        }
+    }
+    #[setter]
+    fn set_base(&mut self, value: PyBaseIoConfig) {
+        self.inner.base = value.inner;
+    }
+    #[getter]
+    fn get_entries(&self) -> u32 {
+        self.inner.entries
+    }
+    #[setter]
+    fn set_entries(&mut self, value: u32) {
+        self.inner.entries = value;
+    }
+    #[getter]
+    fn get_drivers(&self) -> usize {
+        self.inner.drivers
+    }
+    #[setter]
+    fn set_drivers(&mut self, value: usize) {
+        self.inner.drivers = value;
+    }
+    #[getter]
+    fn get_iowq_bounded_workers(&self) -> u32 {
+        self.inner.iowq_bounded_workers
+    }
+    #[setter]
+    fn set_iowq_bounded_workers(&mut self, value: u32) {
+        self.inner.iowq_bounded_workers = value;
+    }
+    #[getter]
+    fn get_iowq_unbounded_workers(&self) -> u32 {
+        self.inner.iowq_unbounded_workers
+    }
+    #[setter]
+    fn set_iowq_unbounded_workers(&mut self, value: u32) {
+        self.inner.iowq_unbounded_workers = value;
+    }
+    #[getter]
+    fn get_registered_files(&self) -> u32 {
+        self.inner.registered_files
+    }
+    #[setter]
+    fn set_registered_files(&mut self, value: u32) {
+        self.inner.registered_files = value;
+    }
 }
 
 #[pyclass(name = "_ThreadedConfig", module = "scdata._scdata")]
@@ -260,14 +432,36 @@ struct PyThreadedConfig {
 impl PyThreadedConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: ThreadedConfig::default() }
+        Self {
+            inner: ThreadedConfig::default(),
+        }
     }
-    #[getter] fn get_base(&self) -> PyBaseIoConfig { PyBaseIoConfig { inner: self.inner.base.clone() } }
-    #[setter] fn set_base(&mut self, value: PyBaseIoConfig) { self.inner.base = value.inner; }
-    #[getter] fn get_num_workers(&self) -> usize { self.inner.num_workers }
-    #[setter] fn set_num_workers(&mut self, value: usize) { self.inner.num_workers = value; }
-    #[getter] fn get_cpus(&self) -> Option<Vec<usize>> { self.inner.cpus.clone() }
-    #[setter] fn set_cpus(&mut self, value: Option<Vec<usize>>) { self.inner.cpus = value; }
+    #[getter]
+    fn get_base(&self) -> PyBaseIoConfig {
+        PyBaseIoConfig {
+            inner: self.inner.base.clone(),
+        }
+    }
+    #[setter]
+    fn set_base(&mut self, value: PyBaseIoConfig) {
+        self.inner.base = value.inner;
+    }
+    #[getter]
+    fn get_num_workers(&self) -> usize {
+        self.inner.num_workers
+    }
+    #[setter]
+    fn set_num_workers(&mut self, value: usize) {
+        self.inner.num_workers = value;
+    }
+    #[getter]
+    fn get_cpus(&self) -> Option<Vec<usize>> {
+        self.inner.cpus.clone()
+    }
+    #[setter]
+    fn set_cpus(&mut self, value: Option<Vec<usize>>) {
+        self.inner.cpus = value;
+    }
 }
 
 /// IO backend selection: `IoConfig.uring(UringConfig())` or `.threaded(ThreadedConfig())`.
@@ -281,10 +475,13 @@ struct PyIoConfig {
 impl PyIoConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: IoConfig::default() }
+        Self {
+            inner: IoConfig::default(),
+        }
     }
 
     #[staticmethod]
+    #[pyo3(signature = (config=None))]
     fn uring(config: Option<PyUringConfig>) -> Self {
         Self {
             inner: IoConfig::Uring(config.map(|c| c.inner).unwrap_or_default()),
@@ -292,6 +489,7 @@ impl PyIoConfig {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (config=None))]
     fn threaded(config: Option<PyThreadedConfig>) -> Self {
         Self {
             inner: IoConfig::Threaded(config.map(|c| c.inner).unwrap_or_default()),
@@ -321,14 +519,34 @@ struct PyDecodePoolConfig {
 impl PyDecodePoolConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: DecodePoolConfig::default() }
+        Self {
+            inner: DecodePoolConfig::default(),
+        }
     }
-    #[getter] fn get_num_workers(&self) -> usize { self.inner.num_workers }
-    #[setter] fn set_num_workers(&mut self, value: usize) { self.inner.num_workers = value; }
-    #[getter] fn get_queue_capacity(&self) -> usize { self.inner.queue_capacity }
-    #[setter] fn set_queue_capacity(&mut self, value: usize) { self.inner.queue_capacity = value; }
-    #[getter] fn get_cpus(&self) -> Option<Vec<usize>> { self.inner.cpus.clone() }
-    #[setter] fn set_cpus(&mut self, value: Option<Vec<usize>>) { self.inner.cpus = value; }
+    #[getter]
+    fn get_num_workers(&self) -> usize {
+        self.inner.num_workers
+    }
+    #[setter]
+    fn set_num_workers(&mut self, value: usize) {
+        self.inner.num_workers = value;
+    }
+    #[getter]
+    fn get_queue_capacity(&self) -> usize {
+        self.inner.queue_capacity
+    }
+    #[setter]
+    fn set_queue_capacity(&mut self, value: usize) {
+        self.inner.queue_capacity = value;
+    }
+    #[getter]
+    fn get_cpus(&self) -> Option<Vec<usize>> {
+        self.inner.cpus.clone()
+    }
+    #[setter]
+    fn set_cpus(&mut self, value: Option<Vec<usize>>) {
+        self.inner.cpus = value;
+    }
 }
 
 #[pyclass(name = "_AccessCpuConfig", module = "scdata._scdata")]
@@ -341,14 +559,34 @@ struct PyAccessCpuConfig {
 impl PyAccessCpuConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: AccessCpuConfig::default() }
+        Self {
+            inner: AccessCpuConfig::default(),
+        }
     }
-    #[getter] fn get_num_workers(&self) -> usize { self.inner.num_workers }
-    #[setter] fn set_num_workers(&mut self, value: usize) { self.inner.num_workers = value; }
-    #[getter] fn get_queue_capacity(&self) -> usize { self.inner.queue_capacity }
-    #[setter] fn set_queue_capacity(&mut self, value: usize) { self.inner.queue_capacity = value; }
-    #[getter] fn get_cpus(&self) -> Option<Vec<usize>> { self.inner.cpus.clone() }
-    #[setter] fn set_cpus(&mut self, value: Option<Vec<usize>>) { self.inner.cpus = value; }
+    #[getter]
+    fn get_num_workers(&self) -> usize {
+        self.inner.num_workers
+    }
+    #[setter]
+    fn set_num_workers(&mut self, value: usize) {
+        self.inner.num_workers = value;
+    }
+    #[getter]
+    fn get_queue_capacity(&self) -> usize {
+        self.inner.queue_capacity
+    }
+    #[setter]
+    fn set_queue_capacity(&mut self, value: usize) {
+        self.inner.queue_capacity = value;
+    }
+    #[getter]
+    fn get_cpus(&self) -> Option<Vec<usize>> {
+        self.inner.cpus.clone()
+    }
+    #[setter]
+    fn set_cpus(&mut self, value: Option<Vec<usize>>) {
+        self.inner.cpus = value;
+    }
 }
 
 #[pyclass(name = "_AccessConfig", module = "scdata._scdata")]
@@ -361,22 +599,68 @@ struct PyAccessConfig {
 impl PyAccessConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: AccessConfig::default() }
+        Self {
+            inner: AccessConfig::default(),
+        }
     }
-    #[getter] fn get_queue_capacity(&self) -> usize { self.inner.queue_capacity }
-    #[setter] fn set_queue_capacity(&mut self, value: usize) { self.inner.queue_capacity = value; }
-    #[getter] fn get_scheduler_shards(&self) -> usize { self.inner.scheduler_shards }
-    #[setter] fn set_scheduler_shards(&mut self, value: usize) { self.inner.scheduler_shards = value; }
-    #[getter] fn get_cache_capacity_bytes(&self) -> usize { self.inner.cache_capacity_bytes }
-    #[setter] fn set_cache_capacity_bytes(&mut self, value: usize) { self.inner.cache_capacity_bytes = value; }
-    #[getter] fn get_memory_budget_bytes(&self) -> usize { self.inner.memory_budget_bytes }
-    #[setter] fn set_memory_budget_bytes(&mut self, value: usize) { self.inner.memory_budget_bytes = value; }
-    #[getter] fn get_default_io_priority(&self) -> u8 { self.inner.default_io_priority }
-    #[setter] fn set_default_io_priority(&mut self, value: u8) { self.inner.default_io_priority = value; }
-    #[getter] fn get_keep_decoded(&self) -> bool { self.inner.keep_decoded }
-    #[setter] fn set_keep_decoded(&mut self, value: bool) { self.inner.keep_decoded = value; }
-    #[getter] fn get_cpu(&self) -> PyAccessCpuConfig { PyAccessCpuConfig { inner: self.inner.cpu.clone() } }
-    #[setter] fn set_cpu(&mut self, value: PyAccessCpuConfig) { self.inner.cpu = value.inner; }
+    #[getter]
+    fn get_queue_capacity(&self) -> usize {
+        self.inner.queue_capacity
+    }
+    #[setter]
+    fn set_queue_capacity(&mut self, value: usize) {
+        self.inner.queue_capacity = value;
+    }
+    #[getter]
+    fn get_scheduler_shards(&self) -> usize {
+        self.inner.scheduler_shards
+    }
+    #[setter]
+    fn set_scheduler_shards(&mut self, value: usize) {
+        self.inner.scheduler_shards = value;
+    }
+    #[getter]
+    fn get_cache_capacity_bytes(&self) -> usize {
+        self.inner.cache_capacity_bytes
+    }
+    #[setter]
+    fn set_cache_capacity_bytes(&mut self, value: usize) {
+        self.inner.cache_capacity_bytes = value;
+    }
+    #[getter]
+    fn get_memory_budget_bytes(&self) -> usize {
+        self.inner.memory_budget_bytes
+    }
+    #[setter]
+    fn set_memory_budget_bytes(&mut self, value: usize) {
+        self.inner.memory_budget_bytes = value;
+    }
+    #[getter]
+    fn get_default_io_priority(&self) -> u8 {
+        self.inner.default_io_priority
+    }
+    #[setter]
+    fn set_default_io_priority(&mut self, value: u8) {
+        self.inner.default_io_priority = value;
+    }
+    #[getter]
+    fn get_keep_decoded(&self) -> bool {
+        self.inner.keep_decoded
+    }
+    #[setter]
+    fn set_keep_decoded(&mut self, value: bool) {
+        self.inner.keep_decoded = value;
+    }
+    #[getter]
+    fn get_cpu(&self) -> PyAccessCpuConfig {
+        PyAccessCpuConfig {
+            inner: self.inner.cpu.clone(),
+        }
+    }
+    #[setter]
+    fn set_cpu(&mut self, value: PyAccessCpuConfig) {
+        self.inner.cpu = value.inner;
+    }
 }
 
 #[pyclass(name = "_FillConfig", module = "scdata._scdata")]
@@ -389,20 +673,58 @@ struct PyFillConfig {
 impl PyFillConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: crate::databank::FillConfig::default() }
+        Self {
+            inner: crate::databank::FillConfig::default(),
+        }
     }
-    #[getter] fn get_parallel(&self) -> bool { self.inner.parallel }
-    #[setter] fn set_parallel(&mut self, value: bool) { self.inner.parallel = value; }
-    #[getter] fn get_num_workers(&self) -> usize { self.inner.num_workers }
-    #[setter] fn set_num_workers(&mut self, value: usize) { self.inner.num_workers = value; }
-    #[getter] fn get_queue_capacity(&self) -> usize { self.inner.queue_capacity }
-    #[setter] fn set_queue_capacity(&mut self, value: usize) { self.inner.queue_capacity = value; }
-    #[getter] fn get_min_parallel_rows(&self) -> usize { self.inner.min_parallel_rows }
-    #[setter] fn set_min_parallel_rows(&mut self, value: usize) { self.inner.min_parallel_rows = value; }
-    #[getter] fn get_min_parallel_bytes(&self) -> usize { self.inner.min_parallel_bytes }
-    #[setter] fn set_min_parallel_bytes(&mut self, value: usize) { self.inner.min_parallel_bytes = value; }
-    #[getter] fn get_cpus(&self) -> Option<Vec<usize>> { self.inner.cpus.clone() }
-    #[setter] fn set_cpus(&mut self, value: Option<Vec<usize>>) { self.inner.cpus = value; }
+    #[getter]
+    fn get_parallel(&self) -> bool {
+        self.inner.parallel
+    }
+    #[setter]
+    fn set_parallel(&mut self, value: bool) {
+        self.inner.parallel = value;
+    }
+    #[getter]
+    fn get_num_workers(&self) -> usize {
+        self.inner.num_workers
+    }
+    #[setter]
+    fn set_num_workers(&mut self, value: usize) {
+        self.inner.num_workers = value;
+    }
+    #[getter]
+    fn get_queue_capacity(&self) -> usize {
+        self.inner.queue_capacity
+    }
+    #[setter]
+    fn set_queue_capacity(&mut self, value: usize) {
+        self.inner.queue_capacity = value;
+    }
+    #[getter]
+    fn get_min_parallel_rows(&self) -> usize {
+        self.inner.min_parallel_rows
+    }
+    #[setter]
+    fn set_min_parallel_rows(&mut self, value: usize) {
+        self.inner.min_parallel_rows = value;
+    }
+    #[getter]
+    fn get_min_parallel_bytes(&self) -> usize {
+        self.inner.min_parallel_bytes
+    }
+    #[setter]
+    fn set_min_parallel_bytes(&mut self, value: usize) {
+        self.inner.min_parallel_bytes = value;
+    }
+    #[getter]
+    fn get_cpus(&self) -> Option<Vec<usize>> {
+        self.inner.cpus.clone()
+    }
+    #[setter]
+    fn set_cpus(&mut self, value: Option<Vec<usize>>) {
+        self.inner.cpus = value;
+    }
 }
 
 #[pyclass(name = "_DataBankConfig", module = "scdata._scdata")]
@@ -415,17 +737,51 @@ struct PyDataBankConfig {
 impl PyDataBankConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: DataBankConfig::default() }
+        Self {
+            inner: DataBankConfig::default(),
+        }
     }
 
-    #[getter] fn get_io_config(&self) -> PyIoConfig { PyIoConfig { inner: self.inner.io_config.clone() } }
-    #[setter] fn set_io_config(&mut self, value: PyIoConfig) { self.inner.io_config = value.inner; }
-    #[getter] fn get_decode_config(&self) -> PyDecodePoolConfig { PyDecodePoolConfig { inner: self.inner.decode_config.clone() } }
-    #[setter] fn set_decode_config(&mut self, value: PyDecodePoolConfig) { self.inner.decode_config = value.inner; }
-    #[getter] fn get_access_config(&self) -> PyAccessConfig { PyAccessConfig { inner: self.inner.access_config.clone() } }
-    #[setter] fn set_access_config(&mut self, value: PyAccessConfig) { self.inner.access_config = value.inner; }
-    #[getter] fn get_fill_config(&self) -> PyFillConfig { PyFillConfig { inner: self.inner.fill_config.clone() } }
-    #[setter] fn set_fill_config(&mut self, value: PyFillConfig) { self.inner.fill_config = value.inner; }
+    #[getter]
+    fn get_io_config(&self) -> PyIoConfig {
+        PyIoConfig {
+            inner: self.inner.io_config.clone(),
+        }
+    }
+    #[setter]
+    fn set_io_config(&mut self, value: PyIoConfig) {
+        self.inner.io_config = value.inner;
+    }
+    #[getter]
+    fn get_decode_config(&self) -> PyDecodePoolConfig {
+        PyDecodePoolConfig {
+            inner: self.inner.decode_config.clone(),
+        }
+    }
+    #[setter]
+    fn set_decode_config(&mut self, value: PyDecodePoolConfig) {
+        self.inner.decode_config = value.inner;
+    }
+    #[getter]
+    fn get_access_config(&self) -> PyAccessConfig {
+        PyAccessConfig {
+            inner: self.inner.access_config.clone(),
+        }
+    }
+    #[setter]
+    fn set_access_config(&mut self, value: PyAccessConfig) {
+        self.inner.access_config = value.inner;
+    }
+    #[getter]
+    fn get_fill_config(&self) -> PyFillConfig {
+        PyFillConfig {
+            inner: self.inner.fill_config.clone(),
+        }
+    }
+    #[setter]
+    fn set_fill_config(&mut self, value: PyFillConfig) {
+        self.inner.fill_config = value.inner;
+    }
 }
 
 #[pyclass(name = "_ScheduledAccessConfig", module = "scdata._scdata")]
@@ -438,14 +794,34 @@ struct PyScheduledAccessConfig {
 impl PyScheduledAccessConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: ScheduledAccessConfig::default() }
+        Self {
+            inner: ScheduledAccessConfig::default(),
+        }
     }
-    #[getter] fn get_prefetch_step(&self) -> usize { self.inner.prefetch_step }
-    #[setter] fn set_prefetch_step(&mut self, value: usize) { self.inner.prefetch_step = value; }
-    #[getter] fn get_decode_ahead_steps(&self) -> usize { self.inner.decode_ahead_steps }
-    #[setter] fn set_decode_ahead_steps(&mut self, value: usize) { self.inner.decode_ahead_steps = value; }
-    #[getter] fn get_ready_ahead_steps(&self) -> usize { self.inner.ready_ahead_steps }
-    #[setter] fn set_ready_ahead_steps(&mut self, value: usize) { self.inner.ready_ahead_steps = value; }
+    #[getter]
+    fn get_prefetch_step(&self) -> usize {
+        self.inner.prefetch_step
+    }
+    #[setter]
+    fn set_prefetch_step(&mut self, value: usize) {
+        self.inner.prefetch_step = value;
+    }
+    #[getter]
+    fn get_decode_ahead_steps(&self) -> usize {
+        self.inner.decode_ahead_steps
+    }
+    #[setter]
+    fn set_decode_ahead_steps(&mut self, value: usize) {
+        self.inner.decode_ahead_steps = value;
+    }
+    #[getter]
+    fn get_ready_ahead_steps(&self) -> usize {
+        self.inner.ready_ahead_steps
+    }
+    #[setter]
+    fn set_ready_ahead_steps(&mut self, value: usize) {
+        self.inner.ready_ahead_steps = value;
+    }
 }
 
 #[pyclass(name = "_ScheduledPrefetchConfig", module = "scdata._scdata")]
@@ -458,12 +834,28 @@ struct PyScheduledPrefetchConfig {
 impl PyScheduledPrefetchConfig {
     #[new]
     fn new() -> Self {
-        Self { inner: ScheduledPrefetchConfig::default() }
+        Self {
+            inner: ScheduledPrefetchConfig::default(),
+        }
     }
-    #[getter] fn get_prefetch_step(&self) -> usize { self.inner.prefetch_step }
-    #[setter] fn set_prefetch_step(&mut self, value: usize) { self.inner.prefetch_step = value; }
-    #[getter] fn get_access(&self) -> PyScheduledAccessConfig { PyScheduledAccessConfig { inner: self.inner.access } }
-    #[setter] fn set_access(&mut self, value: PyScheduledAccessConfig) { self.inner.access = value.inner; }
+    #[getter]
+    fn get_prefetch_step(&self) -> usize {
+        self.inner.prefetch_step
+    }
+    #[setter]
+    fn set_prefetch_step(&mut self, value: usize) {
+        self.inner.prefetch_step = value;
+    }
+    #[getter]
+    fn get_access(&self) -> PyScheduledAccessConfig {
+        PyScheduledAccessConfig {
+            inner: self.inner.access,
+        }
+    }
+    #[setter]
+    fn set_access(&mut self, value: PyScheduledAccessConfig) {
+        self.inner.access = value.inner;
+    }
 }
 
 // ===========================================================================
@@ -492,9 +884,10 @@ impl PyDataBank {
 
     /// Register a dense dataset parsed by ``scdata.read``.
     ///
-    /// ``store_path`` is the filesystem path to the ``.zarr`` directory holding
-    /// the payload files; the dataset's ``payload_path`` is a key relative to
-    /// it.  ZIP stores are not supported yet.
+    /// ``store_path`` is the filesystem path to the zarr directory or
+    /// ZIP_STORED archive.  Datasets produced by ``scdata.io.launch`` already
+    /// carry resolved source files; manually-built datasets use ``store_path``
+    /// as the root for their logical keys.
     fn register_dense(
         &mut self,
         py: Python<'_>,
@@ -524,8 +917,8 @@ impl PyDataBank {
 
     /// Register a CSR sparse dataset parsed by ``scdata.read``.
     ///
-    /// ``store_path`` is the filesystem path to the ``.zarr`` directory holding
-    /// the payload files; each array's ``payload_path`` is a key relative to it.
+    /// ``store_path`` is the filesystem path to the zarr directory or
+    /// ZIP_STORED archive.
     fn register_sparse_csr(
         &mut self,
         py: Python<'_>,
@@ -533,7 +926,7 @@ impl PyDataBank {
         store_path: String,
     ) -> PyResult<PyDatasetId> {
         let gene_names: Vec<String> = ds.getattr("gene_names")?.extract()?;
-        let indptr: Vec<u64> = ds.getattr("indptr")?.extract()?;
+        let indptr = extract_u64_vec(&ds.getattr("indptr")?, "indptr")?;
         let indices_obj = ds.getattr("indices")?;
         let data_obj = ds.getattr("data")?;
         let indices = build_array_meta(py, &indices_obj, &store_path)?;
@@ -605,6 +998,24 @@ impl PyDataBank {
         access_cells_dispatch(py, &self.inner, id.into(), &cells, dtype)
     }
 
+    /// Fast path for numpy ``intp`` cell-index arrays.
+    ///
+    /// This avoids Python ``list`` / Python ``int`` materialization on the hot
+    /// access boundary.  The public Python wrapper normalizes user input to a
+    /// contiguous ``np.intp`` array and calls this method when available.
+    #[pyo3(signature = (id, cells, dtype=None))]
+    fn access_cells_array(
+        &self,
+        py: Python<'_>,
+        id: PyDatasetId,
+        cells: PyReadonlyArray1<'_, isize>,
+        dtype: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
+        let cells = crate::pybind::intp_array_to_usize_vec(&cells, "cells")?;
+        let dtype = resolve_dtype(&self.inner, id.into(), dtype)?;
+        access_cells_dispatch(py, &self.inner, id.into(), &cells, dtype)
+    }
+
     /// Access cells projected onto a subset of gene names.
     ///
     /// Returns a 1D numpy array of shape ``[len(cells) * len(gene_names)]``.
@@ -621,6 +1032,31 @@ impl PyDataBank {
         missing: Option<PyMissingGenePolicy>,
         dtype: Option<Bound<'_, PyAny>>,
     ) -> PyResult<PyObject> {
+        let missing = missing.map(|m| m.inner).unwrap_or(MissingGenePolicy::Zero);
+        let dtype = resolve_dtype(&self.inner, id.into(), dtype)?;
+        access_cells_by_gene_names_dispatch(
+            py,
+            &self.inner,
+            id.into(),
+            &cells,
+            &gene_names,
+            missing,
+            dtype,
+        )
+    }
+
+    /// Fast path for numpy ``intp`` cell-index arrays plus a gene projection.
+    #[pyo3(signature = (id, cells, gene_names, missing=None, dtype=None))]
+    fn access_cells_by_gene_names_array(
+        &self,
+        py: Python<'_>,
+        id: PyDatasetId,
+        cells: PyReadonlyArray1<'_, isize>,
+        gene_names: Vec<String>,
+        missing: Option<PyMissingGenePolicy>,
+        dtype: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
+        let cells = crate::pybind::intp_array_to_usize_vec(&cells, "cells")?;
         let missing = missing.map(|m| m.inner).unwrap_or(MissingGenePolicy::Zero);
         let dtype = resolve_dtype(&self.inner, id.into(), dtype)?;
         access_cells_by_gene_names_dispatch(
@@ -654,6 +1090,18 @@ impl PyDataBank {
         prefetch_cells_dispatch(py, &self.inner, id.into(), batch_source, config, dtype)
     }
 
+    /// Fast path variant accepting an iterable of contiguous ``np.intp`` arrays.
+    #[pyo3(signature = (id, batches, config=None))]
+    fn prefetch_cells_arrays(
+        &self,
+        py: Python<'_>,
+        id: PyDatasetId,
+        batches: Bound<'_, PyAny>,
+        config: Option<PyScheduledPrefetchConfig>,
+    ) -> PyResult<PyPrefetchCells> {
+        self.prefetch_cells(py, id, batches, config)
+    }
+
     /// Like ``prefetch_cells`` but each batch is projected onto ``gene_names``.
     #[pyo3(signature = (id, batches, gene_names, missing=None, config=None))]
     fn prefetch_cells_by_gene_names(
@@ -681,6 +1129,20 @@ impl PyDataBank {
         )
     }
 
+    /// Fast path variant accepting an iterable of contiguous ``np.intp`` arrays.
+    #[pyo3(signature = (id, batches, gene_names, missing=None, config=None))]
+    fn prefetch_cells_by_gene_names_arrays(
+        &self,
+        py: Python<'_>,
+        id: PyDatasetId,
+        batches: Bound<'_, PyAny>,
+        gene_names: Vec<String>,
+        missing: Option<PyMissingGenePolicy>,
+        config: Option<PyScheduledPrefetchConfig>,
+    ) -> PyResult<PyPrefetchCells> {
+        self.prefetch_cells_by_gene_names(py, id, batches, gene_names, missing, config)
+    }
+
     fn __repr__(&self) -> &'static str {
         "DataBank(scdata-rust)"
     }
@@ -699,10 +1161,37 @@ fn resolve_dtype(
 ) -> PyResult<DType> {
     match dtype {
         Some(obj) => extract_dtype(&obj),
-        None => Ok(bank.dataset_dtype(id.into())?),
+        None => Ok(bank.dataset_dtype(id)?),
     }
 }
 
+fn intp_array_to_usize_vec(
+    cells: &PyReadonlyArray1<'_, isize>,
+    context: &str,
+) -> PyResult<Vec<usize>> {
+    let slice = cells.as_slice().map_err(|_| {
+        PyValueError::new_err(format!("{context} must be a contiguous 1D np.intp array"))
+    })?;
+    let mut out = Vec::with_capacity(slice.len());
+    for (i, &cell) in slice.iter().enumerate() {
+        if cell < 0 {
+            return Err(PyValueError::new_err(format!(
+                "{context}[{i}] must be non-negative, got {cell}"
+            )));
+        }
+        out.push(cell as usize);
+    }
+    Ok(out)
+}
+
+fn extract_cells_any(obj: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
+    if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, isize>>() {
+        return intp_array_to_usize_vec(&array, "cells");
+    }
+    obj.extract::<Vec<usize>>()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn access_cells_dispatch(
     py: Python<'_>,
     bank: &RustDataBank,
@@ -715,7 +1204,7 @@ fn access_cells_dispatch(
     macro_rules! arm {
         ($ty:ty) => {{
             let out: Vec<$ty> = bank.access_cells_owned(id, cells)?;
-            PyArray1::from_slice(py, &out).into_any().unbind()
+            out.into_pyarray(py).into_any().unbind()
         }};
     }
     let arr = match dtype {
@@ -732,12 +1221,12 @@ fn access_cells_dispatch(
         DType::F16 => {
             let out: Vec<F16Bits> = bank.access_cells_owned(id, cells)?;
             let bits = f16_bits_to_u16(out);
-            PyArray1::from_slice(py, &bits).into_any().unbind()
+            bits.into_pyarray(py).into_any().unbind()
         }
         DType::BF16 => {
             let out: Vec<Bf16Bits> = bank.access_cells_owned(id, cells)?;
             let bits = bf16_bits_to_u16(out);
-            PyArray1::from_slice(py, &bits).into_any().unbind()
+            bits.into_pyarray(py).into_any().unbind()
         }
     };
     Ok(arr)
@@ -756,7 +1245,7 @@ fn access_cells_by_gene_names_dispatch(
         ($ty:ty) => {{
             let out: Vec<$ty> =
                 bank.access_cells_owned_by_gene_names(id, cells, gene_names, missing)?;
-            PyArray1::from_slice(py, &out).into_any().unbind()
+            out.into_pyarray(py).into_any().unbind()
         }};
     }
     let arr = match dtype {
@@ -774,13 +1263,13 @@ fn access_cells_by_gene_names_dispatch(
             let out: Vec<F16Bits> =
                 bank.access_cells_owned_by_gene_names(id, cells, gene_names, missing)?;
             let bits = f16_bits_to_u16(out);
-            PyArray1::from_slice(py, &bits).into_any().unbind()
+            bits.into_pyarray(py).into_any().unbind()
         }
         DType::BF16 => {
             let out: Vec<Bf16Bits> =
                 bank.access_cells_owned_by_gene_names(id, cells, gene_names, missing)?;
             let bits = bf16_bits_to_u16(out);
-            PyArray1::from_slice(py, &bits).into_any().unbind()
+            bits.into_pyarray(py).into_any().unbind()
         }
     };
     Ok(arr)
@@ -836,9 +1325,12 @@ impl PyBatchSource {
     fn new(batches: Bound<'_, PyAny>) -> PyResult<Self> {
         let mut out = Vec::new();
         for item in batches.try_iter()? {
-            out.push(item?.extract::<Vec<usize>>()?);
+            let item = item?;
+            out.push(extract_cells_any(&item)?);
         }
-        Ok(Self { batches: out.into_iter() })
+        Ok(Self {
+            batches: out.into_iter(),
+        })
     }
 }
 
@@ -876,62 +1368,110 @@ impl Iterator for PrefetchDispatch {
         // dispatch monomorphic on the producer side.
         match self {
             PrefetchDispatch::U8(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::U8(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::U8(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::I8(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::I8(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::I8(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::U16(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::U16(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::U16(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::I16(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::I16(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::I16(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::U32(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::U32(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::U32(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::I32(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::I32(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::I32(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::U64(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::U64(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::U64(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::I64(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::I64(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::I64(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::F32(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::F32(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::F32(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::F64(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::F64(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::F64(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::F16(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::F16(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::F16(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
             PrefetchDispatch::BF16(it) => match it.next() {
-                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny { cells: b.cells, buffer: PrefetchedBufferAny::BF16(b.buffer), num_genes: b.num_genes })),
+                Some(Ok(b)) => Some(Ok(PrefetchedBatchAny {
+                    cells: b.cells,
+                    buffer: PrefetchedBufferAny::BF16(b.buffer),
+                    num_genes: b.num_genes,
+                })),
                 Some(Err(e)) => Some(Err(e)),
                 None => None,
             },
@@ -988,7 +1528,7 @@ impl PyPrefetchCells {
             }
             Some(Ok(batch)) => {
                 let arr = buffer_to_numpy(py, batch.buffer)?;
-                let cells = PyArray1::from_slice(py, &batch.cells).into_any().unbind();
+                let cells = batch.cells.into_pyarray(py).into_any().unbind();
                 let tuple = (cells, arr, batch.num_genes).into_pyobject(py)?;
                 Ok(Some(tuple.into_any().unbind()))
             }
@@ -999,23 +1539,23 @@ impl PyPrefetchCells {
 
 fn buffer_to_numpy(py: Python<'_>, buffer: PrefetchedBufferAny) -> PyResult<PyObject> {
     let arr = match buffer {
-        PrefetchedBufferAny::U8(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::I8(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::U16(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::I16(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::U32(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::I32(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::U64(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::I64(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::F32(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
-        PrefetchedBufferAny::F64(v) => PyArray1::from_slice(py, &v).into_any().unbind(),
+        PrefetchedBufferAny::U8(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::I8(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::U16(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::I16(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::U32(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::I32(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::U64(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::I64(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::F32(v) => v.into_pyarray(py).into_any().unbind(),
+        PrefetchedBufferAny::F64(v) => v.into_pyarray(py).into_any().unbind(),
         PrefetchedBufferAny::F16(v) => {
             let bits = f16_bits_to_u16(v);
-            PyArray1::from_slice(py, &bits).into_any().unbind()
+            bits.into_pyarray(py).into_any().unbind()
         }
         PrefetchedBufferAny::BF16(v) => {
             let bits = bf16_bits_to_u16(v);
-            PyArray1::from_slice(py, &bits).into_any().unbind()
+            bits.into_pyarray(py).into_any().unbind()
         }
     };
     Ok(arr)
@@ -1030,22 +1570,47 @@ fn prefetch_cells_dispatch(
     dtype: DType,
 ) -> PyResult<PyPrefetchCells> {
     let dispatch = match dtype {
-        DType::U8 => PrefetchDispatch::U8(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::I8 => PrefetchDispatch::I8(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::U16 => PrefetchDispatch::U16(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::I16 => PrefetchDispatch::I16(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::U32 => PrefetchDispatch::U32(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::I32 => PrefetchDispatch::I32(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::U64 => PrefetchDispatch::U64(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::I64 => PrefetchDispatch::I64(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::F32 => PrefetchDispatch::F32(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::F64 => PrefetchDispatch::F64(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::F16 => PrefetchDispatch::F16(bank.prefetch_cells_scheduled(id, batch_source, config)?),
-        DType::BF16 => PrefetchDispatch::BF16(bank.prefetch_cells_scheduled(id, batch_source, config)?),
+        DType::U8 => {
+            PrefetchDispatch::U8(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::I8 => {
+            PrefetchDispatch::I8(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::U16 => {
+            PrefetchDispatch::U16(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::I16 => {
+            PrefetchDispatch::I16(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::U32 => {
+            PrefetchDispatch::U32(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::I32 => {
+            PrefetchDispatch::I32(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::U64 => {
+            PrefetchDispatch::U64(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::I64 => {
+            PrefetchDispatch::I64(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::F32 => {
+            PrefetchDispatch::F32(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::F64 => {
+            PrefetchDispatch::F64(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::F16 => {
+            PrefetchDispatch::F16(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
+        DType::BF16 => {
+            PrefetchDispatch::BF16(bank.prefetch_cells_scheduled(id, batch_source, config)?)
+        }
     };
     Ok(PyPrefetchCells::new(dispatch))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prefetch_cells_by_gene_names_dispatch(
     _py: Python<'_>,
     bank: &RustDataBank,
@@ -1057,18 +1622,90 @@ fn prefetch_cells_by_gene_names_dispatch(
     dtype: DType,
 ) -> PyResult<PyPrefetchCells> {
     let dispatch = match dtype {
-        DType::U8 => PrefetchDispatch::U8(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::I8 => PrefetchDispatch::I8(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::U16 => PrefetchDispatch::U16(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::I16 => PrefetchDispatch::I16(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::U32 => PrefetchDispatch::U32(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::I32 => PrefetchDispatch::I32(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::U64 => PrefetchDispatch::U64(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::I64 => PrefetchDispatch::I64(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::F32 => PrefetchDispatch::F32(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::F64 => PrefetchDispatch::F64(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::F16 => PrefetchDispatch::F16(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
-        DType::BF16 => PrefetchDispatch::BF16(bank.prefetch_cells_scheduled_by_gene_names(id, batch_source, gene_names, missing, config)?),
+        DType::U8 => PrefetchDispatch::U8(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::I8 => PrefetchDispatch::I8(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::U16 => PrefetchDispatch::U16(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::I16 => PrefetchDispatch::I16(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::U32 => PrefetchDispatch::U32(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::I32 => PrefetchDispatch::I32(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::U64 => PrefetchDispatch::U64(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::I64 => PrefetchDispatch::I64(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::F32 => PrefetchDispatch::F32(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::F64 => PrefetchDispatch::F64(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::F16 => PrefetchDispatch::F16(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
+        DType::BF16 => PrefetchDispatch::BF16(bank.prefetch_cells_scheduled_by_gene_names(
+            id,
+            batch_source,
+            gene_names,
+            missing,
+            config,
+        )?),
     };
     Ok(PyPrefetchCells::new(dispatch))
 }
@@ -1091,20 +1728,120 @@ fn build_array_meta(
             chunk_shape.len()
         )));
     }
-    let chunk_grid_shape: Vec<usize> = shape
-        .iter()
-        .zip(chunk_shape.iter())
-        .map(|(&s, &c)| div_ceil(s, c))
-        .collect();
-
     let dtype = extract_dtype(&data.getattr("dtype")?)?;
     let codec = build_codec(py, &data.getattr("codec")?)?;
 
-    let payload_path: String = data.getattr("payload_path")?.extract()?;
-    let locations = extract_locations(&data.getattr("chunks")?)?;
-    let chunks = ChunkStoreMeta::FileOffset {
-        path: PathBuf::from(store_path).join(payload_path),
-        locations,
+    let store_kind: String = data.getattr("store_kind")?.extract()?;
+    // `variable_chunks` is optional on the Python side (defaults to False for
+    // regular grids); rectilinear cell-aligned CSR arrays set it True.
+    let variable_chunks: bool = match data.getattr("variable_chunks") {
+        Ok(v) => v.extract().unwrap_or(false),
+        Err(_) => false,
+    };
+    let chunk_boundaries: Option<Vec<Vec<usize>>> = match data.getattr("chunk_boundaries") {
+        Ok(value) => {
+            let axes: Vec<Vec<usize>> = value.extract()?;
+            if axes.is_empty() {
+                None
+            } else {
+                Some(axes)
+            }
+        }
+        Err(_) => None,
+    };
+    let chunk_grid_shape: Vec<usize> = if let Some(axes) = &chunk_boundaries {
+        let mut grid = Vec::with_capacity(axes.len());
+        for (axis, boundaries) in axes.iter().enumerate() {
+            if boundaries.len() < 2 {
+                return Err(PyValueError::new_err(format!(
+                    "chunk_boundaries[{axis}] must contain at least one interval"
+                )));
+            }
+            let chunks = boundaries.len() - 1;
+            grid.push(chunks);
+        }
+        grid
+    } else {
+        shape
+            .iter()
+            .zip(chunk_shape.iter())
+            .map(|(&s, &c)| div_ceil(s, c))
+            .collect()
+    };
+    let chunks = match store_kind.as_str() {
+        "file" => {
+            let payload_path: String = data.getattr("payload_path")?.extract()?;
+            let payload_file_path = optional_string_attr(data, "payload_file_path")?;
+            let path = if payload_file_path.is_empty() {
+                PathBuf::from(store_path).join(payload_path)
+            } else {
+                PathBuf::from(payload_file_path)
+            };
+            let locations = match extract_locations_from_offset_arrays(data)? {
+                Some(locations) => locations,
+                None => extract_locations(&data.getattr("chunks")?)?,
+            };
+            ChunkStoreMeta::FileOffset { path, locations }
+        }
+        "dir" => {
+            // Standard zarr tree: one file per chunk at offset 0. ZIP_STORED
+            // stores: every chunk opens the archive path and uses its physical
+            // in-archive offset. Python exposes both cases through optional
+            // `chunk_file_paths`.
+            let chunk_paths_obj = data.getattr("chunk_paths")?;
+            let chunk_paths: Vec<String> = chunk_paths_obj.extract()?;
+            let n = chunk_paths.len();
+            let chunk_file_paths = match data.getattr("chunk_file_paths") {
+                Ok(paths) => {
+                    let values: Vec<String> = paths.extract()?;
+                    if values.is_empty() {
+                        None
+                    } else {
+                        Some(values)
+                    }
+                }
+                Err(_) => None,
+            };
+            let chunk_file_count = chunk_file_paths.as_ref().map_or(0, Vec::len);
+            if chunk_file_count != 0 && chunk_file_count != n {
+                return Err(PyValueError::new_err(format!(
+                    "chunk_file_paths count {chunk_file_count} != chunk_paths count {n}"
+                )));
+            }
+            let chunk_offsets =
+                extract_optional_u64_vec_attr(data, "chunk_offsets")?.unwrap_or_else(|| vec![0; n]);
+            let chunk_lengths = extract_u64_vec(&data.getattr("chunk_lengths")?, "chunk_lengths")?;
+            if chunk_offsets.len() != n {
+                return Err(PyValueError::new_err(format!(
+                    "chunk_offsets count {} != chunk_paths count {n}",
+                    chunk_offsets.len()
+                )));
+            }
+            if chunk_lengths.len() != n {
+                return Err(PyValueError::new_err(format!(
+                    "chunk_lengths count {} != chunk_paths count {n}",
+                    chunk_lengths.len()
+                )));
+            }
+            let mut locations = Vec::with_capacity(n);
+            let store_root = PathBuf::from(store_path);
+            for (i, rel) in chunk_paths.into_iter().enumerate() {
+                let path = if let Some(paths) = &chunk_file_paths {
+                    PathBuf::from(&paths[i])
+                } else {
+                    store_root.join(rel)
+                };
+                let offset = chunk_offsets[i];
+                let len = u64_to_usize(chunk_lengths[i], "chunk_lengths")?;
+                locations.push(DirectoryChunkLocationMeta { path, offset, len });
+            }
+            ChunkStoreMeta::Directory { locations }
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown store_kind {other:?} (expected 'file' or 'dir')"
+            )))
+        }
     };
 
     Ok(ArrayMeta {
@@ -1115,6 +1852,8 @@ fn build_array_meta(
         order: ArrayOrder::C,
         codec,
         chunks,
+        variable_chunks,
+        chunk_boundaries,
     })
 }
 
@@ -1135,6 +1874,198 @@ fn extract_dtype(dtype: &Bound<'_, PyAny>) -> PyResult<DType> {
         "f32" => Ok(DType::F32),
         "f64" => Ok(DType::F64),
         other => Err(PyValueError::new_err(format!("unknown dtype {other:?}"))),
+    }
+}
+
+fn extract_u64_vec(obj: &Bound<'_, PyAny>, context: &str) -> PyResult<Vec<u64>> {
+    if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, u64>>() {
+        let slice = array.as_slice().map_err(|_| {
+            PyValueError::new_err(format!("{context} must be a contiguous 1D uint64 array"))
+        })?;
+        return Ok(slice.to_vec());
+    }
+    obj.extract::<Vec<u64>>()
+        .map_err(|err| PyValueError::new_err(format!("{context}: {err}")))
+}
+
+fn extract_optional_u64_vec_attr(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<Option<Vec<u64>>> {
+    match obj.getattr(name) {
+        Ok(value) => Ok(Some(extract_u64_vec(&value, name)?)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn u64_to_usize(value: u64, context: &str) -> PyResult<usize> {
+    usize::try_from(value).map_err(|_| {
+        PyValueError::new_err(format!("{context} value {value} does not fit in usize"))
+    })
+}
+
+fn extract_locations_from_offset_arrays(
+    data: &Bound<'_, PyAny>,
+) -> PyResult<Option<Vec<FileChunkLocation>>> {
+    let Some(offsets) = extract_optional_u64_vec_attr(data, "chunk_offsets")? else {
+        return Ok(None);
+    };
+    let lengths = extract_u64_vec(&data.getattr("chunk_lengths")?, "chunk_lengths")?;
+    if offsets.len() != lengths.len() {
+        return Err(PyValueError::new_err(format!(
+            "chunk_offsets length {} != chunk_lengths length {}",
+            offsets.len(),
+            lengths.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(offsets.len());
+    for (offset, len) in offsets.into_iter().zip(lengths) {
+        out.push(FileChunkLocation {
+            offset,
+            len: u64_to_usize(len, "chunk_lengths")?,
+        });
+    }
+    Ok(Some(out))
+}
+
+fn build_shared_codec(py: Python<'_>, codec: &Bound<'_, PyAny>) -> PyResult<Option<SharedCodec>> {
+    match build_codec(py, codec)? {
+        ArrayCodecMeta::Uncompressed => Ok(None),
+        ArrayCodecMeta::ZarrV2Json {
+            filters,
+            compressor,
+        } => codec_pipeline_from_zarr_v2_json_str(filters.as_deref(), compressor.as_deref())
+            .map(Some)
+            .map_err(|err| PyValueError::new_err(err.to_string())),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported index codec metadata: {other:?}"
+        ))),
+    }
+}
+
+fn decode_index_chunk_into(
+    raw: &[u8],
+    dtype: DType,
+    codec: Option<&SharedCodec>,
+    out: &mut Vec<u64>,
+) -> PyResult<()> {
+    let decoded;
+    let bytes = if let Some(codec) = codec {
+        decoded = codec
+            .decode(raw, None)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        decoded.as_slice()
+    } else {
+        raw
+    };
+    decode_index_bytes_into(bytes, dtype, out)
+}
+
+fn decode_index_bytes_into(bytes: &[u8], dtype: DType, out: &mut Vec<u64>) -> PyResult<()> {
+    let item_size = match dtype {
+        DType::U8 | DType::I8 => 1,
+        DType::U16 | DType::I16 => 2,
+        DType::U32 | DType::I32 => 4,
+        DType::U64 | DType::I64 => 8,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "index array dtype must be integer, got {other:?}"
+            )))
+        }
+    };
+    if bytes.len() % item_size != 0 {
+        return Err(PyValueError::new_err(format!(
+            "decoded index chunk has {} bytes, not divisible by dtype item size {item_size}",
+            bytes.len()
+        )));
+    }
+    out.reserve(bytes.len() / item_size);
+    match dtype {
+        DType::U8 => out.extend(bytes.iter().map(|&value| u64::from(value))),
+        DType::I8 => {
+            for &byte in bytes {
+                let value = i8::from_le_bytes([byte]);
+                push_signed_index(i64::from(value), out)?;
+            }
+        }
+        DType::U16 => {
+            for chunk in bytes.chunks_exact(2) {
+                out.push(u64::from(u16::from_le_bytes([chunk[0], chunk[1]])));
+            }
+        }
+        DType::I16 => {
+            for chunk in bytes.chunks_exact(2) {
+                let value = i16::from_le_bytes([chunk[0], chunk[1]]);
+                push_signed_index(i64::from(value), out)?;
+            }
+        }
+        DType::U32 => {
+            for chunk in bytes.chunks_exact(4) {
+                out.push(u64::from(u32::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3],
+                ])));
+            }
+        }
+        DType::I32 => {
+            for chunk in bytes.chunks_exact(4) {
+                let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                push_signed_index(i64::from(value), out)?;
+            }
+        }
+        DType::U64 => {
+            for chunk in bytes.chunks_exact(8) {
+                out.push(u64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]));
+            }
+        }
+        DType::I64 => {
+            for chunk in bytes.chunks_exact(8) {
+                let value = i64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]);
+                push_signed_index(value, out)?;
+            }
+        }
+        _ => unreachable!("non-integer dtype rejected above"),
+    }
+    Ok(())
+}
+
+fn push_signed_index(value: i64, out: &mut Vec<u64>) -> PyResult<()> {
+    let value = u64::try_from(value)
+        .map_err(|_| PyValueError::new_err(format!("negative index value {value}")))?;
+    out.push(value);
+    Ok(())
+}
+
+fn finalize_index_output(
+    py: Python<'_>,
+    mut out: Vec<u64>,
+    count: usize,
+    allow_short: bool,
+) -> PyResult<PyObject> {
+    if allow_short {
+        if out.len() > count {
+            out.truncate(count);
+        } else if out.len() < count {
+            out.resize(count, 0);
+        }
+    }
+    validate_index_output_len(out.len(), count)?;
+    Ok(out.into_pyarray(py).into_any().unbind())
+}
+
+fn validate_index_output_len(actual: usize, expected: usize) -> PyResult<()> {
+    if actual != expected {
+        return Err(PyValueError::new_err(format!(
+            "decoded index length {actual} != expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn optional_string_attr(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<String> {
+    match obj.getattr(name) {
+        Ok(value) => value.extract(),
+        Err(_) => Ok(String::new()),
     }
 }
 

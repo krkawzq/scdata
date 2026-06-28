@@ -31,9 +31,7 @@ use _scdata::codecs::CodecSpec;
 use _scdata::databank::DType;
 use support::codecs::default_codec_matrix;
 use support::data::{DataDist, DataProfile};
-use support::manifest::{
-    self, DecodeOrder, ManifestBenchArgs, VerifyMode,
-};
+use support::manifest::{self, DecodeOrder, ManifestBenchArgs, VerifyMode};
 
 fn main() -> ExitCode {
     match run() {
@@ -105,12 +103,20 @@ fn run_synth(args: &Args, bench_args: &ManifestBenchArgs) -> Result<(), String> 
         .unwrap_or_else(|| support::bench_data_dir().join("codec-manifest-synth"));
     let codecs = default_codec_matrix();
     let dtypes = if args.synth_dtypes.is_empty() {
-        vec!["u32".to_string(), "f32".to_string(), "u64".to_string(), "f64".to_string()]
+        vec![
+            "u32".to_string(),
+            "f32".to_string(),
+            "u64".to_string(),
+            "f64".to_string(),
+        ]
     } else {
         args.synth_dtypes.clone()
     };
     let dists = if args.synth_dists.is_empty() {
-        DataDist::ALL.iter().map(|d| d.label().to_string()).collect()
+        DataDist::ALL
+            .iter()
+            .map(|d| d.label().to_string())
+            .collect()
     } else {
         args.synth_dists.clone()
     };
@@ -140,8 +146,10 @@ fn run_synth(args: &Args, bench_args: &ManifestBenchArgs) -> Result<(), String> 
                         num_chunks: args.synth_num_chunks,
                         seed: args.seed,
                     };
-                    let codec_specs: Vec<(&str, CodecSpec)> =
-                        codecs.iter().map(|(name, spec)| (*name, spec.clone())).collect();
+                    let codec_specs: Vec<(&str, CodecSpec)> = codecs
+                        .iter()
+                        .map(|(name, spec)| (*name, spec.clone()))
+                        .collect();
                     let run = manifest::synthesize_run(&profile.label(), &profile, &codec_specs)?;
                     runs.push(run);
                 }
@@ -237,9 +245,7 @@ fn parse_args() -> Result<Args, String> {
                     .filter_map(|value| value.parse::<usize>().ok())
                     .collect()
             }
-            "--synth-num-chunks" => {
-                synth_num_chunks = parse_next(&mut iter, "--synth-num-chunks")?
-            }
+            "--synth-num-chunks" => synth_num_chunks = parse_next(&mut iter, "--synth-num-chunks")?,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -267,7 +273,8 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn next_arg(iter: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
-    iter.next().ok_or_else(|| format!("{name} requires a value"))
+    iter.next()
+        .ok_or_else(|| format!("{name} requires a value"))
 }
 
 fn parse_next<T>(iter: &mut impl Iterator<Item = String>, name: &str) -> Result<T, String>

@@ -10,6 +10,7 @@ use std::thread;
 use tokio::sync::oneshot;
 
 use super::error::AccessError;
+use super::slice::{RangeCopy, SlicePlan, SliceShape};
 
 const INLINE_MATERIALIZE_MAX_BYTES: usize = 16 * 1024;
 const INLINE_MATERIALIZE_MAX_RANGES: usize = 4;
@@ -67,8 +68,9 @@ impl AccessCpuConfig {
 
 struct AccessCpuWork {
     input: Arc<[u8]>,
-    slice: Option<Vec<usize>>,
+    ranges: Option<Arc<[RangeCopy]>>,
     output_len: usize,
+    shape: SliceShape,
     reply: oneshot::Sender<Result<Vec<u8>, AccessError>>,
 }
 
@@ -123,18 +125,18 @@ impl AccessCpuPool {
     pub(crate) async fn materialize(
         &self,
         input: Arc<[u8]>,
-        slice: Option<&[usize]>,
-        output_len: usize,
+        plan: SlicePlan,
     ) -> Result<Vec<u8>, AccessError> {
-        if should_materialize_inline(slice, output_len) {
-            return materialize_prevalidated(&input, slice, output_len);
+        if should_materialize_inline(&plan) {
+            return materialize_planned(&input, plan.ranges(), plan.output_len, plan.shape);
         }
 
         let (reply, rx) = oneshot::channel();
         let work = AccessCpuWork {
             input,
-            slice: slice.map(Vec::from),
-            output_len,
+            ranges: plan.ranges,
+            output_len: plan.output_len,
+            shape: plan.shape,
             reply,
         };
         let tx = self.tx.as_ref().ok_or(AccessError::Shutdown)?;
@@ -147,19 +149,23 @@ impl AccessCpuPool {
     pub(crate) async fn materialize_owned(
         &self,
         input: Vec<u8>,
-        slice: Option<&[usize]>,
-        output_len: usize,
+        plan: SlicePlan,
     ) -> Result<Vec<u8>, AccessError> {
-        if slice.is_none() {
-            debug_assert_eq!(input.len(), output_len);
+        if plan.ranges.is_none() {
+            debug_assert_eq!(input.len(), plan.output_len);
             return Ok(input);
         }
 
-        if should_materialize_inline(slice, output_len) {
-            return materialize_prevalidated(input.as_slice(), slice, output_len);
+        if should_materialize_inline(&plan) {
+            return materialize_planned(
+                input.as_slice(),
+                plan.ranges(),
+                plan.output_len,
+                plan.shape,
+            );
         }
 
-        self.materialize(Arc::from(input.into_boxed_slice()), slice, output_len)
+        self.materialize(Arc::from(input.into_boxed_slice()), plan)
             .await
     }
 }
@@ -183,49 +189,55 @@ fn worker_loop(rx: flume::Receiver<AccessCpuWork>) {
 
 fn complete_work(work: AccessCpuWork) {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        materialize_prevalidated(&work.input, work.slice.as_deref(), work.output_len)
+        materialize_planned(
+            &work.input,
+            work.ranges.as_deref(),
+            work.output_len,
+            work.shape,
+        )
     }))
     .unwrap_or(Err(AccessError::CpuWorkerPanic));
 
     let _ = work.reply.send(result);
 }
 
-fn materialize_prevalidated(
+fn materialize_planned(
     input: &[u8],
-    slice: Option<&[usize]>,
+    ranges: Option<&[RangeCopy]>,
     output_len: usize,
+    shape: SliceShape,
 ) -> Result<Vec<u8>, AccessError> {
-    let Some(slice) = slice else {
+    let Some(ranges) = ranges else {
         debug_assert_eq!(input.len(), output_len);
         return Ok(input.to_vec());
-    };
-    let Some(shape) = validate_scatter_shape(input.len(), slice, output_len) else {
-        return Err(AccessError::InvalidSlice(
-            "slice spec failed prevalidated CPU bounds check".to_string(),
-        ));
     };
 
     if output_len == 0 {
         return Ok(Vec::new());
     }
 
-    if slice.len() == 3 {
-        let (off, start, end) = prevalidated_triple(slice);
-        if off == 0 && end - start == output_len {
-            return Ok(prevalidated_range(input, start, end).to_vec());
+    if ranges.len() == 1 {
+        let range = ranges[0];
+        if range.dst_offset == 0 && range.len() == output_len {
+            return Ok(prevalidated_range(input, range.src_start, range.src_end).to_vec());
         }
     }
 
-    if shape == ScatterShape::Sequential {
+    if shape == SliceShape::Sequential {
         let mut out = Vec::with_capacity(output_len);
         let out_ptr = out.as_mut_ptr();
-        for triple in slice.chunks_exact(3) {
-            let (off, start, end) = prevalidated_triple(triple);
-            copy_prevalidated_range_to_ptr(input, out_ptr, output_len, off, start, end);
+        for range in ranges {
+            copy_prevalidated_range_to_ptr(
+                input,
+                out_ptr,
+                output_len,
+                range.dst_offset,
+                range.src_start,
+                range.src_end,
+            );
         }
-        // SAFETY: `validate_scatter_shape` classified this slice as
-        // sequential, so the loop above has initialized every byte in
-        // 0..output_len exactly once.
+        // SAFETY: the SlicePlan classified these ranges as sequential, so the
+        // loop above has initialized every byte in 0..output_len exactly once.
         unsafe {
             out.set_len(output_len);
         }
@@ -233,33 +245,24 @@ fn materialize_prevalidated(
     }
 
     let mut out = vec![0; output_len];
-    for triple in slice.chunks_exact(3) {
-        let (off, start, end) = prevalidated_triple(triple);
-        copy_prevalidated_range(input, out.as_mut_slice(), off, start, end);
+    for range in ranges {
+        copy_prevalidated_range(
+            input,
+            out.as_mut_slice(),
+            range.dst_offset,
+            range.src_start,
+            range.src_end,
+        );
     }
     Ok(out)
-}
-
-#[inline]
-fn prevalidated_triple(triple: &[usize]) -> (usize, usize, usize) {
-    debug_assert_eq!(triple.len(), 3);
-    // SAFETY: callers pass either the whole three-element slice fast path or
-    // slices yielded by `chunks_exact(3)`, so these indexes are in-bounds.
-    unsafe {
-        (
-            *triple.get_unchecked(0),
-            *triple.get_unchecked(1),
-            *triple.get_unchecked(2),
-        )
-    }
 }
 
 #[inline]
 fn prevalidated_range(input: &[u8], start: usize, end: usize) -> &[u8] {
     debug_assert!(start <= end);
     debug_assert!(end <= input.len());
-    // SAFETY: `materialize_prevalidated` checks every source range before
-    // entering the unchecked copy path.
+    // SAFETY: `SlicePlan` checked every source range before entering the
+    // planned copy path.
     unsafe { input.get_unchecked(start..end) }
 }
 
@@ -273,9 +276,9 @@ fn copy_prevalidated_range(input: &[u8], output: &mut [u8], off: usize, start: u
         .is_some_and(|out_end| out_end <= output.len()));
 
     let len = end - start;
-    // SAFETY: `materialize_prevalidated` checks source and destination ranges
-    // before calling this helper. `output` is a fresh Vec allocation, so source
-    // and destination do not overlap.
+    // SAFETY: `SlicePlan` checked source and destination ranges before calling
+    // this helper. `output` is a fresh Vec allocation, so source and
+    // destination do not overlap.
     unsafe {
         ptr::copy_nonoverlapping(input.as_ptr().add(start), output.as_mut_ptr().add(off), len);
     }
@@ -307,59 +310,13 @@ fn copy_prevalidated_range_to_ptr(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ScatterShape {
-    Sequential,
-    Sparse,
-}
-
-fn validate_scatter_shape(
-    data_len: usize,
-    slice: &[usize],
-    output_len: usize,
-) -> Option<ScatterShape> {
-    if slice.len() % 3 != 0 {
-        return None;
-    }
-
-    let mut expected_len = 0usize;
-    let mut cursor = 0usize;
-    let mut sequential = true;
-    for triple in slice.chunks_exact(3) {
-        let off = triple[0];
-        let start = triple[1];
-        let end = triple[2];
-        if start > end || end > data_len {
-            return None;
+fn should_materialize_inline(plan: &SlicePlan) -> bool {
+    match plan.ranges.as_ref() {
+        Some(_) => {
+            plan.output_len <= INLINE_MATERIALIZE_MAX_BYTES
+                && plan.range_count() <= INLINE_MATERIALIZE_MAX_RANGES
         }
-        let out_end = off.checked_add(end - start)?;
-
-        if sequential && off == cursor {
-            cursor = out_end;
-        } else {
-            sequential = false;
-        }
-        expected_len = expected_len.max(out_end);
-    }
-
-    if expected_len != output_len {
-        return None;
-    }
-
-    Some(if sequential && cursor == output_len {
-        ScatterShape::Sequential
-    } else {
-        ScatterShape::Sparse
-    })
-}
-
-fn should_materialize_inline(slice: Option<&[usize]>, output_len: usize) -> bool {
-    match slice {
-        Some(slice) => {
-            output_len <= INLINE_MATERIALIZE_MAX_BYTES
-                && slice.len() / 3 <= INLINE_MATERIALIZE_MAX_RANGES
-        }
-        None => output_len <= INLINE_MATERIALIZE_MAX_BYTES,
+        None => plan.output_len <= INLINE_MATERIALIZE_MAX_BYTES,
     }
 }
 
@@ -403,8 +360,20 @@ fn pin_current_thread(cpu: usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::slice::SliceSpec;
     use super::*;
     use tokio::runtime::Builder;
+
+    fn plan(triples: &[(usize, usize, usize)], data_len: usize) -> SlicePlan {
+        let mut flat = Vec::with_capacity(triples.len() * 3);
+        for &(dst_offset, src_start, src_end) in triples {
+            flat.extend_from_slice(&[dst_offset, src_start, src_end]);
+        }
+        SliceSpec::from_triples(flat)
+            .expect("slice spec")
+            .plan(data_len)
+            .expect("slice plan")
+    }
 
     #[test]
     fn config_rejects_invalid_workers() {
@@ -447,7 +416,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime")
-            .block_on(pool.materialize(Arc::from(&b"abcdef"[..]), Some(&[0, 0, 3, 3, 2, 5]), 6))
+            .block_on(pool.materialize(Arc::from(&b"abcdef"[..]), plan(&[(0, 0, 3), (3, 2, 5)], 6)))
             .expect("materialize");
 
         assert_eq!(out, b"abccde");
@@ -455,12 +424,16 @@ mod tests {
 
     #[test]
     fn inline_policy_keeps_small_outputs_on_scheduler() {
-        assert!(should_materialize_inline(Some(&[0, 0, 3, 3, 2, 5]), 6));
-        assert!(should_materialize_inline(None, 1024));
-        assert!(!should_materialize_inline(None, 1024 * 1024));
-        assert!(!should_materialize_inline(
-            Some(&[0, 0, 1024 * 1024]),
-            1024 * 1024
+        assert!(should_materialize_inline(&plan(&[(0, 0, 3), (3, 2, 5)], 6)));
+        assert!(should_materialize_inline(
+            &SliceSpec::Full.plan(1024).expect("full plan")
         ));
+        assert!(!should_materialize_inline(
+            &SliceSpec::Full.plan(1024 * 1024).expect("large full plan")
+        ));
+        assert!(!should_materialize_inline(&plan(
+            &[(0, 0, 1024 * 1024)],
+            1024 * 1024
+        )));
     }
 }

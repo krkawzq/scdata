@@ -4,18 +4,28 @@
 //! deduplicated upstream, but decoded outputs stay per-request so callers own
 //! their returned buffers.
 
+mod buffer;
 mod error;
+mod impls;
+mod pipeline;
 mod pool;
+mod registry;
+mod runner;
 mod spec;
+mod util;
 
 use std::sync::Arc;
 
+pub use buffer::DecodeBuffer;
 pub use error::{CodecError, CodecResult};
-pub use pool::{DecodeFuture, DecodePool, DecodePoolConfig, DecodeRequest};
+pub use impls::{UncompressedCodec, UnsupportedCodec};
+pub use pipeline::CodecPipeline;
+pub use pool::{DecodeFuture, DecodeOutput, DecodePool, DecodePoolConfig, DecodeRequest};
+#[cfg(test)]
+pub(crate) use spec::sealed;
 pub use spec::{
     codec_specs_from_json_str, codec_specs_from_json_value, BloscCodecConfig, BloscShuffle,
-    ChunkCodec, CodecPipeline, CodecSpec, DecodeBuffer, LevelCodecConfig, Lz4CodecConfig,
-    LzmaCodecConfig, UncompressedCodec, UnsupportedCodec, ZstdCodecConfig,
+    ChunkCodec, CodecSpec, LevelCodecConfig, Lz4CodecConfig, LzmaCodecConfig, ZstdCodecConfig,
 };
 
 /// Shared codec implementation used by decode requests.
@@ -32,7 +42,7 @@ pub fn codec_from_json_str(json: &str) -> CodecResult<SharedCodec> {
 
 /// Build a sequential codec pipeline from parsed zarr filters/compressor.
 pub fn codec_pipeline_from_specs(specs: &[CodecSpec]) -> SharedCodec {
-    spec::shared_pipeline_from_specs(specs)
+    registry::shared_pipeline_from_specs(specs)
 }
 
 /// Build a zarr v2 decode pipeline from metadata-order filters plus compressor.
@@ -40,7 +50,7 @@ pub fn codec_pipeline_from_zarr_v2_specs(
     filters: &[CodecSpec],
     compressor: Option<&CodecSpec>,
 ) -> SharedCodec {
-    spec::shared_pipeline_from_zarr_v2_specs(filters, compressor)
+    registry::shared_pipeline_from_zarr_v2_specs(filters, compressor)
 }
 
 pub fn codec_pipeline_from_zarr_v2_json_str(
@@ -59,7 +69,7 @@ pub fn codec_pipeline_from_zarr_v2_json_str(
         .map(CodecSpec::from_json_value)
         .transpose()?
         .filter(|spec| !matches!(spec, CodecSpec::None));
-    Ok(spec::shared_pipeline_from_zarr_v2_specs(
+    Ok(registry::shared_pipeline_from_zarr_v2_specs(
         &filters,
         compressor.as_ref(),
     ))

@@ -1,0 +1,164 @@
+use std::io::Cursor;
+
+use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
+use super::super::spec::{sealed, ChunkCodec};
+use super::super::util::{decode_error, output_too_small, verify_size};
+use super::super::CodecResult;
+
+#[derive(Debug)]
+pub(crate) struct ZstdCodec;
+
+impl sealed::Sealed for ZstdCodec {}
+
+fn zstd_decoded_size(codec: &str, encoded: &[u8]) -> CodecResult<Option<usize>> {
+    match zstd::zstd_safe::get_frame_content_size(encoded) {
+        Ok(Some(size)) => usize::try_from(size).map(Some).map_err(|_| {
+            decode_error(
+                codec,
+                format!("Zstd frame content size {size} does not fit in usize"),
+            )
+        }),
+        Ok(None) => Ok(None),
+        Err(err) => Err(decode_error(codec, err.to_string())),
+    }
+}
+
+impl ChunkCodec for ZstdCodec {
+    fn name(&self) -> &str {
+        "zstd"
+    }
+
+    fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
+        let decoded_size = match expected_size {
+            Some(size) => Some(size),
+            None => zstd_decoded_size(self.name(), encoded)?,
+        };
+        if let Some(decoded_size) = decoded_size {
+            let mut decoded = Vec::with_capacity(decoded_size);
+            set_vec_len_for_decode(&mut decoded, decoded_size);
+            let written = zstd_decompress_into_slice(self.name(), encoded, &mut decoded)?;
+            verify_size(self.name(), written, Some(decoded_size))?;
+            decoded.truncate(written);
+            verify_size(self.name(), decoded.len(), expected_size)?;
+            return Ok(decoded);
+        }
+
+        let decoded = zstd::decode_all(Cursor::new(encoded))
+            .map_err(|err| decode_error(self.name(), err.to_string()))?;
+        verify_size(self.name(), decoded.len(), expected_size)?;
+        Ok(decoded)
+    }
+
+    fn decoded_size_hint(
+        &self,
+        encoded: &[u8],
+        expected_size: Option<usize>,
+    ) -> CodecResult<Option<usize>> {
+        match expected_size {
+            Some(size) => Ok(Some(size)),
+            None => zstd_decoded_size(self.name(), encoded),
+        }
+    }
+
+    fn decode_into(
+        &self,
+        encoded: &[u8],
+        mut output: DecodeBuffer<'_>,
+        expected_size: Option<usize>,
+    ) -> CodecResult<usize> {
+        let decoded_size = match expected_size {
+            Some(size) => Some(size),
+            None => zstd_decoded_size(self.name(), encoded)?,
+        };
+        if let Some(decoded_size) = decoded_size {
+            verify_size(self.name(), decoded_size, expected_size)?;
+            output.ensure_capacity(self.name(), decoded_size)?;
+            let written = zstd_decompress_into_slice(
+                self.name(),
+                encoded,
+                &mut output.as_mut_slice()[..decoded_size],
+            )?;
+            verify_size(self.name(), written, Some(decoded_size))?;
+            return Ok(written);
+        }
+
+        let written = zstd_decompress_into_slice(self.name(), encoded, output.as_mut_slice())?;
+        verify_size(self.name(), written, expected_size)?;
+        Ok(written)
+    }
+
+    fn decode_to_vec(
+        &self,
+        encoded: &[u8],
+        mut output: Vec<u8>,
+        expected_size: Option<usize>,
+    ) -> CodecResult<Vec<u8>> {
+        let decoded_size = match expected_size {
+            Some(size) => Some(size),
+            None => zstd_decoded_size(self.name(), encoded)?,
+        };
+        let Some(decoded_size) = decoded_size else {
+            return self.decode(encoded, expected_size);
+        };
+
+        verify_size(self.name(), decoded_size, expected_size)?;
+        if output.capacity() < decoded_size {
+            return Err(output_too_small(
+                self.name(),
+                decoded_size,
+                output.capacity(),
+            ));
+        }
+        set_vec_len_for_decode(&mut output, decoded_size);
+        let written = zstd_decompress_into_slice(self.name(), encoded, &mut output)?;
+        verify_size(self.name(), written, Some(decoded_size))?;
+        output.truncate(written);
+        verify_size(self.name(), output.len(), expected_size)?;
+        Ok(output)
+    }
+
+    fn decode_to_vec_grow(
+        &self,
+        encoded: &[u8],
+        output: Vec<u8>,
+        expected_size: Option<usize>,
+    ) -> CodecResult<Vec<u8>> {
+        let decoded_size = match expected_size {
+            Some(size) => Some(size),
+            None => zstd_decoded_size(self.name(), encoded)?,
+        };
+        let Some(decoded_size) = decoded_size else {
+            return self.decode(encoded, expected_size);
+        };
+
+        let mut output = output;
+        output.clear();
+        if output.capacity() < decoded_size {
+            output.reserve_exact(decoded_size - output.capacity());
+        }
+        set_vec_len_for_decode(&mut output, decoded_size);
+        let written = zstd_decompress_into_slice(self.name(), encoded, &mut output)?;
+        verify_size(self.name(), written, Some(decoded_size))?;
+        output.truncate(written);
+        verify_size(self.name(), output.len(), expected_size)?;
+        Ok(output)
+    }
+
+    fn decode_to_capacity_vec(
+        &self,
+        encoded: &[u8],
+        output: Vec<u8>,
+        expected_size: Option<usize>,
+    ) -> CodecResult<Vec<u8>> {
+        self.decode_to_vec(encoded, output, expected_size)
+    }
+}
+
+fn zstd_decompress_into_slice(
+    codec: &str,
+    encoded: &[u8],
+    output: &mut [u8],
+) -> CodecResult<usize> {
+    zstd::zstd_safe::decompress(output, encoded)
+        .map_err(|err| decode_error(codec, zstd::zstd_safe::get_error_name(err).to_string()))
+}

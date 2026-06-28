@@ -13,12 +13,19 @@ use tokio::runtime::Builder;
 use tokio::sync::{oneshot, Notify};
 use tokio::task::{JoinError, JoinSet, LocalSet};
 
+#[cfg(test)]
+use super::backend::FileRef;
+use super::backend::{DecodeBackend, DecodeTask, IoBackend, IoTask};
 use super::cache::{CachePayload, CachePayloadKind, ChunkCache, PinGuard, PinnedChunk};
-use super::callback::{DecodeBackend, DecodeTask, FileRef, IoBackend, IoTask};
 use super::cpu::{AccessCpuConfig, AccessCpuPool};
 use super::error::AccessError;
 use super::inflight::{InflightTable, RegisterResult};
+use super::key::{shard_for_key, ChunkKey, DecodeKey};
 use super::membudget::MemBudget;
+use super::scheduled::{ScheduledStage, ScheduledStore, StagedBytes};
+#[cfg(test)]
+use super::slice::RangeCopy;
+use super::slice::{SlicePlan, SliceSpec};
 use crate::codecs::SharedCodec;
 
 type StateHandle = Rc<RefCell<SchedulerState>>;
@@ -34,46 +41,14 @@ struct SchedulerDeps {
     keep_decoded: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct DecodeKey {
-    pub(crate) chunk: ChunkKey,
-    pub(crate) codec: usize,
-    pub(crate) expected_size: Option<usize>,
-}
-
-impl DecodeKey {
-    fn new(item: &AccessItem) -> Self {
-        Self {
-            chunk: item.key,
-            codec: Arc::as_ptr(&item.codec) as *const () as usize,
-            expected_size: item.expected_size,
-        }
-    }
-}
-
-/// Unique identity for one compressed chunk read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChunkKey {
-    pub file: FileRef,
-    pub offset: u64,
-    pub len: usize,
-}
-
-impl ChunkKey {
-    pub fn new(file: FileRef, offset: u64, len: usize) -> Self {
-        Self { file, offset, len }
-    }
-}
-
 /// A chunk access without its reply channel.
 #[derive(Debug, Clone)]
 pub struct AccessItem {
     pub key: ChunkKey,
     pub codec: SharedCodec,
     pub expected_size: Option<usize>,
-    /// Optional scatter-copy triples `[off, start, end]`. Each triple copies
-    /// decoded `[start, end)` into the output buffer at `off`.
-    pub slice: Option<Vec<usize>>,
+    /// Optional scatter-copy plan over decoded bytes.
+    pub slice: SliceSpec,
 }
 
 impl AccessItem {
@@ -82,11 +57,16 @@ impl AccessItem {
             key,
             codec,
             expected_size,
-            slice: None,
+            slice: SliceSpec::Full,
         }
     }
 
     pub fn with_slice(mut self, slice: Option<Vec<usize>>) -> Self {
+        self.slice = SliceSpec::from_optional_triples_deferred(slice);
+        self
+    }
+
+    pub fn with_slice_spec(mut self, slice: SliceSpec) -> Self {
         self.slice = slice;
         self
     }
@@ -97,8 +77,8 @@ pub struct AccessRequest {
     pub key: ChunkKey,
     pub codec: SharedCodec,
     pub expected_size: Option<usize>,
-    /// Optional scatter-copy triples `[off, start, end]`.
-    pub slice: Option<Vec<usize>>,
+    /// Optional scatter-copy plan over decoded bytes.
+    pub slice: SliceSpec,
     pub reply: oneshot::Sender<io::Result<Vec<u8>>>,
 }
 
@@ -113,12 +93,17 @@ impl AccessRequest {
             key,
             codec,
             expected_size,
-            slice: None,
+            slice: SliceSpec::Full,
             reply,
         }
     }
 
     pub fn with_slice(mut self, slice: Option<Vec<usize>>) -> Self {
+        self.slice = SliceSpec::from_optional_triples_deferred(slice);
+        self
+    }
+
+    pub fn with_slice_spec(mut self, slice: SliceSpec) -> Self {
         self.slice = slice;
         self
     }
@@ -398,32 +383,6 @@ impl AccessHandle {
     }
 }
 
-#[inline]
-fn shard_for_key(key: ChunkKey, shard_count: usize) -> usize {
-    debug_assert!(shard_count > 0);
-    if shard_count == 1 {
-        return 0;
-    }
-
-    (mix_chunk_key(key) as usize) % shard_count
-}
-
-#[inline]
-fn mix_chunk_key(key: ChunkKey) -> u64 {
-    let mut x = key.file.0;
-    x ^= key.offset.rotate_left(17);
-    x ^= (key.len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    splitmix64(x)
-}
-
-#[inline]
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
 /// Shared cancellation handle for a scheduled-access consumer.
 ///
 /// When a prefetch consumer is dropped while its producer is still blocked in
@@ -509,6 +468,9 @@ where
     cancel: Option<Arc<PrefetchCancel>>,
     position: usize,
     next_index: usize,
+    next_prefetch_index: usize,
+    next_decode_index: usize,
+    next_ready_index: usize,
     source_done: bool,
     pending_error: Option<io::Error>,
 }
@@ -530,6 +492,9 @@ where
             cancel: None,
             position: 0,
             next_index: 0,
+            next_prefetch_index: 0,
+            next_decode_index: 0,
+            next_ready_index: 0,
             source_done: false,
             pending_error: None,
         };
@@ -550,31 +515,85 @@ where
         let decode_limit = self.position.saturating_add(self.config.decode_ahead_steps);
         let ready_limit = self.position.saturating_add(self.config.ready_ahead_steps);
 
-        for entry in &mut self.buffer {
-            if !entry.ready_sent && entry.index <= ready_limit {
-                self.handle
-                    .send_scheduled_ensure_ready(entry.id, entry.item.clone())?;
+        self.schedule_ready_until(ready_limit)?;
+        self.schedule_decode_until(decode_limit)?;
+        self.schedule_prefetch_until(io_limit)?;
+
+        Ok(())
+    }
+
+    fn schedule_ready_until(&mut self, limit: usize) -> Result<(), AccessError> {
+        self.next_ready_index = self.next_ready_index.max(self.front_index());
+        while self.next_ready_index <= limit {
+            let Some(offset) = self.buffer_offset(self.next_ready_index) else {
+                break;
+            };
+            let request = {
+                let entry = &self.buffer[offset];
+                (!entry.ready_sent).then(|| (entry.id, entry.item.clone()))
+            };
+            if let Some((id, item)) = request {
+                self.handle.send_scheduled_ensure_ready(id, item)?;
+                let entry = &mut self.buffer[offset];
                 entry.ready_sent = true;
                 entry.decode_sent = true;
                 entry.prefetch_sent = true;
-                continue;
             }
+            self.next_ready_index += 1;
+        }
+        Ok(())
+    }
 
-            if !entry.decode_sent && entry.index <= decode_limit {
-                self.handle
-                    .send_scheduled_decode(entry.id, entry.item.clone())?;
+    fn schedule_decode_until(&mut self, limit: usize) -> Result<(), AccessError> {
+        self.next_decode_index = self.next_decode_index.max(self.front_index());
+        while self.next_decode_index <= limit {
+            let Some(offset) = self.buffer_offset(self.next_decode_index) else {
+                break;
+            };
+            let request = {
+                let entry = &self.buffer[offset];
+                (!entry.decode_sent).then(|| (entry.id, entry.item.clone()))
+            };
+            if let Some((id, item)) = request {
+                self.handle.send_scheduled_decode(id, item)?;
+                let entry = &mut self.buffer[offset];
                 entry.decode_sent = true;
                 entry.prefetch_sent = true;
-                continue;
             }
-
-            if !entry.prefetch_sent && entry.index <= io_limit {
-                self.handle.send_scheduled_prefetch(entry.item.key)?;
-                entry.prefetch_sent = true;
-            }
+            self.next_decode_index += 1;
         }
-
         Ok(())
+    }
+
+    fn schedule_prefetch_until(&mut self, limit: usize) -> Result<(), AccessError> {
+        self.next_prefetch_index = self.next_prefetch_index.max(self.front_index());
+        while self.next_prefetch_index <= limit {
+            let Some(offset) = self.buffer_offset(self.next_prefetch_index) else {
+                break;
+            };
+            let request = {
+                let entry = &self.buffer[offset];
+                (!entry.prefetch_sent).then_some(entry.item.key)
+            };
+            if let Some(key) = request {
+                self.handle.send_scheduled_prefetch(key)?;
+                self.buffer[offset].prefetch_sent = true;
+            }
+            self.next_prefetch_index += 1;
+        }
+        Ok(())
+    }
+
+    fn front_index(&self) -> usize {
+        self.buffer
+            .front()
+            .map_or(self.next_index, |entry| entry.index)
+    }
+
+    fn buffer_offset(&self, index: usize) -> Option<usize> {
+        let front = self.buffer.front()?.index;
+        let offset = index.checked_sub(front)?;
+        (offset < self.buffer.len()).then_some(offset)
     }
 
     fn fill_buffer(&mut self) {
@@ -804,7 +823,7 @@ struct SchedulerState {
     inflight: InflightTable,
     decode_inflight: HashMap<DecodeKey, Arc<Notify>>,
     budget: MemBudget,
-    staged: HashMap<u64, ScheduledStage>,
+    scheduled: ScheduledStore,
 }
 
 impl SchedulerState {
@@ -816,48 +835,12 @@ impl SchedulerState {
             inflight: InflightTable::new(),
             decode_inflight: HashMap::new(),
             budget,
-            staged: HashMap::new(),
+            scheduled: ScheduledStore::new(),
         }
     }
 
     fn evict_staged_buffer(&mut self) -> Option<usize> {
-        let victim = self.staged.iter().find_map(|(id, stage)| match stage {
-            ScheduledStage::Decoded { bytes, .. } | ScheduledStage::Ready { bytes, .. } => {
-                Some((*id, *bytes))
-            }
-            ScheduledStage::Pending(_)
-            | ScheduledStage::Complete
-            | ScheduledStage::Failed(_)
-            | ScheduledStage::Cancelled => None,
-        })?;
-
-        self.staged.remove(&victim.0);
-        Some(victim.1)
-    }
-}
-
-#[derive(Debug)]
-enum ScheduledStage {
-    Pending(Arc<Notify>),
-    Complete,
-    Decoded { data: StagedBytes, bytes: usize },
-    Ready { data: Vec<u8>, bytes: usize },
-    Failed(String),
-    Cancelled,
-}
-
-#[derive(Debug)]
-enum StagedBytes {
-    Owned(Vec<u8>),
-    Shared(Arc<[u8]>),
-}
-
-impl StagedBytes {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Owned(data) => data.as_slice(),
-            Self::Shared(data) => data.as_ref(),
-        }
+        self.scheduled.evict_one_buffer()
     }
 }
 
@@ -979,18 +962,22 @@ fn spawn_command(
 
 fn try_scheduled_decode_inline(state: &StateHandle, request: &ScheduledDecodeRequest) -> bool {
     let mut state_ref = state.borrow_mut();
-    if state_ref.staged.contains_key(&request.id) {
+    if state_ref.scheduled.contains(&request.id) {
         return true;
     }
 
-    let decode_key = DecodeKey::new(&request.item);
+    let decode_key = DecodeKey::new(
+        request.item.key,
+        &request.item.codec,
+        request.item.expected_size,
+    );
     let cached_decoded = state_ref
         .cache
         .pin_and_get(&request.item.key)
         .is_some_and(|pinned| is_matching_decoded(&pinned, decode_key));
     if cached_decoded {
         state_ref
-            .staged
+            .scheduled
             .insert(request.id, ScheduledStage::Complete);
     }
 
@@ -1009,12 +996,12 @@ enum InlineStagedAction {
     NeedsAsync,
 }
 
-fn inline_staged_action(data: &StagedBytes, slice: Option<&[usize]>) -> InlineStagedAction {
+fn inline_staged_action(data: &StagedBytes, slice: &SliceSpec) -> InlineStagedAction {
     let StagedBytes::Owned(data) = data else {
         return InlineStagedAction::NeedsAsync;
     };
 
-    match plan_slice(data.len(), slice) {
+    match slice.plan(data.len()) {
         Ok(plan) if plan.ranges.is_none() => InlineStagedAction::MoveOwned,
         Ok(_) => InlineStagedAction::NeedsAsync,
         Err(err) => InlineStagedAction::Fail(err),
@@ -1049,20 +1036,20 @@ fn try_scheduled_ensure_ready_inline(
     request: &ScheduledEnsureReadyRequest,
 ) -> EnsureInline {
     let mut state_ref = state.borrow_mut();
-    let action = match state_ref.staged.get(&request.id) {
+    let action = match state_ref.scheduled.get(&request.id) {
         None => return EnsureInline::Missing,
         Some(ScheduledStage::Ready { .. } | ScheduledStage::Failed(_)) => {
             return EnsureInline::Handled;
         }
         Some(ScheduledStage::Cancelled) => {
-            state_ref.staged.remove(&request.id);
+            state_ref.scheduled.remove(&request.id);
             return EnsureInline::Handled;
         }
         Some(ScheduledStage::Pending(_) | ScheduledStage::Complete) => {
             return EnsureInline::NeedsAsync;
         }
         Some(ScheduledStage::Decoded { data, .. }) => {
-            inline_staged_action(data, request.item.slice.as_deref())
+            inline_staged_action(data, &request.item.slice)
         }
     };
 
@@ -1071,22 +1058,22 @@ fn try_scheduled_ensure_ready_inline(
             if let Some(ScheduledStage::Decoded {
                 data: StagedBytes::Owned(data),
                 bytes,
-            }) = state_ref.staged.remove(&request.id)
+            }) = state_ref.scheduled.remove(&request.id)
             {
                 state_ref
-                    .staged
+                    .scheduled
                     .insert(request.id, ScheduledStage::Ready { data, bytes });
             }
             EnsureInline::Handled
         }
         InlineStagedAction::Fail(err) => {
             if let Some(ScheduledStage::Decoded { bytes, .. }) =
-                state_ref.staged.remove(&request.id)
+                state_ref.scheduled.remove(&request.id)
             {
                 state_ref.budget.release(bytes);
             }
             state_ref
-                .staged
+                .scheduled
                 .insert(request.id, ScheduledStage::Failed(err.to_string()));
             EnsureInline::Handled
         }
@@ -1109,10 +1096,10 @@ fn try_scheduled_take_inline(
 ) -> Result<(), ScheduledTakeRequest> {
     let result = {
         let mut state_ref = state.borrow_mut();
-        let action = match state_ref.staged.get(&request.id) {
+        let action = match state_ref.scheduled.get(&request.id) {
             Some(ScheduledStage::Ready { .. }) => TakeInlineAction::Ready,
             Some(ScheduledStage::Decoded { data, .. }) => {
-                match inline_staged_action(data, request.item.slice.as_deref()) {
+                match inline_staged_action(data, &request.item.slice) {
                     InlineStagedAction::MoveOwned => TakeInlineAction::MoveOwnedDecoded,
                     InlineStagedAction::Fail(err) => TakeInlineAction::Fail(err),
                     InlineStagedAction::NeedsAsync => TakeInlineAction::NeedsAsync,
@@ -1130,7 +1117,7 @@ fn try_scheduled_take_inline(
         match action {
             TakeInlineAction::Ready => {
                 if let Some(ScheduledStage::Ready { data, bytes }) =
-                    state_ref.staged.remove(&request.id)
+                    state_ref.scheduled.remove(&request.id)
                 {
                     state_ref.budget.release(bytes);
                     Some(Ok(data))
@@ -1142,7 +1129,7 @@ fn try_scheduled_take_inline(
                 if let Some(ScheduledStage::Decoded {
                     data: StagedBytes::Owned(data),
                     bytes,
-                }) = state_ref.staged.remove(&request.id)
+                }) = state_ref.scheduled.remove(&request.id)
                 {
                     state_ref.budget.release(bytes);
                     Some(Ok(data))
@@ -1152,18 +1139,18 @@ fn try_scheduled_take_inline(
             }
             TakeInlineAction::Fail(err) => {
                 if let Some(ScheduledStage::Decoded { bytes, .. }) =
-                    state_ref.staged.remove(&request.id)
+                    state_ref.scheduled.remove(&request.id)
                 {
                     state_ref.budget.release(bytes);
                 }
                 Some(Err(err))
             }
             TakeInlineAction::FailedMessage(message) => {
-                state_ref.staged.remove(&request.id);
+                state_ref.scheduled.remove(&request.id);
                 Some(Err(AccessError::Io(io::Error::other(message))))
             }
             TakeInlineAction::Cancelled => {
-                state_ref.staged.remove(&request.id);
+                state_ref.scheduled.remove(&request.id);
                 Some(Err(AccessError::Io(io::Error::other(
                     "scheduled item cancelled",
                 ))))
@@ -1226,7 +1213,7 @@ async fn access_item(
     keep_decoded: bool,
 ) -> Result<Vec<u8>, AccessError> {
     let decoded = decoded_item_data(state, io, decode, &item, priority, keep_decoded).await?;
-    materialize_decoded(cpu, decoded, item.slice.as_deref()).await
+    materialize_decoded(cpu, decoded, &item.slice).await
 }
 
 enum DecodedOutput {
@@ -1251,35 +1238,26 @@ enum MaterializeSource {
     Shared(Arc<[u8]>),
 }
 
-#[derive(Clone, Copy)]
-struct SlicePlan<'a> {
-    ranges: Option<&'a [usize]>,
-    output_len: usize,
-}
-
 async fn materialize_decoded(
     cpu: &AccessCpuPool,
     decoded: DecodedOutput,
-    slice: Option<&[usize]>,
+    slice: &SliceSpec,
 ) -> Result<Vec<u8>, AccessError> {
-    let plan = plan_slice(decoded.as_slice().len(), slice)?;
+    let plan = slice.plan(decoded.as_slice().len())?;
     materialize_decoded_planned(cpu, decoded, plan).await
 }
 
 async fn materialize_decoded_planned(
     cpu: &AccessCpuPool,
     decoded: DecodedOutput,
-    plan: SlicePlan<'_>,
+    plan: SlicePlan,
 ) -> Result<Vec<u8>, AccessError> {
     match decoded {
         DecodedOutput::Owned(data) if plan.ranges.is_none() => Ok(data),
-        DecodedOutput::Owned(data) => {
-            cpu.materialize_owned(data, plan.ranges, plan.output_len)
-                .await
-        }
+        DecodedOutput::Owned(data) => cpu.materialize_owned(data, plan).await,
         DecodedOutput::Shared { data, _pin } => {
             let input = Arc::clone(&data);
-            let result = cpu.materialize(input, plan.ranges, plan.output_len).await;
+            let result = cpu.materialize(input, plan).await;
             drop(_pin);
             result
         }
@@ -1289,17 +1267,12 @@ async fn materialize_decoded_planned(
 async fn materialize_source(
     cpu: &AccessCpuPool,
     source: MaterializeSource,
-    plan: SlicePlan<'_>,
+    plan: SlicePlan,
 ) -> Result<Vec<u8>, AccessError> {
     match source {
         MaterializeSource::Owned(data) if plan.ranges.is_none() => Ok(data),
-        MaterializeSource::Owned(data) => {
-            cpu.materialize_owned(data, plan.ranges, plan.output_len)
-                .await
-        }
-        MaterializeSource::Shared(data) => {
-            cpu.materialize(data, plan.ranges, plan.output_len).await
-        }
+        MaterializeSource::Owned(data) => cpu.materialize_owned(data, plan).await,
+        MaterializeSource::Shared(data) => cpu.materialize(data, plan).await,
     }
 }
 
@@ -1313,55 +1286,6 @@ fn into_materialize_source(decoded: DecodedOutput) -> MaterializeSource {
     }
 }
 
-fn plan_slice(data_len: usize, slice: Option<&[usize]>) -> Result<SlicePlan<'_>, AccessError> {
-    let Some(slice) = slice else {
-        return Ok(SlicePlan {
-            ranges: None,
-            output_len: data_len,
-        });
-    };
-
-    if slice.len() % 3 != 0 {
-        return Err(AccessError::InvalidSlice(
-            "slice spec must contain off/start/end triples".to_string(),
-        ));
-    }
-
-    let mut output_len = 0usize;
-    let mut cursor = 0usize;
-    let mut identity = true;
-    for triple in slice.chunks_exact(3) {
-        let off = triple[0];
-        let start = triple[1];
-        let end = triple[2];
-        if start > end {
-            return Err(AccessError::InvalidSlice(format!(
-                "slice start {start} is greater than end {end}"
-            )));
-        }
-        if end > data_len {
-            return Err(AccessError::InvalidSlice(format!(
-                "slice end {end} exceeds decoded length {data_len}"
-            )));
-        }
-
-        let span = end - start;
-        let out_end = off
-            .checked_add(span)
-            .ok_or_else(|| AccessError::InvalidSlice("slice output length overflow".to_string()))?;
-
-        identity &= off == cursor && start == cursor;
-        cursor = end;
-        output_len = output_len.max(out_end);
-    }
-    identity &= cursor == data_len && output_len == data_len;
-
-    Ok(SlicePlan {
-        ranges: if identity { None } else { Some(slice) },
-        output_len,
-    })
-}
-
 async fn decoded_item_data(
     state: StateHandle,
     io: &dyn IoBackend,
@@ -1370,7 +1294,7 @@ async fn decoded_item_data(
     priority: u8,
     keep_decoded: bool,
 ) -> Result<DecodedOutput, AccessError> {
-    let decode_key = DecodeKey::new(item);
+    let decode_key = DecodeKey::new(item.key, &item.codec, item.expected_size);
     loop {
         let chunk = load_chunk(
             Rc::clone(&state),
@@ -1463,7 +1387,7 @@ enum DecodeRegister {
 
 fn register_decode_waiter(state: &StateHandle, item: &AccessItem) -> DecodeRegister {
     let mut state_ref = state.borrow_mut();
-    let key = DecodeKey::new(item);
+    let key = DecodeKey::new(item.key, &item.codec, item.expected_size);
     if let Some(pinned) = state_ref.cache.pin_and_get(&item.key) {
         if is_matching_decoded(&pinned, key) {
             return DecodeRegister::Ready(pinned);
@@ -1855,22 +1779,22 @@ async fn prefetch_key(
 
 fn begin_scheduled_pending(state: &StateHandle, id: u64) -> Option<Arc<Notify>> {
     let mut state_ref = state.borrow_mut();
-    if state_ref.staged.contains_key(&id) {
+    if state_ref.scheduled.contains(&id) {
         return None;
     }
 
     let notify = Arc::new(Notify::new());
     state_ref
-        .staged
+        .scheduled
         .insert(id, ScheduledStage::Pending(Arc::clone(&notify)));
     Some(notify)
 }
 
 fn cancel_scheduled(state: &StateHandle, id: u64) {
     let mut state_ref = state.borrow_mut();
-    match state_ref.staged.remove(&id) {
+    match state_ref.scheduled.remove(&id) {
         Some(ScheduledStage::Pending(notify)) => {
-            state_ref.staged.insert(id, ScheduledStage::Cancelled);
+            state_ref.scheduled.insert(id, ScheduledStage::Cancelled);
             notify.notify_waiters();
         }
         Some(ScheduledStage::Decoded { bytes, .. }) | Some(ScheduledStage::Ready { bytes, .. }) => {
@@ -1909,15 +1833,18 @@ fn finish_scheduled_decode(
     result: Result<StageDecodeOutput, AccessError>,
 ) {
     let mut state_ref = state.borrow_mut();
-    if matches!(state_ref.staged.get(&id), Some(ScheduledStage::Cancelled)) {
+    if matches!(
+        state_ref.scheduled.get(&id),
+        Some(ScheduledStage::Cancelled)
+    ) {
         if let Ok(StageDecodeOutput::Staged { bytes, .. }) = result {
             state_ref.budget.release(bytes);
         }
-        state_ref.staged.remove(&id);
+        state_ref.scheduled.remove(&id);
         return;
     }
 
-    state_ref.staged.insert(
+    state_ref.scheduled.insert(
         id,
         match result {
             Ok(StageDecodeOutput::Cached) => ScheduledStage::Complete,
@@ -1942,7 +1869,7 @@ async fn decode_for_schedule(
     priority: u8,
     keep_decoded: bool,
 ) -> Result<StageDecodeOutput, AccessError> {
-    let decode_key = DecodeKey::new(&item);
+    let decode_key = DecodeKey::new(item.key, &item.codec, item.expected_size);
 
     loop {
         let chunk = load_chunk(
@@ -2082,17 +2009,17 @@ async fn handle_scheduled_ensure_ready(
     loop {
         let action = {
             let mut state_ref = state.borrow_mut();
-            match state_ref.staged.remove(&request.id) {
+            match state_ref.scheduled.remove(&request.id) {
                 Some(ScheduledStage::Pending(notify)) => {
                     state_ref
-                        .staged
+                        .scheduled
                         .insert(request.id, ScheduledStage::Pending(Arc::clone(&notify)));
                     ReadyAction::Wait(notify)
                 }
                 Some(ScheduledStage::Decoded { data, bytes }) => {
                     let notify = Arc::new(Notify::new());
                     state_ref
-                        .staged
+                        .scheduled
                         .insert(request.id, ScheduledStage::Pending(Arc::clone(&notify)));
                     ReadyAction::ConvertDecoded {
                         data,
@@ -2102,21 +2029,21 @@ async fn handle_scheduled_ensure_ready(
                 }
                 Some(ScheduledStage::Ready { data, bytes }) => {
                     state_ref
-                        .staged
+                        .scheduled
                         .insert(request.id, ScheduledStage::Ready { data, bytes });
                     ReadyAction::Done
                 }
                 Some(ScheduledStage::Complete) => {
                     let notify = Arc::new(Notify::new());
                     state_ref
-                        .staged
+                        .scheduled
                         .insert(request.id, ScheduledStage::Pending(Arc::clone(&notify)));
                     ReadyAction::PrepareDirect { notify }
                 }
                 Some(ScheduledStage::Cancelled) | None => ReadyAction::Done,
                 Some(ScheduledStage::Failed(message)) => {
                     state_ref
-                        .staged
+                        .scheduled
                         .insert(request.id, ScheduledStage::Failed(message.clone()));
                     ReadyAction::Failed(message)
                 }
@@ -2134,7 +2061,7 @@ async fn handle_scheduled_ensure_ready(
                     Rc::clone(&state),
                     deps.cpu.as_ref(),
                     data,
-                    request.item.slice.as_deref(),
+                    &request.item.slice,
                     bytes,
                 )
                 .await;
@@ -2164,14 +2091,7 @@ async fn async_ready_from_decode_output(
     match output {
         StageDecodeOutput::Cached => make_ready_direct(state, deps, item).await,
         StageDecodeOutput::Staged { data, bytes } => {
-            make_ready_from_staged_data(
-                state,
-                deps.cpu.as_ref(),
-                data,
-                item.slice.as_deref(),
-                bytes,
-            )
-            .await
+            make_ready_from_staged_data(state, deps.cpu.as_ref(), data, &item.slice, bytes).await
         }
     }
 }
@@ -2187,15 +2107,18 @@ fn finish_scheduled_ready(
         state_ref.budget.release(release_staged_bytes);
     }
 
-    if matches!(state_ref.staged.get(&id), Some(ScheduledStage::Cancelled)) {
+    if matches!(
+        state_ref.scheduled.get(&id),
+        Some(ScheduledStage::Cancelled)
+    ) {
         if let Ok(buffer) = result {
             state_ref.budget.release(buffer.bytes);
         }
-        state_ref.staged.remove(&id);
+        state_ref.scheduled.remove(&id);
         return;
     }
 
-    state_ref.staged.insert(
+    state_ref.scheduled.insert(
         id,
         match result {
             Ok(buffer) => ScheduledStage::Ready {
@@ -2226,7 +2149,7 @@ async fn make_ready_direct(
         deps.keep_decoded,
     )
     .await?;
-    let plan = plan_slice(decoded.as_slice().len(), item.slice.as_deref())?;
+    let plan = item.slice.plan(decoded.as_slice().len())?;
     let bytes = plan.output_len;
 
     if matches!(&decoded, DecodedOutput::Shared { _pin: Some(_), .. })
@@ -2278,10 +2201,10 @@ async fn make_ready_from_staged_data(
     state: StateHandle,
     cpu: &AccessCpuPool,
     data: StagedBytes,
-    slice: Option<&[usize]>,
+    slice: &SliceSpec,
     staged_bytes: usize,
 ) -> Result<ReadyBuffer, AccessError> {
-    let plan = match plan_slice(data.as_slice().len(), slice) {
+    let plan = match slice.plan(data.as_slice().len()) {
         Ok(plan) => plan,
         Err(err) => {
             state.borrow_mut().budget.release(staged_bytes);
@@ -2308,7 +2231,7 @@ async fn make_ready_from_staged_data(
                     return Err(err);
                 }
 
-                let data = match cpu.materialize(data, None, bytes).await {
+                let data = match cpu.materialize(data, plan).await {
                     Ok(data) => data,
                     Err(err) => {
                         state.borrow_mut().budget.release(staged_bytes + bytes);
@@ -2336,8 +2259,8 @@ async fn make_ready_from_staged_data(
     }
 
     let result = match data {
-        StagedBytes::Owned(data) => cpu.materialize_owned(data, plan.ranges, bytes).await,
-        StagedBytes::Shared(data) => cpu.materialize(data, plan.ranges, bytes).await,
+        StagedBytes::Owned(data) => cpu.materialize_owned(data, plan).await,
+        StagedBytes::Shared(data) => cpu.materialize(data, plan).await,
     };
     let data = match result {
         Ok(data) => data,
@@ -2359,10 +2282,10 @@ async fn scheduled_take(
     loop {
         let action = {
             let mut state_ref = state.borrow_mut();
-            match state_ref.staged.remove(&id) {
+            match state_ref.scheduled.remove(&id) {
                 Some(ScheduledStage::Pending(notify)) => {
                     state_ref
-                        .staged
+                        .scheduled
                         .insert(id, ScheduledStage::Pending(Arc::clone(&notify)));
                     ReadyAction::Wait(notify)
                 }
@@ -2400,7 +2323,7 @@ async fn scheduled_take(
                     Rc::clone(&state),
                     deps.cpu.as_ref(),
                     data,
-                    item.slice.as_deref(),
+                    &item.slice,
                     bytes,
                 )
                 .await?;
@@ -2421,29 +2344,36 @@ async fn scheduled_take(
 
 #[cfg(test)]
 fn copy_slices(data: &[u8], slice: Option<&[usize]>) -> Result<Vec<u8>, AccessError> {
-    let output_len = slice_output_len(data, slice)?;
-    Ok(copy_slices_prevalidated(data, slice, output_len))
+    let spec = slice_spec_from_borrowed_triples(slice)?;
+    let plan = spec.plan(data.len())?;
+    Ok(copy_slices_prevalidated(
+        data,
+        plan.ranges(),
+        plan.output_len,
+    ))
 }
 
 #[cfg(test)]
-fn copy_slices_prevalidated(data: &[u8], slice: Option<&[usize]>, output_len: usize) -> Vec<u8> {
+fn copy_slices_prevalidated(
+    data: &[u8],
+    slice: Option<&[RangeCopy]>,
+    output_len: usize,
+) -> Vec<u8> {
     let Some(slice) = slice else {
         return data.to_vec();
     };
 
     let mut out = vec![0; output_len];
-    for triple in slice.chunks_exact(3) {
-        let off = triple[0];
-        let start = triple[1];
-        let end = triple[2];
-        out[off..off + (end - start)].copy_from_slice(&data[start..end]);
+    for range in slice {
+        out[range.dst_offset..range.dst_offset + range.len()]
+            .copy_from_slice(&data[range.src_start..range.src_end]);
     }
     out
 }
 
 #[cfg(test)]
-fn slice_output_len(data: &[u8], slice: Option<&[usize]>) -> Result<usize, AccessError> {
-    Ok(plan_slice(data.len(), slice)?.output_len)
+fn slice_spec_from_borrowed_triples(slice: Option<&[usize]>) -> Result<SliceSpec, AccessError> {
+    SliceSpec::from_optional_triples(slice.map(Vec::from))
 }
 
 fn send_reply(reply: oneshot::Sender<io::Result<Vec<u8>>>, result: Result<Vec<u8>, AccessError>) {
@@ -2598,6 +2528,8 @@ mod tests {
         prefix: u8,
     }
 
+    impl crate::codecs::sealed::Sealed for PrefixCodec {}
+
     impl ChunkCodec for PrefixCodec {
         fn name(&self) -> &str {
             "prefix"
@@ -2616,6 +2548,8 @@ mod tests {
         byte: u8,
         output_len: usize,
     }
+
+    impl crate::codecs::sealed::Sealed for ExpandCodec {}
 
     impl ChunkCodec for ExpandCodec {
         fn name(&self) -> &str {
@@ -2797,6 +2731,7 @@ mod tests {
 
     #[test]
     fn slice_spec_scatter_copies_left_closed_right_open_ranges() {
+        assert_eq!(copy_slices(b"abcdef", Some(&[])).expect("empty slice"), b"");
         assert_eq!(
             copy_slices(b"abcdef", Some(&[0, 0, 3, 3, 2, 5])).expect("slice"),
             b"abccde"
@@ -2848,6 +2783,25 @@ mod tests {
             .expect("send request");
 
         assert_eq!(recv_reply(rx).expect("decode"), b"bcdab");
+    }
+
+    #[test]
+    fn access_request_with_invalid_slice_returns_error() {
+        let io = StaticIo::new(b"abcdef");
+        let handle =
+            AccessScheduler::spawn(test_config(), Box::new(io), Box::new(IdentityDecode::new()))
+                .expect("spawn scheduler");
+        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let (request, rx) = request(key);
+
+        handle
+            .send(request.with_slice(Some(vec![0, 0])))
+            .expect("send request");
+
+        let err = recv_reply(rx).expect_err("invalid slice should fail");
+        assert!(err
+            .to_string()
+            .contains("slice spec must contain off/start/end triples"));
     }
 
     #[test]
@@ -3448,6 +3402,53 @@ mod tests {
                 .expect("ready result"),
             vec![b'z'; 4]
         );
+    }
+
+    #[test]
+    fn scheduled_cancel_wakes_blocked_take() {
+        let (io, gate, reads) = StaticIo::gated(b"x");
+        let (decode, _decodes) = CodecBackedDecode::counted();
+        let handle =
+            AccessScheduler::spawn(test_config(), Box::new(io), Box::new(decode)).expect("spawn");
+        let cancel = PrefetchCancel::new(handle.clone());
+        let key = ChunkKey::new(FileRef(1), 0, 1);
+        let codec: SharedCodec = Arc::new(ExpandCodec {
+            byte: b'z',
+            output_len: 4,
+        });
+        let item = AccessItem::new(key, codec, Some(4));
+        let mut scheduled = handle
+            .scheduled(
+                vec![item],
+                ScheduledAccessConfig {
+                    prefetch_step: 0,
+                    decode_ahead_steps: 0,
+                    ready_ahead_steps: 0,
+                },
+            )
+            .expect("scheduled");
+        scheduled.set_cancel_handle(Arc::clone(&cancel));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(scheduled.next());
+        });
+        wait_for_reads(&reads, 1);
+
+        cancel.cancel_in_flight();
+        let result = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_else(|_| {
+            Some(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for cancelled scheduled item",
+            )))
+        });
+        assert!(result
+            .expect("scheduled item")
+            .expect_err("cancelled item should return an error")
+            .to_string()
+            .contains("cancelled"));
+
+        let _ = gate.send(());
     }
 
     #[test]

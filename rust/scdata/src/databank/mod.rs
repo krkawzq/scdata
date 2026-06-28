@@ -17,8 +17,9 @@ mod registry;
 use std::sync::Arc;
 
 pub use array::{
-    ArrayCodecMeta, ArrayMeta, ArrayOrder, Bf16Bits, ChunkStoreMeta, DType, DataValue,
-    DirectoryChunkLocationMeta, F16Bits, FileChunkLocation,
+    ArrayCodecMeta, ArrayGridSpec, ArrayMeta, ArrayOrder, ArraySpec, Bf16Bits, ChunkSourceSpec,
+    ChunkSpec, ChunkStoreMeta, DType, DataValue, DirectoryChunkLocationMeta, EdgeChunkLayout,
+    F16Bits, FileChunkLocation, RegisteredFile,
 };
 pub use batch::{MissingGenePolicy, PrefetchCells, PrefetchedBatch};
 pub use config::{DataBankConfig, FillConfig, ScheduledPrefetchConfig};

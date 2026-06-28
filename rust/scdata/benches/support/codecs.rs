@@ -66,8 +66,14 @@ pub fn default_codec_matrix() -> Vec<(&'static str, CodecSpec)> {
             }),
         ),
         ("lz4", CodecSpec::Lz4(Lz4CodecConfig::default())),
-        ("zlib1", CodecSpec::Zlib(LevelCodecConfig { level: Some(1) })),
-        ("gzip5", CodecSpec::Gzip(LevelCodecConfig { level: Some(5) })),
+        (
+            "zlib1",
+            CodecSpec::Zlib(LevelCodecConfig { level: Some(1) }),
+        ),
+        (
+            "gzip5",
+            CodecSpec::Gzip(LevelCodecConfig { level: Some(5) }),
+        ),
         ("bz2_5", CodecSpec::Bz2(LevelCodecConfig { level: Some(5) })),
         ("lzma", CodecSpec::Lzma(LzmaCodecConfig::default())),
         ("crc32", CodecSpec::Crc32),

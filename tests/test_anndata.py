@@ -1,21 +1,21 @@
-"""Regression tests for the AnnData zarr -> scdata payload bridge."""
+"""Regression tests for the AnnData zarr v3 -> scdata databank bridge."""
 
 from __future__ import annotations
 
-import json
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from scdata import ScDataBank
 from scdata.data import DenseDataset, SparseDataset
-from scdata.io import convert_anndata_zarr, launch, write_anndata
+from scdata.io import AnnDataZarrZipConverter, launch, read_zarr, write_zarr
 
 ad = pytest.importorskip("anndata")
 pd = pytest.importorskip("pandas")
 sp = pytest.importorskip("scipy.sparse")
-
-pytestmark = pytest.mark.filterwarnings("ignore:Writing zarr v2 data:UserWarning")
+pytest.importorskip("zarr")
 
 
 @pytest.fixture
@@ -47,45 +47,143 @@ def sparse_adata():
     return adata, matrix
 
 
-def test_write_anndata_dense_converts_required_arrays(tmp_path: Path, dense_adata):
-    root = write_anndata(dense_adata, tmp_path / "dense.zarr", chunks=(2, 2))
+def _registered_matrix(ds):
+    bank = ScDataBank()
+    did = bank.register(ds)
+    try:
+        cells = list(range(bank.dataset_num_cells(did)))
+        out = np.asarray(bank.access_cells(did, cells))
+        return out.reshape(len(cells), bank.dataset_num_genes(did))
+    finally:
+        bank.unregister(did)
+
+
+def test_write_zarr_dense2d_dir_registers_with_databank(tmp_path: Path, dense_adata) -> None:
+    root = write_zarr(
+        dense_adata,
+        tmp_path / "dense2d.zarr",
+        format="dense2d",
+        chunks=(2, 2),
+        store="dir",
+    )
+
     ds = launch(root)
 
     assert isinstance(ds, DenseDataset)
     assert ds.data.shape == (3, 4)
     assert ds.data.num_chunks == 4
-    assert tuple(ds.gene_names) == ("g0", "g1", "g2", "g3")
-    assert (root / "X" / "payload.bin").is_file()
-    assert not (root / "X" / "0.0").exists()
-    assert (root / "var" / "_index" / "payload.bin").is_file()
-    assert not (root / "var" / "_index" / "0").exists()
-    assert not (root / ".zmetadata").exists()
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
 
 
-def test_write_anndata_sparse_csr_preserves_anndata_shape(tmp_path: Path, sparse_adata):
-    adata, matrix = sparse_adata
-    root = write_anndata(adata, tmp_path / "sparse.zarr", chunks=(4,))
-    ds = launch(root)
+def test_write_zarr_dense1d_zip_registers_with_databank(tmp_path: Path, dense_adata) -> None:
+    root = write_zarr(
+        dense_adata,
+        tmp_path / "dense1d.zarr.zip",
+        format="dense1d",
+        chunks=(8,),
+        store="zip",
+    )
 
-    assert isinstance(ds, SparseDataset)
-    assert ds.num_cells == 3
-    assert ds.num_genes == 4
-    assert ds.indptr == tuple(matrix.indptr.tolist())
-    assert tuple(ds.gene_names) == ("g0", "g1", "g2", "g3")
-    x_attrs = json.loads((root / "X" / ".zattrs").read_text())
-    assert x_attrs["encoding-type"] == "csr_matrix"
-    assert x_attrs["shape"] == [3, 4]
-    assert (root / "X" / "data" / "payload.bin").is_file()
-    assert not (root / "X" / "data" / "0").exists()
-
-
-def test_convert_anndata_zarr_can_keep_original_chunks(tmp_path: Path, dense_adata):
-    root = tmp_path / "keep_chunks.zarr"
-    dense_adata.write_zarr(root, chunks=(2, 2))
-
-    convert_anndata_zarr(root, keep_zarr_chunks=True)
     ds = launch(root)
 
     assert isinstance(ds, DenseDataset)
-    assert (root / "X" / "payload.bin").is_file()
-    assert (root / "X" / "0.0").is_file()
+    assert ds.data.shape == (12,)
+    assert ds.data.chunk_file_paths
+    assert set(ds.data.chunk_file_paths) == {str(root)}
+    with zipfile.ZipFile(root) as zf:
+        names = zf.namelist()
+    assert len(names) == len(set(names))
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_write_zarr_sparse_rectilinear_registers_with_databank(
+    tmp_path: Path, sparse_adata
+) -> None:
+    adata, matrix = sparse_adata
+    root = write_zarr(
+        adata,
+        tmp_path / "sparse.zarr",
+        format="sparse",
+        chunks=(4,),
+        align_cells=True,
+        store="dir",
+    )
+
+    ds = launch(root)
+
+    assert isinstance(ds, SparseDataset)
+    assert ds.indices.variable_chunks
+    assert ds.data.variable_chunks
+    assert tuple(np.asarray(ds.indptr).tolist()) == tuple(matrix.indptr.tolist())
+    assert np.array_equal(_registered_matrix(ds), matrix.toarray())
+
+
+def test_read_zarr_reshapes_dense1d(tmp_path: Path, dense_adata) -> None:
+    root = write_zarr(
+        dense_adata,
+        tmp_path / "dense1d_read.zarr",
+        format="dense1d",
+        chunks=(8,),
+        store="dir",
+    )
+
+    loaded = read_zarr(root)
+
+    assert np.array_equal(np.asarray(loaded.X), np.asarray(dense_adata.X))
+
+
+def test_converter_h5ad_dense_auto_writes_same_name_zip(tmp_path: Path, dense_adata) -> None:
+    source = tmp_path / "dense_input.h5ad"
+    dense_adata.write_h5ad(source)
+
+    convert = AnnDataZarrZipConverter(chunks=(8,))
+    root = convert(source)
+
+    assert root == tmp_path / "dense_input.zarr.zip"
+    ds = launch(root)
+    assert isinstance(ds, DenseDataset)
+    assert ds.data.shape == (12,)
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_converter_h5ad_sparse_auto_writes_cell_aligned_zip(tmp_path: Path, sparse_adata) -> None:
+    adata, matrix = sparse_adata
+    source = tmp_path / "sparse_input.h5ad"
+    adata.write_h5ad(source)
+
+    convert = AnnDataZarrZipConverter(chunks=(4,), align_cells=True)
+    root = convert(source)
+
+    assert root == tmp_path / "sparse_input.zarr.zip"
+    ds = launch(root)
+    assert isinstance(ds, SparseDataset)
+    assert ds.indices.variable_chunks
+    assert ds.indices.chunk_boundaries == ((0, 4, 6),)
+    assert np.array_equal(_registered_matrix(ds), matrix.toarray())
+
+
+def test_converter_reads_zarr_directory_without_suffix(tmp_path: Path, dense_adata) -> None:
+    source = tmp_path / "standard_zarr_store"
+    dense_adata.write_zarr(source)
+
+    convert = AnnDataZarrZipConverter(chunks=(8,))
+    root = convert(source)
+
+    assert root == tmp_path / "standard_zarr_store.zarr.zip"
+    ds = launch(root)
+    assert isinstance(ds, DenseDataset)
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_converter_explicit_dense2d_and_output_dir(tmp_path: Path, dense_adata) -> None:
+    source = tmp_path / "explicit.h5ad"
+    out_dir = tmp_path / "converted"
+    dense_adata.write_h5ad(source)
+
+    convert = AnnDataZarrZipConverter(output_dir=out_dir, smart=False, format="dense2d")
+    root = convert(source, read_format="h5ad")
+
+    assert root == out_dir / "explicit.zarr.zip"
+    ds = launch(root)
+    assert isinstance(ds, DenseDataset)
+    assert ds.data.shape == (3, 4)

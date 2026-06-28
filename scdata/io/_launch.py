@@ -1,39 +1,33 @@
-"""Launch a scdata store by parsing its metadata for the Rust databank.
+"""Launch a zarr store by parsing metadata for the Rust databank.
 
-A scdata store is a zarr v2 tree (standard ``.zgroup`` / ``.zarray`` /
-``.zattrs`` metadata) with a scdata-specific data layout: instead of one file
-per chunk, every chunk of an array is concatenated into a single payload file,
-and a ``(offset, length)`` index table is written into the array's ``.zattrs``
-under the ``scdata`` key.  The Rust reader opens the payload once and reads
-chunks by offset (``ChunkStoreMeta::FileOffset``), which is what the io_uring
-fast path is designed for.  Chunk data is therefore not readable by stock
-zarr/anndata (which expect per-chunk files); only the metadata is.
+This module is the Python-side adapter between zarr/anndata metadata and the
+Rust ``databank`` factories.  It reads metadata, resolves chunk addresses, and
+returns :class:`~scdata.data._dataset.Dataset` objects; it does not decode
+numeric chunks.  Dense/sparse dataset semantics are interpreted here, while the
+Rust core receives normalized array metadata plus per-chunk file/off/len
+locations.
 
-This module *launches* the store — it parses metadata only (the JSON
-``.zgroup`` / ``.zarray`` / ``.zattrs`` files plus the scdata chunk index) and
-produces :class:`~scdata.data._dataset.Dataset` objects ready for the Rust
-databank.  It does not decode chunks; that is the Rust reader's job.  It also
-does not depend on the ``zarr`` or ``anndata`` packages at runtime: zarr v2
-metadata is plain JSON, and a ``.zarr.zip`` is a ZIP_STORED archive of those
-JSON files and the payload.
+Supported inputs:
 
-Two containers are supported:
-
-* ``.zarr`` — a directory tree on the filesystem.
-* ``.zarr.zip`` — a single ZIP file.  scdata writes it with
-  ``ZIP_STORED`` (no compression): the payload bytes are already compressed
-  by the array codec, and double-compressing would make chunk offsets
-  un-stable and prevent offset-based reads.
+* zarr v3 stores written by :func:`scdata.io.write_zarr` or compatible anndata
+  writers.  Chunk files are standard zarr files; zip stores are mapped to the
+  zip archive path plus each entry's physical byte offset.
+* legacy zarr v2 scdata stores whose arrays carry ``.zattrs["scdata"]`` payload
+  indexes.  Directory and ``ZIP_STORED`` zip containers are both resolved to
+  local file/off/len locations for Rust.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import struct
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+import numpy as np
 
 from scdata.data._dataset import (
     ArrayMeta,
@@ -46,6 +40,17 @@ from scdata.data._dataset import (
     Dataset,
     SparseDataset,
 )
+
+try:
+    from scdata._scdata import (
+        _decode_index_chunks,
+        _decode_index_payload,
+        _zip_stored_offsets,
+    )
+except Exception:  # pragma: no cover - compatibility with older Rust wheels.
+    _decode_index_chunks = None
+    _decode_index_payload = None
+    _zip_stored_offsets = None
 
 __all__ = ["launch", "launch_store", "StoreError", "Store"]
 
@@ -162,6 +167,10 @@ class _DirectoryStore(Store):
         except OSError as err:
             raise StoreError(f"cannot stat {key}: {err}") from err
 
+    def source_path(self, key: str) -> str:
+        """Filesystem file Rust should open for ``key``."""
+        return os.fspath(self._resolve(key))
+
 
 class _ZipStore(Store):
     """A ``.zarr.zip`` archive written with ``ZIP_STORED``.
@@ -175,10 +184,12 @@ class _ZipStore(Store):
     def __init__(self, path: Path) -> None:
         if not path.is_file():
             raise StoreError(f"not a file: {path}")
+        self._path = path
         try:
             self._zip = zipfile.ZipFile(path)
         except zipfile.BadZipFile as err:
             raise StoreError(f"bad zip archive: {path}") from err
+        infos: list[zipfile.ZipInfo] = []
         for info in self._zip.infolist():
             if info.is_dir():
                 continue
@@ -187,7 +198,20 @@ class _ZipStore(Store):
                     f"zip entry {info.filename!r} is compressed; "
                     "scdata .zarr.zip stores must use ZIP_STORED"
                 )
-        self._names = frozenset(self._zip.namelist())
+            infos.append(info)
+        self._names = frozenset(info.filename for info in infos)
+        self._sizes = {info.filename: int(info.file_size) for info in infos}
+        self._offsets: dict[str, int] = {}
+        if _zip_stored_offsets is not None and infos:
+            try:
+                offsets = _zip_stored_offsets(
+                    os.fspath(path), [int(info.header_offset) for info in infos]
+                )
+            except Exception as err:
+                raise StoreError(f"cannot build zip manifest for {path}: {err}") from err
+            self._offsets = {
+                info.filename: int(offset) for info, offset in zip(infos, offsets, strict=True)
+            }
 
     @staticmethod
     def _normalize(key: str) -> str:
@@ -231,10 +255,38 @@ class _ZipStore(Store):
         name = self._normalize(key)
         if name not in self._names:
             raise StoreError(f"missing payload entry: {key}")
-        try:
-            return self._zip.getinfo(name).file_size
-        except KeyError:
+        return self._sizes[name]
+
+    def source_path(self, key: str) -> str:
+        """Filesystem file Rust should open for an in-archive key."""
+        return os.fspath(self._path)
+
+    def chunk_offset(self, key: str) -> int:
+        """Physical byte offset of a ZIP_STORED entry's data payload."""
+        name = self._normalize(key)
+        if name not in self._names:
             raise StoreError(f"missing payload entry: {key}")
+        offset = self._offsets.get(name)
+        if offset is not None:
+            return offset
+        info = self._zip.getinfo(name)
+        try:
+            with self._path.open("rb") as fh:
+                fh.seek(info.header_offset)
+                header = fh.read(30)
+        except OSError as err:
+            raise StoreError(f"cannot read zip local header for {key}: {err}") from err
+        if len(header) != 30 or header[:4] != b"PK\x03\x04":
+            raise StoreError(f"invalid zip local header for {key}")
+        filename_len, extra_len = struct.unpack_from("<HH", header, 26)
+        return int(info.header_offset + 30 + filename_len + extra_len)
+
+    def chunk_offsets(self, keys: tuple[str, ...], lengths: tuple[int, ...]) -> tuple[int, ...]:
+        """Physical data offsets for many ZIP_STORED entries."""
+        return tuple(
+            0 if length == 0 else self.chunk_offset(key)
+            for key, length in zip(keys, lengths, strict=True)
+        )
 
     def close(self) -> None:
         self._zip.close()
@@ -255,20 +307,20 @@ def _open_store(path: str | os.PathLike[str]) -> Store:
 # ---------------------------------------------------------------------------
 
 
-def _read_json(store: Store, key: str) -> Any:
+def _read_json(store: Store, key: str) -> object:
     try:
         return json.loads(store.read_text(key))
     except json.JSONDecodeError as err:
         raise StoreError(f"invalid JSON in {key}: {err}") from err
 
 
-def _expect_object(value: Any, context: str) -> dict[str, Any]:
+def _expect_object(value: object, context: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise StoreError(f"{context}: expected JSON object, got {type(value).__name__}")
     return value
 
 
-def _is_json_int(value: Any) -> bool:
+def _is_json_int(value: object) -> bool:
     """True for a JSON integer (rejects bools and floats)."""
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -285,21 +337,21 @@ def _expect_zarr_v2(meta: dict[str, Any], context: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _parse_dtype(value: Any, context: str) -> DType:
+def _parse_dtype(value: object, context: str) -> DType:
     try:
         return DType.parse(value)
     except DataError as err:
         raise StoreError(f"{context}: {err}") from err
 
 
-def _parse_order(value: Any, context: str) -> ArrayOrder:
+def _parse_order(value: object, context: str) -> ArrayOrder:
     try:
         return ArrayOrder.parse(value)
     except DataError as err:
         raise StoreError(f"{context}: {err}") from err
 
 
-def _parse_codec(filters: Any, compressor: Any, context: str) -> CodecPipeline:
+def _parse_codec(filters: object, compressor: object, context: str) -> CodecPipeline:
     try:
         return CodecPipeline.from_zarr(filters, compressor)
     except DataError as err:
@@ -337,25 +389,19 @@ def _parse_chunk_index(store: Store, zattrs: dict[str, Any], array_key: str) -> 
     raw = zattrs.get(_SCDATA_KEY)
     if raw is None:
         raise StoreError(
-            f"array {array_key!r} has no '{_SCDATA_KEY}' chunk index; "
-            f"not a scdata-written store"
+            f"array {array_key!r} has no '{_SCDATA_KEY}' chunk index; not a scdata-written store"
         )
     obj = _expect_object(raw, f"{array_key} .zattrs[{_SCDATA_KEY!r}]")
     payload = obj.get("payload")
     if not isinstance(payload, str) or not payload:
-        raise StoreError(
-            f"{array_key} .zattrs[{_SCDATA_KEY!r}].payload must be a non-empty string"
-        )
+        raise StoreError(f"{array_key} .zattrs[{_SCDATA_KEY!r}].payload must be a non-empty string")
     offsets = obj.get("offsets")
     lengths = obj.get("lengths")
     if not isinstance(offsets, list) or not isinstance(lengths, list):
-        raise StoreError(
-            f"{array_key} .zattrs[{_SCDATA_KEY!r}].offsets/lengths must be lists"
-        )
+        raise StoreError(f"{array_key} .zattrs[{_SCDATA_KEY!r}].offsets/lengths must be lists")
     if len(offsets) != len(lengths):
         raise StoreError(
-            f"{array_key}: offsets/lengths length mismatch "
-            f"({len(offsets)} vs {len(lengths)})"
+            f"{array_key}: offsets/lengths length mismatch ({len(offsets)} vs {len(lengths)})"
         )
     locations: list[ChunkLocation] = []
     for i, (off, ln) in enumerate(zip(offsets, lengths)):
@@ -425,8 +471,7 @@ def _validate_payload_locations(
             )
         if end > size:
             raise StoreError(
-                f"{context}: chunk {i} range [{loc.offset}, {end}) exceeds "
-                f"payload size {size}"
+                f"{context}: chunk {i} range [{loc.offset}, {end}) exceeds payload size {size}"
             )
         previous_end = end
 
@@ -448,9 +493,753 @@ class _ZarrArray:
     index: _ChunkIndex
 
 
-def _parse_zarray(
-    store: Store, array_key: str, *, strict: bool = True
-) -> tuple[_ZarrArray, str]:
+# ---------------------------------------------------------------------------
+# zarr v3 array metadata (``zarr.json`` per node, standard chunk files)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _V3Array:
+    """Parsed fields of a zarr v3 array ``zarr.json`` plus chunk-file listing.
+
+    Edge chunks are stored padded to ``chunk_shape`` with the fill value
+    (standard zarr v3); the Rust databank decodes the full padded chunk and
+    the access planner crops to the logical extent.
+    """
+
+    shape: tuple[int, ...]
+    chunk_shape: tuple[int, ...]
+    dtype: DType
+    order: ArrayOrder
+    codec: CodecPipeline
+    #: One store-root-relative path per chunk, C-order logical index.
+    chunk_paths: tuple[str, ...]
+    #: Encoded byte size of each chunk file (parallel to ``chunk_paths``).
+    chunk_lengths: tuple[int, ...]
+    #: Raw ``attributes`` dict from ``zarr.json`` (encoding-type, shape, ...).
+    attrs: dict[str, object]
+    #: Explicit cumulative rectilinear boundaries. Empty for regular grids.
+    chunk_boundaries: tuple[tuple[int, ...], ...] = ()
+    #: Whether the chunk grid is rectilinear (variable-length chunks).
+    rectilinear: bool = False
+
+
+def _v3_node_type(meta: dict[str, object], context: str) -> str:
+    nt = meta.get("node_type")
+    if not isinstance(nt, str):
+        raise StoreError(f"{context}: zarr.json missing 'node_type'")
+    return nt
+
+
+def _v3_dtype(meta: dict[str, object], context: str) -> DType:
+    """Parse a v3 ``data_type`` field into a :class:`DType`.
+
+    v3 uses bare type strings (``"float32"``, ``"int64"``) rather than the v2
+    endianness-prefixed form (``"<f4"``).  anndata writes little-endian
+    implicitly via the ``bytes`` codec; scdata stores are little-endian, so we
+    map the bare name through the existing dtype decoder by synthesizing the
+    little-endian form.  String arrays (``data_type: "string"``) are rejected
+    here — they are metadata-only and handled by the gene-name reader.
+    """
+    raw = meta.get("data_type")
+    if isinstance(raw, dict):
+        # Parameterized type: {"name": "...", "configuration": {...}}.
+        name = raw.get("name")
+    else:
+        name = raw
+    if not isinstance(name, str):
+        raise StoreError(f"{context}: zarr.json data_type must be a string, got {raw!r}")
+    if name in ("string", "variable_length_utf8"):
+        raise StoreError(
+            f"{context}: string arrays are metadata-only; route through the gene-name reader"
+        )
+    # Map the v3 bare name to the little-endian zarr v2 dtype string the
+    # existing DType.parse understands.
+    v3_to_v2 = {
+        "bool": "|b1",
+        "int8": "|i1",
+        "uint8": "|u1",
+        "int16": "<i2",
+        "uint16": "<u2",
+        "int32": "<i4",
+        "uint32": "<u4",
+        "int64": "<i8",
+        "uint64": "<u8",
+        "float16": "<f2",
+        "float32": "<f4",
+        "float64": "<f8",
+        "bfloat16": "bf2",
+    }
+    dtype_str = v3_to_v2.get(name)
+    if dtype_str is None:
+        raise StoreError(f"{context}: unsupported v3 data_type {name!r}")
+    return _parse_dtype(dtype_str, context)
+
+
+def _v3_codec_pipeline(codecs: object, context: str) -> CodecPipeline:
+    """Convert a v3 ``codecs`` list into a numcodecs :class:`CodecPipeline`.
+
+    v3 stores the whole pipeline as one ``codecs`` list: an ArrayBytes
+    serializer (``bytes`` / ``vlen-utf8``) followed by zero or more
+    BytesBytes compressors.  The serializer is a byte-layout codec that Rust
+    does not re-implement (data is already little-endian on disk), so it is
+    dropped; only the compressors are mapped to numcodecs configs that Rust
+    rebuilds via ``codec_pipeline_from_zarr_v2_json_str``.
+
+    Supports the compressors anndata/zarr write by default (``zstd``, ``blosc``,
+    ``lz4``-via-blosc) plus an uncompressed pipeline (``bytes`` only).
+    """
+    if not isinstance(codecs, list):
+        raise StoreError(f"{context}: zarr.json codecs must be a list, got {type(codecs).__name__}")
+    compressors: list[dict[str, Any]] = []
+    for entry in codecs:
+        if not isinstance(entry, dict):
+            raise StoreError(f"{context}: codec entry must be an object, got {entry!r}")
+        name = entry.get("name")
+        config = entry.get("configuration")
+        if not isinstance(name, str):
+            raise StoreError(f"{context}: codec entry missing 'name'")
+        cfg: dict[str, Any] = dict(config) if isinstance(config, dict) else {}
+        if name == "bytes":
+            # Serializer (endian handling) — data is little-endian on disk;
+            # Rust reads raw bytes.  No numcodecs filter produced.
+            continue
+        if name == "vlen-utf8":
+            # String serializer (ArrayBytesCodec for ``data_type: "string"``).
+            # String arrays are decoded by the gene-name reader, which calls
+            # numcodecs VLenUTF8 directly; nothing is added to the Rust
+            # numeric codec pipeline here.
+            continue
+        cid = _v3_codec_id(name)
+        if cid is None:
+            raise StoreError(f"{context}: unsupported v3 codec {name!r}")
+        numcodecs_cfg = _v3_to_numcodecs(cid, cfg, context)
+        if numcodecs_cfg is not None:
+            compressors.append(numcodecs_cfg)
+    if not compressors:
+        return CodecPipeline()
+    if len(compressors) == 1:
+        return CodecPipeline(compressor=compressors[0])
+    # v3 allows multiple BytesBytes codecs; scdata's Rust pipeline applies
+    # filters-then-compressor, so fold extra compressors into the filter list
+    # in reverse decode order (last listed = decoded first).
+    return CodecPipeline(
+        filters=tuple(reversed(compressors[:-1])),
+        compressor=compressors[-1],
+    )
+
+
+def _v3_codec_id(name: str) -> str | None:
+    """Map a v3 codec name to its numcodecs ``id`` (or None if not a compressor)."""
+    return {
+        "zstd": "zstd",
+        "blosc": "blosc",
+        "lz4": "lz4",
+        "gzip": "gzip",
+        "zlib": "gzip",
+    }.get(name)
+
+
+def _v3_to_numcodecs(codec_id: str, cfg: dict[str, Any], context: str) -> dict[str, Any] | None:
+    """Translate a v3 compressor configuration to a numcodecs config dict."""
+    if codec_id == "zstd":
+        return {
+            "id": "zstd",
+            "level": int(cfg.get("level", 0)),
+            "checksum": bool(cfg.get("checksum", False)),
+        }
+    if codec_id == "blosc":
+        return {
+            "id": "blosc",
+            "cname": str(cfg.get("cname", "lz4")),
+            "clevel": int(cfg.get("clevel", 5)),
+            "shuffle": int(cfg.get("shuffle", 1)),
+            "blocksize": int(cfg.get("blocksize", 0)),
+            "typesize": int(cfg.get("typesize", 1)),
+        }
+    if codec_id == "lz4":
+        # numcodecs has no standalone lz4 compressor entry that zarr v3 emits;
+        # lz4 in v3 is normally via blosc.  Fall back to blosc-lz4.
+        return {
+            "id": "blosc",
+            "cname": "lz4",
+            "clevel": int(cfg.get("acceleration", 1)),
+            "shuffle": 0,
+            "blocksize": 0,
+            "typesize": 1,
+        }
+    if codec_id == "gzip":
+        return {"id": "gzip", "level": int(cfg.get("level", 5))}
+    raise StoreError(f"{context}: cannot translate codec {codec_id!r} to numcodecs")
+
+
+def _v3_chunk_key(separator: str, coord: tuple[int, ...], default_encoding: bool) -> str:
+    """Build the on-disk chunk key for one chunk coordinate under v3.
+
+    ``default_encoding=True`` uses the v3 default (``c`` prefix + separator),
+    e.g. ``c/0/0``; ``False`` uses the v2-style encoding (no prefix), e.g.
+    ``0.0``.  Both are legal v3; anndata writes the default form.
+    """
+    if default_encoding:
+        return "c" + separator + separator.join(str(c) for c in coord)
+    return separator.join(str(c) for c in coord)
+
+
+def _chunk_coords(shape: tuple[int, ...], chunks: tuple[int, ...]):
+    """Yield C-order chunk grid coordinates for ``shape`` / ``chunks``."""
+    grid = tuple(_ceil_div(s, c) for s, c in zip(shape, chunks))
+    total = 1
+    for g in grid:
+        total *= g
+    for linear in range(total):
+        coord = [0] * len(grid)
+        x = linear
+        for axis in range(len(grid) - 1, -1, -1):
+            coord[axis] = x % grid[axis]
+            x //= grid[axis]
+        yield tuple(coord)
+
+
+def _v3_chunk_files(
+    store: Store,
+    array_key: str,
+    shape: tuple[int, ...],
+    chunk_shape: tuple[int, ...],
+    chunk_key_encoding: object,
+    context: str,
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """List the chunk files for a v3 array in C-order logical index.
+
+    Returns ``(paths, lengths)`` where ``paths`` are store-root-relative keys
+    and ``lengths`` are each chunk file's encoded byte size.  Missing chunk
+    files are treated as zero-length (fill-value-only) chunks, matching zarr's
+    "absent chunk == all fill value" semantics — but scdata-written stores
+    always materialize every chunk, so a missing file on a scdata store is an
+    error surfaced elsewhere.
+    """
+    sep = "/"
+    default_encoding = True
+    if isinstance(chunk_key_encoding, dict):
+        name = chunk_key_encoding.get("name")
+        cfg = chunk_key_encoding.get("configuration")
+        if isinstance(name, str):
+            if name == "v2":
+                default_encoding = False
+            elif name == "default":
+                default_encoding = True
+            else:
+                raise StoreError(f"{context}: unsupported chunk_key_encoding {name!r}")
+        if isinstance(cfg, dict):
+            s = cfg.get("separator")
+            if isinstance(s, str) and s in (".", "/"):
+                sep = s
+
+    paths: list[str] = []
+    lengths: list[int] = []
+    for coord in _chunk_coords(shape, chunk_shape):
+        key = f"{array_key}/{_v3_chunk_key(sep, coord, default_encoding)}"
+        if store.exists(key):
+            paths.append(key)
+            lengths.append(store.size(key))
+        else:
+            # Absent chunk: zarr treats it as all-fill-value.  We record a
+            # zero-length placeholder so the chunk grid stays aligned; the
+            # databank does not decode zero-length chunks (fill value only).
+            paths.append(key)
+            lengths.append(0)
+    return tuple(paths), tuple(lengths)
+
+
+def _v3_rectilinear_edges(
+    grid_cfg: dict[str, object], shape: tuple[int, ...], context: str
+) -> tuple[int, ...]:
+    """Expand a v3 rectilinear chunk grid config into a flat edge list.
+
+    scdata's cell-aligned CSR arrays are 1D, so we only need the first axis's
+    edge list.  Each edge is a chunk's element count; their sum must equal
+    ``shape[0]``.  Edges may be RLE-encoded (``[[count, value], ...]``) or a
+    bare list of ints.
+    """
+    chunk_shapes = grid_cfg.get("chunk_shapes")
+    if not isinstance(chunk_shapes, list) or not chunk_shapes:
+        raise StoreError(f"{context}: rectilinear chunk_grid needs chunk_shapes")
+    axis = chunk_shapes[0]
+    edges: list[int] = []
+    if isinstance(axis, int):
+        # Bare int shorthand: a regular step that repeats to cover the axis.
+        total = shape[0] if shape else 0
+        n = _ceil_div(total, axis) if axis else 0
+        edges = [axis] * n
+    elif isinstance(axis, list):
+        for e in axis:
+            if isinstance(e, int):
+                edges.append(e)
+            elif isinstance(e, list) and len(e) == 2:
+                # RLE: [count, value].
+                count, value = e
+                edges.extend([value] * count)
+            else:
+                raise StoreError(f"{context}: bad rectilinear edge {e!r}")
+    else:
+        raise StoreError(f"{context}: bad rectilinear axis spec {axis!r}")
+    if any(edge < 0 for edge in edges):
+        raise StoreError(f"{context}: rectilinear edge lengths must be non-negative")
+    total = sum(edges)
+    expected = shape[0] if shape else 0
+    if total != expected:
+        raise StoreError(f"{context}: rectilinear edge lengths sum to {total}, expected {expected}")
+    return tuple(edges)
+
+
+def _rectilinear_boundaries(edges: tuple[int, ...]) -> tuple[int, ...]:
+    out = [0]
+    for edge in edges:
+        out.append(out[-1] + edge)
+    return tuple(out)
+
+
+def _v3_rectilinear_chunk_files(
+    store: Store,
+    array_key: str,
+    num_chunks: int,
+    chunk_key_encoding: object,
+    context: str,
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """List the chunk files for a 1D rectilinear array (one file per edge)."""
+    sep = "/"
+    default_encoding = True
+    if isinstance(chunk_key_encoding, dict):
+        name = chunk_key_encoding.get("name")
+        cfg = chunk_key_encoding.get("configuration")
+        if isinstance(name, str) and name == "v2":
+            default_encoding = False
+        if isinstance(cfg, dict):
+            s = cfg.get("separator")
+            if isinstance(s, str) and s in (".", "/"):
+                sep = s
+    paths: list[str] = []
+    lengths: list[int] = []
+    for i in range(num_chunks):
+        coord = (i,)
+        key = f"{array_key}/{_v3_chunk_key(sep, coord, default_encoding)}"
+        if store.exists(key):
+            paths.append(key)
+            lengths.append(store.size(key))
+        else:
+            paths.append(key)
+            lengths.append(0)
+    return tuple(paths), tuple(lengths)
+
+
+def _parse_v3_array(store: Store, array_key: str) -> _V3Array:
+    """Parse a v3 array ``zarr.json`` and list its chunk files."""
+    key = f"{array_key}/zarr.json"
+    meta = _expect_object(_read_json(store, key), key)
+    if _v3_node_type(meta, key) != "array":
+        raise StoreError(f"{key}: expected node_type 'array'")
+    shape = _parse_shape(meta.get("shape"), key)
+    chunk_grid = meta.get("chunk_grid")
+    if not isinstance(chunk_grid, dict):
+        raise StoreError(f"{key}: chunk_grid must be an object")
+    grid_name = chunk_grid.get("name")
+    grid_cfg = chunk_grid.get("configuration")
+    if not isinstance(grid_cfg, dict):
+        raise StoreError(f"{key}: chunk_grid missing configuration")
+
+    rectilinear = False
+    if grid_name == "regular":
+        chunk_shape = _parse_chunk_shape(grid_cfg.get("chunk_shape"), key)
+        chunk_paths, chunk_lengths = _v3_chunk_files(
+            store,
+            array_key,
+            shape,
+            chunk_shape,
+            meta.get("chunk_key_encoding"),
+            key,
+        )
+        chunk_boundaries: tuple[tuple[int, ...], ...] = ()
+    elif grid_name == "rectilinear":
+        # Variable-length chunk grid: the configuration lists per-axis edge
+        # lengths.  scdata uses this for cell-aligned CSR 1D arrays; each edge
+        # is one chunk file.  ``chunk_shape`` is a placeholder (first edge).
+        rectilinear = True
+        edges = _v3_rectilinear_edges(grid_cfg, shape, key)
+        chunk_shape = (edges[0],) if edges else (1,)
+        chunk_boundaries = (_rectilinear_boundaries(edges),)
+        chunk_paths, chunk_lengths = _v3_rectilinear_chunk_files(
+            store,
+            array_key,
+            len(edges),
+            meta.get("chunk_key_encoding"),
+            key,
+        )
+    else:
+        raise StoreError(f"{key}: unsupported chunk_grid name {grid_name!r}")
+
+    if len(shape) != len(chunk_shape):
+        raise StoreError(f"{key}: shape rank {len(shape)} != chunks rank {len(chunk_shape)}")
+    dtype = _v3_dtype(meta, key)
+    order = _parse_order(meta.get("order"), key)
+    codec = _v3_codec_pipeline(meta.get("codecs"), key)
+    attrs = (
+        _expect_object(meta.get("attributes"), f"{key} attributes")
+        if isinstance(meta.get("attributes"), dict)
+        else {}
+    )
+    return _V3Array(
+        shape=shape,
+        chunk_shape=chunk_shape,
+        dtype=dtype,
+        order=order,
+        codec=codec,
+        chunk_paths=chunk_paths,
+        chunk_lengths=chunk_lengths,
+        attrs=attrs,
+        chunk_boundaries=chunk_boundaries,
+        rectilinear=rectilinear,
+    )
+
+
+def _v3_array_to_meta(arr: _V3Array, store: Store) -> ArrayMeta:
+    """Build a ``store_kind="dir"`` :class:`ArrayMeta` from a v3 array.
+
+    ``store`` is consulted for per-chunk byte offsets: a directory store reads
+    each chunk from offset 0, while a ``.zarr.zip`` store reads each chunk from
+    its physical offset inside the zip archive.
+    """
+    chunk_offsets = _chunk_offsets(store, arr.chunk_paths, arr.chunk_lengths)
+    chunk_file_paths = _chunk_source_paths(store, arr.chunk_paths)
+    variable = _is_rectilinear(arr)
+    return ArrayMeta.from_directory(
+        shape=arr.shape,
+        chunk_shape=arr.chunk_shape,
+        dtype=arr.dtype,
+        chunk_paths=arr.chunk_paths,
+        chunk_file_paths=chunk_file_paths,
+        chunk_lengths=arr.chunk_lengths,
+        order=arr.order,
+        codec=arr.codec,
+        variable_chunks=variable,
+        chunk_boundaries=arr.chunk_boundaries,
+        chunk_offsets=chunk_offsets,
+    )
+
+
+def _is_rectilinear(arr: _V3Array) -> bool:
+    """True if the array uses a rectilinear (variable-length) chunk grid."""
+    # Stored on the parsed _V3Array via the raw metadata; we re-detect by
+    # checking the chunk grid name carried alongside the array.  The launch
+    # path sets this attribute when it parses the chunk grid.
+    return bool(getattr(arr, "rectilinear", False))
+
+
+def _chunk_offsets(
+    store: Store, chunk_paths: tuple[str, ...], chunk_lengths: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Per-chunk byte offset within its file.
+
+    For a directory store (one file per chunk) this is always 0.  For a
+    ``.zarr.zip`` store every chunk lives in the same zip file, so this is the
+    chunk's physical byte offset inside the archive — the Rust reader preads
+    the chunk directly out of the zip file.
+    """
+    if hasattr(store, "chunk_offsets"):
+        return cast(Any, store).chunk_offsets(chunk_paths, chunk_lengths)
+    if hasattr(store, "chunk_offset"):
+        # Only ``_ZipStore`` exposes per-entry physical offsets; ``hasattr``
+        # gates the duck-typed call, and the cast narrows past it for typing.
+        offset_store = cast(Any, store)
+        return tuple(
+            0 if length == 0 else offset_store.chunk_offset(path)
+            for path, length in zip(chunk_paths, chunk_lengths)
+        )
+    return tuple(0 for _ in chunk_paths)
+
+
+def _chunk_source_paths(store: Store, chunk_paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Local files Rust should open for per-chunk zarr keys."""
+    if hasattr(store, "source_path"):
+        path_store = cast(Any, store)
+        return tuple(path_store.source_path(path) for path in chunk_paths)
+    return ()
+
+
+def _source_path(store: Store, key: str) -> str:
+    """Local file Rust should open for a zarr key, if the store can expose it."""
+    if hasattr(store, "source_path"):
+        return cast(Any, store).source_path(key)
+    return ""
+
+
+def _source_offset(store: Store, key: str) -> int:
+    """Physical byte offset for a zarr key within its local source file."""
+    if hasattr(store, "chunk_offset"):
+        return cast(Any, store).chunk_offset(key)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# v3 dense / sparse dataset assembly
+# ---------------------------------------------------------------------------
+
+
+def _v3_build_dense_dataset(
+    store: Store, x_key: str, gene_names: tuple[str, ...], store_root: str
+) -> DenseDataset:
+    """Build a :class:`DenseDataset` from a v3 dense ``X`` array.
+
+    The array may be 2D ``[cells, genes]`` (standard, anndata-readable) or 1D
+    ``[cells * genes]`` (scdata's flattened layout for cell-aligned chunking).
+    For 1D the gene count comes from ``var`` and ``num_cells`` is derived.
+    """
+    arr = _parse_v3_array(store, x_key)
+    meta = _v3_array_to_meta(arr, store)
+
+    if len(arr.shape) == 2:
+        num_cells, num_genes = arr.shape
+    elif len(arr.shape) == 1:
+        num_genes = len(gene_names)
+        if num_genes == 0:
+            raise StoreError("dense 1D array but var has no gene names")
+        total = arr.shape[0]
+        if total % num_genes != 0:
+            raise StoreError(f"dense 1D length {total} not divisible by gene count {num_genes}")
+        num_cells = total // num_genes
+    else:
+        raise StoreError(f"dense X must be 1D or 2D, got shape {arr.shape}")
+
+    if num_genes != len(gene_names):
+        raise StoreError(f"X has {num_genes} genes but var has {len(gene_names)} gene names")
+    try:
+        return DenseDataset(
+            gene_names=gene_names,
+            data=meta,
+            num_cells=num_cells,
+            num_genes=num_genes,
+            store_root=store_root,
+        )
+    except ValueError as err:
+        raise StoreError(f"{x_key}: {err}") from err
+
+
+def _v3_read_gene_names(store: Store, var_key: str) -> tuple[str, ...]:
+    """Read the var index as gene names from a v3 store.
+
+    The var group is a v3 group; its ``_index`` child is a v3 string array
+    (``data_type: "string"``).  String chunk files decode via the VLenUTF8
+    codec embedded in the chunk itself, so we read+decode them here.
+    """
+    group_key = f"{var_key}/zarr.json"
+    if not store.exists(group_key):
+        raise StoreError(f"missing var group: {var_key}")
+    group_meta = _expect_object(_read_json(store, group_key), group_key)
+    if _v3_node_type(group_meta, group_key) != "group":
+        raise StoreError(f"{var_key}: expected v3 group")
+
+    attrs = group_meta.get("attributes")
+    index_name = "_index"
+    if isinstance(attrs, dict):
+        declared = attrs.get("_index")
+        if isinstance(declared, str) and declared:
+            index_name = declared
+
+    candidates = [index_name, "_index", "index"]
+    seen: set[str] = set()
+    index_key: str | None = None
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if store.exists(f"{var_key}/{candidate}/zarr.json"):
+            index_key = f"{var_key}/{candidate}"
+            break
+    if index_key is None:
+        raise StoreError(f"cannot find var index array under {var_key}")
+
+    return _v3_read_string_array(store, index_key)
+
+
+def _v3_read_string_array(store: Store, array_key: str) -> tuple[str, ...]:
+    """Decode a v3 string array (``data_type: "string"``) to Python strings.
+
+    v3 stores strings as ``data_type: "string"`` with a ``vlen-utf8`` serializer
+    codec; each chunk file is an independently encoded VLenUTF8 frame (optionally
+    compressed by a following BytesBytes codec).  We decode chunk-by-chunk.
+
+    This bypasses :func:`_parse_v3_array` (which rejects string dtypes) and
+    reads the chunk grid + codec pipeline directly.
+    """
+    key = f"{array_key}/zarr.json"
+    meta = _expect_object(_read_json(store, key), key)
+    if _v3_node_type(meta, key) != "array":
+        raise StoreError(f"{key}: expected node_type 'array'")
+    shape = _parse_shape(meta.get("shape"), key)
+    if len(shape) != 1:
+        raise StoreError(f"{array_key}: string array must be 1D, got shape {shape}")
+    count = shape[0]
+    chunk_grid = meta.get("chunk_grid")
+    if not isinstance(chunk_grid, dict) or chunk_grid.get("name") != "regular":
+        raise StoreError(f"{key}: string array must use a regular chunk grid")
+    grid_cfg = chunk_grid.get("configuration")
+    if not isinstance(grid_cfg, dict):
+        raise StoreError(f"{key}: chunk_grid missing configuration")
+    chunk_shape = _parse_chunk_shape(grid_cfg.get("chunk_shape"), key)
+    codec = _v3_codec_pipeline(meta.get("codecs"), key)
+    chunk_paths, chunk_lengths = _v3_chunk_files(
+        store,
+        array_key,
+        shape,
+        chunk_shape,
+        meta.get("chunk_key_encoding"),
+        key,
+    )
+    names: list[str] = []
+    for path, length in zip(chunk_paths, chunk_lengths):
+        if length == 0:
+            continue
+        raw = store.read_bytes(path)
+        names.extend(_decode_v3_string_chunk(raw, codec))
+    if len(names) < count:
+        names.extend([""] * (count - len(names)))
+    return tuple(names[:count])
+
+
+def _decode_v3_string_chunk(raw: bytes, codec: CodecPipeline) -> list[str]:
+    """Decode one v3 string-array chunk: compressor first, then VLenUTF8.
+
+    The v3 ``vlen-utf8`` codec is the serializer (innermost); compressors in
+    ``codec.filters`` / ``codec.compressor`` wrap it.  We reuse the existing
+    numcodecs-backed decoders, then run VLenUTF8 on the decompressed bytes.
+    """
+    from numcodecs import VLenUTF8, get_codec
+
+    data = raw
+    try:
+        if codec.compressor is not None:
+            data = _as_bytes(get_codec(dict(codec.compressor)).decode(data))
+        for flt in reversed(codec.filters):
+            data = _as_bytes(get_codec(dict(flt)).decode(data))
+    except Exception as err:
+        raise StoreError(f"failed to decode v3 string chunk: {err}") from err
+    arr = np.asarray(VLenUTF8().decode(_as_bytes(data)))
+    return [str(s) for s in arr.tolist()]
+
+
+def _v3_read_x_shape_attr(store: Store, x_key: str) -> tuple[int, int] | None:
+    """Read anndata's sparse ``shape`` attr from a v3 ``X`` group's zarr.json."""
+    key = f"{x_key}/zarr.json"
+    if not store.exists(key):
+        return None
+    meta = _expect_object(_read_json(store, key), key)
+    attrs = meta.get("attributes")
+    if not isinstance(attrs, dict):
+        return None
+    raw = attrs.get("shape")
+    if raw is None:
+        return None
+    shape = _parse_shape(raw, f"{key} attributes")
+    if len(shape) != 2:
+        raise StoreError(f"{x_key}: sparse matrix shape must be 2D, got {shape}")
+    return shape[0], shape[1]
+
+
+def _v3_build_sparse_dataset(
+    store: Store, x_key: str, gene_names: tuple[str, ...], store_root: str
+) -> SparseDataset:
+    """Build a :class:`SparseDataset` from a v3 anndata CSR ``X`` group."""
+    group_key = f"{x_key}/zarr.json"
+    if not store.exists(group_key):
+        raise StoreError(f"sparse X must be a v3 group: {x_key}")
+    group_meta = _expect_object(_read_json(store, group_key), group_key)
+    if _v3_node_type(group_meta, group_key) != "group":
+        raise StoreError(f"{x_key}: expected v3 group for CSR matrix")
+    x_shape = _v3_read_x_shape_attr(store, x_key)
+
+    # indptr: length num_cells+1; decoded into a uint64 numpy array in memory.
+    indptr_arr = _parse_v3_array(store, f"{x_key}/indptr")
+    if len(indptr_arr.shape) != 1:
+        raise StoreError(f"{x_key}/indptr must be 1D, got shape {indptr_arr.shape}")
+    num_cells = indptr_arr.shape[0] - 1
+    indptr = _v3_decode_index_array(store, indptr_arr, num_cells + 1)
+
+    indices_arr = _parse_v3_array(store, f"{x_key}/indices")
+    data_arr = _parse_v3_array(store, f"{x_key}/data")
+    if len(indices_arr.shape) != 1 or len(data_arr.shape) != 1:
+        raise StoreError(f"{x_key}/indices and data must be 1D")
+
+    nnz = int(indptr[-1]) if len(indptr) else 0
+    if indices_arr.shape[0] != nnz:
+        raise StoreError(f"{x_key}/indices length {indices_arr.shape[0]} != nnz {nnz}")
+    if data_arr.shape[0] != nnz:
+        raise StoreError(f"{x_key}/data length {data_arr.shape[0]} != nnz {nnz}")
+    if not indices_arr.dtype.is_csr_index:
+        raise StoreError(f"{x_key}/indices dtype {indices_arr.dtype!r} not a CSR index")
+
+    if x_shape is not None:
+        shape_cells, shape_genes = x_shape
+        if shape_cells != num_cells:
+            raise StoreError(
+                f"{x_key}: X shape has {shape_cells} cells but indptr implies {num_cells}"
+            )
+        if shape_genes != len(gene_names):
+            raise StoreError(
+                f"{x_key}: X shape has {shape_genes} genes but var has {len(gene_names)} gene names"
+            )
+        num_genes = shape_genes
+    else:
+        num_genes = len(gene_names)
+
+    indices_meta = _v3_array_to_meta(indices_arr, store)
+    data_meta = _v3_array_to_meta(data_arr, store)
+    try:
+        return SparseDataset(
+            gene_names=gene_names,
+            indptr=np.asarray(indptr, dtype=np.uint64),
+            indices=indices_meta,
+            data=data_meta,
+            index_dtype=indices_arr.dtype,
+            num_cells=num_cells,
+            num_genes=num_genes,
+            store_root=store_root,
+        )
+    except ValueError as err:
+        raise StoreError(f"{x_key}: {err}") from err
+
+
+def _v3_decode_index_array(store: Store, arr: _V3Array, count: int) -> list[int] | np.ndarray:
+    """Decode a 1D integer v3 array (indptr) to uint64-compatible values."""
+    if arr.dtype not in _INTEGER_DTYPES:
+        raise StoreError(f"index array dtype {arr.dtype!r} must be an integer type")
+    if _decode_index_chunks is not None:
+        chunks = [
+            store.read_bytes(path)
+            for path, length in zip(arr.chunk_paths, arr.chunk_lengths, strict=True)
+            if length != 0
+        ]
+        try:
+            return _decode_index_chunks(chunks, arr.dtype, arr.codec, count)
+        except Exception:
+            pass
+    np_dtype = np.dtype(_dtype_to_numpy(arr.dtype))
+    item = np_dtype.itemsize
+    out: list[int] = []
+    for path, length in zip(arr.chunk_paths, arr.chunk_lengths):
+        if length == 0:
+            continue
+        raw = store.read_bytes(path)
+        dec = _decode_chunk_bytes(raw, arr.codec)
+        if len(dec) % item != 0:
+            raise StoreError(
+                f"index chunk decoded to {len(dec)} bytes, not a multiple of itemsize {item}"
+            )
+        arr_vals = np.frombuffer(dec, dtype=np_dtype)
+        out.extend(int(x) for x in arr_vals.tolist())
+    if len(out) < count:
+        out.extend([0] * (count - len(out)))
+    return out[:count]
+
+
+def _parse_zarray(store: Store, array_key: str, *, strict: bool = True) -> tuple[_ZarrArray, str]:
     """Parse ``<array_key>/.zarray`` + ``.zattrs`` (scdata index).
 
     When ``strict`` is True (the default, used by the Rust-facing reader) the
@@ -469,9 +1258,7 @@ def _parse_zarray(
     shape = _parse_shape(meta.get("shape"), zarray_key)
     chunks = _parse_chunk_shape(meta.get("chunks"), zarray_key)
     if len(shape) != len(chunks):
-        raise StoreError(
-            f"{zarray_key}: shape rank {len(shape)} != chunks rank {len(chunks)}"
-        )
+        raise StoreError(f"{zarray_key}: shape rank {len(shape)} != chunks rank {len(chunks)}")
     dtype = _parse_dtype(meta.get("dtype"), zarray_key)
     order = _parse_order(meta.get("order"), zarray_key)
     codec = _parse_codec(meta.get("filters"), meta.get("compressor"), zarray_key)
@@ -487,8 +1274,7 @@ def _parse_zarray(
         grid *= _ceil_div(s, c)
     if strict and index.num_chunks != grid:
         raise StoreError(
-            f"{array_key}: scdata index has {index.num_chunks} chunks but "
-            f"chunk grid expects {grid}"
+            f"{array_key}: scdata index has {index.num_chunks} chunks but chunk grid expects {grid}"
         )
 
     payload = _resolve_payload_path(store, array_key, index.payload)
@@ -506,7 +1292,7 @@ def _parse_zarray(
     )
 
 
-def _parse_shape(raw: Any, context: str) -> tuple[int, ...]:
+def _parse_shape(raw: object, context: str) -> tuple[int, ...]:
     if not isinstance(raw, list) or not raw:
         raise StoreError(f"{context}: shape must be a non-empty list")
     if not all(_is_json_int(s) for s in raw):
@@ -517,7 +1303,7 @@ def _parse_shape(raw: Any, context: str) -> tuple[int, ...]:
     return shape
 
 
-def _parse_chunk_shape(raw: Any, context: str) -> tuple[int, ...]:
+def _parse_chunk_shape(raw: object, context: str) -> tuple[int, ...]:
     if not isinstance(raw, list) or not raw:
         raise StoreError(f"{context}: chunks must be a non-empty list")
     if not all(_is_json_int(c) for c in raw):
@@ -532,15 +1318,17 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
 
 
-def _build_array_meta(arr: _ZarrArray, payload: str, context: str) -> ArrayMeta:
+def _build_array_meta(store: Store, arr: _ZarrArray, payload: str, context: str) -> ArrayMeta:
     try:
-        return ArrayMeta(
+        return ArrayMeta.from_chunks(
             shape=arr.shape,
             chunk_shape=arr.chunk_shape,
             dtype=arr.dtype,
             order=arr.order,
             codec=arr.codec,
             payload_path=payload,
+            payload_file_path=_source_path(store, payload),
+            chunk_offset_base=_source_offset(store, payload),
             chunks=arr.index.locations,
         )
     except ValueError as err:
@@ -552,7 +1340,7 @@ def _build_array_meta(arr: _ZarrArray, payload: str, context: str) -> ArrayMeta:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_x_encoding(enc: Any) -> str | None:
+def _normalize_x_encoding(enc: object) -> str | None:
     """Map an anndata ``encoding-type`` to a scdata canonical name.
 
     anndata writes ``"array"`` (dense), ``"csr_matrix"`` / ``"csc_matrix"``
@@ -588,16 +1376,12 @@ def _detect_x_encoding(store: Store, x_key: str) -> str:
         if norm is not None:
             return norm
         if encoding_type is not None:
-            raise StoreError(
-                f"{x_key}: unsupported 'encoding-type' in .zattrs: {encoding_type!r}"
-            )
+            raise StoreError(f"{x_key}: unsupported 'encoding-type' in .zattrs: {encoding_type!r}")
     # No (or incomplete) attrs: only dense arrays are safe to infer.
     if store.exists(f"{x_key}/.zarray"):
         return "array"
     if has_attrs:
-        raise StoreError(
-            f"{x_key}: unsupported or missing 'encoding-type' in .zattrs"
-        )
+        raise StoreError(f"{x_key}: unsupported or missing 'encoding-type' in .zattrs")
     raise StoreError(f"{x_key}: missing .zattrs and not a dense array")
 
 
@@ -654,9 +1438,7 @@ def _read_gene_names(store: Store, var_key: str) -> tuple[str, ...]:
             index_key = f"{var_key}/{candidate}"
             break
     if index_key is None:
-        raise StoreError(
-            f"cannot find var index array under {var_key}/_index or {var_key}/index"
-        )
+        raise StoreError(f"cannot find var index array under {var_key}/_index or {var_key}/index")
 
     meta = _expect_object(_read_json(store, f"{index_key}/.zarray"), index_key)
     _expect_zarr_v2(meta, f"{index_key}/.zarray")
@@ -666,9 +1448,7 @@ def _read_gene_names(store: Store, var_key: str) -> tuple[str, ...]:
         raise StoreError(f"{index_key}: dtype must be a string, got {dtype_raw!r}")
     kind = _string_dtype_kind(dtype_raw)
     if kind is None:
-        raise StoreError(
-            f"{index_key}: var index dtype {dtype_raw!r} is not a string type"
-        )
+        raise StoreError(f"{index_key}: var index dtype {dtype_raw!r} is not a string type")
 
     shape = _parse_shape(meta.get("shape"), index_key)
     if len(shape) != 1:
@@ -676,9 +1456,7 @@ def _read_gene_names(store: Store, var_key: str) -> tuple[str, ...]:
     count = shape[0]
     codec = _parse_codec(meta.get("filters"), meta.get("compressor"), index_key)
     if kind == "O" and _find_vlen_utf8_filter(codec.filters) is None:
-        raise StoreError(
-            f"{index_key}: object dtype string array requires a VLenUTF8 filter"
-        )
+        raise StoreError(f"{index_key}: object dtype string array requires a VLenUTF8 filter")
 
     zattrs: dict[str, Any] = {}
     zattrs_key = f"{index_key}/.zattrs"
@@ -694,11 +1472,17 @@ def _read_gene_names(store: Store, var_key: str) -> tuple[str, ...]:
 
 
 def _as_bytes(value: Any) -> bytes:
-    """Coerce a numcodecs decode result (bytes / buffer / array) to bytes."""
+    """Coerce a numcodecs decode result (bytes / buffer / array) to bytes.
+
+    ``value`` is typed :data:`~typing.Any` because numcodecs ships no type
+    stubs, so its ``decode`` return is ``Unknown`` to pyright; the runtime
+    branches narrow it to the real bytes / buffer / ndarray shapes.
+    """
     if isinstance(value, bytes):
         return value
     if isinstance(value, (bytearray, memoryview)):
         return bytes(value)
+    # ndarray (or anything duck-typed with ``.tobytes`` from numcodecs).
     if hasattr(value, "tobytes"):
         return value.tobytes()
     return bytes(value)
@@ -780,13 +1564,16 @@ def _decode_vlen_chunks(
     vlen_codec = get_codec(dict(vlen_filter))
     out: list[str] = []
     for loc in chunks:
-        data = payload[loc.offset:loc.offset + loc.length]
+        data = payload[loc.offset : loc.offset + loc.length]
         try:
             if codec.compressor is not None:
                 data = _as_bytes(get_codec(dict(codec.compressor)).decode(data))
             for flt in reversed(other_filters):
                 data = _as_bytes(get_codec(dict(flt)).decode(data))
-            arr = vlen_codec.decode(_as_bytes(data))
+            # ``vlen_codec.decode`` returns a numpy object array of str, but
+            # numcodecs ships no type stubs, so pyright sees it as Unknown and
+            # narrows to None.  ``np.asarray`` re-establishes a real type.
+            arr = np.asarray(vlen_codec.decode(_as_bytes(data)))
         except Exception as err:
             raise StoreError(f"failed to decode VLenUTF8 chunk: {err}") from err
         out.extend(arr.tolist())
@@ -805,8 +1592,6 @@ def _decode_string_array(
     Dispatches on dtype kind (``|S`` / ``<U`` / ``|O``); each chunk is sliced
     from the payload by its ``(offset, length)`` and decoded independently.
     """
-    import numpy as np
-
     kind = _string_dtype_kind(dtype)
     if kind == "O":
         names = _decode_vlen_chunks(payload, chunks, codec)
@@ -815,12 +1600,11 @@ def _decode_string_array(
         item = np_dt.itemsize
         names: list[str] = []
         for loc in chunks:
-            raw = payload[loc.offset:loc.offset + loc.length]
+            raw = payload[loc.offset : loc.offset + loc.length]
             dec = _decode_chunk_bytes(raw, codec)
             if len(dec) % item != 0:
                 raise StoreError(
-                    f"string chunk decoded to {len(dec)} bytes, "
-                    f"not a multiple of itemsize {item}"
+                    f"string chunk decoded to {len(dec)} bytes, not a multiple of itemsize {item}"
                 )
             arr = np.frombuffer(dec, dtype=np_dt)
             if kind == "S":
@@ -830,9 +1614,7 @@ def _decode_string_array(
     else:
         raise StoreError(f"unsupported string dtype {dtype!r}")
     if len(names) != count:
-        raise StoreError(
-            f"string array decoded {len(names)} elements, expected {count}"
-        )
+        raise StoreError(f"string array decoded {len(names)} elements, expected {count}")
     return names
 
 
@@ -841,10 +1623,12 @@ def _decode_string_array(
 # ---------------------------------------------------------------------------
 
 
-def _build_dense_dataset(store: Store, x_key: str, gene_names: tuple[str, ...]) -> DenseDataset:
+def _build_dense_dataset(
+    store: Store, x_key: str, gene_names: tuple[str, ...], store_root: str
+) -> DenseDataset:
     """Build a :class:`DenseDataset` from ``X`` stored as a dense zarr array."""
     arr, payload = _parse_zarray(store, x_key)
-    meta = _build_array_meta(arr, payload, x_key)
+    meta = _build_array_meta(store, arr, payload, x_key)
 
     if len(arr.shape) == 2:
         num_cells, num_genes = arr.shape
@@ -855,30 +1639,27 @@ def _build_dense_dataset(store: Store, x_key: str, gene_names: tuple[str, ...]) 
             raise StoreError("dense 1D array but var has no gene names")
         total = arr.shape[0]
         if total % num_genes != 0:
-            raise StoreError(
-                f"dense 1D length {total} not divisible by gene count {num_genes}"
-            )
+            raise StoreError(f"dense 1D length {total} not divisible by gene count {num_genes}")
         num_cells = total // num_genes
     else:
         raise StoreError(f"dense X must be 1D or 2D, got shape {arr.shape}")
 
     if num_genes != len(gene_names):
-        raise StoreError(
-            f"X has {num_genes} genes but var has {len(gene_names)} gene names"
-        )
+        raise StoreError(f"X has {num_genes} genes but var has {len(gene_names)} gene names")
     try:
         return DenseDataset(
             gene_names=gene_names,
             data=meta,
             num_cells=num_cells,
             num_genes=num_genes,
+            store_root=store_root,
         )
     except ValueError as err:
         raise StoreError(f"{x_key}: {err}") from err
 
 
 def _build_sparse_dataset(
-    store: Store, x_key: str, gene_names: tuple[str, ...]
+    store: Store, x_key: str, gene_names: tuple[str, ...], store_root: str
 ) -> SparseDataset:
     """Build a :class:`SparseDataset` from an anndata CSR ``X`` group."""
     if not store.exists(f"{x_key}/.zgroup"):
@@ -910,11 +1691,9 @@ def _build_sparse_dataset(
     if len(indices_arr.shape) != 1 or len(data_arr.shape) != 1:
         raise StoreError(f"{x_key}/indices and data must be 1D")
 
-    nnz = int(indptr[-1]) if indptr else 0
+    nnz = int(indptr[-1]) if len(indptr) else 0
     if indices_arr.shape[0] != nnz:
-        raise StoreError(
-            f"{x_key}/indices length {indices_arr.shape[0]} != nnz {nnz}"
-        )
+        raise StoreError(f"{x_key}/indices length {indices_arr.shape[0]} != nnz {nnz}")
     if data_arr.shape[0] != nnz:
         raise StoreError(f"{x_key}/data length {data_arr.shape[0]} != nnz {nnz}")
     if not indices_arr.dtype.is_csr_index:
@@ -928,24 +1707,24 @@ def _build_sparse_dataset(
             )
         if shape_genes != len(gene_names):
             raise StoreError(
-                f"{x_key}: X shape has {shape_genes} genes but var has "
-                f"{len(gene_names)} gene names"
+                f"{x_key}: X shape has {shape_genes} genes but var has {len(gene_names)} gene names"
             )
         num_genes = shape_genes
     else:
         num_genes = len(gene_names)
 
-    indices_meta = _build_array_meta(indices_arr, indices_payload, f"{x_key}/indices")
-    data_meta = _build_array_meta(data_arr, data_payload, f"{x_key}/data")
+    indices_meta = _build_array_meta(store, indices_arr, indices_payload, f"{x_key}/indices")
+    data_meta = _build_array_meta(store, data_arr, data_payload, f"{x_key}/data")
     try:
         return SparseDataset(
             gene_names=gene_names,
-            indptr=tuple(indptr),
+            indptr=np.asarray(indptr, dtype=np.uint64),
             indices=indices_meta,
             data=data_meta,
             index_dtype=indices_arr.dtype,
             num_cells=num_cells,
             num_genes=num_genes,
+            store_root=store_root,
         )
     except ValueError as err:
         raise StoreError(f"{x_key}: {err}") from err
@@ -957,27 +1736,31 @@ def _decode_index_array(
     dtype: DType,
     codec: CodecPipeline,
     count: int,
-) -> list[int]:
-    """Decode a 1D integer array payload (indptr) to a list of Python ints.
+) -> list[int] | np.ndarray:
+    """Decode a 1D integer array payload (indptr) to uint64-compatible values.
 
     Each chunk is sliced by ``(offset, length)`` and decoded independently;
     the dtype must be an integer type (the CSR indptr is widened to ``u64``
     on the Rust side, so a float dtype is rejected here).
     """
-    import numpy as np
-
     if dtype not in _INTEGER_DTYPES:
         raise StoreError(f"index array dtype {dtype!r} must be an integer type")
+    if _decode_index_payload is not None:
+        offsets = np.fromiter((loc.offset for loc in chunks), dtype=np.uint64, count=len(chunks))
+        lengths = np.fromiter((loc.length for loc in chunks), dtype=np.uint64, count=len(chunks))
+        try:
+            return _decode_index_payload(payload, offsets, lengths, dtype, codec, count)
+        except Exception:
+            pass
     np_dtype = np.dtype(_dtype_to_numpy(dtype))
     item = np_dtype.itemsize
     out: list[int] = []
     for loc in chunks:
-        raw = payload[loc.offset:loc.offset + loc.length]
+        raw = payload[loc.offset : loc.offset + loc.length]
         dec = _decode_chunk_bytes(raw, codec)
         if len(dec) % item != 0:
             raise StoreError(
-                f"index chunk decoded to {len(dec)} bytes, "
-                f"not a multiple of itemsize {item}"
+                f"index chunk decoded to {len(dec)} bytes, not a multiple of itemsize {item}"
             )
         arr = np.frombuffer(dec, dtype=np_dtype)
         out.extend(int(x) for x in arr.tolist())
@@ -988,8 +1771,14 @@ def _decode_index_array(
 
 _INTEGER_DTYPES = frozenset(
     {
-        DType.U8, DType.I8, DType.U16, DType.I16,
-        DType.U32, DType.I32, DType.U64, DType.I64,
+        DType.U8,
+        DType.I8,
+        DType.U16,
+        DType.I16,
+        DType.U32,
+        DType.I32,
+        DType.U64,
+        DType.I64,
     }
 )
 
@@ -1019,32 +1808,70 @@ def _dtype_to_numpy(dtype: DType) -> str:
 def launch(path: str | os.PathLike[str]) -> Dataset:
     """Launch a scdata store and return its dataset metadata.
 
-    The store must be an anndata-readable zarr v2 tree (``.zarr`` directory
-    or ``.zarr.zip`` archive) with scdata chunk indexes under each array's
-    ``.zattrs["scdata"]``.  Returns a :class:`DenseDataset` or
-    :class:`SparseDataset` carrying every field the Rust databank needs to
-    open the store: shape, chunk_shape, dtype, codec pipeline, and the
-    concatenated-chunk payload path plus ``(offset, length)`` table.
+    The store may be a zarr v3 tree (standard per-chunk files) or a legacy
+    zarr v2 tree with scdata chunk indexes under each array's
+    ``.zattrs["scdata"]``.  Directory and ``ZIP_STORED`` containers are
+    supported.  The returned :class:`DenseDataset` or :class:`SparseDataset`
+    carries shape, dtype, codec metadata, chunk grid metadata, and normalized
+    local file/off/len chunk locations, with ``store_root`` set to ``path`` so
+    :class:`scdata.ScDataBank` can register it directly.
 
     This parses metadata only; chunk payloads are not decoded here.
     """
-    with _open_store(path) as store:
-        return launch_store(store)
+    store_root = os.fspath(path)
+    with _open_store(store_root) as store:
+        return launch_store(store, store_root=store_root)
 
 
-def launch_store(store: Store) -> Dataset:
+def launch_store(store: Store, *, store_root: str = "") -> Dataset:
     """Launch an already-open :class:`Store` into a :class:`Dataset`.
 
     Use :func:`launch` for the common case; this entry point lets callers
-    reuse a custom :class:`Store` implementation.
+    reuse a custom :class:`Store` implementation.  Pass ``store_root`` so the
+    returned dataset records the store's filesystem path for the databank;
+    when omitted it is left empty and the caller must pass the path to
+    ``register_dense`` / ``register_sparse_csr`` explicitly.
+
+    Both zarr v3 (``zarr.json`` per node, standard chunk files — the layout
+    :func:`scdata.io.write_zarr` produces and anndata reads) and the legacy
+    v2 + concatenated-payload layout are accepted.
     """
-    if not store.exists(".zgroup"):
-        if store.exists(".zarr.json"):
-            raise StoreError(
-                "zarr v3 stores are not yet supported; "
-                "scdata reads zarr v2 (.zgroup) stores"
-            )
-        raise StoreError("not a zarr group (missing .zgroup)")
+    if store.exists("zarr.json"):
+        return _launch_v3(store, store_root=store_root)
+    if store.exists(".zgroup"):
+        return _launch_v2(store, store_root=store_root)
+    raise StoreError("not a zarr store (missing zarr.json / .zgroup)")
+
+
+def _launch_v3(store: Store, *, store_root: str) -> Dataset:
+    """Launch a zarr v3 store (standard chunk files, anndata-compatible)."""
+    root_meta = _expect_object(_read_json(store, "zarr.json"), "zarr.json")
+    if _v3_node_type(root_meta, "zarr.json") != "group":
+        raise StoreError("zarr.json root is not a group")
+    if not store.exists("X/zarr.json"):
+        raise StoreError("store has no X array or group")
+    if not store.exists("var/zarr.json"):
+        raise StoreError("store has no var group")
+
+    x_meta = _expect_object(_read_json(store, "X/zarr.json"), "X/zarr.json")
+    x_node = _v3_node_type(x_meta, "X/zarr.json")
+    x_attrs = x_meta.get("attributes") if isinstance(x_meta.get("attributes"), dict) else {}
+    encoding_type = x_attrs.get("encoding-type") if isinstance(x_attrs, dict) else None
+    if not isinstance(encoding_type, str):
+        encoding_type = "array" if x_node == "array" else None
+    if encoding_type == "csc_matrix" or x_node == "group" and encoding_type == "csc_matrix":
+        raise StoreError("scdata does not read CSC matrices; store as CSR")
+
+    gene_names = _v3_read_gene_names(store, "var")
+    if x_node == "array":
+        return _v3_build_dense_dataset(store, "X", gene_names, store_root)
+    if x_node == "group" and encoding_type in ("csr_matrix", "CSR"):
+        return _v3_build_sparse_dataset(store, "X", gene_names, store_root)
+    raise StoreError(f"unsupported X layout: node_type={x_node!r} encoding-type={encoding_type!r}")
+
+
+def _launch_v2(store: Store, *, store_root: str) -> Dataset:
+    """Launch a legacy zarr v2 + scdata concatenated-payload store."""
     _expect_zarr_v2(_expect_object(_read_json(store, ".zgroup"), ".zgroup"), ".zgroup")
     # anndata root attrs are optional for scdata; we only need X and var.
     # X may be a dense array (X/.zarray) or a sparse group (X/.zgroup).
@@ -1063,5 +1890,5 @@ def launch_store(store: Store) -> Dataset:
 
     gene_names = _read_gene_names(store, "var")
     if encoding == "array":
-        return _build_dense_dataset(store, "X", gene_names)
-    return _build_sparse_dataset(store, "X", gene_names)
+        return _build_dense_dataset(store, "X", gene_names, store_root)
+    return _build_sparse_dataset(store, "X", gene_names, store_root)
