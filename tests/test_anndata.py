@@ -52,7 +52,7 @@ def _registered_matrix(ds):
     did = bank.register(ds)
     try:
         cells = list(range(bank.dataset_num_cells(did)))
-        out = np.asarray(bank.access_cells(did, cells))
+        out = np.asarray(bank.load(did, cells))
         return out.reshape(len(cells), bank.dataset_num_genes(did))
     finally:
         bank.unregister(did)

@@ -16,6 +16,7 @@ decoded outputs of the single-call and streaming paths respectively.
 from __future__ import annotations
 
 from scdata.data._cell import CellAccess, CellBatch, CellData
+from scdata.data._dataloader import ScDataLoader
 from scdata.data._dataset import (
     ArrayMeta,
     ArrayOrder,
@@ -46,6 +47,7 @@ __all__ = [
     "CellAccess",
     "CellBatch",
     "CellData",
+    "ScDataLoader",
     "PrefetchBatches",
     "PrefetchIterator",
 ]

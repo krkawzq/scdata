@@ -56,6 +56,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
+from os import PathLike, fspath
 from typing import Any, Iterable, Iterator, Literal, TypeVar, get_type_hints
 
 from .data._cell import CellAccess, CellBatch, CellData, _as_cell_index
@@ -165,6 +166,35 @@ MissingGenePolicy.ZERO = MissingGenePolicy(_MissingGenePolicy.ZERO)
 MissingGenePolicy.ERROR = MissingGenePolicy(_MissingGenePolicy.ERROR)
 
 
+def _coerce_missing_policy(
+    missing: MissingGenePolicy | Literal["zero", "error", "raise", "strict"] | str | None,
+) -> MissingGenePolicy | None:
+    """Normalize a public missing-gene policy value."""
+    if missing is None or isinstance(missing, MissingGenePolicy):
+        return missing
+    text = str(missing).strip().lower()
+    if text in ("zero", "zeros"):
+        return MissingGenePolicy.ZERO
+    if text in ("error", "raise", "strict"):
+        return MissingGenePolicy.ERROR
+    raise ValueError(
+        "missing must be MissingGenePolicy.ZERO, MissingGenePolicy.ERROR, "
+        f"'zero', or 'error'; got {missing!r}"
+    )
+
+
+def _coerce_dtype(dtype: DType | str | None) -> DType | None:
+    """Normalize a public dtype value."""
+    if dtype is None or isinstance(dtype, DType):
+        return dtype
+    text = str(dtype).strip()
+    folded = text.lower()
+    for candidate in DType:
+        if folded == candidate.value or text.upper() == candidate.name:
+            return candidate
+    return DType.parse(dtype)
+
+
 # ===========================================================================
 # Config dataclasses
 # ===========================================================================
@@ -192,6 +222,8 @@ class _Config:
     :func:`_config_to_rust`, not on the dataclasses.
     """
 
+    __slots__ = ()
+
     @classmethod
     def make(cls: type[_C], **kwargs: Any) -> _C:
         """Build a config from flat kwargs, dynamically routed to nested fields.
@@ -211,7 +243,7 @@ class _Config:
         return self
 
 
-@dataclass
+@dataclass(slots=True)
 class BaseIoConfig(_Config):
     """Shared IO backend settings (max in-flight, priority levels, ...)."""
 
@@ -221,7 +253,7 @@ class BaseIoConfig(_Config):
     assume_non_overlapping_reads: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class UringConfig(_Config):
     """io_uring backend settings."""
 
@@ -233,7 +265,7 @@ class UringConfig(_Config):
     base: BaseIoConfig = field(default_factory=BaseIoConfig)
 
 
-@dataclass
+@dataclass(slots=True)
 class ThreadedConfig(_Config):
     """Thread-pool pread/pwrite backend settings."""
 
@@ -242,7 +274,7 @@ class ThreadedConfig(_Config):
     base: BaseIoConfig = field(default_factory=BaseIoConfig)
 
 
-@dataclass
+@dataclass(slots=True)
 class IoConfig(_Config):
     """IO backend selection.
 
@@ -255,6 +287,12 @@ class IoConfig(_Config):
     backend: Literal["uring", "threaded"] = "threaded"
     uring_config: UringConfig = field(default_factory=UringConfig)
     threaded_config: ThreadedConfig = field(default_factory=ThreadedConfig)
+
+    def __post_init__(self) -> None:
+        if self.backend not in ("uring", "threaded"):
+            raise ValueError(
+                f"IoConfig.backend must be 'uring' or 'threaded', got {self.backend!r}"
+            )
 
     @classmethod
     def uring(cls, config: UringConfig | None = None, **kwargs: Any) -> "IoConfig":
@@ -284,7 +322,7 @@ class IoConfig(_Config):
         return self.backend
 
 
-@dataclass
+@dataclass(slots=True)
 class DecodePoolConfig(_Config):
     """Decode worker pool settings."""
 
@@ -293,7 +331,7 @@ class DecodePoolConfig(_Config):
     cpus: list[int] | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class AccessCpuConfig(_Config):
     """Access-side CPU materialization pool settings."""
 
@@ -302,7 +340,7 @@ class AccessCpuConfig(_Config):
     cpus: list[int] | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class AccessConfig(_Config):
     """Access scheduler settings (cache, memory budget, shards, ...)."""
 
@@ -315,7 +353,7 @@ class AccessConfig(_Config):
     cpu: AccessCpuConfig = field(default_factory=AccessCpuConfig)
 
 
-@dataclass
+@dataclass(slots=True)
 class FillConfig(_Config):
     """Compute / fill pool settings."""
 
@@ -327,7 +365,7 @@ class FillConfig(_Config):
     cpus: list[int] | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class DataBankConfig(_Config):
     """Top-level DataBank configuration.
 
@@ -352,7 +390,7 @@ class DataBankConfig(_Config):
     fill_config: FillConfig = field(default_factory=FillConfig)
 
 
-@dataclass
+@dataclass(slots=True)
 class ScheduledAccessConfig(_Config):
     """Look-ahead distances for scheduled access."""
 
@@ -361,7 +399,7 @@ class ScheduledAccessConfig(_Config):
     ready_ahead_steps: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class ScheduledPrefetchConfig(_Config):
     """Per-call settings for scheduled DataBank cell prefetch."""
 
@@ -423,7 +461,9 @@ def _config_to_rust(config: Any) -> Any:
     if cls is IoConfig:
         if config.backend == "uring":
             return _IoConfig.uring(_config_to_rust(config.uring_config))
-        return _IoConfig.threaded(_config_to_rust(config.threaded_config))
+        if config.backend == "threaded":
+            return _IoConfig.threaded(_config_to_rust(config.threaded_config))
+        raise ValueError(f"IoConfig.backend must be 'uring' or 'threaded', got {config.backend!r}")
     rust_cls = _RUST_CONFIG_TYPES.get(cls)
     if rust_cls is None:
         raise TypeError(f"not a config type: {cls.__name__}")
@@ -452,9 +492,7 @@ def _config_subfields(cls: Any) -> tuple[tuple[str, type], ...]:
     """``(field_name, config_type)`` for each field whose type is a config."""
     hints = _config_type_hints(cls)
     return tuple(
-        (f.name, hints[f.name])
-        for f in fields(cls)
-        if hints.get(f.name) in _CONFIG_CLASSES
+        (f.name, hints[f.name]) for f in fields(cls) if hints.get(f.name) in _CONFIG_CLASSES
     )
 
 
@@ -465,6 +503,19 @@ def _config_leaf_names(cls: Any) -> frozenset[str]:
     for _fname, sub in _config_subfields(cls):
         names |= _config_leaf_names(sub)
     return frozenset(names)
+
+
+@lru_cache(maxsize=None)
+def _config_leaf_paths(cls: Any, leaf_name: str) -> tuple[tuple[str, ...], ...]:
+    """All field paths from ``cls`` to a reachable field named ``leaf_name``."""
+    paths: list[tuple[str, ...]] = []
+    direct = {f.name for f in fields(cls)}
+    if leaf_name in direct:
+        paths.append((leaf_name,))
+    for fname, sub in _config_subfields(cls):
+        for subpath in _config_leaf_paths(sub, leaf_name):
+            paths.append((fname, *subpath))
+    return tuple(paths)
 
 
 def _resolve_path_field(cls: Any, segment: str) -> str:
@@ -483,6 +534,28 @@ def _resolve_path_field(cls: Any, segment: str) -> str:
     raise TypeError(f"{cls.__name__} has no field matching path segment {segment!r}")
 
 
+def _path_hint(path: Iterable[str]) -> str:
+    """Render a config path using the public short-form convention."""
+    return "__".join(part.removesuffix("_config") for part in path)
+
+
+def _set_config_path(config: Any, path: tuple[str, ...], value: Any) -> None:
+    """Set ``value`` at a resolved config field path."""
+    obj = config
+    for field_name in path[:-1]:
+        obj = getattr(obj, field_name)
+        if type(obj) not in _CONFIG_CLASSES:
+            raise TypeError(f"{type(obj).__name__} at {_path_hint(path)} is not a config object")
+    setattr(obj, path[-1], value)
+    _validate_config_object(obj)
+
+
+def _validate_config_object(config: Any) -> None:
+    """Run lightweight Python-side validation for dynamically updated configs."""
+    if isinstance(config, IoConfig):
+        config.__post_init__()
+
+
 def _apply_dynamic(config: Any, kwargs: dict[str, Any]) -> Any:
     """Route ``kwargs`` onto ``config`` by direct field, unique leaf, or path.
 
@@ -499,7 +572,6 @@ def _apply_dynamic(config: Any, kwargs: dict[str, Any]) -> Any:
     """
     cls = type(config)
     direct = {f.name for f in fields(cls)}
-    subfields = dict(_config_subfields(cls))
     for key, value in kwargs.items():
         if "__" in key:
             segments = key.split("__")
@@ -510,24 +582,22 @@ def _apply_dynamic(config: Any, kwargs: dict[str, Any]) -> Any:
                 obj = getattr(obj, fname)
                 obj_cls = type(obj)
             setattr(obj, _resolve_path_field(obj_cls, segments[-1]), value)
+            _validate_config_object(obj)
             continue
         if key in direct:
             setattr(config, key, value)
+            _validate_config_object(config)
             continue
-        hits = [
-            fname for fname, sub in subfields.items() if key in _config_leaf_names(sub)
-        ]
+        hits = [path for path in _config_leaf_paths(cls, key) if len(path) > 1]
         if len(hits) == 1:
-            # Recurse so a leaf living deeper than the immediate child (e.g.
-            # ``entries`` on ``io_config.uring_config``) lands on the right
-            # field instead of being attached as a stray attribute.
-            _apply_dynamic(getattr(config, hits[0]), {key: value})
+            _set_config_path(config, hits[0], value)
         elif not hits:
             raise TypeError(f"{cls.__name__} has no field {key!r}")
         else:
+            suggestions = ", ".join(_path_hint(path) for path in hits)
             raise TypeError(
-                f"{cls.__name__}: {key!r} is ambiguous across {hits}; "
-                f"qualify with a path like {hits[0]}__{key}"
+                f"{cls.__name__}: {key!r} is ambiguous across {suggestions}; "
+                f"qualify with a path like {_path_hint(hits[0])}"
             )
     return config
 
@@ -567,12 +637,7 @@ class ScDataBank:
 
     __slots__ = ("_inner", "_registered_count", "_meta_cache")
 
-    # Declared non-Optional so the access methods below type-check.  ``close``
-    # and ``__exit__`` invalidate the slot by storing ``None`` (each assignment
-    # suppressed with ``# type: ignore[assignment]``); that ``None`` is exactly
-    # what makes post-close calls raise ``AttributeError``, as documented on
-    # :meth:`close`.
-    _inner: _DataBank
+    _inner: _DataBank | None
 
     def __init__(self, config: DataBankConfig | None = None) -> None:
         if config is None:
@@ -580,10 +645,21 @@ class ScDataBank:
         self._inner = _DataBank(_config_to_rust(config))
         self._registered_count = 0
         # Per-dataset ``(gene_names, num_genes)`` cache, keyed by DatasetId.
-        # Access results carry num_genes / gene_names, and ``access_cells``
+        # Load results carry num_genes / gene_names, and ``load``
         # needs num_genes to validate shape before Rust returns the payload —
         # caching avoids a Rust round-trip on every call.
         self._meta_cache: dict[DatasetId, tuple[list[str], int]] = {}
+
+    def _core(self) -> _DataBank:
+        inner = self._inner
+        if inner is None:
+            raise RuntimeError("ScDataBank is closed")
+        return inner
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether this bank has already released its Rust core."""
+        return self._inner is None
 
     # -- registration --------------------------------------------------------
 
@@ -609,7 +685,7 @@ class ScDataBank:
             )
         return self._register(dataset, store_root)
 
-    def register_dense(self, ds: DenseDataset, store_path: str) -> DatasetId:
+    def register_dense(self, ds: DenseDataset, store_path: str | PathLike[str]) -> DatasetId:
         """Register a dense dataset parsed by :func:`scdata.io.launch`.
 
         ``store_path`` is the filesystem path to the zarr directory or
@@ -617,19 +693,19 @@ class ScDataBank:
         already carry resolved source files; manually-built datasets use
         ``store_path`` as the root for their logical payload/chunk keys.
         """
-        rust_id = self._inner.register_dense(ds, store_path)
+        rust_id = self._core().register_dense(ds, fspath(store_path))
         did = DatasetId(rust_id)
         self._registered_count += 1
         return did
 
-    def register_sparse_csr(self, ds: SparseDataset, store_path: str) -> DatasetId:
+    def register_sparse_csr(self, ds: SparseDataset, store_path: str | PathLike[str]) -> DatasetId:
         """Register a CSR sparse dataset parsed by :func:`scdata.io.launch`."""
-        rust_id = self._inner.register_sparse_csr(ds, store_path)
+        rust_id = self._core().register_sparse_csr(ds, fspath(store_path))
         did = DatasetId(rust_id)
         self._registered_count += 1
         return did
 
-    def _register(self, ds: Dataset, store_path: str) -> DatasetId:
+    def _register(self, ds: Dataset, store_path: str | PathLike[str]) -> DatasetId:
         """Register a dataset by type, dispatching to the matching Rust entry point."""
         if isinstance(ds, DenseDataset):
             return self.register_dense(ds, store_path)
@@ -639,7 +715,7 @@ class ScDataBank:
 
     def unregister(self, id: DatasetId) -> None:
         """Unregister a dataset, releasing its file handles and gene refs."""
-        self._inner.unregister(id._rust)
+        self._core().unregister(id._rust)
         self._meta_cache.pop(id, None)
         self._registered_count = max(0, self._registered_count - 1)
 
@@ -651,7 +727,7 @@ class ScDataBank:
 
     def dataset_num_cells(self, id: DatasetId) -> int:
         """Number of cells (rows) in the registered dataset."""
-        return self._inner.dataset_num_cells(id._rust)
+        return self._core().dataset_num_cells(id._rust)
 
     def dataset_num_genes(self, id: DatasetId) -> int:
         """Number of genes (columns) in the registered dataset."""
@@ -659,61 +735,70 @@ class ScDataBank:
 
     def dataset_dtype(self, id: DatasetId) -> DType:
         """Stored value dtype of the registered dataset (a ``DType``)."""
-        return self._inner.dataset_dtype(id._rust)
+        return self._core().dataset_dtype(id._rust)
 
     def _meta(self, id: DatasetId) -> tuple[list[str], int]:
         """Cached ``(gene_names, num_genes)`` for ``id``, fetched on first use."""
         cached = self._meta_cache.get(id)
         if cached is None:
-            genes = self._inner.dataset_genes(id._rust)
-            num_genes = self._inner.dataset_num_genes(id._rust)
+            core = self._core()
+            genes = core.dataset_genes(id._rust)
+            num_genes = core.dataset_num_genes(id._rust)
             cached = (genes, num_genes)
             self._meta_cache[id] = cached
         return cached
 
     # -- cell access ---------------------------------------------------------
 
-    def access_cells(
+    def load(
         self,
         id: DatasetId,
-        cells: Iterable[int],
-        dtype: DType | None = None,
+        cells: CellAccess | Iterable[int],
+        genes: Iterable[str] | None = None,
+        *,
+        missing: MissingGenePolicy
+        | Literal["zero", "error", "raise", "strict"]
+        | str
+        | None = None,
+        dtype: DType | str | None = None,
     ) -> CellData:
-        """Read cells and return a decoded :class:`CellData`.
+        """Load cells, optionally projected onto a gene subset.
 
-        Args:
-            id: Dataset handle from :meth:`register` / :meth:`register_dense` /
-                :meth:`register_sparse_csr`.
-            cells: Cell indices into the dataset (any order, subset, repeats).
-            dtype: Optional scdata ``DType``; when omitted it is inferred from
-                the dataset's stored value dtype.
-
-        Returns:
-            A :class:`CellData` whose :attr:`~CellData.data` is a row-major
-            1D array of shape ``[len(cells) * num_genes]`` (cell ``i``'s genes
-            occupy ``data[i*num_genes : (i+1)*num_genes]``), with
-            :attr:`~CellData.num_genes` and :attr:`~CellData.gene_names`
-            populated.  ``np.asarray(result)`` returns the raw 1D array, and
-            :attr:`~CellData.matrix` is a zero-copy ``[num_cells, num_genes]``
-            view.  ``f16`` returns ``float16``; ``bf16`` returns ``uint16`` bit
-            patterns.
+        ``genes=None`` returns all genes in dataset order.  Passing ``genes``
+        dispatches to the Rust projection path and returns columns in the
+        requested order.  ``cells`` may also be a :class:`CellAccess`; when
+        ``genes`` is omitted, its ``gene_names`` are used.
         """
-        return self.access_cells_fast(id, cells, dtype=dtype)
+        if isinstance(cells, CellAccess):
+            if genes is None:
+                genes = cells.gene_names
+            cells = cells.cells
+        dtype_value = _coerce_dtype(dtype)
+        if genes is None:
+            return self._load_all_genes(id, cells, dtype=dtype_value)
+        return self._load_genes(
+            id,
+            cells,
+            genes,
+            missing=_coerce_missing_policy(missing),
+            dtype=dtype_value,
+        )
 
-    def access_cells_fast(
+    def _load_all_genes(
         self,
         id: DatasetId,
         cells: Iterable[int],
+        *,
         dtype: DType | None = None,
     ) -> CellData:
-        """Read cells through the public numpy-array fast path."""
         cell_arr = _as_cell_index(cells, "cells")
         gene_names, num_genes = self._meta(id)
-        fast = getattr(self._inner, "access_cells_array", None)
+        core = self._core()
+        fast = getattr(core, "access_cells_array", None)
         if fast is not None:
             data = fast(id._rust, cell_arr, dtype)
         else:
-            data = self._inner.access_cells(id._rust, cell_arr.tolist(), dtype)
+            data = core.access_cells(id._rust, cell_arr.tolist(), dtype)
         return CellData.from_array(
             cells=cell_arr,
             data=data,
@@ -721,65 +806,28 @@ class ScDataBank:
             gene_names=tuple(gene_names),
         )
 
-    def access_cells_by_gene_names(
+    def _load_genes(
         self,
         id: DatasetId,
         cells: Iterable[int],
-        gene_names: Iterable[str],
+        genes: Iterable[str],
+        *,
         missing: MissingGenePolicy | None = None,
         dtype: DType | None = None,
     ) -> CellData:
-        """Read cells projected onto a subset of gene names.
-
-        Args:
-            id: Dataset handle.
-            cells: Cell indices into the dataset (any order, subset, repeats).
-            gene_names: Gene names to project each cell onto, in the requested
-                order.  ``missing`` controls genes absent from the dataset:
-                ``ZERO`` (default) fills a zero column, ``ERROR`` raises.
-            missing: :class:`MissingGenePolicy` for absent gene names.
-            dtype: Optional scdata ``DType``; when omitted it is inferred from
-                the dataset's stored value dtype.
-
-        Returns:
-            A :class:`CellData` with :attr:`~CellData.data` of shape
-            ``[len(cells) * len(gene_names)]`` and :attr:`~CellData.gene_names`
-            set to the requested projection.
-        """
-        return self.access_cells_by_gene_names_fast(
-            id,
-            cells,
-            gene_names,
-            missing=missing,
-            dtype=dtype,
-        )
-
-    def access_cells_by_gene_names_fast(
-        self,
-        id: DatasetId,
-        cells: Iterable[int],
-        gene_names: Iterable[str],
-        missing: MissingGenePolicy | None = None,
-        dtype: DType | None = None,
-    ) -> CellData:
-        """Read projected cells through the public numpy-array fast path."""
         cell_arr = _as_cell_index(cells, "cells")
-        names = tuple(gene_names)
-        fast = getattr(self._inner, "access_cells_by_gene_names_array", None)
+        names = tuple(genes)
+        core = self._core()
+        rust_missing = missing._rust if missing is not None else None
+        fast = getattr(core, "access_cells_by_gene_names_array", None)
         if fast is not None:
-            data = fast(
-                id._rust,
-                cell_arr,
-                list(names),
-                missing._rust if missing is not None else None,
-                dtype,
-            )
+            data = fast(id._rust, cell_arr, list(names), rust_missing, dtype)
         else:
-            data = self._inner.access_cells_by_gene_names(
+            data = core.access_cells_by_gene_names(
                 id._rust,
                 cell_arr.tolist(),
                 list(names),
-                missing._rust if missing is not None else None,
+                rust_missing,
                 dtype,
             )
         return CellData.from_array(
@@ -791,97 +839,78 @@ class ScDataBank:
 
     # -- prefetch ------------------------------------------------------------
 
-    def prefetch_cells(
+    def prefetch(
         self,
         id: DatasetId,
         batches: Iterable[CellAccess | Iterable[int]],
+        genes: Iterable[str] | None = None,
+        *,
+        missing: MissingGenePolicy
+        | Literal["zero", "error", "raise", "strict"]
+        | str
+        | None = None,
         config: ScheduledPrefetchConfig | None = None,
     ) -> Iterator[CellBatch]:
-        """Stream cell batches through a scheduled prefetch iterator.
-
-        Args:
-            id: Dataset handle.
-            batches: Iterable of batch inputs.  Each element may be a
-                :class:`CellAccess` or any 1D cell-index iterable; it is
-                normalized to a :class:`CellAccess` up front (see
-                :class:`~scdata.data._prefetch.PrefetchBatches` for why this is
-                not lazy).
-            config: Optional :class:`ScheduledPrefetchConfig` tuning the
-                ring-buffer depth and access-layer look-ahead.
-
-        Returns:
-            Iterator of decoded :class:`CellBatch` objects (each with
-            ``cells`` / ``data`` / ``num_genes`` populated).
-        """
-        return self.prefetch_cells_fast(id, batches, config=config)
-
-    def prefetch_cells_fast(
-        self,
-        id: DatasetId,
-        batches: Iterable[CellAccess | Iterable[int]],
-        config: ScheduledPrefetchConfig | None = None,
-    ) -> Iterator[CellBatch]:
-        """Stream batches through the public numpy-array fast path."""
-        request = PrefetchBatches.from_iterable(batches)
-        rust_config = _config_to_rust(config) if config is not None else None
-        fast = getattr(self._inner, "prefetch_cells_arrays", None)
-        if fast is not None:
-            inner = fast(id._rust, request.batch_cell_arrays(), rust_config)
-        else:
-            inner = self._inner.prefetch_cells(id._rust, request.batch_cell_lists(), rust_config)
-        return PrefetchIterator(inner)
-
-    def prefetch_cells_by_gene_names(
-        self,
-        id: DatasetId,
-        batches: Iterable[CellAccess | Iterable[int]],
-        gene_names: Iterable[str],
-        missing: MissingGenePolicy | None = None,
-        config: ScheduledPrefetchConfig | None = None,
-    ) -> Iterator[CellBatch]:
-        """Like :meth:`prefetch_cells` but each batch is projected onto ``gene_names``.
-
-        ``gene_names`` applies to every batch in the stream (the Rust entry
-        point takes one shared projection).  ``missing`` controls genes absent
-        from the dataset: ``ZERO`` (default) fills a zero column, ``ERROR``
-        raises.
-        """
-        return self.prefetch_cells_by_gene_names_fast(
+        """Stream decoded cell batches, optionally projected onto ``genes``."""
+        if genes is None:
+            return self._prefetch_all_genes(id, batches, config=config)
+        return self._prefetch_genes(
             id,
             batches,
-            gene_names,
-            missing=missing,
+            genes,
+            missing=_coerce_missing_policy(missing),
             config=config,
         )
 
-    def prefetch_cells_by_gene_names_fast(
+    def _prefetch_all_genes(
         self,
         id: DatasetId,
         batches: Iterable[CellAccess | Iterable[int]],
-        gene_names: Iterable[str],
+        *,
+        config: ScheduledPrefetchConfig | None = None,
+    ) -> Iterator[CellBatch]:
+        request = PrefetchBatches.from_iterable(batches)
+        rust_config = _config_to_rust(config) if config is not None else None
+        core = self._core()
+        fast = getattr(core, "prefetch_cells_arrays", None)
+        if fast is not None:
+            inner = fast(id._rust, request.batch_cell_arrays(), rust_config)
+        else:
+            inner = core.prefetch_cells(id._rust, request.batch_cell_lists(), rust_config)
+        return PrefetchIterator(inner, gene_names=tuple(self._meta(id)[0]))
+
+    def _prefetch_genes(
+        self,
+        id: DatasetId,
+        batches: Iterable[CellAccess | Iterable[int]],
+        genes: Iterable[str],
+        *,
         missing: MissingGenePolicy | None = None,
         config: ScheduledPrefetchConfig | None = None,
     ) -> Iterator[CellBatch]:
-        """Stream projected batches through the public numpy-array fast path."""
-        request = PrefetchBatches.from_iterable(batches, gene_names=gene_names)
-        names = list(request.gene_names) if request.gene_names is not None else []
+        request = PrefetchBatches.from_iterable(batches, gene_names=genes)
+        names = tuple(request.gene_names) if request.gene_names is not None else ()
         rust_missing = missing._rust if missing is not None else None
         rust_config = _config_to_rust(config) if config is not None else None
-        fast = getattr(self._inner, "prefetch_cells_by_gene_names_arrays", None)
+        core = self._core()
+        fast = getattr(core, "prefetch_cells_by_gene_names_arrays", None)
         if fast is not None:
-            inner = fast(id._rust, request.batch_cell_arrays(), names, rust_missing, rust_config)
+            inner = fast(
+                id._rust, request.batch_cell_arrays(), list(names), rust_missing, rust_config
+            )
         else:
-            inner = self._inner.prefetch_cells_by_gene_names(
+            inner = core.prefetch_cells_by_gene_names(
                 id._rust,
                 request.batch_cell_lists(),
-                names,
+                list(names),
                 rust_missing,
                 rust_config,
             )
-        return PrefetchIterator(inner)
+        return PrefetchIterator(inner, gene_names=names)
 
     def __repr__(self) -> str:
-        return f"ScDataBank(registered={self._registered_count})"
+        state = "closed" if self.is_closed else "open"
+        return f"ScDataBank(state={state!r}, registered={self._registered_count})"
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -892,12 +921,12 @@ class ScDataBank:
         # Drop the Rust core explicitly so its IO / decode / access / compute
         # thread pools are torn down deterministically on scope exit or
         # exception, rather than waiting on garbage collection.
-        self._inner = None  # type: ignore[assignment]
+        self._inner = None
 
     def close(self) -> None:
         """Release the Rust core and its thread pools immediately.
 
         Safe to call more than once.  After ``close``, any further call on
-        this bank raises :class:`AttributeError`.
+        this bank raises :class:`RuntimeError`.
         """
-        self._inner = None  # type: ignore[assignment]
+        self._inner = None

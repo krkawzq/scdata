@@ -41,6 +41,7 @@ from scdata.data import (  # noqa: E402
     Dataset,
     DtypeParseError,
     CodecConfigError,
+    ScDataLoader,
     SparseDataset,
 )
 from scdata.io import (  # noqa: E402
@@ -126,6 +127,7 @@ __all__ = [
     "CellAccess",
     "CellBatch",
     "CellData",
+    "ScDataLoader",
     "ArrayMeta",
     "ArrayOrder",
     "ChunkLocation",

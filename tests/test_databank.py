@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from scdata import MissingGenePolicy, ScDataBank
+from scdata import DataBankConfig, IoConfig, MissingGenePolicy, ScDataBank
 from scdata._scdata import DataBankError
 from scdata.data._dataset import (
     ArrayMeta,
@@ -100,6 +100,32 @@ def test_dataset_id_identity(dense_store_factory) -> None:
     bank.unregister(did2)
 
 
+def test_config_dynamic_routing_and_validation() -> None:
+    cfg = DataBankConfig.make(
+        backend="uring",
+        entries=512,
+        cache_capacity_bytes=512 * 1024**2,
+        io__uring__base__max_in_flight=2048,
+    )
+
+    assert cfg.io_config.backend == "uring"
+    assert cfg.io_config.uring_config.entries == 512
+    assert cfg.io_config.uring_config.base.max_in_flight == 2048
+    assert cfg.access_config.cache_capacity_bytes == 512 * 1024**2
+
+    cfg.update(fill__num_workers=8)
+    assert cfg.fill_config.num_workers == 8
+
+    with pytest.raises(TypeError, match="ambiguous"):
+        DataBankConfig.make(num_workers=8)
+    with pytest.raises(TypeError):
+        DataBankConfig.make(entires=512)
+    with pytest.raises(ValueError, match="backend"):
+        IoConfig.make(backend="bad")
+    with pytest.raises(ValueError, match="backend"):
+        DataBankConfig.make(backend="bad")
+
+
 # ---------------------------------------------------------------------------
 # cell access values
 # ---------------------------------------------------------------------------
@@ -109,18 +135,23 @@ def test_access_dense_values(dense_store_factory) -> None:
     root = dense_store_factory("acc", (5, 6), (2, 3), np.float32, None, [f"g{i}" for i in range(6)])
     ds = _dense_dataset(root, [f"g{i}" for i in range(6)])
     bank = ScDataBank()
-    did = bank.register_dense(ds, str(root))
+    did = bank.register_dense(ds, root)
     expected = _expected_dense((5, 6), np.float32)
-    out = np.asarray(bank.access_cells(did, [0, 1, 2, 3, 4]))
+    result = bank.load(did, [0, 1, 2, 3, 4], dtype="f32")
+    out = np.asarray(result)
     assert out.shape == (30,)
+    assert result.shape == (5, 6)
+    assert result.var_names == tuple(f"g{i}" for i in range(6))
+    assert np.shares_memory(result.to_numpy(), result.data)
+    assert np.shares_memory(result.to_flat_numpy(), result.data)
     assert np.array_equal(out.reshape(5, 6), expected)
     # subset + reordered
-    out2 = np.asarray(bank.access_cells(did, [3, 0, 4]))
+    out2 = np.asarray(bank.load(did, [3, 0, 4]))
     assert np.array_equal(out2.reshape(3, 6), expected[[3, 0, 4]])
     bank.unregister(did)
 
 
-def test_public_fastpath_methods(dense_store_factory) -> None:
+def test_load_and_prefetch_accept_numpy_inputs(dense_store_factory) -> None:
     root = dense_store_factory(
         "public_fast",
         (5, 6),
@@ -134,20 +165,14 @@ def test_public_fastpath_methods(dense_store_factory) -> None:
     did = bank.register_dense(ds, str(root))
     expected = _expected_dense((5, 6), np.float32)
 
-    out = np.asarray(bank.access_cells_fast(did, np.array([4, 0, 2], dtype=np.intp)))
+    out = np.asarray(bank.load(did, np.array([4, 0, 2], dtype=np.intp)))
     assert np.array_equal(out.reshape(3, 6), expected[[4, 0, 2]])
 
-    projected = np.asarray(
-        bank.access_cells_by_gene_names_fast(
-            did,
-            np.array([1, 3], dtype=np.intp),
-            ["g5", "g1"],
-        )
-    )
+    projected = np.asarray(bank.load(did, np.array([1, 3], dtype=np.intp), genes=["g5", "g1"]))
     assert np.array_equal(projected.reshape(2, 2), expected[[1, 3]][:, [5, 1]])
 
     batches = list(
-        bank.prefetch_cells_fast(
+        bank.prefetch(
             did,
             [np.array([0, 2], dtype=np.intp), np.array([4], dtype=np.intp)],
         )
@@ -157,11 +182,7 @@ def test_public_fastpath_methods(dense_store_factory) -> None:
     assert np.array_equal(np.asarray(batches[1].data).reshape(1, 6), expected[[4]])
 
     projected_batches = list(
-        bank.prefetch_cells_by_gene_names_fast(
-            did,
-            [np.array([0, 1], dtype=np.intp)],
-            ["g0", "g5"],
-        )
+        bank.prefetch(did, [np.array([0, 1], dtype=np.intp)], genes=["g0", "g5"])
     )
     assert len(projected_batches) == 1
     assert np.array_equal(
@@ -185,7 +206,7 @@ def test_access_dense_codec(codec_configs, dense_store_factory, codec_name) -> N
     bank = ScDataBank()
     did = bank.register_dense(ds, str(root))
     expected = _expected_dense((5, 6), np.float64)
-    out = np.asarray(bank.access_cells(did, list(range(5))))
+    out = np.asarray(bank.load(did, list(range(5))))
     assert np.array_equal(out.reshape(5, 6), expected)
     bank.unregister(did)
 
@@ -205,7 +226,7 @@ def test_register_launched_zip_dense(dense_store_factory, zip_store_factory) -> 
     bank = ScDataBank()
     did = bank.register(ds)
     expected = _expected_dense((5, 6), np.float32)
-    out = np.asarray(bank.access_cells(did, [4, 0, 2]))
+    out = np.asarray(bank.load(did, [4, 0, 2]))
 
     assert np.array_equal(out.reshape(3, 6), expected[[4, 0, 2]])
     bank.unregister(did)
@@ -219,32 +240,34 @@ def test_access_dtype_round_trip(dense_store_factory) -> None:
         ds = _dense_dataset(root, ["g0", "g1", "g2", "g3"])
         bank = ScDataBank()
         did = bank.register_dense(ds, str(root))
-        out = bank.access_cells(did, [0, 1, 2])
+        out = bank.load(did, [0, 1, 2])
         arr = np.asarray(out)
         assert arr.dtype == np.dtype(np_dt)
         assert np.array_equal(arr.reshape(3, 4), _expected_dense((3, 4), np_dt))
         bank.unregister(did)
 
 
-def test_access_by_gene_names(dense_store_factory) -> None:
+def test_load_by_genes(dense_store_factory) -> None:
     root = dense_store_factory("gn", (5, 6), (2, 3), np.float32, None, [f"g{i}" for i in range(6)])
     ds = _dense_dataset(root, [f"g{i}" for i in range(6)])
     bank = ScDataBank()
     did = bank.register_dense(ds, str(root))
     expected = _expected_dense((5, 6), np.float32)
-    out = np.asarray(bank.access_cells_by_gene_names(did, [0, 2], ["g1", "g3"]))
+    out = np.asarray(bank.load(did, [0, 2], genes=["g1", "g3"]))
     assert out.shape == (4,)
     assert np.array_equal(out.reshape(2, 2), expected[[0, 2]][:, [1, 3]])
     bank.unregister(did)
 
 
-def test_access_by_gene_names_missing_error(dense_store_factory) -> None:
+def test_load_by_genes_missing_error(dense_store_factory) -> None:
     root = dense_store_factory("gn_err", (3, 4), (2, 2), np.float32, None, ["g0", "g1", "g2", "g3"])
     ds = _dense_dataset(root, ["g0", "g1", "g2", "g3"])
     bank = ScDataBank()
     did = bank.register_dense(ds, str(root))
     with pytest.raises(DataBankError):
-        bank.access_cells_by_gene_names(did, [0], ["nope"], missing=MissingGenePolicy.ERROR)
+        bank.load(did, [0], genes=["nope"], missing=MissingGenePolicy.ERROR)
+    with pytest.raises(DataBankError):
+        bank.load(did, [0], genes=["nope"], missing="error")
     bank.unregister(did)
 
 
@@ -255,7 +278,7 @@ def test_access_unregistered_raises(dense_store_factory) -> None:
     did = bank.register_dense(ds, str(root))
     bank.unregister(did)
     with pytest.raises(DataBankError):
-        bank.access_cells(did, [0])
+        bank.load(did, [0])
 
 
 # ---------------------------------------------------------------------------
@@ -263,20 +286,22 @@ def test_access_unregistered_raises(dense_store_factory) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_prefetch_cells(dense_store_factory) -> None:
+def test_prefetch(dense_store_factory) -> None:
     root = dense_store_factory("pf", (5, 6), (2, 3), np.float32, None, [f"g{i}" for i in range(6)])
     ds = _dense_dataset(root, [f"g{i}" for i in range(6)])
     bank = ScDataBank()
     did = bank.register_dense(ds, str(root))
     expected = _expected_dense((5, 6), np.float32)
     batches = [[0, 1], [2, 3, 4]]
-    pf = bank.prefetch_cells(did, batches)
+    pf = bank.prefetch(did, batches)
     seen = 0
     for batch in pf:
         assert hasattr(batch, "cells") and hasattr(batch, "data") and hasattr(batch, "num_genes")
         cells = np.asarray(batch.cells)
         data = np.asarray(batch.data)
         assert batch.num_genes == 6
+        assert batch.var_names == tuple(f"g{i}" for i in range(6))
+        assert batch.to_numpy().shape == (len(cells), 6)
         assert data.shape == (len(cells) * 6,)
         seen += len(cells)
         rows = expected[cells.tolist()]
@@ -285,7 +310,7 @@ def test_prefetch_cells(dense_store_factory) -> None:
     bank.unregister(did)
 
 
-def test_prefetch_by_gene_names(dense_store_factory) -> None:
+def test_prefetch_by_genes(dense_store_factory) -> None:
     root = dense_store_factory(
         "pfgn", (5, 6), (2, 3), np.float32, None, [f"g{i}" for i in range(6)]
     )
@@ -293,12 +318,13 @@ def test_prefetch_by_gene_names(dense_store_factory) -> None:
     bank = ScDataBank()
     did = bank.register_dense(ds, str(root))
     expected = _expected_dense((5, 6), np.float32)
-    pf = bank.prefetch_cells_by_gene_names(did, [[0, 1], [2]], ["g0", "g5"])
+    pf = bank.prefetch(did, [[0, 1], [2]], genes=["g0", "g5"])
     seen = 0
     for batch in pf:
         cells = np.asarray(batch.cells)
         data = np.asarray(batch.data)
         assert batch.num_genes == 2
+        assert batch.var_names == ("g0", "g5")
         rows = expected[cells.tolist()][:, [0, 5]]
         assert np.array_equal(data.reshape(len(cells), 2), rows)
         seen += len(cells)
@@ -322,3 +348,13 @@ def test_multiple_banks(dense_store_factory) -> None:
     assert b2.dataset_genes(d2) == ["h0", "h1", "h2", "h3"]
     del b1
     assert b2.dataset_genes(d2) == ["h0", "h1", "h2", "h3"]
+
+
+def test_closed_bank_raises_runtime_error() -> None:
+    bank = ScDataBank()
+    assert not bank.is_closed
+    bank.close()
+    assert bank.is_closed
+    assert "closed" in repr(bank)
+    with pytest.raises(RuntimeError, match="closed"):
+        bank.dataset_num_cells(object())  # type: ignore[arg-type]

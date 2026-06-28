@@ -7,16 +7,17 @@ touches the Rust core.
 
 Three value types cover the whole surface:
 
-* :class:`CellAccess` — input for one ``access_cells`` /
-  ``access_cells_by_gene_names`` call, and the per-batch input unit for
-  scheduled prefetch: which cells, optionally which genes.
+* :class:`CellAccess` — input for one :meth:`scdata.databank.ScDataBank.load`
+  call, and the per-batch input unit for scheduled prefetch: which cells,
+  optionally which genes.
 * :class:`CellData` — output of one access call: the decoded 1D array plus
   enough shape (and the matching gene names) to interpret it.  Implements
   ``__array__`` so ``np.asarray(result)`` works directly, in addition to the
   :attr:`matrix` zero-copy view.
 * :class:`CellBatch` — the **output** batch type yielded by the prefetch
-  iterator (``cells`` + ``data`` + ``num_genes``).  It is always decoded; the
-  prefetch *input* side is a :class:`CellAccess`, not a half-filled batch.
+  iterator (``cells`` + ``data`` + ``num_genes`` + optional gene names).  It is
+  always decoded; the prefetch *input* side is a :class:`CellAccess`, not a
+  half-filled batch.
 
 Layout contract
 ---------------
@@ -164,6 +165,30 @@ class CellData:
         """``data`` reshaped to ``[num_cells, num_genes]`` (zero-copy view)."""
         return self.data.reshape(self.num_cells, self.num_genes)
 
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Matrix shape as ``(num_cells, num_genes)``."""
+        return (self.num_cells, self.num_genes)
+
+    @property
+    def obs_indices(self) -> NDArray[np.intp]:
+        """Requested cell indices, in output row order."""
+        return self.cells
+
+    @property
+    def var_names(self) -> tuple[str, ...] | None:
+        """Gene names, in output column order, when known."""
+        return self.gene_names
+
+    def to_numpy(self, *, copy: bool = False) -> NDArray[np.generic]:
+        """Return the decoded 2D matrix view, copying only when requested."""
+        matrix = self.matrix
+        return matrix.copy() if copy else matrix
+
+    def to_flat_numpy(self, *, copy: bool = False) -> NDArray[np.generic]:
+        """Return the raw 1D row-major payload, copying only when requested."""
+        return self.data.copy() if copy else self.data
+
     def __array__(self, dtype: Any = None, copy: Any = None) -> NDArray[np.generic]:
         """Allow ``np.asarray(cell_data)`` to read the decoded payload.
 
@@ -198,6 +223,7 @@ class CellBatch:
     cells: NDArray[np.intp] = field(compare=False)
     data: NDArray[np.generic] = field(compare=False)
     num_genes: int
+    gene_names: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.num_genes <= 0:
@@ -216,6 +242,11 @@ class CellBatch:
             data = np.ascontiguousarray(data)
         object.__setattr__(self, "cells", cells)
         object.__setattr__(self, "data", data)
+        if self.gene_names is not None:
+            names = tuple(self.gene_names)
+            if len(names) != self.num_genes:
+                raise ValueError(f"gene_names length {len(names)} != num_genes {self.num_genes}")
+            object.__setattr__(self, "gene_names", names)
 
     @classmethod
     def from_array(
@@ -223,9 +254,10 @@ class CellBatch:
         cells: Any,
         data: Any,
         num_genes: int,
+        gene_names: Any | None = None,
     ) -> "CellBatch":
         """Build a decoded batch from a raw 1D result array."""
-        return cls(cells=cells, data=data, num_genes=num_genes)
+        return cls(cells=cells, data=data, num_genes=num_genes, gene_names=gene_names)
 
     @property
     def num_cells(self) -> int:
@@ -236,3 +268,33 @@ class CellBatch:
     def matrix(self) -> NDArray[np.generic]:
         """``data`` reshaped to ``[num_cells, num_genes]`` (zero-copy view)."""
         return self.data.reshape(self.num_cells, self.num_genes)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Matrix shape as ``(num_cells, num_genes)``."""
+        return (self.num_cells, self.num_genes)
+
+    @property
+    def obs_indices(self) -> NDArray[np.intp]:
+        """Requested cell indices, in output row order."""
+        return self.cells
+
+    @property
+    def var_names(self) -> tuple[str, ...] | None:
+        """Gene names, in output column order, when known."""
+        return self.gene_names
+
+    def to_numpy(self, *, copy: bool = False) -> NDArray[np.generic]:
+        """Return the decoded 2D matrix view, copying only when requested."""
+        matrix = self.matrix
+        return matrix.copy() if copy else matrix
+
+    def to_flat_numpy(self, *, copy: bool = False) -> NDArray[np.generic]:
+        """Return the raw 1D row-major payload, copying only when requested."""
+        return self.data.copy() if copy else self.data
+
+    def __array__(self, dtype: Any = None, copy: Any = None) -> NDArray[np.generic]:
+        """Allow ``np.asarray(cell_batch)`` to read the decoded payload."""
+        if dtype is None:
+            return self.data
+        return np.asarray(self.data, dtype=dtype)

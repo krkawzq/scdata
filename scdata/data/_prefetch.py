@@ -1,10 +1,10 @@
 """Scheduled prefetch input and iterator types for the DataBank.
 
 These are the pure-Python data carriers for the streaming access path:
-:class:`PrefetchBatches` describes what a ``ScDataBank.prefetch_cells`` /
-``prefetch_cells_by_gene_names`` call consumes (a stream of cell-index
-batches), and :class:`PrefetchIterator` describes what it returns (a lazily
-decoded stream of :class:`~scdata.data._cell.CellBatch` objects).
+:class:`PrefetchBatches` describes what a ``ScDataBank.prefetch`` call consumes
+(a stream of cell-index batches), and :class:`PrefetchIterator` describes what
+it returns (a lazily decoded stream of :class:`~scdata.data._cell.CellBatch`
+objects).
 
 Like :mod:`scdata.data._cell`, this module stays in the data layer — no
 dependency on the Rust extension.  The bank's execution layer
@@ -53,8 +53,8 @@ class PrefetchBatches:
         batches: Tuple of :class:`~scdata.data._cell.CellAccess` instances, each
             carrying the cell indices for one batch (and, when a gene subset
             applies to every batch, the same ``gene_names``).  Stored as
-            ``CellAccess`` so the prefetch input unit is the same type a single
-            ``access_cells`` call takes.
+            ``CellAccess`` so the prefetch input unit is the same type a
+            single ``load`` call takes.
         gene_names: Optional gene-name subset projected onto every batch;
             ``None`` means all genes in dataset column order.  When set, this
             is the authoritative projection — the per-batch ``CellAccess``
@@ -134,17 +134,27 @@ class PrefetchIterator:
     layer constructs it with the Rust producer as the source.
     """
 
-    __slots__ = ("_inner",)
+    __slots__ = ("_inner", "_gene_names")
 
-    def __init__(self, inner: Iterable[tuple[NDArray[np.intp], NDArray[np.generic], int]]) -> None:
+    def __init__(
+        self,
+        inner: Iterable[tuple[NDArray[np.intp], NDArray[np.generic], int]],
+        gene_names: Iterable[str] | None = None,
+    ) -> None:
         # Bind the iterator protocol once; ``inner`` may be a Rust pyclass that
         # is itself an iterator (``__iter__`` returns self) or any Python
         # iterable.
         self._inner: Iterator[tuple[NDArray[np.intp], NDArray[np.generic], int]] = iter(inner)
+        self._gene_names = tuple(gene_names) if gene_names is not None else None
 
     def __iter__(self) -> "PrefetchIterator":
         return self
 
     def __next__(self) -> CellBatch:
         cells, data, num_genes = next(self._inner)
-        return CellBatch.from_array(cells=cells, data=data, num_genes=num_genes)
+        return CellBatch.from_array(
+            cells=cells,
+            data=data,
+            num_genes=num_genes,
+            gene_names=self._gene_names,
+        )
