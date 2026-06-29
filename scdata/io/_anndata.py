@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
 
 import numpy as np
 
@@ -45,6 +47,7 @@ __all__ = ["write_zarr", "read_zarr"]
 _XFormat = Literal["dense2d", "dense1d", "sparse"]
 _LayerFormat = Literal["preserve", "auto", "dense2d", "dense1d", "sparse"]
 _Store = Literal["zip", "dir"]
+_Compressor = str | Mapping[str, Any] | None
 
 # scdata marker stored in matrix array/group ``attributes`` so :func:`read_zarr`
 # can recover the layout without guessing from shape.  ``scdata-x`` is the
@@ -55,6 +58,7 @@ _SCDATA_SHAPE_2D = "scdata-shape-2d"
 
 # Default chunk element count when ``chunk_size`` is an int.
 _DEFAULT_CHUNK_ELEMENTS = 1_000_000
+_DEFAULT_COMPRESSOR = "blosc.lz4.level5"
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +75,7 @@ def write_zarr(
     chunk_size: int | list[int] | tuple[int, ...] = _DEFAULT_CHUNK_ELEMENTS,
     align_cells: bool = True,
     store: _Store = "zip",
+    compressor: _Compressor = _DEFAULT_COMPRESSOR,
 ) -> Path:
     """Write an :class:`anndata.AnnData` as a scdata zarr v3 store.
 
@@ -105,6 +110,9 @@ def write_zarr(
     store:
         ``"zip"`` (default) writes a ``ZIP_STORED`` archive; ``"dir"`` writes
         a directory tree.
+    compressor:
+        Chunk compressor.  Defaults to ``"blosc.lz4.level5"``.  Pass ``None``
+        or ``"none"`` for uncompressed chunks.
     """
     import zarr
     from anndata._io.specs import write_elem
@@ -118,6 +126,7 @@ def write_zarr(
         layer_format=layer_format,
         chunk_size=chunk_size,
         store=store,
+        compressor=compressor,
     )
     if store == "zip":
         _prepare_zip_target(root)
@@ -131,35 +140,43 @@ def write_zarr(
         g.attrs["encoding-type"] = "anndata"
         g.attrs["encoding-version"] = "0.1.0"
 
-        # Everything except X is written by anndata's own element writers, so
-        # obs/var/uns/obsm/... are byte-identical to ``anndata.write_zarr``.
-        write_elem(g, "obs", adata.obs)
-        write_elem(g, "var", adata.var)
-        if adata.obsm:
-            write_elem(g, "obsm", dict(adata.obsm))
-        if adata.varm:
-            write_elem(g, "varm", dict(adata.varm))
-        if adata.obsp:
-            write_elem(g, "obsp", dict(adata.obsp))
-        if adata.varp:
-            write_elem(g, "varp", dict(adata.varp))
-        write_elem(g, "uns", dict(adata.uns))
-        if adata.raw is not None:
-            write_elem(g, "raw", adata.raw)
+        with _suppress_known_zarr_write_warnings():
+            # Everything except X is written by anndata's own element writers,
+            # so obs/var/uns/obsm/... stay compatible with anndata.write_zarr.
+            write_elem(g, "obs", adata.obs)
+            write_elem(g, "var", adata.var)
+            if adata.obsm:
+                write_elem(g, "obsm", dict(adata.obsm))
+            if adata.varm:
+                write_elem(g, "varm", dict(adata.varm))
+            if adata.obsp:
+                write_elem(g, "obsp", dict(adata.obsp))
+            if adata.varp:
+                write_elem(g, "varp", dict(adata.varp))
+            write_elem(g, "uns", dict(adata.uns))
+            if adata.raw is not None:
+                write_elem(g, "raw", adata.raw)
 
-        _write_x(g, adata, format=format, chunk_size=chunk_size, align_cells=align_cells)
-        _write_layers(
-            g,
-            adata,
-            layer_format=layer_format,
-            chunk_size=chunk_size,
-            align_cells=align_cells,
-        )
+            _write_x(
+                g,
+                adata,
+                format=format,
+                chunk_size=chunk_size,
+                align_cells=align_cells,
+                compressor=compressor,
+            )
+            _write_layers(
+                g,
+                adata,
+                layer_format=layer_format,
+                chunk_size=chunk_size,
+                align_cells=align_cells,
+                compressor=compressor,
+            )
 
         if store == "zip":
             _zip_store(zstore, root)
         else:
-            zarr.consolidate_metadata(g.store)
             _replace_directory(tmp_root, root)
             tmp_root = None
     finally:
@@ -183,6 +200,7 @@ def _write_x(
     format: _XFormat,
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
+    compressor: _Compressor,
 ) -> None:
     """Write the X array/group in the requested layout."""
     _write_matrix(
@@ -194,6 +212,7 @@ def _write_x(
         format=format,
         chunk_size=chunk_size,
         align_cells=align_cells,
+        compressor=compressor,
     )
 
 
@@ -204,6 +223,7 @@ def _write_layers(
     layer_format: _LayerFormat,
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
+    compressor: _Compressor,
 ) -> None:
     """Write all AnnData layers using the same scdata matrix layouts as X."""
     if not adata.layers:
@@ -222,6 +242,7 @@ def _write_layers(
             format=fmt,
             chunk_size=chunk_size,
             align_cells=align_cells,
+            compressor=compressor,
         )
 
 
@@ -235,6 +256,7 @@ def _write_matrix(
     format: _XFormat,
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
+    compressor: _Compressor,
 ) -> None:
     """Write one dense or CSR matrix under ``g[name]`` in a scdata layout."""
     from scipy import sparse as _sparse
@@ -255,6 +277,7 @@ def _write_matrix(
             dense,
             chunk_shape,
             attrs=_matrix_attrs("dense2d", n_obs, n_var),
+            compressor=compressor,
         )
     elif format == "dense1d":
         dense = matrix.toarray() if _sparse.issparse(matrix) else np.asarray(matrix)
@@ -266,10 +289,18 @@ def _write_matrix(
             flat,
             chunk_shape,
             attrs=_matrix_attrs("dense1d", n_obs, n_var),
+            compressor=compressor,
         )
     elif format == "sparse":
         csr = matrix.tocsr() if not _sparse.isspmatrix_csr(matrix) else matrix
-        _write_csr_group(g, name, csr, chunk_size=chunk_size, align_cells=align_cells)
+        _write_csr_group(
+            g,
+            name,
+            csr,
+            chunk_size=chunk_size,
+            align_cells=align_cells,
+            compressor=compressor,
+        )
     else:  # pragma: no cover - Literal exhausts the cases
         raise StoreError(f"unsupported X format: {format!r}")
 
@@ -332,18 +363,21 @@ def _create_dense_array(
     chunk_shape: tuple[int, ...],
     *,
     attrs: dict[str, Any],
+    compressor: _Compressor,
 ) -> None:
     """Create a v3 dense array with the scdata default codec pipeline."""
     from zarr.codecs import BytesCodec
 
+    data = np.asarray(data, dtype=_little_endian_dtype(data.dtype))
     arr = g.create_array(
         name,
         shape=data.shape,
         dtype=data.dtype,
         chunks=chunk_shape,
+        shards=None,
         filters=(),
         serializer=BytesCodec(endian="little"),
-        compressors="auto",
+        compressors=_zarr_compressors(np.dtype(data.dtype), compressor),
         fill_value=_fill_value_for(data.dtype),
     )
     arr.attrs.update(attrs)
@@ -357,6 +391,7 @@ def _write_csr_group(
     *,
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
+    compressor: _Compressor,
 ) -> None:
     """Write a CSR matrix as an anndata-compatible v3 group.
 
@@ -390,12 +425,27 @@ def _write_csr_group(
             "encoding-type": "array",
             "encoding-version": "0.2.0",
         },
+        compressor=compressor,
     )
 
     if align_cells:
         boundaries = _aligned_cell_boundaries(indptr, _resolve_sparse_chunk_target(chunk_size))
-        _write_rectilinear_array(sub, "indices", indices, boundaries, csr.indices.dtype)
-        _write_rectilinear_array(sub, "data", data, boundaries, csr.data.dtype)
+        _write_rectilinear_array(
+            sub,
+            "indices",
+            indices,
+            boundaries,
+            csr.indices.dtype,
+            compressor=compressor,
+        )
+        _write_rectilinear_array(
+            sub,
+            "data",
+            data,
+            boundaries,
+            csr.data.dtype,
+            compressor=compressor,
+        )
     else:
         nnz_chunks = _resolve_chunk_size_1d(chunk_size, 1, align_cells=False)
         _create_dense_array(
@@ -407,6 +457,7 @@ def _write_csr_group(
                 "encoding-type": "array",
                 "encoding-version": "0.2.0",
             },
+            compressor=compressor,
         )
         _create_dense_array(
             sub,
@@ -417,6 +468,7 @@ def _write_csr_group(
                 "encoding-type": "array",
                 "encoding-version": "0.2.0",
             },
+            compressor=compressor,
         )
 
 
@@ -465,6 +517,8 @@ def _write_rectilinear_array(
     values: np.ndarray,
     boundaries: list[int],
     dtype: Any,
+    *,
+    compressor: _Compressor,
 ) -> None:
     """Write a 1D array with a rectilinear (variable-length) chunk grid.
 
@@ -476,7 +530,7 @@ def _write_rectilinear_array(
     chunk grids.
     """
     total = int(values.shape[0])
-    np_dtype = np.dtype(dtype)
+    np_dtype = _little_endian_dtype(dtype)
     attrs = {
         "encoding-type": "array",
         "encoding-version": "0.2.0",
@@ -490,6 +544,7 @@ def _write_rectilinear_array(
             np.asarray(values, dtype=np_dtype),
             (1,),
             attrs=attrs,
+            compressor=compressor,
         )
         return
 
@@ -504,7 +559,7 @@ def _write_rectilinear_array(
                 "chunk_shapes": [runs],
             },
         },
-        codecs=_v3_bytes_codecs(np_dtype),
+        codecs=_v3_codecs(np_dtype, compressor),
         fill_value=_fill_value_for(np_dtype),
         attrs=attrs,
     )
@@ -517,6 +572,7 @@ def _write_rectilinear_array(
         if end <= start:
             continue
         chunk_bytes = np.ascontiguousarray(values[start:end]).astype(np_dtype, copy=False).tobytes()
+        chunk_bytes = _encode_chunk_bytes(chunk_bytes, np_dtype, compressor)
         _store_set_bytes(store, f"{base}/{i}", chunk_bytes)
 
 
@@ -602,6 +658,11 @@ def _fill_value_for(dtype: Any) -> Any:
     return 0
 
 
+def _little_endian_dtype(dtype: Any) -> np.dtype:
+    """Return the on-disk numeric dtype scdata writes for zarr v3 chunks."""
+    return np.dtype(dtype).newbyteorder("<")
+
+
 # ---------------------------------------------------------------------------
 # v3 metadata + store helpers
 # ---------------------------------------------------------------------------
@@ -612,6 +673,18 @@ def _enable_rectilinear() -> None:
     import zarr
 
     zarr.config.set({"array.rectilinear_chunks": True})
+
+
+@contextmanager
+def _suppress_known_zarr_write_warnings():
+    """Suppress zarr migration notices that callers cannot act on per write."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"zarr v3 autosharding will be the default.*",
+            category=UserWarning,
+        )
+        yield
 
 
 def _v3_dtype_name(np_dtype: np.dtype) -> str:
@@ -629,10 +702,8 @@ def _v3_dtype_name(np_dtype: np.dtype) -> str:
 
 
 def _default_v3_codecs(np_dtype: np.dtype) -> list[dict[str, Any]]:
-    """The codec pipeline anndata/zarr writes by default for a numeric dtype."""
-    return _v3_bytes_codecs(np_dtype) + [
-        {"name": "zstd", "configuration": {"level": 0, "checksum": False}}
-    ]
+    """The codec pipeline scdata writes by default for a numeric dtype."""
+    return _v3_codecs(np_dtype, _DEFAULT_COMPRESSOR)
 
 
 def _v3_bytes_codecs(np_dtype: np.dtype) -> list[dict[str, Any]]:
@@ -641,6 +712,193 @@ def _v3_bytes_codecs(np_dtype: np.dtype) -> list[dict[str, Any]]:
     if np_dtype.itemsize > 1:
         serializer = {"name": "bytes", "configuration": {"endian": "little"}}
     return [serializer]
+
+
+def _v3_codecs(np_dtype: np.dtype, compressor: _Compressor) -> list[dict[str, Any]]:
+    """Return the v3 serializer plus optional BytesBytes compressor codecs."""
+    codecs = _v3_bytes_codecs(np_dtype)
+    cfg = _compressor_config(compressor, np_dtype)
+    if cfg is None:
+        return codecs
+    if cfg["id"] == "blosc":
+        codecs.append(
+            {
+                "name": "blosc",
+                "configuration": {
+                    "typesize": int(cfg["typesize"]),
+                    "cname": str(cfg["cname"]),
+                    "clevel": int(cfg["clevel"]),
+                    "shuffle": _blosc_shuffle_name(cfg["shuffle"]),
+                    "blocksize": int(cfg["blocksize"]),
+                },
+            }
+        )
+        return codecs
+    raise StoreError(f"unsupported compressor id: {cfg['id']!r}")
+
+
+def _zarr_compressors(np_dtype: np.dtype, compressor: _Compressor) -> tuple[Any, ...]:
+    """Return zarr v3 BytesBytes codec objects for dense arrays."""
+    cfg = _compressor_config(compressor, np_dtype)
+    if cfg is None:
+        return ()
+    if cfg["id"] == "blosc":
+        from zarr.codecs import BloscCodec
+
+        return (
+            BloscCodec(
+                typesize=int(cfg["typesize"]),
+                cname=str(cfg["cname"]),
+                clevel=int(cfg["clevel"]),
+                shuffle=_blosc_shuffle_name(cfg["shuffle"]),
+                blocksize=int(cfg["blocksize"]),
+            ),
+        )
+    raise StoreError(f"unsupported compressor id: {cfg['id']!r}")
+
+
+def _encode_chunk_bytes(raw: bytes, np_dtype: np.dtype, compressor: _Compressor) -> bytes:
+    """Apply the write compressor to one manually-written chunk."""
+    cfg = _compressor_config(compressor, np_dtype)
+    if cfg is None:
+        return raw
+    if cfg["id"] == "blosc":
+        from numcodecs import Blosc
+
+        return bytes(
+            Blosc(
+                cname=str(cfg["cname"]),
+                clevel=int(cfg["clevel"]),
+                shuffle=int(cfg["shuffle"]),
+                blocksize=int(cfg["blocksize"]),
+                typesize=int(cfg["typesize"]),
+            ).encode(raw)
+        )
+    raise StoreError(f"unsupported compressor id: {cfg['id']!r}")
+
+
+def _compressor_config(compressor: _Compressor, np_dtype: np.dtype) -> dict[str, Any] | None:
+    """Normalize public compressor input to a numcodecs-compatible config."""
+    if compressor is None:
+        return None
+    if isinstance(compressor, str):
+        return _compressor_config_from_string(compressor, np_dtype)
+    if isinstance(compressor, Mapping):
+        return _compressor_config_from_mapping(compressor, np_dtype)
+    raise StoreError(
+        "compressor must be None, a string such as 'blosc.lz4.level5', "
+        f"or a mapping, got {type(compressor).__name__}"
+    )
+
+
+def _compressor_config_from_string(text: str, np_dtype: np.dtype) -> dict[str, Any] | None:
+    value = text.strip().lower()
+    if value in ("", "none", "null", "false", "0", "uncompressed"):
+        return None
+    if value == "blosc":
+        return _blosc_config(np_dtype=np_dtype)
+    if value.startswith("blosc."):
+        parts = [part for part in value.split(".") if part]
+        if len(parts) < 2:
+            return _blosc_config(np_dtype=np_dtype)
+        cname = parts[1]
+        clevel = 5
+        shuffle: int | str | None = 1
+        for part in parts[2:]:
+            if part.startswith("level"):
+                clevel = int(part.removeprefix("level"))
+            elif part.startswith("clevel"):
+                clevel = int(part.removeprefix("clevel"))
+            elif part.isdigit():
+                clevel = int(part)
+            elif part in ("noshuffle", "none", "shuffle", "bitshuffle"):
+                shuffle = part
+            else:
+                raise StoreError(f"unsupported blosc compressor option: {part!r}")
+        return _blosc_config(np_dtype=np_dtype, cname=cname, clevel=clevel, shuffle=shuffle)
+    raise StoreError(
+        f"unsupported compressor {text!r}; supported values include "
+        "'blosc.lz4.level5' and None"
+    )
+
+
+def _compressor_config_from_mapping(
+    value: Mapping[str, Any], np_dtype: np.dtype
+) -> dict[str, Any] | None:
+    name = value.get("id", value.get("name"))
+    if name is None:
+        raise StoreError("compressor mapping must include 'id' or 'name'")
+    codec_id = str(name).strip().lower()
+    if codec_id in ("none", "null", "uncompressed"):
+        return None
+    cfg = value.get("configuration")
+    options = dict(cfg) if isinstance(cfg, Mapping) else dict(value)
+    if codec_id == "blosc":
+        return _blosc_config(
+            np_dtype=np_dtype,
+            cname=str(options.get("cname", "lz4")),
+            clevel=int(options.get("clevel", options.get("level", 5))),
+            shuffle=options.get("shuffle", 1),
+            blocksize=int(options.get("blocksize", 0)),
+            typesize=int(options.get("typesize", np_dtype.itemsize)),
+        )
+    raise StoreError(f"unsupported compressor id: {codec_id!r}")
+
+
+def _blosc_config(
+    *,
+    np_dtype: np.dtype,
+    cname: str = "lz4",
+    clevel: int = 5,
+    shuffle: int | str | None = 1,
+    blocksize: int = 0,
+    typesize: int | None = None,
+) -> dict[str, Any]:
+    if not 0 <= int(clevel) <= 9:
+        raise StoreError(f"blosc clevel must be between 0 and 9, got {clevel}")
+    if int(blocksize) < 0:
+        raise StoreError(f"blosc blocksize must be non-negative, got {blocksize}")
+    parsed_typesize = int(np_dtype.itemsize if typesize is None else typesize)
+    if parsed_typesize <= 0:
+        raise StoreError(f"blosc typesize must be positive, got {parsed_typesize}")
+    return {
+        "id": "blosc",
+        "cname": str(cname),
+        "clevel": int(clevel),
+        "shuffle": _blosc_shuffle_int(shuffle),
+        "blocksize": int(blocksize),
+        "typesize": parsed_typesize,
+    }
+
+
+def _blosc_shuffle_int(value: int | str | None) -> int:
+    if value is None:
+        return 1
+    if isinstance(value, str):
+        text = value.strip().lower()
+        names = {
+            "0": 0,
+            "none": 0,
+            "noshuffle": 0,
+            "no_shuffle": 0,
+            "1": 1,
+            "shuffle": 1,
+            "byte": 1,
+            "2": 2,
+            "bitshuffle": 2,
+            "bit_shuffle": 2,
+        }
+        if text in names:
+            return names[text]
+        raise StoreError(f"unsupported blosc shuffle value: {value!r}")
+    parsed = int(value)
+    if parsed not in (0, 1, 2):
+        raise StoreError(f"unsupported blosc shuffle value: {value!r}")
+    return parsed
+
+
+def _blosc_shuffle_name(value: int | str | None) -> str:
+    return {0: "noshuffle", 1: "shuffle", 2: "bitshuffle"}[_blosc_shuffle_int(value)]
 
 
 def _v3_array_json(
@@ -690,6 +948,7 @@ def _validate_write_options(
     layer_format: str,
     chunk_size: int | list[int] | tuple[int, ...],
     store: str,
+    compressor: _Compressor,
 ) -> None:
     """Validate cheap write options before touching the output path."""
     if store not in ("zip", "dir"):
@@ -699,6 +958,7 @@ def _validate_write_options(
     if layer_format not in ("preserve", "auto", "dense2d", "dense1d", "sparse"):
         raise StoreError(f"unsupported layer_format {layer_format!r}")
     _validate_chunk_size_values(chunk_size)
+    _compressor_config(compressor, np.dtype("float32"))
 
 
 def _validate_chunk_size_values(chunk_size: int | list[int] | tuple[int, ...]) -> None:
@@ -815,30 +1075,35 @@ def read_zarr(path: str | os.PathLike[str]) -> "AnnData":
     _enable_rectilinear()
     f = _open_store_for_read(path)
 
-    def callback(read_func: Any, elem_name: str, elem: Any, *, iospec: Any) -> Any:
-        name = elem_name.lstrip("/")
-        attrs = _node_attrs(elem)
-        kind = _matrix_kind(attrs)
-        if _is_matrix_root(name) and kind in ("dense1d", "sparse", "sparse-vlen"):
-            return _read_matrix_scdata(f, name, kind, attrs)
-        if iospec.encoding_type == "anndata" or elem_name.endswith("/"):
-            # ``read_dispatched`` returns the anndata ``RWAble`` union; the
-            # values are passed straight into the AnnData constructor, whose
-            # own kwargs accept them at runtime.  Annotate as ``dict[str, Any]``
-            # so pyright does not flag each RWAble member against the ctor.
-            kwargs: dict[str, Any] = {
-                k: read_dispatched(v, callback=callback)
-                for k, v in dict(elem).items()
-                if not k.startswith("raw.")
-            }
-            return ad.AnnData(**kwargs)
-        if elem_name.startswith("/raw."):
-            return None
-        if elem_name in {"/obs", "/var"}:
-            return read_elem(elem)
-        return read_func(elem)
+    try:
+        def callback(read_func: Any, elem_name: str, elem: Any, *, iospec: Any) -> Any:
+            name = elem_name.lstrip("/")
+            attrs = _node_attrs(elem)
+            kind = _matrix_kind(attrs)
+            if _is_matrix_root(name) and kind in ("dense1d", "sparse", "sparse-vlen"):
+                return _read_matrix_scdata(f, name, kind, attrs)
+            if iospec.encoding_type == "anndata" or elem_name.endswith("/"):
+                # ``read_dispatched`` returns the anndata ``RWAble`` union; the
+                # values are passed straight into the AnnData constructor, whose
+                # own kwargs accept them at runtime.  Annotate as ``dict[str, Any]``
+                # so pyright does not flag each RWAble member against the ctor.
+                kwargs: dict[str, Any] = {
+                    k: read_dispatched(v, callback=callback)
+                    for k, v in dict(elem).items()
+                    if not k.startswith("raw.")
+                }
+                return ad.AnnData(**kwargs)
+            if elem_name.startswith("/raw."):
+                return None
+            if elem_name in {"/obs", "/var"}:
+                return read_elem(elem)
+            return read_func(elem)
 
-    return cast("AnnData", read_dispatched(f, callback=callback))
+        return cast("AnnData", read_dispatched(f, callback=callback))
+    finally:
+        close = getattr(getattr(f, "store", None), "close", None)
+        if close is not None:
+            close()
 
 
 def _node_attrs(elem: Any) -> dict[str, Any]:
@@ -894,9 +1159,10 @@ def _read_csr(f: Any, matrix_key: str) -> Any:
 def _read_sub_array(f: Any, key: str) -> np.ndarray:
     """Read a 1D sub-array of X (indptr/indices/data).
 
-    Regular-grid arrays go through ``read_elem``; rectilinear (``sparse-vlen``)
-    arrays are rebuilt by concatenating chunk files in grid order, since
-    zarr's regular-grid math would misread a variable-length grid.
+    Regular-grid arrays go through ``read_elem``.  Rectilinear arrays are read
+    through zarr's array slicing path: ``read_elem`` may inspect regular-only
+    ``.chunks`` metadata, while ``node[:]`` supports rectilinear grids once the
+    zarr feature flag is enabled.
     """
     from anndata._io.specs import read_elem
 
@@ -904,18 +1170,10 @@ def _read_sub_array(f: Any, key: str) -> np.ndarray:
     attrs = dict(node.attrs)
     if _matrix_kind(attrs) != "sparse-vlen":
         return np.asarray(read_elem(node))
-
-    store = node.store
-    prefix = f"{key}/c/"
-    keys = sorted(
-        _store_list(store, prefix),
-        key=lambda k: int(k[len(prefix) :].split("/")[0]),
-    )
-    parts: list[bytes] = []
-    for k in keys:
-        parts.append(_store_get_bytes(store, k))
-    buf = b"".join(parts)
-    return np.frombuffer(buf, dtype=node.dtype).copy()
+    try:
+        return np.asarray(node[:])
+    except Exception as err:
+        raise StoreError(f"{key}: failed to read rectilinear array") from err
 
 
 def _store_set_bytes(store: Any, key: str, value: bytes) -> None:

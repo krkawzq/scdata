@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from scdata.data import CellAccess, CellBatch, CellData
 from scdata.data._dataset import (
     ArrayMeta,
     ArrayOrder,
@@ -13,6 +14,7 @@ from scdata.data._dataset import (
     CodecPipeline,
     DataError,
     DenseDataset,
+    DatasetCollection,
     DtypeParseError,
     DType,
     SparseDataset,
@@ -212,6 +214,13 @@ def test_chunk_location_zero_length_ok():
     assert loc.length == 0
 
 
+def test_chunk_location_rejects_float_and_bool():
+    with pytest.raises(TypeError, match="integer"):
+        ChunkLocation(offset=1.2, length=4)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="bool"):
+        ChunkLocation(offset=True, length=4)  # type: ignore[arg-type]
+
+
 # --------------------------------------------------------------------------
 # ArrayMeta
 # --------------------------------------------------------------------------
@@ -321,6 +330,17 @@ def test_array_meta_directory_source_paths_and_offsets():
     assert tuple((c.offset, c.length) for c in meta.chunks) == ((100, 8), (200, 8))
 
 
+def test_array_meta_rejects_float_chunk_lengths():
+    with pytest.raises(TypeError, match="integer"):
+        ArrayMeta.from_directory(
+            shape=(2,),
+            chunk_shape=(1,),
+            dtype=DType.F32,
+            chunk_paths=("X/c/0", "X/c/1"),
+            chunk_lengths=(8, 8.5),
+        )
+
+
 # --------------------------------------------------------------------------
 # DenseDataset / SparseDataset validation
 # --------------------------------------------------------------------------
@@ -389,6 +409,25 @@ def test_dense_dataset_1d_ok():
     )
     assert ds.num_cells == 3
     assert ds.num_genes == 4
+    assert ds.shape == (3, 4)
+    assert ds.n_obs == 3
+    assert ds.n_vars == 4
+    assert ds.dtype == DType.F32
+    assert ds.var_names == tuple(f"g{i}" for i in range(4))
+    assert "DenseDataset(shape=(3, 4)" in repr(ds)
+
+
+def test_dense_dataset_single_gene_string_is_one_name():
+    meta = ArrayMeta.from_chunks(
+        shape=(3, 1),
+        chunk_shape=(2, 1),
+        dtype=DType.F32,
+        chunks=_chunk_locs(2),
+    )
+    ds = DenseDataset(gene_names="TP53", data=meta, num_cells=3, num_genes=1)
+
+    assert ds.gene_names == ("TP53",)
+    assert ds.var_names == ("TP53",)
 
 
 def test_sparse_dataset_indptr_length_mismatch(csr_array_metas):
@@ -439,6 +478,20 @@ def test_sparse_dataset_indptr_non_negative(csr_array_metas):
         SparseDataset(
             gene_names=tuple(f"g{i}" for i in range(4)),
             indptr=(0, -1, 4, 6),
+            indices=indices,
+            data=data,
+            index_dtype=DType.I32,
+            num_cells=3,
+            num_genes=4,
+        )
+
+
+def test_sparse_dataset_indptr_rejects_float(csr_array_metas):
+    indices, data = csr_array_metas
+    with pytest.raises(TypeError, match="integer"):
+        SparseDataset(
+            gene_names=tuple(f"g{i}" for i in range(4)),
+            indptr=(0, 1.5, 4, 6),
             indices=indices,
             data=data,
             index_dtype=DType.I32,
@@ -520,6 +573,62 @@ def test_sparse_dataset_dtype_mismatch():
             num_cells=3,
             num_genes=4,
         )
+
+
+# --------------------------------------------------------------------------
+# DatasetCollection / cell carriers
+# --------------------------------------------------------------------------
+
+
+def test_dataset_collection_behaves_like_mapping():
+    meta = ArrayMeta.from_chunks(
+        shape=(3, 4),
+        chunk_shape=(2, 2),
+        dtype=DType.F32,
+        chunks=_chunk_locs(4),
+    )
+    ds = DenseDataset(
+        gene_names=tuple(f"g{i}" for i in range(4)),
+        data=meta,
+        num_cells=3,
+        num_genes=4,
+    )
+    collection = DatasetCollection(x=ds, layers={"counts": ds}, store_root="/tmp/store.zarr")
+
+    assert len(collection) == 2
+    assert list(collection) == ["X", "layers/counts"]
+    assert collection.keys() == ("X", "layers/counts")
+    assert collection.get("counts") is ds
+    assert list(collection.values()) == [ds, ds]
+    assert dict(collection.items()) == {"X": ds, "layers/counts": ds}
+    with pytest.raises(TypeError):
+        collection.layers["new"] = ds  # type: ignore[index]
+    assert "DatasetCollection(keys=('X', 'layers/counts')" in repr(collection)
+
+
+def test_cell_carriers_strict_indices_and_single_gene_string():
+    access = CellAccess.from_cells([0, 2], gene_names="TP53")
+    assert access.cells.tolist() == [0, 2]
+    assert access.gene_names == ("TP53",)
+    assert repr(access) == "CellAccess(num_cells=2, genes=1)"
+
+    with pytest.raises(TypeError, match="integer"):
+        CellAccess.from_cells([0, 1.2])
+    with pytest.raises(TypeError, match="bool"):
+        CellAccess.from_cells([True])
+
+    data = CellData.from_array(cells=[0], data=np.array([1, 2], dtype=np.float32), num_genes=2)
+    assert "CellData(shape=(1, 2), dtype=float32" in repr(data)
+    with pytest.raises(ValueError, match="gene_names length"):
+        CellData.from_array(cells=[0], data=np.array([1, 2]), num_genes=2, gene_names=["g0"])
+
+    batch = CellBatch.from_array(
+        cells=[0],
+        data=np.array([1], dtype=np.float32),
+        num_genes=1,
+        gene_names="TP53",
+    )
+    assert batch.gene_names == ("TP53",)
 
 
 # --------------------------------------------------------------------------

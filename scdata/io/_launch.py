@@ -467,11 +467,12 @@ def _v3_codec_pipeline(codecs: object, context: str) -> CodecPipeline:
         return CodecPipeline()
     if len(compressors) == 1:
         return CodecPipeline(compressor=compressors[0])
-    # v3 allows multiple BytesBytes codecs; scdata's Rust pipeline applies
-    # filters-then-compressor, so fold extra compressors into the filter list
-    # in reverse decode order (last listed = decoded first).
+    # v3 allows multiple BytesBytes codecs.  Keep all but the final codec in
+    # encode order as "filters"; Rust's zarr-v2-compatible pipeline decodes the
+    # final compressor first and then reverses filters, yielding the v3 decode
+    # order: last codec back to first codec.
     return CodecPipeline(
-        filters=tuple(reversed(compressors[:-1])),
+        filters=tuple(compressors[:-1]),
         compressor=compressors[-1],
     )
 
@@ -500,26 +501,42 @@ def _v3_to_numcodecs(codec_id: str, cfg: dict[str, Any], context: str) -> dict[s
             "id": "blosc",
             "cname": str(cfg.get("cname", "lz4")),
             "clevel": int(cfg.get("clevel", 5)),
-            "shuffle": int(cfg.get("shuffle", 1)),
+            "shuffle": _v3_blosc_shuffle(cfg.get("shuffle", 1), context),
             "blocksize": int(cfg.get("blocksize", 0)),
             "typesize": int(cfg.get("typesize", 1)),
         }
     if codec_id == "lz4":
-        # numcodecs has no standalone lz4 compressor entry that zarr v3 emits;
-        # lz4 in v3 is normally via blosc.  Fall back to blosc-lz4.
-        return {
-            "id": "blosc",
-            "cname": "lz4",
-            "clevel": int(cfg.get("acceleration", 1)),
-            "shuffle": 0,
-            "blocksize": 0,
-            "typesize": 1,
-        }
+        return {"id": "lz4", "acceleration": int(cfg.get("acceleration", 1))}
     if codec_id == "gzip":
         return {"id": "gzip", "level": int(cfg.get("level", 5))}
     if codec_id == "zlib":
         return {"id": "zlib", "level": int(cfg.get("level", 5))}
     raise StoreError(f"{context}: cannot translate codec {codec_id!r} to numcodecs")
+
+
+def _v3_blosc_shuffle(value: object, context: str) -> int:
+    """Normalize zarr v3 blosc shuffle names to numcodecs integer constants."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        names = {
+            "0": 0,
+            "none": 0,
+            "noshuffle": 0,
+            "no_shuffle": 0,
+            "1": 1,
+            "shuffle": 1,
+            "byte": 1,
+            "2": 2,
+            "bitshuffle": 2,
+            "bit_shuffle": 2,
+        }
+        if text in names:
+            return names[text]
+        raise StoreError(f"{context}: unsupported blosc shuffle value {value!r}")
+    parsed = int(value)
+    if parsed not in (0, 1, 2):
+        raise StoreError(f"{context}: unsupported blosc shuffle value {value!r}")
+    return parsed
 
 
 def _v3_chunk_key(separator: str, coord: tuple[int, ...], default_encoding: bool) -> str:
@@ -614,18 +631,20 @@ def _v3_rectilinear_edges(
         raise StoreError(f"{context}: rectilinear chunk_grid needs chunk_shapes")
     axis = chunk_shapes[0]
     edges: list[int] = []
-    if isinstance(axis, int):
+    if _is_json_int(axis):
         # Bare int shorthand: a regular step that repeats to cover the axis.
         total = shape[0] if shape else 0
         n = _ceil_div(total, axis) if axis else 0
         edges = [axis] * n
     elif isinstance(axis, list):
         for e in axis:
-            if isinstance(e, int):
+            if _is_json_int(e):
                 edges.append(e)
-            elif isinstance(e, list) and len(e) == 2:
+            elif isinstance(e, list) and len(e) == 2 and all(_is_json_int(v) for v in e):
                 # RLE: [count, value].
                 count, value = e
+                if count <= 0:
+                    raise StoreError(f"{context}: rectilinear RLE count must be positive")
                 edges.extend([value] * count)
             else:
                 raise StoreError(f"{context}: bad rectilinear edge {e!r}")
@@ -662,8 +681,13 @@ def _v3_rectilinear_chunk_files(
     if isinstance(chunk_key_encoding, dict):
         name = chunk_key_encoding.get("name")
         cfg = chunk_key_encoding.get("configuration")
-        if isinstance(name, str) and name == "v2":
-            default_encoding = False
+        if isinstance(name, str):
+            if name == "v2":
+                default_encoding = False
+            elif name == "default":
+                default_encoding = True
+            else:
+                raise StoreError(f"{context}: unsupported chunk_key_encoding {name!r}")
         if isinstance(cfg, dict):
             s = cfg.get("separator")
             if isinstance(s, str) and s in (".", "/"):

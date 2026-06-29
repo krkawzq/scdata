@@ -316,6 +316,9 @@ def test_load_by_genes(tmp_path: Path) -> None:
     out = np.asarray(bank.load(did, [0, 2], genes=["g1", "g3"]))
     assert out.shape == (4,)
     assert np.array_equal(out.reshape(2, 2), expected[[0, 2]][:, [1, 3]])
+    out_single = np.asarray(bank.load(did, [0, 2], genes="g1"))
+    assert out_single.shape == (2,)
+    assert np.array_equal(out_single.reshape(2, 1), expected[[0, 2]][:, [1]])
     bank.unregister(did)
 
 
@@ -369,15 +372,15 @@ def test_prefetch_by_genes(tmp_path: Path) -> None:
     )
     bank = ScDataBank()
     did = bank.register_dense(ds, str(root))
-    pf = bank.prefetch(did, [[0, 1], [2]], genes=["g0", "g5"])
+    pf = bank.prefetch(did, [[0, 1], [2]], genes="g0")
     seen = 0
     for batch in pf:
         cells = np.asarray(batch.cells)
         data = np.asarray(batch.data)
-        assert batch.num_genes == 2
-        assert batch.var_names == ("g0", "g5")
-        rows = expected[cells.tolist()][:, [0, 5]]
-        assert np.array_equal(data.reshape(len(cells), 2), rows)
+        assert batch.num_genes == 1
+        assert batch.var_names == ("g0",)
+        rows = expected[cells.tolist()][:, [0]]
+        assert np.array_equal(data.reshape(len(cells), 1), rows)
         seen += len(cells)
     assert seen == 3
     bank.unregister(did)

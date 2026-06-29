@@ -296,6 +296,28 @@ def test_csr_index_dtype_mismatch(tmp_path: Path) -> None:
         launch(root)
 
 
+def test_rectilinear_unknown_chunk_key_encoding_rejected(tmp_path: Path) -> None:
+    adata, _ = _sparse_adata()
+    root = write_zarr(adata, tmp_path / "bad_rect_key.zarr", format="sparse", store="dir")
+    meta = _read_json(root / "X" / "data" / "zarr.json")
+    meta["chunk_key_encoding"] = {"name": "custom", "configuration": {"separator": "/"}}
+    _write_json(root / "X" / "data" / "zarr.json", meta)
+
+    with pytest.raises(StoreError, match="chunk_key_encoding"):
+        launch(root)
+
+
+def test_rectilinear_bool_edge_rejected(tmp_path: Path) -> None:
+    adata, _ = _sparse_adata()
+    root = write_zarr(adata, tmp_path / "bad_rect_edge.zarr", format="sparse", store="dir")
+    meta = _read_json(root / "X" / "data" / "zarr.json")
+    meta["chunk_grid"]["configuration"]["chunk_shapes"] = [[True, 3, 2]]
+    _write_json(root / "X" / "data" / "zarr.json", meta)
+
+    with pytest.raises(StoreError, match="rectilinear edge"):
+        launch(root)
+
+
 def test_indptr_float_dtype_rejected(tmp_path: Path) -> None:
     adata, _ = _sparse_adata()
     root = write_zarr(adata, tmp_path / "indptr_f.zarr", format="sparse", store="dir")

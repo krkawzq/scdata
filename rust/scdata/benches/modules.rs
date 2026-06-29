@@ -2877,9 +2877,11 @@ fn py_uncompressed_codec(py: Python<'_>) -> Py<PyAny> {
 fn drain_py_prefetch(py: Python<'_>, prefetch: &Py<PyAny>) -> usize {
     let mut sum = 0usize;
     loop {
-        let item = prefetch
-            .call_method0(py, "__next__")
-            .expect("prefetch __next__");
+        let item = match prefetch.call_method0(py, "__next__") {
+            Ok(item) => item,
+            Err(err) if err.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => break,
+            Err(err) => panic!("prefetch __next__: {err:?}"),
+        };
         let item = item.bind(py);
         if item.is_none() {
             break;

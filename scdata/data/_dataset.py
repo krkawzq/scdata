@@ -26,12 +26,15 @@ caller that has not switched to the numpy path.
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence
+from types import MappingProxyType
+from typing import Any, Iterable, Literal, Sequence
 
 import numpy as np
-from numpy.typing import NDArray
+
+from scdata.data._coerce import _as_gene_names, _as_u64_array, _coerce_u64_int
 
 __all__ = [
     "ArrayOrder",
@@ -309,30 +312,8 @@ class ChunkLocation:
     length: int
 
     def __post_init__(self) -> None:
-        if self.offset < 0:
-            raise ValueError(f"chunk offset must be non-negative, got {self.offset}")
-        if self.length < 0:
-            raise ValueError(f"chunk length must be non-negative, got {self.length}")
-
-
-def _as_u64_array(value: object, name: str) -> NDArray[np.uint64]:
-    """Coerce a chunk index / indptr input into a contiguous 1D ``uint64`` array.
-
-    Accepts a numpy array (any integer dtype) or any iterable of ints.  The
-    result is always C-contiguous ``uint64`` so the Rust binding can borrow it
-    zero-copy.  ``uint64`` matches Rust ``FileChunkLocation::offset`` /
-    ``indptr: Vec<u64>``; values are range-checked because a negative Python
-    int silently reinterprets as a huge unsigned value otherwise.
-    """
-    arr = np.asarray(value, dtype=np.int64)
-    if arr.ndim != 1:
-        raise ValueError(f"{name} must be 1D, got {arr.ndim}D")
-    if arr.size and arr.min() < 0:
-        raise ValueError(f"{name} values must be non-negative")
-    arr = arr.astype(np.uint64, copy=False)
-    if not arr.flags["C_CONTIGUOUS"]:
-        arr = np.ascontiguousarray(arr)
-    return arr
+        object.__setattr__(self, "offset", _coerce_u64_int(self.offset, "chunk offset"))
+        object.__setattr__(self, "length", _coerce_u64_int(self.length, "chunk length"))
 
 
 @dataclass(frozen=True)
@@ -450,7 +431,7 @@ class ArrayMeta:
             # the wrong bytes.  ``diff`` is done on a signed view: on ``uint64``
             # a decreasing pair would wrap to a huge positive value and silently
             # pass the check.
-            if offsets.shape[0] >= 2 and np.any(np.diff(offsets.view(np.int64)) < 0):
+            if offsets.shape[0] >= 2 and np.any(offsets[1:] < offsets[:-1]):
                 raise ValueError("chunk offsets must be monotonically non-decreasing")
             object.__setattr__(self, "chunk_offsets", offsets)
             object.__setattr__(self, "chunk_paths", ())
@@ -502,12 +483,14 @@ class ArrayMeta:
         pairs are copied into two contiguous ``uint64`` arrays once; afterwards
         the tuple form is available via the :attr:`chunks` property.
         """
+        base = _coerce_u64_int(chunk_offset_base, "chunk_offset_base")
         chunk_list = tuple(chunks)
         count = len(chunk_list)
         offsets = np.empty(count, dtype=np.uint64)
         lengths = np.empty(count, dtype=np.uint64)
         for i, loc in enumerate(chunk_list):
-            offsets[i] = loc.offset + chunk_offset_base
+            offset = loc.offset + base
+            offsets[i] = _coerce_u64_int(offset, f"chunks[{i}].offset + chunk_offset_base")
             lengths[i] = loc.length
         return cls(
             shape=shape,
@@ -574,10 +557,8 @@ class ArrayMeta:
             else (),
             chunk_paths=tuple(chunk_paths),
             chunk_file_paths=tuple(chunk_file_paths) if chunk_file_paths is not None else (),
-            chunk_lengths=np.asarray(tuple(chunk_lengths), dtype=np.uint64),
-            chunk_offsets=np.asarray(tuple(chunk_offsets), dtype=np.uint64)
-            if chunk_offsets is not None
-            else np.empty(0, dtype=np.uint64),
+            chunk_lengths=tuple(chunk_lengths),
+            chunk_offsets=tuple(chunk_offsets) if chunk_offsets is not None else (),
         )
 
     @property
@@ -616,6 +597,17 @@ class ArrayMeta:
         offsets = self.chunk_offsets.tolist()
         lengths = self.chunk_lengths.tolist()
         return tuple(ChunkLocation(offset=o, length=length) for o, length in zip(offsets, lengths))
+
+    def __repr__(self) -> str:
+        return (
+            "ArrayMeta("
+            f"shape={self.shape}, "
+            f"chunk_shape={self.chunk_shape}, "
+            f"dtype={self.dtype.value!r}, "
+            f"store_kind={self.store_kind!r}, "
+            f"num_chunks={self.num_chunks}"
+            ")"
+        )
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -723,15 +715,17 @@ class DenseDataset:
     store_root: str = ""
 
     def __post_init__(self) -> None:
+        gene_names = _as_gene_names(self.gene_names)
+        object.__setattr__(self, "gene_names", gene_names)
         if self.num_cells <= 0:
             raise ValueError(f"dense dataset requires positive num_cells, got {self.num_cells}")
         if self.num_genes <= 0:
             raise ValueError(f"dense dataset requires positive num_genes, got {self.num_genes}")
-        if len(self.gene_names) != self.num_genes:
+        if len(gene_names) != self.num_genes:
             raise ValueError(
-                f"gene_names count {len(self.gene_names)} != num_genes {self.num_genes}"
+                f"gene_names count {len(gene_names)} != num_genes {self.num_genes}"
             )
-        _validate_unique_gene_names(self.gene_names)
+        _validate_unique_gene_names(gene_names)
         elements = 1
         for s in self.data.shape:
             elements *= s
@@ -745,6 +739,26 @@ class DenseDataset:
     def kind(self) -> str:
         """Canonical dataset kind: ``"dense"``."""
         return "dense"
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.num_cells, self.num_genes)
+
+    @property
+    def n_obs(self) -> int:
+        return self.num_cells
+
+    @property
+    def n_vars(self) -> int:
+        return self.num_genes
+
+    @property
+    def dtype(self) -> DType:
+        return self.data.dtype
+
+    @property
+    def var_names(self) -> tuple[str, ...]:
+        return self.gene_names
 
     @property
     def ndim(self) -> int:
@@ -781,6 +795,18 @@ class DenseDataset:
             gene_names=_align_gene_names(self.gene_names, mapping, default, keep=keep),
         )
 
+    def __repr__(self) -> str:
+        root = f", store_root={self.store_root!r}" if self.store_root else ""
+        return (
+            "DenseDataset("
+            f"shape={self.shape}, "
+            f"dtype={self.dtype.value!r}, "
+            f"layout={self.data.ndim}D, "
+            f"num_chunks={self.num_chunks}"
+            f"{root}"
+            ")"
+        )
+
 
 @dataclass(frozen=True)
 class SparseDataset:
@@ -810,22 +836,24 @@ class SparseDataset:
     store_root: str = ""
 
     def __post_init__(self) -> None:
+        gene_names = _as_gene_names(self.gene_names)
+        object.__setattr__(self, "gene_names", gene_names)
         if self.num_cells <= 0:
             raise ValueError(f"sparse dataset requires positive num_cells, got {self.num_cells}")
         if self.num_genes <= 0:
             raise ValueError(f"sparse dataset requires positive num_genes, got {self.num_genes}")
-        if len(self.gene_names) != self.num_genes:
+        if len(gene_names) != self.num_genes:
             raise ValueError(
-                f"gene_names count {len(self.gene_names)} != num_genes {self.num_genes}"
+                f"gene_names count {len(gene_names)} != num_genes {self.num_genes}"
             )
-        _validate_unique_gene_names(self.gene_names)
+        _validate_unique_gene_names(gene_names)
 
         indptr = _as_u64_array(self.indptr, "indptr")
         if indptr.shape[0] != self.num_cells + 1:
             raise ValueError(f"indptr length {indptr.shape[0]} != num_cells+1 {self.num_cells + 1}")
         if indptr.shape[0] > 0 and int(indptr[0]) != 0:
             raise ValueError(f"indptr must start at 0, got {int(indptr[0])}")
-        if indptr.shape[0] >= 2 and np.any(np.diff(indptr.view(np.int64)) < 0):
+        if indptr.shape[0] >= 2 and np.any(indptr[1:] < indptr[:-1]):
             raise ValueError("indptr must be monotonically non-decreasing")
         object.__setattr__(self, "indptr", indptr)
 
@@ -854,6 +882,26 @@ class SparseDataset:
     def kind(self) -> str:
         """Canonical dataset kind: ``"sparse-csr"``."""
         return "sparse-csr"
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.num_cells, self.num_genes)
+
+    @property
+    def n_obs(self) -> int:
+        return self.num_cells
+
+    @property
+    def n_vars(self) -> int:
+        return self.num_genes
+
+    @property
+    def dtype(self) -> DType:
+        return self.data.dtype
+
+    @property
+    def var_names(self) -> tuple[str, ...]:
+        return self.gene_names
 
     @property
     def nnz(self) -> int:
@@ -898,13 +946,26 @@ class SparseDataset:
             gene_names=_align_gene_names(self.gene_names, mapping, default, keep=keep),
         )
 
+    def __repr__(self) -> str:
+        root = f", store_root={self.store_root!r}" if self.store_root else ""
+        return (
+            "SparseDataset("
+            f"shape={self.shape}, "
+            f"dtype={self.dtype.value!r}, "
+            f"nnz={self.nnz}, "
+            f"index_dtype={self.index_dtype.value!r}, "
+            f"num_chunks={self.num_chunks}"
+            f"{root}"
+            ")"
+        )
+
 
 Dataset = DenseDataset | SparseDataset
 """Union type for a parsed dataset, returned by :mod:`scdata.io._launch`."""
 
 
 @dataclass(frozen=True)
-class DatasetCollection:
+class DatasetCollection(Mapping[str, Dataset]):
     """All matrix datasets parsed from one AnnData-style store.
 
     ``x`` is the primary ``X`` matrix.  ``layers`` maps AnnData layer names
@@ -938,7 +999,7 @@ class DatasetCollection:
                 )
             if tuple(dataset.gene_names) != tuple(self.x.gene_names):
                 raise ValueError(f"layer {name!r} gene names differ from X")
-        object.__setattr__(self, "layers", normalized)
+        object.__setattr__(self, "layers", MappingProxyType(normalized))
 
     def __getitem__(self, key: str) -> Dataset:
         if key == "X":
@@ -959,6 +1020,12 @@ class DatasetCollection:
             return key[len("layers/") :] in self.layers
         return key in self.layers
 
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return 1 + len(self.layers)
+
     def keys(self) -> tuple[str, ...]:
         return ("X", *(f"layers/{name}" for name in self.layers))
 
@@ -966,3 +1033,12 @@ class DatasetCollection:
         yield "X", self.x
         for name, dataset in self.layers.items():
             yield f"layers/{name}", dataset
+
+    def __repr__(self) -> str:
+        return (
+            "DatasetCollection("
+            f"keys={self.keys()}, "
+            f"shape={self.x.shape}, "
+            f"store_root={self.store_root!r}"
+            ")"
+        )

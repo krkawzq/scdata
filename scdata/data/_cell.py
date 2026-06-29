@@ -39,25 +39,9 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from scdata.data._coerce import _as_cell_index, _as_gene_names
+
 __all__ = ["CellAccess", "CellData", "CellBatch"]
-
-
-def _as_cell_index(value: Any, name: str) -> NDArray[np.intp]:
-    """Coerce cell indices into a contiguous 1D ``intp`` numpy array.
-
-    Accepts a list, tuple, range, or numpy array of any integer dtype.  The
-    result is C-contiguous ``intp`` (numpy's native index dtype) so it can be
-    passed straight to Rust via ``tolist()`` without a further copy.  Negative
-    indices are rejected — they are never valid cell positions.
-    """
-    arr = np.asarray(value, dtype=np.intp)
-    if arr.ndim != 1:
-        raise ValueError(f"{name} must be 1D, got {arr.ndim}D")
-    if arr.size and int(arr.min()) < 0:
-        raise ValueError(f"{name} values must be non-negative")
-    if not arr.flags["C_CONTIGUOUS"]:
-        arr = np.ascontiguousarray(arr)
-    return arr
 
 
 @dataclass(frozen=True)
@@ -81,7 +65,7 @@ class CellAccess:
         cells = _as_cell_index(self.cells, "cells")
         object.__setattr__(self, "cells", cells)
         if self.gene_names is not None:
-            object.__setattr__(self, "gene_names", tuple(self.gene_names))
+            object.__setattr__(self, "gene_names", _as_gene_names(self.gene_names))
 
     @classmethod
     def from_cells(
@@ -101,6 +85,10 @@ class CellAccess:
     def is_gene_subset(self) -> bool:
         """True when only a subset of genes was requested."""
         return self.gene_names is not None
+
+    def __repr__(self) -> str:
+        genes = "all" if self.gene_names is None else len(self.gene_names)
+        return f"CellAccess(num_cells={self.num_cells}, genes={genes})"
 
 
 @dataclass(frozen=True)
@@ -142,7 +130,10 @@ class CellData:
         object.__setattr__(self, "cells", cells)
         object.__setattr__(self, "data", data)
         if self.gene_names is not None:
-            object.__setattr__(self, "gene_names", tuple(self.gene_names))
+            names = _as_gene_names(self.gene_names)
+            if len(names) != self.num_genes:
+                raise ValueError(f"gene_names length {len(names)} != num_genes {self.num_genes}")
+            object.__setattr__(self, "gene_names", names)
 
     @classmethod
     def from_array(
@@ -195,9 +186,12 @@ class CellData:
         Returns the raw 1D ``data`` array, so callers that treat an access
         result as a plain ndarray keep working without touching ``.data``.
         """
-        if dtype is None:
-            return self.data
-        return np.asarray(self.data, dtype=dtype)
+        array = self.data if dtype is None else np.asarray(self.data, dtype=dtype)
+        return array.copy() if copy else array
+
+    def __repr__(self) -> str:
+        genes = "unknown" if self.gene_names is None else len(self.gene_names)
+        return f"CellData(shape={self.shape}, dtype={self.data.dtype}, genes={genes})"
 
 
 @dataclass(frozen=True)
@@ -243,7 +237,7 @@ class CellBatch:
         object.__setattr__(self, "cells", cells)
         object.__setattr__(self, "data", data)
         if self.gene_names is not None:
-            names = tuple(self.gene_names)
+            names = _as_gene_names(self.gene_names)
             if len(names) != self.num_genes:
                 raise ValueError(f"gene_names length {len(names)} != num_genes {self.num_genes}")
             object.__setattr__(self, "gene_names", names)
@@ -295,6 +289,9 @@ class CellBatch:
 
     def __array__(self, dtype: Any = None, copy: Any = None) -> NDArray[np.generic]:
         """Allow ``np.asarray(cell_batch)`` to read the decoded payload."""
-        if dtype is None:
-            return self.data
-        return np.asarray(self.data, dtype=dtype)
+        array = self.data if dtype is None else np.asarray(self.data, dtype=dtype)
+        return array.copy() if copy else array
+
+    def __repr__(self) -> str:
+        genes = "unknown" if self.gene_names is None else len(self.gene_names)
+        return f"CellBatch(shape={self.shape}, dtype={self.data.dtype}, genes={genes})"

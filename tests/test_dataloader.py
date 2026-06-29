@@ -157,6 +157,53 @@ def test_sc_dataloader_reuses_torch_batch_sampler_order(
     assert [batch["batch"].cells.tolist() for batch in batches] == [[2, 0], [3]]
 
 
+def test_sc_dataloader_single_gene_string_and_dict_prefetch_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_torch_base(monkeypatch)
+
+    bank = _FakeBank()
+    loader = ScDataLoader(
+        bank,
+        [(0, 1)],
+        batch_size=1,
+        dataset_ids=["ds0"],
+        genes="g0",
+        prefetch_config={"prefetch_step": 2},
+    )
+
+    list(iter(loader))
+    assert bank.calls[0]["genes"] == ("g0",)
+    assert bank.calls[0]["config"] == {"prefetch_step": 2}
+
+
+def test_sc_dataloader_rejects_float_sample_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_fake_torch_base(monkeypatch)
+
+    loader = ScDataLoader(
+        _FakeBank(),
+        [(0, 1.2)],  # type: ignore[list-item]
+        batch_size=1,
+        dataset_ids=["ds0"],
+    )
+
+    with pytest.raises(TypeError, match="cell_id"):
+        list(iter(loader))
+
+
+def test_sc_dataloader_rejects_unsupported_worker_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_torch_base(monkeypatch)
+
+    with pytest.raises(ValueError, match="num_workers"):
+        ScDataLoader(_FakeBank(), [(0, 0)], batch_size=1, dataset_ids=["ds0"], num_workers=1)
+    with pytest.raises(ValueError, match="pin_memory"):
+        ScDataLoader(_FakeBank(), [(0, 0)], batch_size=1, dataset_ids=["ds0"], pin_memory=True)
+    with pytest.raises(ValueError, match="prefetch_factor"):
+        ScDataLoader(_FakeBank(), [(0, 0)], batch_size=1, dataset_ids=["ds0"], prefetch_factor=2)
+
+
 def test_sc_dataloader_reports_missing_torch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("scdata.data._dataloader.torch", None)
 

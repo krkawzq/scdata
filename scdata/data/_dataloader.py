@@ -10,6 +10,7 @@ from typing import TypedDict, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from scdata.data._coerce import _as_gene_names, _coerce_index_int
 from scdata.data._cell import CellBatch, _as_cell_index
 
 try:
@@ -43,7 +44,7 @@ class _SupportsPrefetch(Protocol):
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy | str | None = None,
-        config: ScheduledPrefetchConfig | None = None,
+        config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]: ...
 
 
@@ -91,12 +92,7 @@ def _identity_sc_collate(batch: ScDataBatch) -> ScDataBatch:
 
 
 def _to_int(value: int | np.integer[Any] | object, context: str) -> int:
-    if hasattr(value, "item"):
-        value = value.item()  # type: ignore
-    try:
-        return int(value)  # type: ignore
-    except (TypeError, ValueError) as err:
-        raise TypeError(f"{context} must be an integer, got {value!r}") from err
+    return _coerce_index_int(value, context)
 
 
 def _parse_sample(
@@ -221,6 +217,39 @@ def _extract_positional_collate(
     return tuple(mutable), collate_fn
 
 
+def _reject_unsupported_torch_options(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> None:
+    """Reject DataLoader options this adapter would otherwise ignore."""
+    if len(args) >= 5 and _to_int(args[4], "num_workers") != 0:
+        raise ValueError("ScDataLoader does not support torch worker processes; use num_workers=0")
+    if "num_workers" in kwargs and _to_int(kwargs["num_workers"], "num_workers") != 0:
+        raise ValueError("ScDataLoader does not support torch worker processes; use num_workers=0")
+
+    if len(args) >= 7 and bool(args[6]):
+        raise ValueError("ScDataLoader does not support pin_memory=True")
+    if bool(kwargs.get("pin_memory", False)):
+        raise ValueError("ScDataLoader does not support pin_memory=True")
+
+    if len(args) >= 9 and args[8] not in (0, 0.0):
+        raise ValueError("ScDataLoader does not support DataLoader timeout")
+    if kwargs.get("timeout", 0) not in (0, 0.0):
+        raise ValueError("ScDataLoader does not support DataLoader timeout")
+
+    if len(args) >= 10 and args[9] is not None:
+        raise ValueError("ScDataLoader does not support worker_init_fn")
+    if kwargs.get("worker_init_fn") is not None:
+        raise ValueError("ScDataLoader does not support worker_init_fn")
+
+    if len(args) >= 11 and args[10] is not None:
+        raise ValueError("ScDataLoader does not support multiprocessing_context")
+    if kwargs.get("multiprocessing_context") is not None:
+        raise ValueError("ScDataLoader does not support multiprocessing_context")
+
+    if kwargs.get("prefetch_factor") is not None:
+        raise ValueError("ScDataLoader does not support torch prefetch_factor")
+    if bool(kwargs.get("persistent_workers", False)):
+        raise ValueError("ScDataLoader does not support persistent_workers=True")
+
+
 class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
     """Torch DataLoader whose samples are ``(file_id, cell_id)`` pairs.
 
@@ -250,7 +279,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         | None = None,
         genes: Iterable[str] | None = None,
         missing: "MissingGenePolicy | str | None" = None,
-        prefetch_config: "ScheduledPrefetchConfig | None" = None,
+        prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
         collate_fn: Callable[[ScDataBatch], Any] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -263,6 +292,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
                 raise TypeError("collate_fn was passed twice")
             collate_fn = cast(Callable[[ScDataBatch], Any], kwargs_collate)
 
+        _reject_unsupported_torch_options(args, kwargs)
         args, collate_fn = _extract_positional_collate(args, collate_fn)
         if len(args) < 6:
             kwargs["collate_fn"] = _identity_raw_collate
@@ -272,9 +302,9 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         self.sc_dataset_id: Callable[[int], DatasetId | str | int | PathLike[str]] = (
             _normalize_dataset_ids(dataset_ids)
         )
-        self.sc_genes: tuple[str, ...] | None = tuple(genes) if genes is not None else None
+        self.sc_genes: tuple[str, ...] | None = _as_gene_names(genes, "genes") if genes is not None else None
         self.sc_missing: MissingGenePolicy | str | None = missing
-        self.sc_prefetch_config: ScheduledPrefetchConfig | None = prefetch_config
+        self.sc_prefetch_config: ScheduledPrefetchConfig | Mapping[str, Any] | None = prefetch_config
         self.sc_collate_fn: Callable[[ScDataBatch], Any] = (
             collate_fn if collate_fn is not None else _identity_sc_collate
         )

@@ -253,6 +253,8 @@ pub enum ChunkSourceSpec {
         offset: u64,
         len: usize,
     },
+    /// A file id registered by the caller. The caller retains ownership of the
+    /// registration; arrays built from this source will not unregister it.
     RegisteredFile {
         file: RegisteredFile,
         offset: u64,
@@ -888,9 +890,6 @@ pub fn build_array_from_spec(spec: ArraySpec, io_pool: &IoPool) -> DataBankResul
                         decoded: true,
                     }
                 } else {
-                    if !files.iter().any(|existing| existing.id == file.id) {
-                        files.push(file);
-                    }
                     ChunkSource::File { file, offset, len }
                 }
             }
@@ -1326,5 +1325,41 @@ mod tests {
             io_pool.unregister_file(0).is_err(),
             "partially registered file should have been unregistered"
         );
+    }
+
+    #[test]
+    fn registered_file_source_is_not_unregistered_by_array() {
+        let path = temp_file(&[1, 2, 3, 4]);
+        let io_pool = IoPool::new(IoConfig::default()).expect("io pool");
+        let file_id = io_pool
+            .register_readonly_file(&path)
+            .expect("register external file");
+        let file = RegisteredFile::new(file_id).expect("registered file");
+        let spec = ArraySpec {
+            shape: vec![1],
+            dtype: DType::U32,
+            order: ArrayOrder::C,
+            codec: ArrayCodecMeta::Uncompressed,
+            grid: ArrayGridSpec::Regular {
+                chunk_shape: vec![1],
+                edge: EdgeChunkLayout::Padded,
+            },
+            chunks: vec![ChunkSpec {
+                source: ChunkSourceSpec::RegisteredFile {
+                    file,
+                    offset: 0,
+                    len: 4,
+                },
+                decoded_bytes: 4,
+            }],
+        };
+
+        let array = build_array_from_spec(spec, &io_pool).expect("array");
+        array
+            .unregister_files(&io_pool)
+            .expect("array unregister should not close external file");
+        io_pool
+            .unregister_file(file_id)
+            .expect("caller still owns registered file");
     }
 }

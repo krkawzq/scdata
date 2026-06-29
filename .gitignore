@@ -24,6 +24,7 @@ outputs/
 
 # Rust
 target/
+target*/
 rust/**/target/
 
 # OS / editor

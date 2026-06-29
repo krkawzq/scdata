@@ -40,6 +40,7 @@ from typing import Iterable, Iterator
 import numpy as np
 from numpy.typing import NDArray
 
+from scdata.data._coerce import _as_gene_names
 from scdata.data._cell import CellAccess, CellBatch, _as_cell_index
 
 __all__ = ["PrefetchBatches", "PrefetchIterator"]
@@ -69,7 +70,7 @@ class PrefetchBatches:
         materialized = tuple(self._coerce_batch(b, i) for i, b in enumerate(self.batches))
         object.__setattr__(self, "batches", materialized)
         if self.gene_names is not None:
-            object.__setattr__(self, "gene_names", tuple(self.gene_names))
+            object.__setattr__(self, "gene_names", _as_gene_names(self.gene_names))
 
     @staticmethod
     def _coerce_batch(value: CellAccess | Iterable[int], index: int) -> CellAccess:
@@ -96,7 +97,7 @@ class PrefetchBatches:
         the module docstring for why this is not lazy).
         """
         coerced = tuple(cls._coerce_batch(b, i) for i, b in enumerate(batches))
-        names = tuple(gene_names) if gene_names is not None else None
+        names = _as_gene_names(gene_names) if gene_names is not None else None
         return cls(batches=coerced, gene_names=names)
 
     @property
@@ -145,7 +146,7 @@ class PrefetchIterator:
         # is itself an iterator (``__iter__`` returns self) or any Python
         # iterable.
         self._inner: Iterator[tuple[NDArray[np.intp], NDArray[np.generic], int]] = iter(inner)
-        self._gene_names = tuple(gene_names) if gene_names is not None else None
+        self._gene_names = _as_gene_names(gene_names) if gene_names is not None else None
 
     def __iter__(self) -> "PrefetchIterator":
         return self

@@ -12,6 +12,7 @@ import pytest
 from scdata import ScDataBank
 from scdata.data import DenseDataset, SparseDataset
 from scdata.io import AnnDataZarrZipConverter, launch, launch_all, read_zarr, write_zarr
+from scdata.io._launch import StoreError
 
 ad = pytest.importorskip("anndata")
 pd = pytest.importorskip("pandas")
@@ -84,6 +85,26 @@ def test_write_zarr_dense2d_dir_registers_with_databank(tmp_path: Path, dense_ad
     assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
 
 
+def test_write_zarr_dense_big_endian_normalizes_for_rust(tmp_path: Path) -> None:
+    data = np.arange(12, dtype=">f4").reshape(3, 4)
+    adata = ad.AnnData(
+        X=data,
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3"]),
+    )
+    root = write_zarr(
+        adata,
+        tmp_path / "dense_be.zarr",
+        format="dense2d",
+        chunk_size=(2, 2),
+        store="dir",
+    )
+
+    ds = launch(root)
+
+    assert np.array_equal(_registered_matrix(ds), np.asarray(data, dtype=np.float32))
+
+
 def test_write_zarr_dense1d_zip_registers_with_databank(tmp_path: Path, dense_adata) -> None:
     root = write_zarr(
         dense_adata,
@@ -119,12 +140,45 @@ def test_write_zarr_sparse_rectilinear_registers_with_databank(
     )
 
     ds = launch(root)
+    data_meta = _read_json(root / "X" / "data" / "zarr.json")
 
     assert isinstance(ds, SparseDataset)
     assert ds.indices.variable_chunks
     assert ds.data.variable_chunks
+    assert data_meta["codecs"][1] == {
+        "name": "blosc",
+        "configuration": {
+            "typesize": 4,
+            "cname": "lz4",
+            "clevel": 5,
+            "shuffle": "shuffle",
+            "blocksize": 0,
+        },
+    }
+    assert ds.data.codec.compressor == {
+        "id": "blosc",
+        "cname": "lz4",
+        "clevel": 5,
+        "shuffle": 1,
+        "blocksize": 0,
+        "typesize": 4,
+    }
     assert tuple(np.asarray(ds.indptr).tolist()) == tuple(matrix.indptr.tolist())
     assert np.array_equal(_registered_matrix(ds), matrix.toarray())
+
+
+def test_write_zarr_rejects_unknown_compressor(tmp_path: Path, sparse_adata) -> None:
+    adata, matrix = sparse_adata
+    with pytest.raises(StoreError, match="unsupported compressor"):
+        write_zarr(
+            adata,
+            tmp_path / "sparse_alias.zarr",
+            format="sparse",
+            chunk_size=(4,),
+            align_cells=True,
+            store="dir",
+            compressor="blocs.lz4.level5",
+        )
 
 
 def test_write_zarr_sparse_zero_nnz_round_trip(tmp_path: Path) -> None:
@@ -191,6 +245,67 @@ def test_launch_zlib_v3_codec_registers_with_databank(tmp_path: Path, dense_adat
     ds = launch(root)
 
     assert ds.data.codec.compressor == {"id": "zlib", "level": 1}
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_launch_lz4_v3_codec_registers_with_databank(tmp_path: Path, dense_adata) -> None:
+    from numcodecs import LZ4
+
+    root = write_zarr(
+        dense_adata,
+        tmp_path / "lz4_dense.zarr",
+        format="dense2d",
+        chunk_size=(3, 4),
+        store="dir",
+        compressor=None,
+    )
+    raw = np.ascontiguousarray(np.asarray(dense_adata.X)).tobytes()
+    (root / "X" / "c" / "0" / "0").write_bytes(LZ4(acceleration=1).encode(raw))
+    meta = _read_json(root / "X" / "zarr.json")
+    meta["codecs"] = [
+        {"name": "bytes", "configuration": {"endian": "little"}},
+        {"name": "lz4", "configuration": {"acceleration": 1}},
+    ]
+    _write_json(root / "X" / "zarr.json", meta)
+
+    ds = launch(root)
+
+    assert ds.data.codec.compressor == {"id": "lz4", "acceleration": 1}
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_launch_multiple_v3_codecs_preserves_decode_order(
+    tmp_path: Path, dense_adata
+) -> None:
+    from numcodecs import GZip, Zlib, Zstd
+
+    root = write_zarr(
+        dense_adata,
+        tmp_path / "multi_codec_dense.zarr",
+        format="dense2d",
+        chunk_size=(3, 4),
+        store="dir",
+        compressor=None,
+    )
+    raw = np.ascontiguousarray(np.asarray(dense_adata.X)).tobytes()
+    encoded = GZip(level=1).encode(Zstd(level=1).encode(Zlib(level=1).encode(raw)))
+    (root / "X" / "c" / "0" / "0").write_bytes(encoded)
+    meta = _read_json(root / "X" / "zarr.json")
+    meta["codecs"] = [
+        {"name": "bytes", "configuration": {"endian": "little"}},
+        {"name": "zlib", "configuration": {"level": 1}},
+        {"name": "zstd", "configuration": {"level": 1, "checksum": False}},
+        {"name": "gzip", "configuration": {"level": 1}},
+    ]
+    _write_json(root / "X" / "zarr.json", meta)
+
+    ds = launch(root)
+
+    assert ds.data.codec.compressor == {"id": "gzip", "level": 1}
+    assert ds.data.codec.filters == (
+        {"id": "zlib", "level": 1},
+        {"id": "zstd", "level": 1, "checksum": False},
+    )
     assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
 
 
@@ -269,6 +384,30 @@ def test_converter_h5ad_dense_auto_writes_same_name_zip(tmp_path: Path, dense_ad
     ds = launch(root)
     assert isinstance(ds, DenseDataset)
     assert ds.data.shape == (12,)
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_converter_can_disable_default_compressor(tmp_path: Path, dense_adata) -> None:
+    source = tmp_path / "dense_uncompressed.h5ad"
+    dense_adata.write_h5ad(source)
+
+    convert = AnnDataZarrZipConverter(chunk_size=(8,), compressor=None)
+    root = convert(source)
+    ds = launch(root)
+
+    assert ds.data.codec.compressor is None
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_converter_call_can_disable_default_compressor(tmp_path: Path, dense_adata) -> None:
+    source = tmp_path / "dense_call_uncompressed.h5ad"
+    dense_adata.write_h5ad(source)
+
+    convert = AnnDataZarrZipConverter(chunk_size=(8,))
+    root = convert(source, compressor=None)
+    ds = launch(root)
+
+    assert ds.data.codec.compressor is None
     assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
 
 

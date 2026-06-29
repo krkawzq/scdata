@@ -9,7 +9,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Mapping
 
-from scdata.io._anndata import _DEFAULT_CHUNK_ELEMENTS, _LayerFormat, write_zarr
+from scdata.io._anndata import (
+    _DEFAULT_CHUNK_ELEMENTS,
+    _DEFAULT_COMPRESSOR,
+    _Compressor,
+    _LayerFormat,
+    write_zarr,
+)
 from scdata.io._launch import StoreError
 
 if TYPE_CHECKING:
@@ -28,6 +34,7 @@ _ReadFormat = Literal[
     "mtx",
 ]
 _XFormat = Literal["auto", "dense2d", "dense1d", "sparse"]
+_UNSET = object()
 
 _READ_FORMAT_ALIASES = {
     "h5": "hdf",
@@ -89,6 +96,9 @@ class AnnDataZarrZipConverter:
     ``format="dense2d"`` for the standard anndata dense layout.  Layers are
     written with ``layer_format``; the default preserves dense vs sparse
     storage while making both registerable by scdata.
+
+    Chunks are compressed by default using ``"blosc.lz4.level5"``.  Pass
+    ``compressor=None`` to write uncompressed chunks.
     """
 
     smart: bool = True
@@ -96,6 +106,7 @@ class AnnDataZarrZipConverter:
     chunk_size: int | list[int] | tuple[int, ...] = _DEFAULT_CHUNK_ELEMENTS
     align_cells: bool = True
     layer_format: _LayerFormat = "preserve"
+    compressor: _Compressor = _DEFAULT_COMPRESSOR
     output_dir: str | os.PathLike[str] | None = None
     overwrite: bool = True
     read_kwargs: Mapping[str, Any] = field(default_factory=dict)
@@ -123,6 +134,7 @@ class AnnDataZarrZipConverter:
         chunk_size: int | list[int] | tuple[int, ...] | None = None,
         align_cells: bool | None = None,
         layer_format: _LayerFormat | None = None,
+        compressor: Any = _UNSET,
         read_kwargs: Mapping[str, Any] | None = None,
         overwrite: bool | None = None,
     ) -> Path:
@@ -152,6 +164,7 @@ class AnnDataZarrZipConverter:
             layer_format=self.layer_format if layer_format is None else layer_format,
             chunk_size=self.chunk_size if chunk_size is None else chunk_size,
             align_cells=self.align_cells if align_cells is None else align_cells,
+            compressor=self.compressor if compressor is _UNSET else compressor,
             store="zip",
         )
 

@@ -44,6 +44,7 @@ pub struct DataBank {
     access: AccessHandle,
     compute: Arc<DataBankComputePool>,
     registry: DatasetRegistry,
+    retired: Vec<Arc<Dataset>>,
     interner: GeneInterner,
     config: DataBankConfig,
 }
@@ -65,12 +66,14 @@ impl DataBank {
             access,
             compute,
             registry: DatasetRegistry::new(),
+            retired: Vec::new(),
             interner: GeneInterner::new(),
             config,
         })
     }
 
     pub fn register_dense_1d(&mut self, meta: Dense1DMeta) -> DataBankResult<DatasetId> {
+        self.cleanup_retired()?;
         self.registry.ensure_can_register()?;
         let genes = self.interner.intern_dataset(&meta.gene_names);
         match Dense1DDataset::from_meta(genes.clone(), meta, self.io_pool.as_ref()) {
@@ -83,6 +86,7 @@ impl DataBank {
     }
 
     pub fn register_dense_2d(&mut self, meta: Dense2DMeta) -> DataBankResult<DatasetId> {
+        self.cleanup_retired()?;
         self.registry.ensure_can_register()?;
         let genes = self.interner.intern_dataset(&meta.gene_names);
         match Dense2DDataset::from_meta(genes.clone(), meta, self.io_pool.as_ref()) {
@@ -99,6 +103,7 @@ impl DataBank {
     }
 
     pub fn register_sparse_csr(&mut self, meta: SparseCsrDatasetMeta) -> DataBankResult<DatasetId> {
+        self.cleanup_retired()?;
         self.registry.ensure_can_register()?;
         let genes = self.interner.intern_dataset(&meta.gene_names);
         match SparseCsrDataset::from_meta(genes.clone(), meta, self.io_pool.as_ref()) {
@@ -111,10 +116,10 @@ impl DataBank {
     }
 
     pub fn unregister(&mut self, id: DatasetId) -> DataBankResult<()> {
+        self.cleanup_retired()?;
         let dataset = self.registry.remove(id)?;
-        let result = dataset.unregister_files(self.io_pool.as_ref());
         self.interner.release_dataset(dataset.genes());
-        result
+        self.unregister_files_or_retire(dataset)
     }
 
     pub fn access_cells<T: DataValue>(
@@ -465,13 +470,43 @@ impl DataBank {
     pub fn config(&self) -> &DataBankConfig {
         &self.config
     }
+
+    fn unregister_files_or_retire(&mut self, dataset: Arc<Dataset>) -> DataBankResult<()> {
+        if Arc::strong_count(&dataset) == 1 {
+            dataset.unregister_files(self.io_pool.as_ref())
+        } else {
+            self.retired.push(dataset);
+            Ok(())
+        }
+    }
+
+    fn cleanup_retired(&mut self) -> DataBankResult<()> {
+        let mut first_error = None;
+        let mut retained = Vec::with_capacity(self.retired.len());
+
+        for dataset in self.retired.drain(..) {
+            if Arc::strong_count(&dataset) == 1 {
+                if let Err(err) = dataset.unregister_files(self.io_pool.as_ref()) {
+                    first_error.get_or_insert(err);
+                }
+            } else {
+                retained.push(dataset);
+            }
+        }
+
+        self.retired = retained;
+        first_error.map_or(Ok(()), Err)
+    }
 }
 
 impl Drop for DataBank {
     fn drop(&mut self) {
+        let _ = self.cleanup_retired();
         for dataset in self.registry.drain() {
-            let _ = dataset.unregister_files(self.io_pool.as_ref());
             self.interner.release_dataset(dataset.genes());
+            if Arc::strong_count(&dataset) == 1 {
+                let _ = dataset.unregister_files(self.io_pool.as_ref());
+            }
         }
     }
 }

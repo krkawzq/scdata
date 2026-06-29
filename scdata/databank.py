@@ -67,6 +67,7 @@ from os import PathLike, fspath
 from typing import Any, Iterable, Iterator, Literal, Mapping, TypeVar, get_type_hints, overload
 
 from .data._cell import CellAccess, CellBatch, CellData, _as_cell_index
+from .data._coerce import _as_gene_names
 from .data._dataset import Dataset, DatasetCollection, DenseDataset, DType, SparseDataset
 from .data._prefetch import PrefetchBatches, PrefetchIterator
 from ._scdata import (
@@ -270,9 +271,9 @@ class _Config:
 class BaseIoConfig(_Config):
     """Shared IO backend settings (max in-flight, priority levels, ...)."""
 
-    max_in_flight: int = 1024
+    max_in_flight: int = 768
     priority_levels: int = 3
-    queue_shards: int = 1
+    queue_shards: int = 8
     assume_non_overlapping_reads: bool = False
 
 
@@ -295,7 +296,7 @@ class UringConfig(_Config):
 class ThreadedConfig(_Config):
     """Thread-pool pread/pwrite backend settings."""
 
-    num_workers: int = 32
+    num_workers: int = 24
     cpus: list[int] | None = None
     base: BaseIoConfig = field(default_factory=BaseIoConfig)
 
@@ -389,7 +390,7 @@ class IoConfig(_Config):
 class DecodePoolConfig(_Config):
     """Decode worker pool settings."""
 
-    num_workers: int = 8
+    num_workers: int = 24
     queue_capacity: int = 1024
     cpus: list[int] | None = None
 
@@ -398,7 +399,7 @@ class DecodePoolConfig(_Config):
 class AccessCpuConfig(_Config):
     """Access-side CPU materialization pool settings."""
 
-    num_workers: int = 8
+    num_workers: int = 12
     queue_capacity: int = 1024
     cpus: list[int] | None = None
 
@@ -408,7 +409,7 @@ class AccessConfig(_Config):
     """Access scheduler settings (cache, memory budget, shards, ...)."""
 
     queue_capacity: int = 1024
-    scheduler_shards: int = 1
+    scheduler_shards: int = 8
     cache_capacity_bytes: int = 256 * 1024**3
     memory_budget_bytes: int = 512 * 1024**3
     default_io_priority: int = 1
@@ -424,7 +425,7 @@ class FillConfig(_Config):
     """Compute / fill pool settings."""
 
     parallel: bool = True
-    num_workers: int = 8
+    num_workers: int = 12
     queue_capacity: int = 1024
     min_parallel_rows: int = 16
     min_parallel_bytes: int = 1048576
@@ -474,16 +475,16 @@ class DataBankConfig(_Config):
 class ScheduledAccessConfig(_Config):
     """Look-ahead distances for scheduled access."""
 
-    prefetch_step: int = 128
-    decode_ahead_steps: int = 64
-    ready_ahead_steps: int = 32
+    prefetch_step: int = 16
+    decode_ahead_steps: int = 8
+    ready_ahead_steps: int = 4
 
 
 @dataclass(slots=True)
 class ScheduledPrefetchConfig(_Config):
     """Per-call settings for scheduled DataBank cell prefetch."""
 
-    prefetch_step: int = 32
+    prefetch_step: int = 8
     access: ScheduledAccessConfig = field(default_factory=ScheduledAccessConfig)
 
     def __post_init__(self) -> None:
@@ -1014,7 +1015,7 @@ class ScDataBank:
         dtype: DType | None = None,
     ) -> CellData:
         cell_arr = _as_cell_index(cells, "cells")
-        names = tuple(genes)
+        names = _as_gene_names(genes, "genes")
         core = self._core()
         rust_missing = missing._rust if missing is not None else None
         fast = getattr(core, "access_cells_by_gene_names_array", None)

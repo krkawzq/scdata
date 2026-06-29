@@ -1,13 +1,15 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
@@ -1491,6 +1493,66 @@ fn load_sparse_group(access: &AccessHandle, group: &SparseReadGroup) -> DataBank
     }
 }
 
+type SparseGroupScheduledAccess = ScheduledAccess<std::vec::IntoIter<AccessItem>>;
+
+fn schedule_sparse_selected_file_groups(
+    access: &AccessHandle,
+    access_config: &ScheduledAccessConfig,
+    plan: &SparseBatchPlan,
+    selected_groups: &[usize],
+    cancel: Option<&Arc<PrefetchCancel>>,
+) -> DataBankResult<Option<SparseGroupScheduledAccess>> {
+    if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        return Err(DataBankError::PrefetchCancelled);
+    }
+
+    let mut items = Vec::with_capacity(selected_groups.len());
+    for &group_index in selected_groups {
+        let group = &plan.data_groups[group_index];
+        if matches!(group.source, SparseGroupSource::AccessItem(_)) {
+            items.push(file_sparse_group_access_item(group));
+        }
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut scheduled = access.scheduled(items, *access_config)?;
+    if let Some(cancel) = cancel {
+        scheduled.set_cancel_handle(Arc::clone(cancel));
+    }
+    Ok(Some(scheduled))
+}
+
+fn next_scheduled_sparse_group_bytes(
+    scheduled: &mut SparseGroupScheduledAccess,
+) -> DataBankResult<Vec<u8>> {
+    scheduled
+        .next()
+        .ok_or_else(|| {
+            DataBankError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "scheduled CSR data access ended early",
+            ))
+        })?
+        .map_err(DataBankError::Io)
+}
+
+fn finish_scheduled_sparse_group_bytes(
+    scheduled: Option<SparseGroupScheduledAccess>,
+) -> DataBankResult<()> {
+    let Some(mut scheduled) = scheduled else {
+        return Ok(());
+    };
+    match scheduled.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(DataBankError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scheduled CSR data access returned extra output",
+        ))),
+        Some(Err(err)) => Err(DataBankError::Io(err)),
+    }
+}
+
 fn load_sparse_index_groups(
     access: &AccessHandle,
     access_config: &ScheduledAccessConfig,
@@ -2602,6 +2664,7 @@ fn load_sparse_selected_data_group_bytes(
     access_config: &ScheduledAccessConfig,
     plan: &SparseBatchPlan,
     selected_groups: &[usize],
+    cancel: Option<&Arc<PrefetchCancel>>,
 ) -> DataBankResult<Vec<Arc<[u8]>>> {
     if selected_groups.iter().all(|&group_index| {
         matches!(
@@ -2609,21 +2672,61 @@ fn load_sparse_selected_data_group_bytes(
             SparseGroupSource::AccessItem(_)
         )
     }) {
-        let mut scheduled = access.scheduled(
-            selected_groups
-                .iter()
-                .map(|&group_index| file_sparse_group_access_item(&plan.data_groups[group_index])),
-            *access_config,
+        let mut scheduled = schedule_sparse_selected_file_groups(
+            access,
+            access_config,
+            plan,
+            selected_groups,
+            cancel,
+        )?
+        .expect("file-backed selected groups should create a scheduled reader");
+        let mut out = Vec::with_capacity(selected_groups.len());
+        for &group_index in selected_groups {
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
+            }
+            let group = &plan.data_groups[group_index];
+            let bytes = next_scheduled_sparse_group_bytes(&mut scheduled)?;
+            if bytes.len() != group.bytes {
+                return Err(DataBankError::InvalidArrayMeta(format!(
+                    "CSR data group decoded length is {}, expected {}",
+                    bytes.len(),
+                    group.bytes
+                )));
+            }
+            out.push(Arc::from(bytes.into_boxed_slice()));
+        }
+        finish_scheduled_sparse_group_bytes(Some(scheduled))?;
+        Ok(out)
+    } else {
+        let mut scheduled = schedule_sparse_selected_file_groups(
+            access,
+            access_config,
+            plan,
+            selected_groups,
+            cancel,
         )?;
         let mut out = Vec::with_capacity(selected_groups.len());
         for &group_index in selected_groups {
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
+            }
             let group = &plan.data_groups[group_index];
-            let bytes = scheduled.next().ok_or_else(|| {
-                DataBankError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "scheduled CSR data access ended early",
-                ))
-            })??;
+            let bytes = match &group.source {
+                SparseGroupSource::AccessItem(_) => {
+                    let scheduled = scheduled.as_mut().ok_or_else(|| {
+                        DataBankError::InvalidArrayMeta(
+                            "CSR file group missing scheduled reader".to_string(),
+                        )
+                    })?;
+                    next_scheduled_sparse_group_bytes(scheduled)?
+                }
+                SparseGroupSource::Memory { .. } => load_sparse_group(access, group)?,
+            };
             if bytes.len() != group.bytes {
                 return Err(DataBankError::InvalidArrayMeta(format!(
                     "CSR data group decoded length is {}, expected {}",
@@ -2633,27 +2736,7 @@ fn load_sparse_selected_data_group_bytes(
             }
             out.push(Arc::from(bytes.into_boxed_slice()));
         }
-        if scheduled.next().is_some() {
-            return Err(DataBankError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "scheduled CSR data access returned extra output",
-            )));
-        }
-        Ok(out)
-    } else {
-        let mut out = Vec::with_capacity(selected_groups.len());
-        for &group_index in selected_groups {
-            let group = &plan.data_groups[group_index];
-            let bytes = load_sparse_group(access, group)?;
-            if bytes.len() != group.bytes {
-                return Err(DataBankError::InvalidArrayMeta(format!(
-                    "CSR data group decoded length is {}, expected {}",
-                    bytes.len(),
-                    group.bytes
-                )));
-            }
-            out.push(Arc::from(bytes.into_boxed_slice()));
-        }
+        finish_scheduled_sparse_group_bytes(scheduled)?;
         Ok(out)
     }
 }
@@ -2699,8 +2782,13 @@ fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue>(
         DataBankError::InvalidConfig("sparse output byte length overflow".to_string())
     })?;
     if compute.should_parallelize(output_rows, output_bytes) {
-        let data_group_bytes =
-            load_sparse_selected_data_group_bytes(access, access_config, plan, &selected_groups)?;
+        let data_group_bytes = load_sparse_selected_data_group_bytes(
+            access,
+            access_config,
+            plan,
+            &selected_groups,
+            cancel,
+        )?;
         if try_scatter_sparse_rows_parallel_checked_with_group_indices(
             compute,
             dataset,
@@ -2722,15 +2810,14 @@ fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue>(
             SparseGroupSource::AccessItem(_)
         )
     }) {
-        let mut scheduled = access.scheduled(
-            selected_groups
-                .iter()
-                .map(|&group_index| file_sparse_group_access_item(&plan.data_groups[group_index])),
-            *access_config,
-        )?;
-        if let Some(cancel) = cancel {
-            scheduled.set_cancel_handle(Arc::clone(cancel));
-        }
+        let mut scheduled = schedule_sparse_selected_file_groups(
+            access,
+            access_config,
+            plan,
+            &selected_groups,
+            cancel,
+        )?
+        .expect("file-backed selected groups should create a scheduled reader");
         for &group_index in &selected_groups {
             if let Some(cancel) = cancel {
                 if cancel.is_cancelled() {
@@ -2738,12 +2825,7 @@ fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue>(
                 }
             }
             let group = &plan.data_groups[group_index];
-            let bytes = scheduled.next().ok_or_else(|| {
-                DataBankError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "scheduled CSR data access ended early",
-                ))
-            })??;
+            let bytes = next_scheduled_sparse_group_bytes(&mut scheduled)?;
             scatter_sparse_data_group_projected_checked(
                 dataset,
                 &plan.data_pieces,
@@ -2754,15 +2836,22 @@ fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue>(
                 out,
             )?;
         }
-        if scheduled.next().is_some() {
-            return Err(DataBankError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "scheduled CSR data access returned extra output",
-            )));
-        }
+        finish_scheduled_sparse_group_bytes(Some(scheduled))?;
     } else {
+        let mut scheduled = schedule_sparse_selected_file_groups(
+            access,
+            access_config,
+            plan,
+            &selected_groups,
+            cancel,
+        )?;
         for &group_index in &selected_groups {
             let group = &plan.data_groups[group_index];
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
+            }
             if try_scatter_sparse_memory_identity_data_group_projected_checked(
                 dataset,
                 &plan.data_pieces,
@@ -2773,7 +2862,17 @@ fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue>(
             )? {
                 continue;
             }
-            let bytes = load_sparse_group(access, group)?;
+            let bytes = match &group.source {
+                SparseGroupSource::AccessItem(_) => {
+                    let scheduled = scheduled.as_mut().ok_or_else(|| {
+                        DataBankError::InvalidArrayMeta(
+                            "CSR file group missing scheduled reader".to_string(),
+                        )
+                    })?;
+                    next_scheduled_sparse_group_bytes(scheduled)?
+                }
+                SparseGroupSource::Memory { .. } => load_sparse_group(access, group)?,
+            };
             scatter_sparse_data_group_projected_checked(
                 dataset,
                 &plan.data_pieces,
@@ -2784,6 +2883,7 @@ fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue>(
                 out,
             )?;
         }
+        finish_scheduled_sparse_group_bytes(scheduled)?;
     }
     Ok(())
 }
@@ -5728,7 +5828,7 @@ fn wait_prefetch(rx: oneshot::Receiver<io::Result<()>>) -> DataBankResult<()> {
 /// The plan carries both the scatter metadata needed to assemble the decoded
 /// bytes into a row-major output buffer and the ordered list of access items
 /// that the access scheduler consumes.
-enum BatchPlan<'a> {
+enum BatchPlan {
     Dense {
         cells: Vec<usize>,
         segments: Vec<DenseSegment>,
@@ -5738,7 +5838,7 @@ enum BatchPlan<'a> {
     Sparse {
         cells: Vec<usize>,
         plan: SparseBatchPlan,
-        dataset: &'a SparseCsrDataset,
+        dataset: Arc<Dataset>,
     },
 }
 
@@ -5748,20 +5848,18 @@ enum BatchPlan<'a> {
 /// batches. File-backed chunks are streamed through the access scheduler;
 /// memory-backed chunks stay in the batch plan and are decoded by databank when
 /// the prefetched batch is assembled.
-fn plan_batch<'a>(
-    dataset: &'a Dataset,
+fn plan_batch_owned(
+    dataset: Arc<Dataset>,
     cells: Vec<usize>,
     gene_axis: &GeneAxisPlan,
-) -> DataBankResult<(BatchPlan<'a>, Vec<AccessItem>)> {
+) -> DataBankResult<(BatchPlan, Vec<AccessItem>)> {
+    let num_cells = dataset.as_ref().num_cells();
     for &cell in &cells {
-        if cell >= dataset.num_cells() {
-            return Err(DataBankError::CellIndexOutOfRange {
-                cell,
-                num_cells: dataset.num_cells(),
-            });
+        if cell >= num_cells {
+            return Err(DataBankError::CellIndexOutOfRange { cell, num_cells });
         }
     }
-    match dataset {
+    match dataset.as_ref() {
         Dataset::Dense1D(d) => {
             let segments = match gene_axis.projection() {
                 Some(projection) => {
@@ -5816,7 +5914,7 @@ fn plan_batch<'a>(
                 BatchPlan::Sparse {
                     cells,
                     plan,
-                    dataset: d,
+                    dataset,
                 },
                 items,
             ))
@@ -5895,7 +5993,7 @@ where
     output_names: Vec<GeneNameView>,
     _dataset: Arc<Dataset>,
     prefetch_step: usize,
-    cancel: Arc<PrefetchCancel>,
+    cancel: Arc<PrefetchCancelRegistry>,
     producer: Option<thread::JoinHandle<()>>,
 }
 
@@ -5939,11 +6037,7 @@ where
     T: DataValue,
 {
     fn drop(&mut self) {
-        // Cancel first: this sets the flag the producer polls between batches
-        // and, crucially, cancels any entry the producer is currently blocked on
-        // in `ScheduledAccess::next`'s `blocking_recv`. Without the in-flight
-        // cancel, `join` below would deadlock waiting for that IO to complete.
-        self.cancel.cancel_in_flight();
+        self.cancel.cancel_all();
         self.rx.take();
         if let Some(handle) = self.producer.take() {
             let _ = handle.join();
@@ -5964,7 +6058,439 @@ where
     access_config: ScheduledAccessConfig,
     gene_axis: GeneAxisPlan,
     tx: flume::Sender<DataBankResult<PrefetchedBatch<T>>>,
+    cancel: Arc<PrefetchCancelRegistry>,
+    prefetch_step: usize,
+    profiler: ScheduledPrefetchProfiler,
+}
+
+type BatchSeq = u64;
+type ScheduledBatchAccess = ScheduledAccess<std::vec::IntoIter<AccessItem>>;
+
+struct PlannedBatch {
+    seq: BatchSeq,
+    plan: BatchPlan,
+    scheduled: ScheduledBatchAccess,
     cancel: Arc<PrefetchCancel>,
+}
+
+struct PlannedMessage {
+    seq: BatchSeq,
+    result: DataBankResult<Box<PlannedBatch>>,
+}
+
+struct DoneMessage<T>
+where
+    T: DataValue,
+{
+    seq: BatchSeq,
+    result: DataBankResult<PrefetchedBatch<T>>,
+}
+
+#[derive(Clone)]
+struct ScheduledPrefetchProfiler {
+    inner: Option<Arc<ScheduledPrefetchProfileInner>>,
+}
+
+struct ScheduledPrefetchProfileInner {
+    label: String,
+    producer_started: Instant,
+    batch_source_next_ns: AtomicU64,
+    submit_request_ns: AtomicU64,
+    submit_response_ns: AtomicU64,
+    coordinator_wait_ns: AtomicU64,
+    output_send_ns: AtomicU64,
+    request_queue_wait_ns: AtomicU64,
+    request_plan_ns: AtomicU64,
+    request_schedule_ns: AtomicU64,
+    request_send_ns: AtomicU64,
+    request_total_ns: AtomicU64,
+    response_queue_wait_ns: AtomicU64,
+    response_total_ns: AtomicU64,
+    assemble_total_ns: AtomicU64,
+    scheduled_drain_ns: AtomicU64,
+    scheduled_drain_calls: AtomicU64,
+    scheduled_drain_bytes: AtomicU64,
+    alloc_ns: AtomicU64,
+    memory_load_ns: AtomicU64,
+    memory_load_calls: AtomicU64,
+    memory_load_bytes: AtomicU64,
+    scatter_ns: AtomicU64,
+    scatter_calls: AtomicU64,
+    request_jobs: AtomicU64,
+    response_jobs: AtomicU64,
+    emitted_batches: AtomicU64,
+    request_errors: AtomicU64,
+    response_errors: AtomicU64,
+}
+
+impl ScheduledPrefetchProfileInner {
+    fn new(label: String) -> Self {
+        Self {
+            label,
+            producer_started: Instant::now(),
+            batch_source_next_ns: AtomicU64::new(0),
+            submit_request_ns: AtomicU64::new(0),
+            submit_response_ns: AtomicU64::new(0),
+            coordinator_wait_ns: AtomicU64::new(0),
+            output_send_ns: AtomicU64::new(0),
+            request_queue_wait_ns: AtomicU64::new(0),
+            request_plan_ns: AtomicU64::new(0),
+            request_schedule_ns: AtomicU64::new(0),
+            request_send_ns: AtomicU64::new(0),
+            request_total_ns: AtomicU64::new(0),
+            response_queue_wait_ns: AtomicU64::new(0),
+            response_total_ns: AtomicU64::new(0),
+            assemble_total_ns: AtomicU64::new(0),
+            scheduled_drain_ns: AtomicU64::new(0),
+            scheduled_drain_calls: AtomicU64::new(0),
+            scheduled_drain_bytes: AtomicU64::new(0),
+            alloc_ns: AtomicU64::new(0),
+            memory_load_ns: AtomicU64::new(0),
+            memory_load_calls: AtomicU64::new(0),
+            memory_load_bytes: AtomicU64::new(0),
+            scatter_ns: AtomicU64::new(0),
+            scatter_calls: AtomicU64::new(0),
+            request_jobs: AtomicU64::new(0),
+            response_jobs: AtomicU64::new(0),
+            emitted_batches: AtomicU64::new(0),
+            request_errors: AtomicU64::new(0),
+            response_errors: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ScheduledPrefetchProfiler {
+    fn from_env() -> Self {
+        if !env_flag("SCDATA_DATABANK_PREFETCH_PROFILE") {
+            return Self { inner: None };
+        }
+        let label = std::env::var("SCDATA_DATABANK_PREFETCH_PROFILE_LABEL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "scheduled_prefetch".to_string());
+        Self {
+            inner: Some(Arc::new(ScheduledPrefetchProfileInner::new(label))),
+        }
+    }
+
+    fn start(&self) -> Option<Instant> {
+        self.inner.as_ref().map(|_| Instant::now())
+    }
+
+    fn record_duration(
+        &self,
+        started: Option<Instant>,
+        counter: impl FnOnce(&ScheduledPrefetchProfileInner) -> &AtomicU64,
+    ) {
+        let (Some(inner), Some(started)) = (&self.inner, started) else {
+            return;
+        };
+        counter(inner).fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+    }
+
+    fn record_batch_source_next(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.batch_source_next_ns);
+    }
+
+    fn record_submit_request(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.submit_request_ns);
+    }
+
+    fn record_submit_response(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.submit_response_ns);
+    }
+
+    fn record_coordinator_wait(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.coordinator_wait_ns);
+    }
+
+    fn record_output_send(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.output_send_ns);
+    }
+
+    fn record_request_queue_wait(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.request_queue_wait_ns);
+    }
+
+    fn record_request_plan(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.request_plan_ns);
+    }
+
+    fn record_request_schedule(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.request_schedule_ns);
+    }
+
+    fn record_request_send(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.request_send_ns);
+    }
+
+    fn record_request_total(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.request_total_ns);
+    }
+
+    fn record_response_queue_wait(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.response_queue_wait_ns);
+    }
+
+    fn record_response_total(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.response_total_ns);
+    }
+
+    fn record_assemble_total(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.assemble_total_ns);
+    }
+
+    fn record_scheduled_drain(&self, started: Option<Instant>, bytes: usize) {
+        let (Some(inner), Some(started)) = (&self.inner, started) else {
+            return;
+        };
+        inner
+            .scheduled_drain_ns
+            .fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+        inner.scheduled_drain_calls.fetch_add(1, Ordering::Relaxed);
+        inner
+            .scheduled_drain_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_alloc(&self, started: Option<Instant>) {
+        self.record_duration(started, |inner| &inner.alloc_ns);
+    }
+
+    fn record_memory_load(&self, started: Option<Instant>, bytes: usize) {
+        let (Some(inner), Some(started)) = (&self.inner, started) else {
+            return;
+        };
+        inner
+            .memory_load_ns
+            .fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+        inner.memory_load_calls.fetch_add(1, Ordering::Relaxed);
+        inner
+            .memory_load_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_scatter(&self, started: Option<Instant>) {
+        let (Some(inner), Some(started)) = (&self.inner, started) else {
+            return;
+        };
+        inner
+            .scatter_ns
+            .fetch_add(duration_ns(started.elapsed()), Ordering::Relaxed);
+        inner.scatter_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_request_job(&self) {
+        if let Some(inner) = &self.inner {
+            inner.request_jobs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn inc_response_job(&self) {
+        if let Some(inner) = &self.inner {
+            inner.response_jobs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn inc_emitted_batch(&self) {
+        if let Some(inner) = &self.inner {
+            inner.emitted_batches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn inc_request_error(&self) {
+        if let Some(inner) = &self.inner {
+            inner.request_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn inc_response_error(&self) {
+        if let Some(inner) = &self.inner {
+            inner.response_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn print_summary(&self) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let producer_elapsed_ms = duration_ms(inner.producer_started.elapsed());
+        println!(
+            "databank/scheduled_prefetch_profile label={} producer_elapsed_ms={producer_elapsed_ms:.3} request_jobs={} response_jobs={} emitted_batches={} request_queue_ms={:.3} request_plan_ms={:.3} request_schedule_ms={:.3} request_send_ms={:.3} request_total_ms={:.3} response_queue_ms={:.3} response_assemble_ms={:.3} response_total_ms={:.3} scheduled_drain_ms={:.3} scheduled_drain_calls={} scheduled_drain_mib={:.3} alloc_ms={:.3} memory_load_ms={:.3} memory_load_calls={} memory_load_mib={:.3} scatter_ms={:.3} scatter_calls={} submit_request_ms={:.3} submit_response_ms={:.3} producer_wait_ms={:.3} output_send_ms={:.3} batch_source_ms={:.3} request_errors={} response_errors={}",
+            inner.label,
+            load(&inner.request_jobs),
+            load(&inner.response_jobs),
+            load(&inner.emitted_batches),
+            ns_to_ms(load(&inner.request_queue_wait_ns)),
+            ns_to_ms(load(&inner.request_plan_ns)),
+            ns_to_ms(load(&inner.request_schedule_ns)),
+            ns_to_ms(load(&inner.request_send_ns)),
+            ns_to_ms(load(&inner.request_total_ns)),
+            ns_to_ms(load(&inner.response_queue_wait_ns)),
+            ns_to_ms(load(&inner.assemble_total_ns)),
+            ns_to_ms(load(&inner.response_total_ns)),
+            ns_to_ms(load(&inner.scheduled_drain_ns)),
+            load(&inner.scheduled_drain_calls),
+            bytes_to_mib(load(&inner.scheduled_drain_bytes)),
+            ns_to_ms(load(&inner.alloc_ns)),
+            ns_to_ms(load(&inner.memory_load_ns)),
+            load(&inner.memory_load_calls),
+            bytes_to_mib(load(&inner.memory_load_bytes)),
+            ns_to_ms(load(&inner.scatter_ns)),
+            load(&inner.scatter_calls),
+            ns_to_ms(load(&inner.submit_request_ns)),
+            ns_to_ms(load(&inner.submit_response_ns)),
+            ns_to_ms(load(&inner.coordinator_wait_ns)),
+            ns_to_ms(load(&inner.output_send_ns)),
+            ns_to_ms(load(&inner.batch_source_next_ns)),
+            load(&inner.request_errors),
+            load(&inner.response_errors),
+        );
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+fn bytes_to_mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+#[derive(Debug)]
+struct PrefetchCancelRegistry {
+    cancelled: AtomicBool,
+    active: Mutex<BTreeMap<BatchSeq, Arc<PrefetchCancel>>>,
+}
+
+impl PrefetchCancelRegistry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            active: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn register(&self, seq: BatchSeq, cancel: Arc<PrefetchCancel>) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.cancelled.load(Ordering::Acquire) {
+            drop(active);
+            cancel.cancel_in_flight();
+        } else {
+            active.insert(seq, cancel);
+        }
+    }
+
+    fn unregister(&self, seq: BatchSeq) {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&seq);
+    }
+
+    fn cancel_all(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cancels = active.values().cloned().collect::<Vec<_>>();
+        active.clear();
+        drop(active);
+        for cancel in cancels {
+            cancel.cancel_in_flight();
+        }
+    }
+}
+
+struct ProducerState<T>
+where
+    T: DataValue,
+{
+    next_read_seq: BatchSeq,
+    next_emit_seq: BatchSeq,
+    source_done: bool,
+    stop_reading: bool,
+    outstanding: usize,
+    active_requests: usize,
+    active_responses: usize,
+    response_limit: usize,
+    planned_ready: VecDeque<PlannedBatch>,
+    completed: BTreeMap<BatchSeq, DataBankResult<PrefetchedBatch<T>>>,
+}
+
+impl<T> ProducerState<T>
+where
+    T: DataValue,
+{
+    fn new(prefetch_step: usize, worker_count: usize) -> Self {
+        let response_limit = prefetch_step.min(worker_count.saturating_sub(1).max(1));
+        Self {
+            next_read_seq: 0,
+            next_emit_seq: 0,
+            source_done: false,
+            stop_reading: false,
+            outstanding: 0,
+            active_requests: 0,
+            active_responses: 0,
+            response_limit,
+            planned_ready: VecDeque::new(),
+            completed: BTreeMap::new(),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.source_done
+            && self.outstanding == 0
+            && self.active_requests == 0
+            && self.active_responses == 0
+            && self.planned_ready.is_empty()
+    }
+}
+
+enum ProducerEvent<T>
+where
+    T: DataValue,
+{
+    Planned(Result<PlannedMessage, flume::RecvError>),
+    Done(Result<DoneMessage<T>, flume::RecvError>),
+}
+
+struct ActiveBatchGuard {
+    seq: BatchSeq,
+    registry: Arc<PrefetchCancelRegistry>,
+}
+
+impl Drop for ActiveBatchGuard {
+    fn drop(&mut self) {
+        self.registry.unregister(self.seq);
+    }
 }
 
 impl<T, I> PrefetchProducer<T, I>
@@ -5974,456 +6500,868 @@ where
     I::Item: AsRef<[usize]>,
 {
     fn run(mut self) {
-        while !self.cancel.is_cancelled() {
-            // `next_batch` allocates output buffers and runs scatter work that
-            // can panic (OOM, codec panics). Catch it so the consumer observes
-            // a real error instead of a silent `None` from a dropped join handle.
-            let result = match panic::catch_unwind(AssertUnwindSafe(|| self.next_batch())) {
-                Ok(Some(result)) => result,
-                Ok(None) => break,
-                Err(_) => {
-                    let _ = self.tx.send(Err(DataBankError::PrefetchProducerPanic));
-                    break;
-                }
-            };
-            if matches!(result, Err(DataBankError::PrefetchCancelled)) {
-                // Cancellation originates from `Drop`; the receiver is already
-                // gone (or going), so don't surface it as a regular error.
-                break;
-            }
-            let is_err = result.is_err();
-            if self.tx.send(result).is_err() || is_err {
-                break;
-            }
+        if panic::catch_unwind(AssertUnwindSafe(|| self.run_pipeline())).is_err() {
+            self.cancel.cancel_all();
+            let _ = self.tx.send(Err(DataBankError::PrefetchProducerPanic));
         }
+        self.profiler.print_summary();
     }
 
-    fn next_batch(&mut self) -> Option<DataBankResult<PrefetchedBatch<T>>> {
-        let cells = self.batch_source.next()?;
-        let (plan, items) = match plan_batch(
-            self.dataset.as_ref(),
-            cells.as_ref().to_vec(),
-            &self.gene_axis,
-        ) {
-            Ok(planned) => planned,
-            Err(err) => return Some(Err(err)),
-        };
-        let mut scheduled = match self.access.scheduled(items, self.access_config) {
-            Ok(scheduled) => scheduled,
-            Err(err) => return Some(Err(DataBankError::Access(err))),
-        };
-        scheduled.set_cancel_handle(Arc::clone(&self.cancel));
-        let batch = match self.scatter_plan(plan, &mut scheduled) {
-            Ok(batch) => batch,
-            Err(err) => return Some(Err(err)),
-        };
-        if scheduled.next().is_some() {
-            return Some(Err(DataBankError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "scheduled prefetch returned extra output",
-            ))));
-        }
-        Some(Ok(batch))
-    }
+    fn run_pipeline(&mut self) {
+        let (planned_tx, planned_rx) = flume::unbounded();
+        let (done_tx, done_rx) = flume::unbounded();
+        let mut state = ProducerState::<T>::new(self.prefetch_step, self.compute.worker_count());
 
-    fn scatter_plan<'d, J>(
-        &self,
-        plan: BatchPlan<'d>,
-        scheduled: &mut ScheduledAccess<J>,
-    ) -> DataBankResult<PrefetchedBatch<T>>
-    where
-        J: Iterator<Item = AccessItem>,
-    {
-        match plan {
-            BatchPlan::Dense {
-                cells,
-                segments,
-                groups,
-                num_genes,
-            } => {
-                let output_genes = self.gene_axis.output_genes(num_genes);
-                let total = cells.len().checked_mul(output_genes).ok_or_else(|| {
-                    DataBankError::InvalidConfig("dense output length overflow".to_string())
-                })?;
-                let mut buffer = vec![T::zero(); total];
-                let output_bytes =
-                    buffer
-                        .len()
-                        .checked_mul(mem::size_of::<T>())
-                        .ok_or_else(|| {
-                            DataBankError::InvalidConfig(
-                                "dense output byte length overflow".to_string(),
-                            )
-                        })?;
-                if self.compute.should_parallelize(cells.len(), output_bytes) {
-                    let mut loaded_groups = Vec::with_capacity(groups.len());
-                    for group in &groups {
-                        if self.cancel.is_cancelled() {
-                            return Err(DataBankError::PrefetchCancelled);
-                        }
-                        match &group.source {
-                            DenseGroupSource::AccessItem(_) => {
-                                let bytes = next_scheduled_bytes(scheduled)?;
-                                if bytes.len() != group.bytes {
-                                    return Err(DataBankError::InvalidArrayMeta(format!(
-                                        "dense group decoded length is {}, expected {}",
-                                        bytes.len(),
-                                        group.bytes
-                                    )));
-                                }
-                                loaded_groups.push(DenseLoadedGroup::Packed(Arc::from(
-                                    bytes.into_boxed_slice(),
-                                )));
-                            }
-                            DenseGroupSource::Memory { .. } => {
-                                loaded_groups
-                                    .push(load_dense_group_for_parallel(&self.access, group)?);
-                            }
-                        }
-                    }
-                    if try_scatter_dense_rows_parallel(
-                        self.compute.as_ref(),
-                        num_genes,
-                        output_genes,
-                        &segments,
-                        &groups,
-                        &loaded_groups,
-                        self.gene_axis.projection().cloned(),
-                        &mut buffer,
-                    )? {
-                        return Ok(PrefetchedBatch {
-                            cells,
-                            buffer,
-                            num_genes: output_genes,
-                        });
-                    }
-                    // Parallel scatter declined (e.g. too few rows after a
-                    // config change). Reuse the already-loaded groups instead
-                    // of re-consuming `scheduled`, which would otherwise run the
-                    // iterator dry and report a spurious "ended early" error.
-                    scatter_dense_group_range_checked::<T>(
-                        num_genes,
-                        output_genes,
-                        &segments,
-                        &groups,
-                        &loaded_groups,
-                        self.gene_axis.projection(),
-                        0,
-                        groups.len(),
-                        buffer.as_mut_ptr() as usize,
-                        buffer.len(),
-                    )?;
-                    return Ok(PrefetchedBatch {
-                        cells,
-                        buffer,
-                        num_genes: output_genes,
-                    });
-                }
-                for group in &groups {
-                    if self.cancel.is_cancelled() {
-                        return Err(DataBankError::PrefetchCancelled);
-                    }
-                    match &group.source {
-                        DenseGroupSource::AccessItem(_) => {
-                            let bytes = next_scheduled_bytes(scheduled)?;
-                            if self.gene_axis.projection().is_some() {
-                                scatter_dense_group_projected(
-                                    num_genes,
-                                    output_genes,
-                                    &segments,
-                                    group,
-                                    &bytes,
-                                    &self.gene_axis,
-                                    &mut buffer,
-                                )?;
-                            } else {
-                                scatter_dense_group(
-                                    num_genes,
-                                    &segments,
-                                    group,
-                                    &bytes,
-                                    &mut buffer,
-                                )?;
-                            }
-                        }
-                        DenseGroupSource::Memory { .. } => {
-                            let scattered = if self.gene_axis.projection().is_some() {
-                                try_scatter_dense_memory_identity_group_projected(
-                                    num_genes,
-                                    output_genes,
-                                    &segments,
-                                    group,
-                                    &self.gene_axis,
-                                    &mut buffer,
-                                )?
-                            } else {
-                                try_scatter_dense_memory_identity_group(
-                                    num_genes,
-                                    &segments,
-                                    group,
-                                    &mut buffer,
-                                )?
-                            };
-                            if !scattered {
-                                let bytes = load_dense_group(&self.access, group)?;
-                                if self.gene_axis.projection().is_some() {
-                                    scatter_dense_group_projected(
-                                        num_genes,
-                                        output_genes,
-                                        &segments,
-                                        group,
-                                        &bytes,
-                                        &self.gene_axis,
-                                        &mut buffer,
-                                    )?;
-                                } else {
-                                    scatter_dense_group(
-                                        num_genes,
-                                        &segments,
-                                        group,
-                                        &bytes,
-                                        &mut buffer,
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(PrefetchedBatch {
-                    cells,
-                    buffer,
-                    num_genes: output_genes,
-                })
-            }
-            BatchPlan::Sparse {
-                cells,
-                plan,
-                dataset,
-            } => self.scatter_sparse_plan(cells, plan, dataset, scheduled),
-        }
-    }
-
-    fn scatter_sparse_plan<J>(
-        &self,
-        cells: Vec<usize>,
-        plan: SparseBatchPlan,
-        dataset: &SparseCsrDataset,
-        scheduled: &mut ScheduledAccess<J>,
-    ) -> DataBankResult<PrefetchedBatch<T>>
-    where
-        J: Iterator<Item = AccessItem>,
-    {
-        let output_genes = self.gene_axis.output_genes(dataset.num_genes);
-        let total = cells.len().checked_mul(output_genes).ok_or_else(|| {
-            DataBankError::InvalidConfig("sparse output length overflow".to_string())
-        })?;
-        let mut buffer = vec![T::zero(); total];
-        let index_bytes = self.load_sparse_prefetch_indices(&plan, scheduled)?;
-
-        if self.gene_axis.projection().is_some() {
-            self.scatter_sparse_prefetch_projected_data(dataset, &plan, index_bytes, &mut buffer)?;
-        } else {
-            self.scatter_sparse_prefetch_data(dataset, &plan, index_bytes, scheduled, &mut buffer)?;
-        }
-
-        Ok(PrefetchedBatch {
-            cells,
-            buffer,
-            num_genes: output_genes,
-        })
-    }
-
-    fn load_sparse_prefetch_indices<J>(
-        &self,
-        plan: &SparseBatchPlan,
-        scheduled: &mut ScheduledAccess<J>,
-    ) -> DataBankResult<Vec<u8>>
-    where
-        J: Iterator<Item = AccessItem>,
-    {
-        let mut index_bytes = zeroed_byte_vec(plan.index_bytes);
-        for group in &plan.index_groups {
+        loop {
             if self.cancel.is_cancelled() {
+                break;
+            }
+
+            let mut progressed = false;
+            progressed |= self.fill_request_window(&mut state, &planned_tx);
+            progressed |= self.drain_messages(&mut state, &planned_rx, &done_rx);
+            progressed |= self.submit_ready_responses(&mut state, &done_tx);
+            let (keep_running, emitted) = self.emit_ready(&mut state);
+            progressed |= emitted;
+            if !keep_running {
+                break;
+            }
+
+            if state.is_finished() {
+                break;
+            }
+
+            if !progressed && !self.wait_for_event(&mut state, &planned_rx, &done_rx) {
+                break;
+            }
+        }
+
+        self.cancel.cancel_all();
+        state.planned_ready.clear();
+    }
+
+    fn fill_request_window(
+        &mut self,
+        state: &mut ProducerState<T>,
+        planned_tx: &flume::Sender<PlannedMessage>,
+    ) -> bool {
+        let mut progressed = false;
+        while !state.source_done
+            && !state.stop_reading
+            && state.outstanding < self.prefetch_step
+            && !self.cancel.is_cancelled()
+        {
+            let next_started = self.profiler.start();
+            let next = self.batch_source.next();
+            self.profiler.record_batch_source_next(next_started);
+            let Some(cells) = next else {
+                state.source_done = true;
+                progressed = true;
+                break;
+            };
+            let seq = state.next_read_seq;
+            state.next_read_seq += 1;
+            state.outstanding += 1;
+            state.active_requests += 1;
+
+            let job = make_prefetch_request_job(
+                seq,
+                self.access.clone(),
+                Arc::clone(&self.dataset),
+                cells.as_ref().to_vec(),
+                self.gene_axis.clone(),
+                self.access_config,
+                Arc::clone(&self.cancel),
+                planned_tx.clone(),
+                self.profiler.clone(),
+                self.profiler.start(),
+            );
+            let submit_started = self.profiler.start();
+            let submit_result = self.compute.submit_request(job);
+            self.profiler.record_submit_request(submit_started);
+            if let Err(err) = submit_result {
+                state.active_requests = state.active_requests.saturating_sub(1);
+                state.completed.insert(seq, Err(err));
+                state.stop_reading = true;
+            }
+            progressed = true;
+        }
+        progressed
+    }
+
+    fn drain_messages(
+        &self,
+        state: &mut ProducerState<T>,
+        planned_rx: &flume::Receiver<PlannedMessage>,
+        done_rx: &flume::Receiver<DoneMessage<T>>,
+    ) -> bool {
+        let mut progressed = false;
+        while let Ok(message) = planned_rx.try_recv() {
+            self.handle_planned_message(state, message);
+            progressed = true;
+        }
+        while let Ok(message) = done_rx.try_recv() {
+            self.handle_done_message(state, message);
+            progressed = true;
+        }
+        progressed
+    }
+
+    fn wait_for_event(
+        &self,
+        state: &mut ProducerState<T>,
+        planned_rx: &flume::Receiver<PlannedMessage>,
+        done_rx: &flume::Receiver<DoneMessage<T>>,
+    ) -> bool {
+        if state.active_requests == 0 && state.active_responses == 0 {
+            return false;
+        }
+
+        let wait_started = self.profiler.start();
+        let event = match (state.active_requests > 0, state.active_responses > 0) {
+            (true, true) => flume::Selector::new()
+                .recv(planned_rx, ProducerEvent::Planned)
+                .recv(done_rx, ProducerEvent::Done)
+                .wait(),
+            (true, false) => ProducerEvent::Planned(planned_rx.recv()),
+            (false, true) => ProducerEvent::Done(done_rx.recv()),
+            (false, false) => return false,
+        };
+        self.profiler.record_coordinator_wait(wait_started);
+
+        match event {
+            ProducerEvent::Planned(Ok(message)) => {
+                self.handle_planned_message(state, message);
+                true
+            }
+            ProducerEvent::Done(Ok(message)) => {
+                self.handle_done_message(state, message);
+                true
+            }
+            ProducerEvent::Planned(Err(_)) | ProducerEvent::Done(Err(_)) => false,
+        }
+    }
+
+    fn handle_planned_message(&self, state: &mut ProducerState<T>, message: PlannedMessage) {
+        state.active_requests = state.active_requests.saturating_sub(1);
+        match message.result {
+            Ok(planned) => {
+                if self.cancel.is_cancelled() {
+                    self.cancel.unregister(planned.seq);
+                } else {
+                    state.planned_ready.push_back(*planned);
+                }
+            }
+            Err(err) => {
+                if !matches!(err, DataBankError::PrefetchCancelled) || !self.cancel.is_cancelled() {
+                    state.stop_reading = true;
+                }
+                state.completed.insert(message.seq, Err(err));
+            }
+        }
+    }
+
+    fn handle_done_message(&self, state: &mut ProducerState<T>, message: DoneMessage<T>) {
+        state.active_responses = state.active_responses.saturating_sub(1);
+        if message.result.is_err()
+            && (!matches!(&message.result, Err(DataBankError::PrefetchCancelled))
+                || !self.cancel.is_cancelled())
+        {
+            state.stop_reading = true;
+        }
+        state.completed.insert(message.seq, message.result);
+    }
+
+    fn submit_ready_responses(
+        &self,
+        state: &mut ProducerState<T>,
+        done_tx: &flume::Sender<DoneMessage<T>>,
+    ) -> bool {
+        let mut progressed = false;
+        while state.active_responses < state.response_limit && !self.cancel.is_cancelled() {
+            let Some(planned) = state.planned_ready.pop_front() else {
+                break;
+            };
+            let seq = planned.seq;
+            state.active_responses += 1;
+            let job = make_prefetch_response_job(
+                planned,
+                self.access.clone(),
+                Arc::clone(&self.compute),
+                self.access_config,
+                self.gene_axis.clone(),
+                Arc::clone(&self.cancel),
+                done_tx.clone(),
+                self.profiler.clone(),
+                self.profiler.start(),
+            );
+            let submit_started = self.profiler.start();
+            let submit_result = self.compute.submit_response(job);
+            self.profiler.record_submit_response(submit_started);
+            if let Err(err) = submit_result {
+                state.active_responses = state.active_responses.saturating_sub(1);
+                self.cancel.unregister(seq);
+                state.completed.insert(seq, Err(err));
+                state.stop_reading = true;
+            }
+            progressed = true;
+        }
+        progressed
+    }
+
+    fn emit_ready(&self, state: &mut ProducerState<T>) -> (bool, bool) {
+        let mut emitted = false;
+        while let Some(result) = state.completed.remove(&state.next_emit_seq) {
+            emitted = true;
+            state.outstanding = state.outstanding.saturating_sub(1);
+            state.next_emit_seq += 1;
+            match result {
+                Ok(batch) => {
+                    let send_started = self.profiler.start();
+                    let send_result = self.tx.send(Ok(batch));
+                    self.profiler.record_output_send(send_started);
+                    if send_result.is_err() {
+                        self.cancel.cancel_all();
+                        return (false, emitted);
+                    }
+                    self.profiler.inc_emitted_batch();
+                }
+                Err(DataBankError::PrefetchCancelled) if self.cancel.is_cancelled() => {
+                    return (false, emitted);
+                }
+                Err(err) => {
+                    let send_started = self.profiler.start();
+                    if self.tx.send(Err(err)).is_ok() {
+                        self.profiler.inc_emitted_batch();
+                    }
+                    self.profiler.record_output_send(send_started);
+                    self.cancel.cancel_all();
+                    return (false, emitted);
+                }
+            }
+        }
+        (true, emitted)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_prefetch_request_job(
+    seq: BatchSeq,
+    access: AccessHandle,
+    dataset: Arc<Dataset>,
+    cells: Vec<usize>,
+    gene_axis: GeneAxisPlan,
+    access_config: ScheduledAccessConfig,
+    registry: Arc<PrefetchCancelRegistry>,
+    planned_tx: flume::Sender<PlannedMessage>,
+    profiler: ScheduledPrefetchProfiler,
+    queued_at: Option<Instant>,
+) -> ComputeJob {
+    Box::new(move || {
+        profiler.inc_request_job();
+        profiler.record_request_queue_wait(queued_at);
+        let total_started = profiler.start();
+        let result =
+            panic::catch_unwind(AssertUnwindSafe(|| -> DataBankResult<Box<PlannedBatch>> {
+                if registry.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
+                let plan_started = profiler.start();
+                let planned = plan_batch_owned(dataset, cells, &gene_axis);
+                profiler.record_request_plan(plan_started);
+                let (plan, items) = planned?;
+                if registry.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
+                let cancel = PrefetchCancel::new(access.clone());
+                let schedule_started = profiler.start();
+                let scheduled_result = access.scheduled(items, access_config);
+                profiler.record_request_schedule(schedule_started);
+                let mut scheduled = scheduled_result?;
+                scheduled.set_cancel_handle(Arc::clone(&cancel));
+                registry.register(seq, Arc::clone(&cancel));
+                Ok(Box::new(PlannedBatch {
+                    seq,
+                    plan,
+                    scheduled,
+                    cancel,
+                }))
+            }))
+            .unwrap_or(Err(DataBankError::ComputeWorkerPanic));
+        if result.is_err() {
+            profiler.inc_request_error();
+        }
+        let send_started = profiler.start();
+        if let Err(err) = planned_tx.send(PlannedMessage { seq, result }) {
+            if let Ok(planned) = err.0.result {
+                registry.unregister(planned.seq);
+            }
+        }
+        profiler.record_request_send(send_started);
+        profiler.record_request_total(total_started);
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_prefetch_response_job<T>(
+    planned: PlannedBatch,
+    access: AccessHandle,
+    compute: Arc<DataBankComputePool>,
+    access_config: ScheduledAccessConfig,
+    gene_axis: GeneAxisPlan,
+    registry: Arc<PrefetchCancelRegistry>,
+    done_tx: flume::Sender<DoneMessage<T>>,
+    profiler: ScheduledPrefetchProfiler,
+    queued_at: Option<Instant>,
+) -> ComputeJob
+where
+    T: DataValue,
+{
+    Box::new(move || {
+        profiler.inc_response_job();
+        profiler.record_response_queue_wait(queued_at);
+        let total_started = profiler.start();
+        let PlannedBatch {
+            seq,
+            plan,
+            mut scheduled,
+            cancel,
+        } = planned;
+        let _guard = ActiveBatchGuard {
+            seq,
+            registry: Arc::clone(&registry),
+        };
+        let result = panic::catch_unwind(AssertUnwindSafe(
+            || -> DataBankResult<PrefetchedBatch<T>> {
+                if registry.is_cancelled() || cancel.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
+                let batch = assemble_planned_batch(
+                    &access,
+                    compute.as_ref(),
+                    &access_config,
+                    &gene_axis,
+                    &cancel,
+                    &profiler,
+                    plan,
+                    &mut scheduled,
+                )?;
+                if scheduled.next().is_some() {
+                    return Err(DataBankError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "scheduled prefetch returned extra output",
+                    )));
+                }
+                Ok(batch)
+            },
+        ))
+        .unwrap_or(Err(DataBankError::ComputeWorkerPanic));
+        if result.is_err() {
+            profiler.inc_response_error();
+        }
+        let _ = done_tx.send(DoneMessage { seq, result });
+        profiler.record_response_total(total_started);
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_planned_batch<T, J>(
+    access: &AccessHandle,
+    compute: &DataBankComputePool,
+    access_config: &ScheduledAccessConfig,
+    gene_axis: &GeneAxisPlan,
+    cancel: &Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    plan: BatchPlan,
+    scheduled: &mut ScheduledAccess<J>,
+) -> DataBankResult<PrefetchedBatch<T>>
+where
+    T: DataValue,
+    J: Iterator<Item = AccessItem>,
+{
+    let assemble_started = profiler.start();
+    let result = match plan {
+        BatchPlan::Dense {
+            cells,
+            segments,
+            groups,
+            num_genes,
+        } => assemble_dense_prefetch_batch(
+            access, compute, gene_axis, cancel, profiler, cells, segments, groups, num_genes,
+            scheduled,
+        ),
+        BatchPlan::Sparse {
+            cells,
+            plan,
+            dataset,
+        } => {
+            if let Dataset::SparseCsr(dataset) = dataset.as_ref() {
+                assemble_sparse_prefetch_batch(
+                    access,
+                    compute,
+                    access_config,
+                    gene_axis,
+                    cancel,
+                    profiler,
+                    cells,
+                    plan,
+                    dataset,
+                    scheduled,
+                )
+            } else {
+                Err(DataBankError::InvalidArrayMeta(
+                    "sparse prefetch plan carried non-CSR dataset".to_string(),
+                ))
+            }
+        }
+    };
+    profiler.record_assemble_total(assemble_started);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_dense_prefetch_batch<T, J>(
+    access: &AccessHandle,
+    compute: &DataBankComputePool,
+    gene_axis: &GeneAxisPlan,
+    cancel: &Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    cells: Vec<usize>,
+    segments: Vec<DenseSegment>,
+    groups: Vec<DenseReadGroup>,
+    num_genes: usize,
+    scheduled: &mut ScheduledAccess<J>,
+) -> DataBankResult<PrefetchedBatch<T>>
+where
+    T: DataValue,
+    J: Iterator<Item = AccessItem>,
+{
+    let output_genes = gene_axis.output_genes(num_genes);
+    let total = cells
+        .len()
+        .checked_mul(output_genes)
+        .ok_or_else(|| DataBankError::InvalidConfig("dense output length overflow".to_string()))?;
+    let alloc_started = profiler.start();
+    let mut buffer = vec![T::zero(); total];
+    profiler.record_alloc(alloc_started);
+    let output_bytes = buffer
+        .len()
+        .checked_mul(mem::size_of::<T>())
+        .ok_or_else(|| {
+            DataBankError::InvalidConfig("dense output byte length overflow".to_string())
+        })?;
+    if compute.should_parallelize(cells.len(), output_bytes) {
+        let mut loaded_groups = Vec::with_capacity(groups.len());
+        for group in &groups {
+            if cancel.is_cancelled() {
                 return Err(DataBankError::PrefetchCancelled);
             }
             match &group.source {
-                SparseGroupSource::AccessItem(_) => {
-                    let bytes = next_scheduled_bytes(scheduled)?;
-                    copy_sparse_group_to_index_buffer(
-                        &plan.index_pieces,
-                        group,
-                        &bytes,
-                        &mut index_bytes,
-                    )?;
-                }
-                SparseGroupSource::Memory { .. } => {
-                    if try_copy_sparse_memory_identity_group_to_index_buffer(
-                        &plan.index_pieces,
-                        group,
-                        &mut index_bytes,
-                    )? {
-                        continue;
+                DenseGroupSource::AccessItem(_) => {
+                    let bytes = next_scheduled_bytes(scheduled, profiler)?;
+                    if bytes.len() != group.bytes {
+                        return Err(DataBankError::InvalidArrayMeta(format!(
+                            "dense group decoded length is {}, expected {}",
+                            bytes.len(),
+                            group.bytes
+                        )));
                     }
-                    let bytes = load_sparse_group(&self.access, group)?;
-                    copy_sparse_group_to_index_buffer(
-                        &plan.index_pieces,
-                        group,
-                        &bytes,
-                        &mut index_bytes,
-                    )?;
+                    loaded_groups.push(DenseLoadedGroup::Packed(Arc::from(
+                        bytes.into_boxed_slice(),
+                    )));
+                }
+                DenseGroupSource::Memory { .. } => {
+                    let load_started = profiler.start();
+                    let loaded = load_dense_group_for_parallel(access, group)?;
+                    let loaded_bytes = match &loaded {
+                        DenseLoadedGroup::Packed(bytes) => bytes.len(),
+                        DenseLoadedGroup::DecodedSource { .. } => group.bytes,
+                    };
+                    profiler.record_memory_load(load_started, loaded_bytes);
+                    loaded_groups.push(loaded);
                 }
             }
         }
-        Ok(index_bytes)
+        let scatter_started = profiler.start();
+        let scattered = try_scatter_dense_rows_parallel(
+            compute,
+            num_genes,
+            output_genes,
+            &segments,
+            &groups,
+            &loaded_groups,
+            gene_axis.projection().cloned(),
+            &mut buffer,
+        )?;
+        profiler.record_scatter(scatter_started);
+        if scattered {
+            return Ok(PrefetchedBatch {
+                cells,
+                buffer,
+                num_genes: output_genes,
+            });
+        }
+        let scatter_started = profiler.start();
+        scatter_dense_group_range_checked::<T>(
+            num_genes,
+            output_genes,
+            &segments,
+            &groups,
+            &loaded_groups,
+            gene_axis.projection(),
+            0,
+            groups.len(),
+            buffer.as_mut_ptr() as usize,
+            buffer.len(),
+        )?;
+        profiler.record_scatter(scatter_started);
+        return Ok(PrefetchedBatch {
+            cells,
+            buffer,
+            num_genes: output_genes,
+        });
+    }
+    for group in &groups {
+        if cancel.is_cancelled() {
+            return Err(DataBankError::PrefetchCancelled);
+        }
+        match &group.source {
+            DenseGroupSource::AccessItem(_) => {
+                let bytes = next_scheduled_bytes(scheduled, profiler)?;
+                let scatter_started = profiler.start();
+                if gene_axis.projection().is_some() {
+                    scatter_dense_group_projected(
+                        num_genes,
+                        output_genes,
+                        &segments,
+                        group,
+                        &bytes,
+                        gene_axis,
+                        &mut buffer,
+                    )?;
+                } else {
+                    scatter_dense_group(num_genes, &segments, group, &bytes, &mut buffer)?;
+                }
+                profiler.record_scatter(scatter_started);
+            }
+            DenseGroupSource::Memory { .. } => {
+                let scatter_started = profiler.start();
+                let scattered = if gene_axis.projection().is_some() {
+                    try_scatter_dense_memory_identity_group_projected(
+                        num_genes,
+                        output_genes,
+                        &segments,
+                        group,
+                        gene_axis,
+                        &mut buffer,
+                    )?
+                } else {
+                    try_scatter_dense_memory_identity_group(
+                        num_genes,
+                        &segments,
+                        group,
+                        &mut buffer,
+                    )?
+                };
+                profiler.record_scatter(scatter_started);
+                if !scattered {
+                    let load_started = profiler.start();
+                    let bytes = load_dense_group(access, group)?;
+                    profiler.record_memory_load(load_started, bytes.len());
+                    let scatter_started = profiler.start();
+                    if gene_axis.projection().is_some() {
+                        scatter_dense_group_projected(
+                            num_genes,
+                            output_genes,
+                            &segments,
+                            group,
+                            &bytes,
+                            gene_axis,
+                            &mut buffer,
+                        )?;
+                    } else {
+                        scatter_dense_group(num_genes, &segments, group, &bytes, &mut buffer)?;
+                    }
+                    profiler.record_scatter(scatter_started);
+                }
+            }
+        }
+    }
+    Ok(PrefetchedBatch {
+        cells,
+        buffer,
+        num_genes: output_genes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_sparse_prefetch_batch<T, J>(
+    access: &AccessHandle,
+    compute: &DataBankComputePool,
+    access_config: &ScheduledAccessConfig,
+    gene_axis: &GeneAxisPlan,
+    cancel: &Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    cells: Vec<usize>,
+    plan: SparseBatchPlan,
+    dataset: &SparseCsrDataset,
+    scheduled: &mut ScheduledAccess<J>,
+) -> DataBankResult<PrefetchedBatch<T>>
+where
+    T: DataValue,
+    J: Iterator<Item = AccessItem>,
+{
+    let output_genes = gene_axis.output_genes(dataset.num_genes);
+    let total = cells
+        .len()
+        .checked_mul(output_genes)
+        .ok_or_else(|| DataBankError::InvalidConfig("sparse output length overflow".to_string()))?;
+    let alloc_started = profiler.start();
+    let mut buffer = vec![T::zero(); total];
+    profiler.record_alloc(alloc_started);
+    let index_bytes = load_sparse_prefetch_indices(access, cancel, profiler, &plan, scheduled)?;
+
+    if gene_axis.projection().is_some() {
+        let scatter_started = profiler.start();
+        load_sparse_data_groups_and_scatter_projected_checked(
+            access,
+            compute,
+            access_config,
+            dataset,
+            &plan,
+            index_bytes,
+            gene_axis,
+            Some(cancel),
+            &mut buffer,
+        )?;
+        profiler.record_scatter(scatter_started);
+    } else {
+        scatter_sparse_prefetch_data(
+            access,
+            compute,
+            cancel,
+            profiler,
+            dataset,
+            &plan,
+            index_bytes,
+            scheduled,
+            &mut buffer,
+        )?;
     }
 
-    fn scatter_sparse_prefetch_data<J>(
-        &self,
-        dataset: &SparseCsrDataset,
-        plan: &SparseBatchPlan,
-        index_bytes: Vec<u8>,
-        scheduled: &mut ScheduledAccess<J>,
-        buffer: &mut [T],
-    ) -> DataBankResult<()>
-    where
-        J: Iterator<Item = AccessItem>,
-    {
-        let output_rows = row_count_for_width(buffer.len(), dataset.num_genes);
-        let output_bytes = buffer
-            .len()
-            .checked_mul(mem::size_of::<T>())
-            .ok_or_else(|| {
-                DataBankError::InvalidConfig("sparse output byte length overflow".to_string())
-            })?;
-        if self.compute.should_parallelize(output_rows, output_bytes) {
-            let mut data_group_bytes = Vec::with_capacity(plan.data_groups.len());
-            for group in &plan.data_groups {
-                if self.cancel.is_cancelled() {
-                    return Err(DataBankError::PrefetchCancelled);
-                }
-                let bytes = match &group.source {
-                    SparseGroupSource::AccessItem(_) => next_scheduled_bytes(scheduled)?,
-                    SparseGroupSource::Memory { .. } => load_sparse_group(&self.access, group)?,
-                };
-                if bytes.len() != group.bytes {
-                    return Err(DataBankError::InvalidArrayMeta(format!(
-                        "CSR data group decoded length is {}, expected {}",
-                        bytes.len(),
-                        group.bytes
-                    )));
-                }
-                data_group_bytes.push(Arc::from(bytes.into_boxed_slice()));
+    Ok(PrefetchedBatch {
+        cells,
+        buffer,
+        num_genes: output_genes,
+    })
+}
+
+fn load_sparse_prefetch_indices<J>(
+    access: &AccessHandle,
+    cancel: &Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    plan: &SparseBatchPlan,
+    scheduled: &mut ScheduledAccess<J>,
+) -> DataBankResult<Vec<u8>>
+where
+    J: Iterator<Item = AccessItem>,
+{
+    let alloc_started = profiler.start();
+    let mut index_bytes = zeroed_byte_vec(plan.index_bytes);
+    profiler.record_alloc(alloc_started);
+    for group in &plan.index_groups {
+        if cancel.is_cancelled() {
+            return Err(DataBankError::PrefetchCancelled);
+        }
+        match &group.source {
+            SparseGroupSource::AccessItem(_) => {
+                let bytes = next_scheduled_bytes(scheduled, profiler)?;
+                let scatter_started = profiler.start();
+                copy_sparse_group_to_index_buffer(
+                    &plan.index_pieces,
+                    group,
+                    &bytes,
+                    &mut index_bytes,
+                )?;
+                profiler.record_scatter(scatter_started);
             }
-            // Owns `index_bytes` uniquely, so box it directly without cloning.
-            let index_bytes_arc: Arc<[u8]> = Arc::from(index_bytes.into_boxed_slice());
-            // Keep cheap clones for the fallback path: the parallel scatter
-            // takes ownership, but on decline we reuse the same bytes instead of
-            // re-consuming `scheduled`.
-            let fallback_index = Arc::clone(&index_bytes_arc);
-            let fallback_data = data_group_bytes.clone();
-            if try_scatter_sparse_rows_parallel_checked(
-                self.compute.as_ref(),
+            SparseGroupSource::Memory { .. } => {
+                let scatter_started = profiler.start();
+                if try_copy_sparse_memory_identity_group_to_index_buffer(
+                    &plan.index_pieces,
+                    group,
+                    &mut index_bytes,
+                )? {
+                    profiler.record_scatter(scatter_started);
+                    continue;
+                }
+                profiler.record_scatter(scatter_started);
+                let load_started = profiler.start();
+                let bytes = load_sparse_group(access, group)?;
+                profiler.record_memory_load(load_started, bytes.len());
+                let scatter_started = profiler.start();
+                copy_sparse_group_to_index_buffer(
+                    &plan.index_pieces,
+                    group,
+                    &bytes,
+                    &mut index_bytes,
+                )?;
+                profiler.record_scatter(scatter_started);
+            }
+        }
+    }
+    Ok(index_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scatter_sparse_prefetch_data<T, J>(
+    access: &AccessHandle,
+    compute: &DataBankComputePool,
+    cancel: &Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    dataset: &SparseCsrDataset,
+    plan: &SparseBatchPlan,
+    index_bytes: Vec<u8>,
+    scheduled: &mut ScheduledAccess<J>,
+    buffer: &mut [T],
+) -> DataBankResult<()>
+where
+    T: DataValue,
+    J: Iterator<Item = AccessItem>,
+{
+    let output_rows = row_count_for_width(buffer.len(), dataset.num_genes);
+    let output_bytes = buffer
+        .len()
+        .checked_mul(mem::size_of::<T>())
+        .ok_or_else(|| {
+            DataBankError::InvalidConfig("sparse output byte length overflow".to_string())
+        })?;
+    if compute.should_parallelize(output_rows, output_bytes) {
+        let mut data_group_bytes = Vec::with_capacity(plan.data_groups.len());
+        for group in &plan.data_groups {
+            if cancel.is_cancelled() {
+                return Err(DataBankError::PrefetchCancelled);
+            }
+            let bytes = match &group.source {
+                SparseGroupSource::AccessItem(_) => next_scheduled_bytes(scheduled, profiler)?,
+                SparseGroupSource::Memory { .. } => {
+                    let load_started = profiler.start();
+                    let bytes = load_sparse_group(access, group)?;
+                    profiler.record_memory_load(load_started, bytes.len());
+                    bytes
+                }
+            };
+            if bytes.len() != group.bytes {
+                return Err(DataBankError::InvalidArrayMeta(format!(
+                    "CSR data group decoded length is {}, expected {}",
+                    bytes.len(),
+                    group.bytes
+                )));
+            }
+            data_group_bytes.push(Arc::from(bytes.into_boxed_slice()));
+        }
+        let index_bytes_arc: Arc<[u8]> = Arc::from(index_bytes.into_boxed_slice());
+        let fallback_index = Arc::clone(&index_bytes_arc);
+        let fallback_data = data_group_bytes.clone();
+        let scatter_started = profiler.start();
+        let scattered = try_scatter_sparse_rows_parallel_checked(
+            compute,
+            dataset,
+            plan,
+            index_bytes_arc,
+            data_group_bytes,
+            dataset.num_genes,
+            None,
+            buffer,
+        )?;
+        profiler.record_scatter(scatter_started);
+        if scattered {
+            return Ok(());
+        }
+        for (group, bytes) in plan.data_groups.iter().zip(fallback_data.iter()) {
+            let scatter_started = profiler.start();
+            scatter_sparse_data_group_checked(
                 dataset,
-                plan,
-                index_bytes_arc,
-                data_group_bytes,
-                dataset.num_genes,
-                None,
+                &plan.data_pieces,
+                group,
+                fallback_index.as_ref(),
+                bytes.as_ref(),
                 buffer,
-            )? {
-                return Ok(());
-            }
-            // Parallel scatter declined; reuse the already-loaded data bytes
-            // (and the index buffer) instead of re-consuming `scheduled`.
-            for (group, bytes) in plan.data_groups.iter().zip(fallback_data.iter()) {
+            )?;
+            profiler.record_scatter(scatter_started);
+        }
+        return Ok(());
+    }
+    for group in &plan.data_groups {
+        if cancel.is_cancelled() {
+            return Err(DataBankError::PrefetchCancelled);
+        }
+        match &group.source {
+            SparseGroupSource::AccessItem(_) => {
+                let bytes = next_scheduled_bytes(scheduled, profiler)?;
+                let scatter_started = profiler.start();
                 scatter_sparse_data_group_checked(
                     dataset,
                     &plan.data_pieces,
                     group,
-                    fallback_index.as_ref(),
-                    bytes.as_ref(),
+                    &index_bytes,
+                    &bytes,
                     buffer,
                 )?;
+                profiler.record_scatter(scatter_started);
             }
-            return Ok(());
-        }
-        for group in &plan.data_groups {
-            if self.cancel.is_cancelled() {
-                return Err(DataBankError::PrefetchCancelled);
-            }
-            match &group.source {
-                SparseGroupSource::AccessItem(_) => {
-                    let bytes = next_scheduled_bytes(scheduled)?;
-                    scatter_sparse_data_group_checked(
-                        dataset,
-                        &plan.data_pieces,
-                        group,
-                        &index_bytes,
-                        &bytes,
-                        buffer,
-                    )?;
+            SparseGroupSource::Memory { .. } => {
+                let scatter_started = profiler.start();
+                if try_scatter_sparse_memory_identity_data_group_checked(
+                    dataset,
+                    &plan.data_pieces,
+                    group,
+                    &index_bytes,
+                    buffer,
+                )? {
+                    profiler.record_scatter(scatter_started);
+                    continue;
                 }
-                SparseGroupSource::Memory { .. } => {
-                    if try_scatter_sparse_memory_identity_data_group_checked(
-                        dataset,
-                        &plan.data_pieces,
-                        group,
-                        &index_bytes,
-                        buffer,
-                    )? {
-                        continue;
-                    }
-                    let bytes = load_sparse_group(&self.access, group)?;
-                    scatter_sparse_data_group_checked(
-                        dataset,
-                        &plan.data_pieces,
-                        group,
-                        &index_bytes,
-                        &bytes,
-                        buffer,
-                    )?;
-                }
+                profiler.record_scatter(scatter_started);
+                let load_started = profiler.start();
+                let bytes = load_sparse_group(access, group)?;
+                profiler.record_memory_load(load_started, bytes.len());
+                let scatter_started = profiler.start();
+                scatter_sparse_data_group_checked(
+                    dataset,
+                    &plan.data_pieces,
+                    group,
+                    &index_bytes,
+                    &bytes,
+                    buffer,
+                )?;
+                profiler.record_scatter(scatter_started);
             }
         }
-        Ok(())
     }
-
-    fn scatter_sparse_prefetch_projected_data(
-        &self,
-        dataset: &SparseCsrDataset,
-        plan: &SparseBatchPlan,
-        index_bytes: Vec<u8>,
-        buffer: &mut [T],
-    ) -> DataBankResult<()> {
-        // Projected CSR prefetch plans only index groups in the outer
-        // ScheduledAccess. Data groups are filtered after indices are decoded,
-        // then scheduled independently here.
-        load_sparse_data_groups_and_scatter_projected_checked(
-            &self.access,
-            self.compute.as_ref(),
-            &self.access_config,
-            dataset,
-            plan,
-            index_bytes,
-            &self.gene_axis,
-            Some(&self.cancel),
-            buffer,
-        )
-    }
+    Ok(())
 }
 
-fn next_scheduled_bytes<J>(scheduled: &mut ScheduledAccess<J>) -> DataBankResult<Vec<u8>>
+fn next_scheduled_bytes<J>(
+    scheduled: &mut ScheduledAccess<J>,
+    profiler: &ScheduledPrefetchProfiler,
+) -> DataBankResult<Vec<u8>>
 where
     J: Iterator<Item = AccessItem>,
 {
-    match scheduled.next() {
+    let drain_started = profiler.start();
+    let result = match scheduled.next() {
         Some(Ok(bytes)) => Ok(bytes),
         Some(Err(err)) => Err(DataBankError::Io(err)),
         None => Err(DataBankError::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "scheduled prefetch ended before batch was complete",
         ))),
-    }
+    };
+    profiler.record_scheduled_drain(drain_started, result.as_ref().map_or(0, Vec::len));
+    result
 }
 
 /// Build a scheduled prefetcher over `batch_source`.
@@ -6513,7 +7451,8 @@ where
     let retained_dataset = Arc::clone(&dataset);
     let prefetch_step = config.prefetch_step;
     let (tx, rx) = flume::bounded(prefetch_step);
-    let cancel = PrefetchCancel::new(access.clone());
+    let cancel = PrefetchCancelRegistry::new();
+    let profiler = ScheduledPrefetchProfiler::from_env();
     let producer = PrefetchProducer {
         access,
         compute,
@@ -6523,6 +7462,8 @@ where
         gene_axis,
         tx,
         cancel: Arc::clone(&cancel),
+        prefetch_step,
+        profiler,
     };
     let handle = thread::Builder::new()
         .name("databank-prefetch-producer".to_string())
@@ -6542,10 +7483,12 @@ mod tests {
     use std::fmt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
 
-    use super::super::array::{Array, ArrayGrid, Chunk, ChunkSource, EdgeChunkLayout};
-    use super::super::dataset::{Dataset, SparseCsrDataset};
+    use super::super::array::{
+        Array, ArrayGrid, Chunk, ChunkSource, EdgeChunkLayout, RegisteredFile,
+    };
+    use super::super::dataset::{Dataset, Dense2DDataset, SparseCsrDataset};
     use crate::access::SliceSpec;
     use crate::codecs::{ChunkCodec, CodecError, CodecResult, SharedCodec, UncompressedCodec};
     use crate::databank::{
@@ -7268,6 +8211,83 @@ mod tests {
     }
 
     #[test]
+    fn unregister_defers_file_release_for_retained_prefetch_dataset() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let id = register_dense_2d_file(&mut bank, 4, 4, 2);
+        let dataset = bank.registry.get_arc(id).expect("dataset arc");
+        let batches: Vec<Vec<usize>> = vec![vec![0, 1], vec![2, 3]];
+        let expected: Vec<Vec<u32>> = batches
+            .iter()
+            .map(|cells| expected_dense_rows(cells, 4))
+            .collect();
+
+        bank.unregister(id)
+            .expect("unregister should retire retained dataset");
+        let prefetch = super::prefetch_cells_scheduled::<u32, _>(
+            &bank.access,
+            Arc::clone(&bank.compute),
+            Arc::clone(&dataset),
+            batches.into_iter(),
+            ScheduledPrefetchConfig::default(),
+        )
+        .expect("prefetch retained dataset");
+        let collected: Vec<Vec<u32>> = prefetch
+            .map(|batch| batch.expect("prefetch batch").buffer)
+            .collect();
+        assert_eq!(collected, expected);
+
+        drop(dataset);
+        bank.cleanup_retired().expect("cleanup retired dataset");
+    }
+
+    #[test]
+    fn scheduled_prefetch_emits_in_order_when_later_response_finishes_first() {
+        let mut config = DataBankConfig::default();
+        config.fill_config.parallel = true;
+        config.fill_config.num_workers = 3;
+        let mut bank = DataBank::new(config).expect("databank");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (decoded_tx, decoded_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let codec: SharedCodec = Arc::new(BlockingFirstChunkCodec {
+            blocked: std::sync::atomic::AtomicBool::new(false),
+            started: started_tx,
+            decoded: decoded_tx,
+            release: Arc::clone(&release),
+        });
+        let id = register_dense_2d_memory_with_codec(&mut bank, 2, 4, codec);
+        let batches = vec![vec![0], vec![1]];
+        let mut prefetch = bank
+            .prefetch_cells_scheduled::<u32, _>(
+                id,
+                batches.clone(),
+                ScheduledPrefetchConfig::default(),
+            )
+            .expect("scheduled prefetch");
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("first response blocked");
+        let decoded_first = decoded_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("later response decoded");
+        assert_eq!(decoded_first, dense_value(1, 0));
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().expect("release lock") = true;
+            cvar.notify_all();
+        }
+
+        let first = prefetch.next().expect("first item").expect("first batch");
+        let second = prefetch.next().expect("second item").expect("second batch");
+        assert_eq!(first.cells, batches[0]);
+        assert_eq!(first.buffer, expected_dense_rows(&batches[0], 4));
+        assert_eq!(second.cells, batches[1]);
+        assert_eq!(second.buffer, expected_dense_rows(&batches[1], 4));
+        assert!(prefetch.next().is_none());
+    }
+
+    #[test]
     fn scheduled_prefetch_csr_matches_direct_access() {
         let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
         let id = register_csr_file(&mut bank);
@@ -7510,6 +8530,33 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_prefetch_single_worker_parallel_scatter_does_not_deadlock() {
+        let mut config = DataBankConfig::default();
+        config.fill_config.parallel = true;
+        config.fill_config.num_workers = 1;
+        config.fill_config.min_parallel_rows = 1;
+        config.fill_config.min_parallel_bytes = 1;
+        let mut bank = DataBank::new(config).expect("databank");
+        let id = register_dense_2d_file(&mut bank, 6, 4, 1);
+        let batches: Vec<Vec<usize>> = vec![vec![0, 1, 2], vec![3, 4, 5]];
+        let expected: Vec<Vec<u32>> = batches
+            .iter()
+            .map(|cells| {
+                bank.access_cells_alloc::<u32>(id, cells)
+                    .expect("direct access")
+            })
+            .collect();
+
+        let prefetch = bank
+            .prefetch_cells_scheduled::<u32, _>(id, batches, ScheduledPrefetchConfig::default())
+            .expect("scheduled prefetch");
+        let collected: Vec<Vec<u32>> = prefetch
+            .map(|batch| batch.expect("prefetch batch").buffer)
+            .collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
     fn parallel_projected_csr_scatter_reads_only_selected_groups() {
         let mut seq_bank = DataBank::new(DataBankConfig::default()).expect("seq databank");
         let seq_id = register_csr_file(&mut seq_bank);
@@ -7560,6 +8607,63 @@ mod tests {
                 ScheduledPrefetchConfig::default(),
             )
             .expect("scheduled projected CSR");
+        let collected: Vec<Vec<u32>> = prefetch
+            .map(|batch| batch.expect("prefetch batch").buffer)
+            .collect();
+        assert_eq!(collected, expected_batches);
+    }
+
+    #[test]
+    fn projected_csr_mixed_file_memory_data_groups_matches_direct_and_prefetch() {
+        let mut seq_bank = DataBank::new(DataBankConfig::default()).expect("seq databank");
+        let seq_id = register_csr_mixed_file_memory_data(&mut seq_bank);
+        let mut par_bank = DataBank::new(parallel_config()).expect("parallel databank");
+        let par_id = register_csr_mixed_file_memory_data(&mut par_bank);
+        let cells = vec![1, 0, 2, 1, 0];
+        let genes = vec!["g1", "g3"];
+
+        let expected = seq_bank
+            .access_cells_owned_by_gene_names::<u32, _>(
+                seq_id,
+                &cells,
+                &genes,
+                MissingGenePolicy::Zero,
+            )
+            .expect("sequential mixed projected CSR");
+        let checked = par_bank
+            .access_cells_owned_by_gene_names::<u32, _>(
+                par_id,
+                &cells,
+                &genes,
+                MissingGenePolicy::Zero,
+            )
+            .expect("parallel mixed projected CSR");
+        assert_eq!(checked, expected);
+        assert_eq!(checked, vec![0, 0, 10, 30, 0, 3000, 0, 0, 10, 30]);
+
+        let batches: Vec<Vec<usize>> = vec![vec![1, 0], vec![2, 1, 0]];
+        let expected_batches: Vec<Vec<u32>> = batches
+            .iter()
+            .map(|batch| {
+                par_bank
+                    .access_cells_owned_by_gene_names::<u32, _>(
+                        par_id,
+                        batch,
+                        &genes,
+                        MissingGenePolicy::Zero,
+                    )
+                    .expect("direct mixed projected CSR")
+            })
+            .collect();
+        let prefetch = par_bank
+            .prefetch_cells_scheduled_by_gene_names::<u32, _, _>(
+                par_id,
+                batches.clone(),
+                &genes,
+                MissingGenePolicy::Zero,
+                ScheduledPrefetchConfig::default(),
+            )
+            .expect("scheduled mixed projected CSR");
         let collected: Vec<Vec<u32>> = prefetch
             .map(|batch| batch.expect("prefetch batch").buffer)
             .collect();
@@ -7618,6 +8722,26 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
+    #[test]
+    fn scheduled_prefetch_exposes_first_ordered_error_only() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let id = register_dense_2d_file(&mut bank, 4, 4, 2);
+
+        let batches: Vec<Vec<usize>> = vec![vec![0, 1], vec![99], vec![2, 3]];
+        let mut iter = bank
+            .prefetch_cells_scheduled::<u32, _>(id, batches, ScheduledPrefetchConfig::default())
+            .expect("scheduled prefetch");
+
+        let first = iter.next().expect("first batch").expect("first ok");
+        assert_eq!(first.cells, vec![0, 1]);
+        let err = iter.next().expect("error item").expect_err("first error");
+        assert!(matches!(
+            err,
+            crate::databank::DataBankError::CellIndexOutOfRange { cell: 99, .. }
+        ));
+        assert!(iter.next().is_none());
+    }
+
     #[derive(Clone)]
     struct CountingCodec {
         decodes: Arc<AtomicUsize>,
@@ -7641,6 +8765,61 @@ mod tests {
             if let Some(expected_size) = expected_size {
                 assert_eq!(encoded.len(), expected_size);
             }
+            Ok(encoded.to_vec())
+        }
+
+        fn decoded_size_hint(
+            &self,
+            _encoded: &[u8],
+            expected_size: Option<usize>,
+        ) -> CodecResult<Option<usize>> {
+            Ok(expected_size)
+        }
+    }
+
+    struct BlockingFirstChunkCodec {
+        blocked: std::sync::atomic::AtomicBool,
+        started: mpsc::Sender<()>,
+        decoded: mpsc::Sender<u32>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl fmt::Debug for BlockingFirstChunkCodec {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BlockingFirstChunkCodec")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl crate::codecs::sealed::Sealed for BlockingFirstChunkCodec {}
+
+    impl ChunkCodec for BlockingFirstChunkCodec {
+        fn name(&self) -> &str {
+            "blocking-first"
+        }
+
+        fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
+            if let Some(expected_size) = expected_size {
+                assert_eq!(encoded.len(), expected_size);
+            }
+            let first = encoded
+                .get(..std::mem::size_of::<u32>())
+                .map(|bytes| {
+                    let mut word = [0u8; std::mem::size_of::<u32>()];
+                    word.copy_from_slice(bytes);
+                    u32::from_ne_bytes(word)
+                })
+                .unwrap_or(0);
+
+            if first == 0 && !self.blocked.swap(true, Ordering::SeqCst) {
+                self.started.send(()).expect("started");
+                let (lock, cvar) = &*self.release;
+                let mut released = lock.lock().expect("release lock");
+                while !*released {
+                    released = cvar.wait(released).expect("release wait");
+                }
+            }
+            self.decoded.send(first).expect("decoded");
             Ok(encoded.to_vec())
         }
 
@@ -7935,6 +9114,54 @@ mod tests {
         .expect("register dense 2d memory")
     }
 
+    fn register_dense_2d_memory_with_codec(
+        bank: &mut DataBank,
+        num_cells: usize,
+        num_genes: usize,
+        codec: SharedCodec,
+    ) -> crate::databank::DatasetId {
+        let chunk_rows = 1;
+        let chunk_cols = num_genes;
+        let mut chunks = Vec::with_capacity(num_cells);
+        for cell in 0..num_cells {
+            let mut bytes = Vec::with_capacity(num_genes * std::mem::size_of::<u32>());
+            for gene in 0..num_genes {
+                bytes.extend_from_slice(&dense_value(cell, gene).to_ne_bytes());
+            }
+            chunks.push(Chunk {
+                source: ChunkSource::Memory {
+                    bytes: Arc::from(bytes.into_boxed_slice()),
+                    decoded: false,
+                },
+                decoded_bytes: chunk_cols * std::mem::size_of::<u32>(),
+            });
+        }
+        let gene_names = (0..num_genes)
+            .map(|gene| format!("g{gene}"))
+            .collect::<Vec<_>>();
+        let genes = bank.interner.intern_dataset(&gene_names);
+        let dataset = Dense2DDataset {
+            genes,
+            data: Array {
+                shape: vec![num_cells, num_genes],
+                dtype: DType::U32,
+                codec,
+                grid: ArrayGrid::Regular {
+                    chunk_shape: vec![chunk_rows, chunk_cols],
+                    grid_shape: vec![num_cells, 1],
+                    edge: EdgeChunkLayout::Padded,
+                },
+                chunks,
+                files: Vec::new(),
+            },
+            num_cells,
+            num_genes,
+        };
+        bank.registry
+            .register(Dataset::Dense2D(dataset))
+            .expect("register dense 2d memory with codec")
+    }
+
     fn expected_dense_rows(cells: &[usize], num_genes: usize) -> Vec<u32> {
         cells
             .iter()
@@ -7989,6 +9216,82 @@ mod tests {
             num_genes: 5,
         })
         .expect("register CSR file")
+    }
+
+    fn register_csr_mixed_file_memory_data(bank: &mut DataBank) -> crate::databank::DatasetId {
+        let (data_path, data_locations) =
+            write_chunk_file(vec![arc_u32_bytes(&[10, 30, 100, 400])]);
+        let file_id = bank
+            .io_pool
+            .register_readonly_file(&data_path)
+            .expect("register data file");
+        let file = RegisteredFile::new(file_id).expect("registered file");
+        let gene_names = (0..5).map(|idx| format!("g{idx}")).collect::<Vec<_>>();
+        let genes = bank.interner.intern_dataset(&gene_names);
+        let index_chunks = vec![
+            Chunk {
+                source: ChunkSource::Memory {
+                    bytes: arc_u32_bytes(&[1, 3, 0, 4]),
+                    decoded: false,
+                },
+                decoded_bytes: 4 * std::mem::size_of::<u32>(),
+            },
+            Chunk {
+                source: ChunkSource::Memory {
+                    bytes: arc_u32_bytes(&[2, 3]),
+                    decoded: false,
+                },
+                decoded_bytes: 2 * std::mem::size_of::<u32>(),
+            },
+        ];
+        let data_chunks = vec![
+            Chunk {
+                source: ChunkSource::File {
+                    file,
+                    offset: data_locations[0].offset,
+                    len: data_locations[0].len,
+                },
+                decoded_bytes: 4 * std::mem::size_of::<u32>(),
+            },
+            Chunk {
+                source: ChunkSource::Memory {
+                    bytes: arc_u32_bytes(&[200, 3000]),
+                    decoded: false,
+                },
+                decoded_bytes: 2 * std::mem::size_of::<u32>(),
+            },
+        ];
+        let grid = ArrayGrid::Regular {
+            chunk_shape: vec![4],
+            grid_shape: vec![2],
+            edge: EdgeChunkLayout::Cropped,
+        };
+        let dataset = SparseCsrDataset {
+            genes,
+            indptr: vec![0, 2, 5, 6],
+            indices: Array {
+                shape: vec![6],
+                dtype: DType::U32,
+                codec: Arc::new(UncompressedCodec),
+                grid: grid.clone(),
+                chunks: index_chunks,
+                files: Vec::new(),
+            },
+            data: Array {
+                shape: vec![6],
+                dtype: DType::U32,
+                codec: Arc::new(UncompressedCodec),
+                grid,
+                chunks: data_chunks,
+                files: vec![file],
+            },
+            index_dtype: DType::U32,
+            num_cells: 3,
+            num_genes: 5,
+        };
+        bank.registry
+            .register(Dataset::SparseCsr(dataset))
+            .expect("register mixed CSR")
     }
 
     fn u32_array_meta(chunks: Vec<Arc<[u8]>>) -> ArrayMeta {

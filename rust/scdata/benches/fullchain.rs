@@ -10,12 +10,18 @@
 //! cargo bench --manifest-path rust/scdata/Cargo.toml --bench fullchain
 //! ```
 //!
+//! Matrix runs add `SCDATA_FULLCHAIN_MATRIX_PREFETCH_PROFILES` with
+//! comma-separated `no-ahead,current,deep-ahead,deeper` values, so the same data
+//! shape can compare shallow, default, and deeper scheduled lookahead.
+//! `SCDATA_FULLCHAIN_PROFILE=0` disables the default stage-profile output.
+//!
 //! This is a re-implementation of the original fullchain harness: the same
 //! surface (file-backed CSR, scheduled prefetch, bg CPU/IO contention,
 //! percentile waits) with a slimmer, fully `support`-backed implementation.
 
 mod support;
 
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::io::{Cursor, Write};
 use std::os::unix::fs::FileExt;
@@ -58,7 +64,7 @@ fn main() {
 
 fn run_fullchain_case(fc: &FullchainConfig) {
     println!(
-        "databank/fullchain_scheduled_prefetch_config label={} codec={} batches={} batch_cells={} genes={} nnz_per_cell={} chunk_nnz={} chunks_per_batch={} chunk_miss_permille={} prefetch_step={} access_prefetch_step={} access_decode_ahead={} access_ready_ahead={} io_backend={} io_workers={} io_shards={} io_inflight={} scheduler_shards={} access_cpu_workers={} decode_workers={} fill_workers={} bg_cpu_threads={} bg_io_readers={} bg_io_file_mib={} bg_io_read_kib={} bg_io_same_file={} bg_io_drop_cache={} repeat_encoded_chunk={} data_dir={}",
+        "databank/fullchain_scheduled_prefetch_config label={} codec={} batches={} batch_cells={} genes={} nnz_per_cell={} chunk_nnz={} chunks_per_batch={} chunk_miss_permille={} prefetch_step={} access_prefetch_step={} access_decode_ahead={} access_ready_ahead={} io_backend={} io_workers={} io_shards={} io_inflight={} scheduler_shards={} access_cpu_workers={} decode_workers={} fill_workers={} bg_cpu_threads={} bg_io_readers={} bg_io_file_mib={} bg_io_read_kib={} bg_io_same_file={} bg_io_drop_cache={} repeat_encoded_chunk={} profile={} data_dir={}",
         fc.label,
         fc.codec.name(),
         fc.batches,
@@ -87,6 +93,7 @@ fn run_fullchain_case(fc: &FullchainConfig) {
         fc.bg_io_same_file,
         fc.bg_io_drop_cache,
         fc.repeat_encoded_chunk,
+        fc.profile,
         fc.data_dir.display(),
     );
 
@@ -230,6 +237,7 @@ struct FullchainConfig {
     bg_io_drop_cache: bool,
     data_dir: PathBuf,
     warmups: usize,
+    profile: bool,
 }
 
 impl FullchainConfig {
@@ -332,6 +340,7 @@ impl FullchainConfig {
                     config.warmups.min(1)
                 }
             }),
+            profile: env_flag_default("SCDATA_FULLCHAIN_PROFILE", true),
         }
     }
 }
@@ -395,18 +404,72 @@ impl MatrixBackground {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MatrixPrefetchProfile {
+    NoAhead,
+    Current,
+    DeepAhead,
+    Deeper,
+}
+
+impl MatrixPrefetchProfile {
+    fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "no-ahead" | "no_ahead" | "none" | "shallow" => Some(Self::NoAhead),
+            "current" | "default" | "base" => Some(Self::Current),
+            "deep-ahead" | "deep_ahead" | "deep" => Some(Self::DeepAhead),
+            "deeper" | "very-deep" | "very_deep" => Some(Self::Deeper),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::NoAhead => "no_ahead",
+            Self::Current => "current",
+            Self::DeepAhead => "deep_ahead",
+            Self::Deeper => "deeper",
+        }
+    }
+
+    fn apply(self, config: &mut FullchainConfig) {
+        match self {
+            Self::NoAhead => {
+                config.prefetch_step = 1;
+                config.access_prefetch_step = 1;
+                config.access_decode_ahead = 0;
+                config.access_ready_ahead = 0;
+            }
+            Self::Current => {}
+            Self::DeepAhead => {
+                config.prefetch_step = 4;
+                config.access_prefetch_step = 8;
+                config.access_decode_ahead = 4;
+                config.access_ready_ahead = 2;
+            }
+            Self::Deeper => {
+                config.prefetch_step = 8;
+                config.access_prefetch_step = 16;
+                config.access_decode_ahead = 8;
+                config.access_ready_ahead = 4;
+            }
+        }
+    }
+}
+
 fn run_fullchain_matrix(base: &FullchainConfig) {
     let codecs = matrix_codecs();
     let backends = matrix_backends();
     let backgrounds = matrix_backgrounds();
+    let prefetch_profiles = matrix_prefetch_profiles();
     let matrix_cpu_threads = env_usize("SCDATA_FULLCHAIN_MATRIX_BG_CPU_THREADS")
         .unwrap_or_else(|| base.bg_cpu_threads.max(4));
     let matrix_io_readers = env_usize("SCDATA_FULLCHAIN_MATRIX_BG_IO_READERS")
         .unwrap_or_else(|| base.bg_io_readers.max(4));
 
     println!(
-        "databank/fullchain_matrix cases={} codecs={} backends={} backgrounds={}",
-        codecs.len() * backends.len() * backgrounds.len(),
+        "databank/fullchain_matrix cases={} codecs={} backends={} backgrounds={} prefetch_profiles={}",
+        codecs.len() * backends.len() * backgrounds.len() * prefetch_profiles.len(),
         codecs
             .iter()
             .map(|codec| codec.name())
@@ -422,17 +485,31 @@ fn run_fullchain_matrix(base: &FullchainConfig) {
             .map(|background| background.name())
             .collect::<Vec<_>>()
             .join(","),
+        prefetch_profiles
+            .iter()
+            .map(|profile| profile.name())
+            .collect::<Vec<_>>()
+            .join(","),
     );
 
     for codec in codecs {
         for backend in &backends {
             for background in &backgrounds {
-                let mut config = base.clone();
-                config.codec = codec;
-                config.io_backend = *backend;
-                background.apply(&mut config, matrix_cpu_threads, matrix_io_readers);
-                config.label = format!("{}-{}-{}", codec.name(), backend.name(), background.name());
-                run_fullchain_case(&config);
+                for prefetch_profile in &prefetch_profiles {
+                    let mut config = base.clone();
+                    config.codec = codec;
+                    config.io_backend = *backend;
+                    background.apply(&mut config, matrix_cpu_threads, matrix_io_readers);
+                    prefetch_profile.apply(&mut config);
+                    config.label = format!(
+                        "{}-{}-{}-{}",
+                        codec.name(),
+                        backend.name(),
+                        background.name(),
+                        prefetch_profile.name()
+                    );
+                    run_fullchain_case(&config);
+                }
             }
         }
     }
@@ -480,6 +557,20 @@ fn matrix_backgrounds() -> Vec<MatrixBackground> {
             MatrixBackground::Cpu,
             MatrixBackground::Io,
             MatrixBackground::CpuIo,
+        ]
+    })
+}
+
+fn matrix_prefetch_profiles() -> Vec<MatrixPrefetchProfile> {
+    parse_csv_env(
+        "SCDATA_FULLCHAIN_MATRIX_PREFETCH_PROFILES",
+        MatrixPrefetchProfile::from_name,
+    )
+    .unwrap_or_else(|| {
+        vec![
+            MatrixPrefetchProfile::NoAhead,
+            MatrixPrefetchProfile::Current,
+            MatrixPrefetchProfile::DeepAhead,
         ]
     })
 }
@@ -661,6 +752,7 @@ fn run_fullchain(fc: &FullchainConfig, csr: &CsrFile) {
         .expect("register fullchain csr dataset");
 
     let batches = make_batches(fc);
+    let encoded_workload = encoded_workload(csr, &batches, fc.chunk_nnz);
     let sp_config = ScheduledPrefetchConfig {
         prefetch_step: fc.prefetch_step,
         access: ScheduledAccessConfig {
@@ -671,6 +763,7 @@ fn run_fullchain(fc: &FullchainConfig, csr: &CsrFile) {
     };
 
     // Warm-up pass (no bg contention, no timing).
+    clear_databank_prefetch_profile_env();
     for _ in 0..fc.warmups {
         let prefetch = bank
             .prefetch_cells_scheduled::<f32, _>(dataset_id, batches.clone(), sp_config)
@@ -687,6 +780,7 @@ fn run_fullchain(fc: &FullchainConfig, csr: &CsrFile) {
     let mut total_cells = 0usize;
     let mut total_values = 0usize;
 
+    configure_databank_prefetch_profile_env(fc);
     let mut prefetch = bank
         .prefetch_cells_scheduled::<f32, _>(dataset_id, batches, sp_config)
         .expect("fullchain prefetch");
@@ -702,6 +796,8 @@ fn run_fullchain(fc: &FullchainConfig, csr: &CsrFile) {
         black_box(batch.buffer.as_ptr());
     }
     let elapsed = started.elapsed();
+    drop(prefetch);
+    clear_databank_prefetch_profile_env();
     let bg_sum = bg.stop();
 
     waits.sort_unstable();
@@ -716,9 +812,11 @@ fn run_fullchain(fc: &FullchainConfig, csr: &CsrFile) {
         * (std::mem::size_of::<u32>() + std::mem::size_of::<f32>()) as f64
         / (1024.0 * 1024.0);
     let encoded_file_mib = csr.encoded_bytes as f64 / (1024.0 * 1024.0);
+    let encoded_requested_mib = encoded_workload.requested_bytes as f64 / (1024.0 * 1024.0);
+    let encoded_unique_mib = encoded_workload.unique_bytes as f64 / (1024.0 * 1024.0);
 
     println!(
-        "databank/fullchain_scheduled_prefetch    label={} batches={} cells={} values={} elapsed_s={seconds:.4} throughput_mib_s={:.1} output_mib_s={:.1} slice_mib_s={:.1} encoded_file_mib={encoded_file_mib:.1} kops={:.1} wait_ns_p50={p50} p99={p99} p999={p999} max={max_ns} bg_sum={bg_sum}",
+        "databank/fullchain_scheduled_prefetch    label={} batches={} cells={} values={} elapsed_s={seconds:.4} throughput_mib_s={:.1} output_mib_s={:.1} slice_mib_s={:.1} encoded_requested_mib_s={:.1} encoded_unique_mib_s={:.1} encoded_file_mib={encoded_file_mib:.1} encoded_requested_mib={encoded_requested_mib:.1} encoded_unique_mib={encoded_unique_mib:.1} encoded_requested_chunks={} encoded_unique_chunks={} kops={:.1} wait_ns_p50={p50} p99={p99} p999={p999} max={max_ns} bg_sum={bg_sum}",
         fc.label,
         waits.len(),
         total_cells,
@@ -726,6 +824,10 @@ fn run_fullchain(fc: &FullchainConfig, csr: &CsrFile) {
         output_mib / seconds,
         output_mib / seconds,
         slice_mib / seconds,
+        encoded_requested_mib / seconds,
+        encoded_unique_mib / seconds,
+        encoded_workload.requested_chunks,
+        encoded_workload.unique_chunks,
         waits.len() as f64 / seconds / 1000.0,
     );
 }
@@ -742,6 +844,66 @@ fn make_batches(fc: &FullchainConfig) -> Vec<Vec<usize>> {
             (0..fc.batch_cells).map(|i| active_base + i).collect()
         })
         .collect()
+}
+
+#[derive(Default)]
+struct EncodedWorkload {
+    requested_bytes: u64,
+    unique_bytes: u64,
+    requested_chunks: usize,
+    unique_chunks: usize,
+}
+
+fn encoded_workload(csr: &CsrFile, batches: &[Vec<usize>], chunk_nnz: usize) -> EncodedWorkload {
+    let chunk_nnz = chunk_nnz.max(1);
+    let mut requested_bytes = 0u64;
+    let mut requested_chunks = 0usize;
+    let mut unique_chunks = HashSet::new();
+
+    for batch in batches {
+        let mut batch_chunks = HashSet::new();
+        for &cell in batch {
+            if cell + 1 >= csr.indptr.len() {
+                continue;
+            }
+            let start = csr.indptr[cell] as usize;
+            let end = csr.indptr[cell + 1] as usize;
+            if start >= end {
+                continue;
+            }
+            for chunk in (start / chunk_nnz)..=((end - 1) / chunk_nnz) {
+                batch_chunks.insert(chunk);
+            }
+        }
+        for chunk in batch_chunks {
+            requested_bytes += encoded_chunk_bytes(csr, chunk);
+            requested_chunks += 2;
+            unique_chunks.insert(chunk);
+        }
+    }
+
+    let unique_bytes = unique_chunks
+        .iter()
+        .map(|&chunk| encoded_chunk_bytes(csr, chunk))
+        .sum();
+    EncodedWorkload {
+        requested_bytes,
+        unique_bytes,
+        requested_chunks,
+        unique_chunks: unique_chunks.len() * 2,
+    }
+}
+
+fn encoded_chunk_bytes(csr: &CsrFile, chunk: usize) -> u64 {
+    let indices = csr
+        .indices_locations
+        .get(chunk)
+        .map_or(0, |location| location.len as u64);
+    let data = csr
+        .data_locations
+        .get(chunk)
+        .map_or(0, |location| location.len as u64);
+    indices + data
 }
 
 fn should_start_miss_batch(batch: usize, miss_permille: usize) -> bool {
@@ -943,10 +1105,34 @@ fn env_str(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+fn env_flag_default(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => default,
+    }
+}
+
 fn env_path(name: &str) -> Option<PathBuf> {
     env_str(name).map(PathBuf::from)
 }
 
 fn env_usize_any(names: &[&str]) -> Option<usize> {
     names.iter().find_map(|name| env_usize(name))
+}
+
+fn configure_databank_prefetch_profile_env(fc: &FullchainConfig) {
+    if fc.profile {
+        std::env::set_var("SCDATA_DATABANK_PREFETCH_PROFILE", "1");
+        std::env::set_var("SCDATA_DATABANK_PREFETCH_PROFILE_LABEL", &fc.label);
+    } else {
+        clear_databank_prefetch_profile_env();
+    }
+}
+
+fn clear_databank_prefetch_profile_env() {
+    std::env::remove_var("SCDATA_DATABANK_PREFETCH_PROFILE");
+    std::env::remove_var("SCDATA_DATABANK_PREFETCH_PROFILE_LABEL");
 }
