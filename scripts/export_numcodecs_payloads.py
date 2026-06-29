@@ -83,7 +83,7 @@ def encode_codec(
     chunks: list[bench.SampleChunk],
     encoded_path: Path,
     verify: bench.VerifyMode,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> dict[str, Any]:
     records: list[bench.EncodedChunk] = []
     started = time.perf_counter()
     for chunk in chunks:
@@ -123,7 +123,7 @@ def encode_codec(
         "notes": codec.notes,
         "records": encoded_rows,
     }
-    return meta, encoded_rows
+    return meta
 
 
 def skipped_algorithm(codec: bench.CodecAdapter, raw_bytes: int, exc: Exception) -> dict[str, Any]:
@@ -146,37 +146,7 @@ def skipped_algorithm(codec: bench.CodecAdapter, raw_bytes: int, exc: Exception)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=bench.DEFAULT_INPUT)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--sample-bytes", type=bench.parse_size, default=bench.parse_size("512MiB"))
-    parser.add_argument("--sample-bytes-list", action="append")
-    parser.add_argument("--block-bytes", type=bench.parse_size, default=bench.parse_size("8MiB"))
-    parser.add_argument("--block-bytes-list", action="append")
-    parser.add_argument(
-        "--min-sample-per-dataset", type=bench.parse_size, default=bench.parse_size("4MiB")
-    )
-    parser.add_argument(
-        "--min-dataset-bytes", type=bench.parse_size, default=bench.parse_size("1MiB")
-    )
-    parser.add_argument("--max-datasets", type=int, default=12)
-    parser.add_argument(
-        "--selection", choices=["largest", "stratified", "all"], default="stratified"
-    )
-    parser.add_argument("--dataset", action="append")
-    parser.add_argument("--exclude-dataset", action="append")
-    parser.add_argument(
-        "--profile", choices=["quick", "default", "broad", "all"], default="default"
-    )
-    parser.add_argument("--profile-list", action="append")
-    parser.add_argument("--blosc-shuffle", action="append")
-    parser.add_argument("--only-codec", action="append")
-    parser.add_argument("--exclude-codec", action="append")
-    parser.add_argument("--include-optional", action="store_true")
-    parser.add_argument("--skip-slow", action="store_true")
-    parser.add_argument("--no-baseline", action="store_true")
-    parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--verify", choices=["none", "first", "all"], default="all")
-    parser.add_argument("--seed", type=int, default=17)
+    bench.add_common_compression_args(parser, output_dir_default=None)
     return parser
 
 
@@ -225,7 +195,7 @@ def export_run(
         try:
             if codec_config(codec.name) is None:
                 raise RuntimeError("unsupported by Rust codec benchmark")
-            algorithm, _records = encode_codec(codec, chunks, encoded_path, args.verify)
+            algorithm = encode_codec(codec, chunks, encoded_path, args.verify)
         except Exception as exc:
             if encoded_path.exists():
                 encoded_path.unlink()
@@ -287,26 +257,15 @@ def export_run(
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    include_patterns = bench.parse_csv_list(args.dataset)
-    exclude_patterns = bench.parse_csv_list(args.exclude_dataset)
-    only_codecs = bench.parse_csv_list(args.only_codec)
-    exclude_codecs = bench.parse_csv_list(args.exclude_codec)
-    blosc_shuffles = bench.parse_csv_list(args.blosc_shuffle) or ["auto"]
-    sample_bytes_values = bench.parse_size_list(args.sample_bytes_list, args.sample_bytes)
-    block_bytes_values = bench.parse_size_list(args.block_bytes_list, args.block_bytes)
-    try:
-        profile_values = bench.parse_profile_list(args.profile_list, args.profile)
-    except ValueError as exc:
-        parser.error(str(exc))
+    common = bench.parse_common_benchmark_args(args, parser)
 
     bench.configure_threads(args.threads)
 
     infos = bench.collect_dataset_infos(args.input)
     selected = bench.select_datasets(
         infos,
-        include_patterns=include_patterns,
-        exclude_patterns=exclude_patterns,
+        include_patterns=common.include_patterns,
+        exclude_patterns=common.exclude_patterns,
         min_dataset_bytes=args.min_dataset_bytes,
         max_datasets=args.max_datasets,
         selection=args.selection,
@@ -315,9 +274,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("No numeric datasets selected.")
 
     runs = bench.build_run_matrix(
-        sample_bytes_values=sample_bytes_values,
-        block_bytes_values=block_bytes_values,
-        profile_values=profile_values,
+        sample_bytes_values=common.sample_bytes_values,
+        block_bytes_values=common.block_bytes_values,
+        profile_values=common.profile_values,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -330,9 +289,9 @@ def main(argv: list[str] | None = None) -> int:
                 run=run,
                 selected=selected,
                 output_dir=run_dir,
-                blosc_shuffles=blosc_shuffles,
-                only_codecs=only_codecs,
-                exclude_codecs=exclude_codecs,
+                blosc_shuffles=common.blosc_shuffles,
+                only_codecs=common.only_codecs,
+                exclude_codecs=common.exclude_codecs,
             )
         )
 

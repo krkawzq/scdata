@@ -47,7 +47,11 @@ DEFAULT_INPUT_ROOT = Path(
 DEFAULT_OUTPUT_ROOT = Path(
     "/mnt/shared-storage-user/dnacoding/wangzhongqi/Data/FFPE/20260625_dataset_zarrzip"
 )
-MATRIX_DIR_NAMES = frozenset({"filtered_feature_bc_matrix", "raw_feature_bc_matrix"})
+MATRIX_DIR_SUFFIXES = {
+    "filtered_feature_bc_matrix": "filtered",
+    "raw_feature_bc_matrix": "raw",
+}
+MATRIX_DIR_NAMES = frozenset(MATRIX_DIR_SUFFIXES)
 DEFAULT_COMPRESSOR = "blosc.lz4.level5"
 _DataDtype = Literal[
     "auto",
@@ -239,7 +243,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep-matrix-dir-in-output-name",
         action="store_true",
-        help="Use raw_feature_bc_matrix.zarr.zip instead of parent-sample-name.zarr.zip.",
+        help=(
+            "Use sample/raw_feature_bc_matrix.zarr.zip instead of the default "
+            "flat sample.raw.zarr.zip naming."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--print-limit", type=int, default=20)
@@ -344,7 +351,8 @@ def default_target_zip(
 
     if drop_matrix_dir and rel.name in MATRIX_DIR_NAMES and rel.parent != Path("."):
         sample_rel = rel.parent
-        return output_root / sample_rel.parent / f"{safe_name(sample_rel.name)}.zarr.zip"
+        suffix = MATRIX_DIR_SUFFIXES[rel.name]
+        return output_root / sample_rel.parent / f"{safe_name(sample_rel.name)}.{suffix}.zarr.zip"
     return output_root / rel.parent / f"{safe_name(rel.name)}.zarr.zip"
 
 
@@ -498,7 +506,7 @@ def read_10x_directory(
     selected_names = select_var_names(var, var_names)
     var["scdata_original_var_names"] = selected_names
     if make_var_names_unique:
-        var.index = ad.utils.make_index_unique(pd.Index(selected_names), join="-")
+        var.index = make_exact_index_unique(selected_names)
     else:
         var.index = selected_names
 
@@ -641,6 +649,27 @@ def select_var_names(var: Any, mode: Literal["symbol", "id"]) -> list[str]:
             text = str(fallback[i]).strip()
         cleaned.append(text or f"feature_{i}")
     return cleaned
+
+
+def make_exact_index_unique(names: list[str]) -> list[str]:
+    occupied = set(names)
+    seen: dict[str, int] = {}
+    unique: list[str] = []
+    for name in names:
+        count = seen.get(name, 0)
+        if count == 0:
+            unique.append(name)
+        else:
+            suffix = count
+            while True:
+                candidate = f"{name}_{suffix}"
+                if candidate not in occupied:
+                    occupied.add(candidate)
+                    unique.append(candidate)
+                    break
+                suffix += 1
+        seen[name] = count + 1
+    return unique
 
 
 def read_sample_metadata(source_dir: Path, *, pd: Any) -> dict[str, Any]:

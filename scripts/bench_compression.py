@@ -56,17 +56,38 @@ except Exception:  # pragma: no cover
     numcodecs_blosc = None
 
 
-DEFAULT_INPUT = Path(
-    "/mnt/shared-storage-user/dnacoding/wangzhongqi/Code/Project/PRISM/data/tahoe_dmso_control.h5ad"
-)
-DEFAULT_OUTPUT_DIR = Path("outputs/bench_compression")
-
 NumericKind = Literal["bool", "int", "uint", "float"]
 SelectionMode = Literal["largest", "stratified", "all"]
 VerifyMode = Literal["none", "first", "all"]
 DecodeOrder = Literal["sequential", "random"]
 Profile = Literal["quick", "default", "broad", "all"]
 SortBy = Literal["decode", "ratio", "compress", "name", "input"]
+
+DEFAULT_INPUT = Path(
+    "/mnt/shared-storage-user/dnacoding/wangzhongqi/Code/Project/PRISM/data/tahoe_dmso_control.h5ad"
+)
+DEFAULT_OUTPUT_DIR = Path("outputs/bench_compression")
+DEFAULT_SAMPLE_BYTES = "512MiB"
+DEFAULT_BLOCK_BYTES = "8MiB"
+DEFAULT_MIN_SAMPLE_PER_DATASET = "4MiB"
+DEFAULT_MIN_DATASET_BYTES = "1MiB"
+DEFAULT_MAX_DATASETS = 12
+DEFAULT_SELECTION: SelectionMode = "stratified"
+DEFAULT_PROFILE: Profile = "default"
+DEFAULT_THREADS = 1
+DEFAULT_REPEATS = 3
+DEFAULT_WARMUPS = 1
+DEFAULT_VERIFY: VerifyMode = "all"
+DEFAULT_DECODE_ORDER: DecodeOrder = "sequential"
+DEFAULT_SEED = 17
+DEFAULT_SORT: SortBy = "decode"
+
+SELECTION_CHOICES = ("largest", "stratified", "all")
+PROFILE_CHOICES = ("quick", "default", "broad", "all")
+VERIFY_CHOICES = ("none", "first", "all")
+DECODE_ORDER_CHOICES = ("sequential", "random")
+SORT_CHOICES = ("decode", "ratio", "compress", "name", "input")
+BLOSC_SHUFFLE_CHOICES = ("auto", "noshuffle", "shuffle", "bitshuffle")
 
 
 @dataclass(frozen=True)
@@ -1030,6 +1051,18 @@ class RunConfig:
     profile: Profile
 
 
+@dataclass(frozen=True)
+class CommonBenchmarkConfig:
+    include_patterns: list[str]
+    exclude_patterns: list[str]
+    only_codecs: list[str]
+    exclude_codecs: list[str]
+    blosc_shuffles: list[str]
+    sample_bytes_values: list[int]
+    block_bytes_values: list[int]
+    profile_values: list[Profile]
+
+
 def size_slug(value: int) -> str:
     units = (
         ("TiB", 1 << 40),
@@ -1051,14 +1084,45 @@ def parse_size_list(values: Iterable[str] | None, fallback: int) -> list[int]:
 
 
 def parse_profile_list(values: Iterable[str] | None, fallback: Profile) -> list[Profile]:
-    valid = {"quick", "default", "broad", "all"}
     items = parse_csv_list(values)
     if not items:
         return [fallback]
-    invalid = sorted(set(items) - valid)
+    invalid = sorted(set(items) - set(PROFILE_CHOICES))
     if invalid:
         raise ValueError(f"invalid profile values: {invalid}")
     return [item for item in items]  # type: ignore[return-value]
+
+
+def parse_common_benchmark_args(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> CommonBenchmarkConfig:
+    include_patterns = parse_csv_list(args.dataset)
+    exclude_patterns = parse_csv_list(args.exclude_dataset)
+    only_codecs = parse_csv_list(args.only_codec)
+    exclude_codecs = parse_csv_list(args.exclude_codec)
+    blosc_shuffles = parse_csv_list(args.blosc_shuffle) or ["auto"]
+    sample_bytes_values = parse_size_list(args.sample_bytes_list, args.sample_bytes)
+    block_bytes_values = parse_size_list(args.block_bytes_list, args.block_bytes)
+    try:
+        profile_values = parse_profile_list(args.profile_list, args.profile)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    invalid_shuffles = sorted(set(blosc_shuffles) - set(BLOSC_SHUFFLE_CHOICES))
+    if invalid_shuffles:
+        parser.error(f"invalid --blosc-shuffle values: {invalid_shuffles}")
+
+    return CommonBenchmarkConfig(
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+        only_codecs=only_codecs,
+        exclude_codecs=exclude_codecs,
+        blosc_shuffles=blosc_shuffles,
+        sample_bytes_values=sample_bytes_values,
+        block_bytes_values=block_bytes_values,
+        profile_values=profile_values,
+    )
 
 
 def build_run_matrix(
@@ -1194,33 +1258,40 @@ def print_codec_table(codecs: list[CodecAdapter]) -> None:
         print(f"{codec.name}\tfamily={codec.family}\t{codec.notes}")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Benchmark compression ratio and in-memory decode throughput for "
-            "H5AD/HDF5 numeric chunks."
-        )
-    )
+def add_common_compression_args(
+    parser: argparse.ArgumentParser,
+    *,
+    output_dir_default: Path | None,
+) -> None:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--sample-bytes", type=parse_size, default=parse_size("512MiB"))
+    if output_dir_default is None:
+        parser.add_argument("--output-dir", type=Path, required=True)
+    else:
+        parser.add_argument("--output-dir", type=Path, default=output_dir_default)
+    parser.add_argument("--sample-bytes", type=parse_size, default=parse_size(DEFAULT_SAMPLE_BYTES))
     parser.add_argument(
         "--sample-bytes-list",
         action="append",
         help="Comma-separated scan values, e.g. 128MiB,512MiB,1GiB.",
     )
-    parser.add_argument("--block-bytes", type=parse_size, default=parse_size("8MiB"))
+    parser.add_argument("--block-bytes", type=parse_size, default=parse_size(DEFAULT_BLOCK_BYTES))
     parser.add_argument(
         "--block-bytes-list",
         action="append",
         help="Comma-separated scan values, e.g. 2MiB,8MiB,32MiB.",
     )
-    parser.add_argument("--min-sample-per-dataset", type=parse_size, default=parse_size("4MiB"))
-    parser.add_argument("--min-dataset-bytes", type=parse_size, default=parse_size("1MiB"))
-    parser.add_argument("--max-datasets", type=int, default=12)
     parser.add_argument(
-        "--selection", choices=["largest", "stratified", "all"], default="stratified"
+        "--min-sample-per-dataset",
+        type=parse_size,
+        default=parse_size(DEFAULT_MIN_SAMPLE_PER_DATASET),
     )
+    parser.add_argument(
+        "--min-dataset-bytes",
+        type=parse_size,
+        default=parse_size(DEFAULT_MIN_DATASET_BYTES),
+    )
+    parser.add_argument("--max-datasets", type=int, default=DEFAULT_MAX_DATASETS)
+    parser.add_argument("--selection", choices=SELECTION_CHOICES, default=DEFAULT_SELECTION)
     parser.add_argument(
         "--dataset",
         action="append",
@@ -1231,9 +1302,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Dataset glob to exclude. Can be repeated or comma-separated.",
     )
-    parser.add_argument(
-        "--profile", choices=["quick", "default", "broad", "all"], default="default"
-    )
+    parser.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE)
     parser.add_argument(
         "--profile-list",
         action="append",
@@ -1252,11 +1321,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Codec glob to include, e.g. 'blosc.*' or 'zstd.*'.",
     )
-    parser.add_argument(
-        "--exclude-codec",
-        action="append",
-        help="Codec glob to exclude.",
-    )
+    parser.add_argument("--exclude-codec", action="append", help="Codec glob to exclude.")
     parser.add_argument(
         "--include-optional", action="store_true", help="Try optional PCodec/ZFPY codecs."
     )
@@ -1264,15 +1329,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-baseline", action="store_true", help="Drop uncompressed copy baseline."
     )
-    parser.add_argument("--threads", type=int, default=1, help="Blosc threads. Default: 1.")
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--verify", choices=["none", "first", "all"], default="all")
-    parser.add_argument("--decode-order", choices=["sequential", "random"], default="sequential")
-    parser.add_argument("--seed", type=int, default=17)
     parser.add_argument(
-        "--sort", choices=["decode", "ratio", "compress", "name", "input"], default="decode"
+        "--threads", type=int, default=DEFAULT_THREADS, help="Blosc threads. Default: 1."
     )
+    parser.add_argument("--verify", choices=VERIFY_CHOICES, default=DEFAULT_VERIFY)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+
+
+def add_decode_benchmark_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
+    parser.add_argument("--warmups", type=int, default=DEFAULT_WARMUPS)
+    parser.add_argument(
+        "--decode-order", choices=DECODE_ORDER_CHOICES, default=DEFAULT_DECODE_ORDER
+    )
+    parser.add_argument("--sort", choices=SORT_CHOICES, default=DEFAULT_SORT)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Benchmark compression ratio and in-memory decode throughput for "
+            "H5AD/HDF5 numeric chunks."
+        )
+    )
+    add_common_compression_args(parser, output_dir_default=DEFAULT_OUTPUT_DIR)
+    add_decode_benchmark_args(parser)
     parser.add_argument("--list-datasets", action="store_true")
     parser.add_argument("--list-codecs", action="store_true")
     parser.add_argument(
@@ -1471,28 +1552,12 @@ def best_decode_row(results: list[dict[str, Any]]) -> dict[str, Any] | None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    include_patterns = parse_csv_list(args.dataset)
-    exclude_patterns = parse_csv_list(args.exclude_dataset)
-    only_codecs = parse_csv_list(args.only_codec)
-    exclude_codecs = parse_csv_list(args.exclude_codec)
-    blosc_shuffles = parse_csv_list(args.blosc_shuffle) or ["auto"]
-    sample_bytes_values = parse_size_list(args.sample_bytes_list, args.sample_bytes)
-    block_bytes_values = parse_size_list(args.block_bytes_list, args.block_bytes)
-    try:
-        profile_values = parse_profile_list(args.profile_list, args.profile)
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    valid_shuffles = {"auto", "noshuffle", "shuffle", "bitshuffle"}
-    invalid_shuffles = set(blosc_shuffles) - valid_shuffles
-    if invalid_shuffles:
-        parser.error(f"invalid --blosc-shuffle values: {sorted(invalid_shuffles)}")
+    common = parse_common_benchmark_args(args, parser)
 
     runs = build_run_matrix(
-        sample_bytes_values=sample_bytes_values,
-        block_bytes_values=block_bytes_values,
-        profile_values=profile_values,
+        sample_bytes_values=common.sample_bytes_values,
+        block_bytes_values=common.block_bytes_values,
+        profile_values=common.profile_values,
     )
     if args.list_runs:
         print("runs:")
@@ -1506,14 +1571,14 @@ def main(argv: list[str] | None = None) -> int:
     configure_threads(args.threads)
 
     if args.list_codecs:
-        for profile in profile_values:
+        for profile in common.profile_values:
             print(f"profile={profile}")
             codecs = build_selected_codecs(
                 args,
                 profile=profile,
-                blosc_shuffles=blosc_shuffles,
-                only_codecs=only_codecs,
-                exclude_codecs=exclude_codecs,
+                blosc_shuffles=common.blosc_shuffles,
+                only_codecs=common.only_codecs,
+                exclude_codecs=common.exclude_codecs,
             )
             print_codec_table(codecs)
         return 0
@@ -1525,8 +1590,8 @@ def main(argv: list[str] | None = None) -> int:
 
     selected = select_datasets(
         infos,
-        include_patterns=include_patterns,
-        exclude_patterns=exclude_patterns,
+        include_patterns=common.include_patterns,
+        exclude_patterns=common.exclude_patterns,
         min_dataset_bytes=args.min_dataset_bytes,
         max_datasets=args.max_datasets,
         selection=args.selection,
@@ -1546,9 +1611,9 @@ def main(argv: list[str] | None = None) -> int:
             run=run,
             selected=selected,
             output_dir=run_output_dir,
-            blosc_shuffles=blosc_shuffles,
-            only_codecs=only_codecs,
-            exclude_codecs=exclude_codecs,
+            blosc_shuffles=common.blosc_shuffles,
+            only_codecs=common.only_codecs,
+            exclude_codecs=common.exclude_codecs,
         )
 
         for row in payload["results"]:
