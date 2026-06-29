@@ -497,7 +497,10 @@ def read_10x_directory(
     var = features.copy()
     selected_names = select_var_names(var, var_names)
     var["scdata_original_var_names"] = selected_names
-    var.index = selected_names
+    if make_var_names_unique:
+        var.index = ad.utils.make_index_unique(pd.Index(selected_names), join="-")
+    else:
+        var.index = selected_names
 
     obs = pd.DataFrame(index=barcodes["barcode"].astype(str).to_numpy())
     sample_id = sample_id_from_source_dir(source_dir)
@@ -506,8 +509,6 @@ def read_10x_directory(
         obs["source_group"] = source_group_from_source_dir(source_dir)
 
     adata = ad.AnnData(X=x, obs=obs, var=var)
-    if make_var_names_unique:
-        adata.var_names_make_unique()
 
     adata.uns["scdata_source"] = {
         "sample_id": sample_id,
