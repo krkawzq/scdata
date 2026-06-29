@@ -345,10 +345,14 @@ class IoConfig(_Config):
         kwargs are routed onto it (e.g. ``entries=256``,
         ``base__max_in_flight=2048``).
         """
-        config = UringConfig() if config is None else _coerce_config_value(
-            config,
-            UringConfig,
-            "config",
+        config = (
+            UringConfig()
+            if config is None
+            else _coerce_config_value(
+                config,
+                UringConfig,
+                "config",
+            )
         )
         _apply_dynamic(config, kwargs)
         return cls(backend="uring", uring_config=config)
@@ -364,10 +368,14 @@ class IoConfig(_Config):
         ``config`` optionally supplies a whole :class:`ThreadedConfig`; extra
         kwargs are routed onto it (e.g. ``num_workers=16``).
         """
-        config = ThreadedConfig() if config is None else _coerce_config_value(
-            config,
-            ThreadedConfig,
-            "config",
+        config = (
+            ThreadedConfig()
+            if config is None
+            else _coerce_config_value(
+                config,
+                ThreadedConfig,
+                "config",
+            )
         )
         _apply_dynamic(config, kwargs)
         return cls(backend="threaded", threaded_config=config)
@@ -616,8 +624,7 @@ def _coerce_config_value(value: Any, target_cls: type[_C], field_name: str) -> _
     if isinstance(value, MappingABC):
         return target_cls.from_dict(value)
     raise TypeError(
-        f"{field_name} must be {target_cls.__name__} or a mapping, "
-        f"got {type(value).__name__}"
+        f"{field_name} must be {target_cls.__name__} or a mapping, got {type(value).__name__}"
     )
 
 
@@ -734,8 +741,7 @@ def _coerce_prefetch_config(
     if isinstance(config, MappingABC):
         return ScheduledPrefetchConfig.from_dict(config)
     raise TypeError(
-        "config must be ScheduledPrefetchConfig, a mapping, or None; "
-        f"got {type(config).__name__}"
+        f"config must be ScheduledPrefetchConfig, a mapping, or None; got {type(config).__name__}"
     )
 
 

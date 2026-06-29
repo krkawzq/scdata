@@ -228,7 +228,7 @@ impl ChunkCodec for CodecPipeline {
         encoded: &[u8],
         expected_size: Option<usize>,
     ) -> CodecResult<Option<usize>> {
-        if self.codecs.is_empty() {
+        if self.codecs.is_empty() || self.is_identity() {
             return Ok(Some(encoded.len()));
         }
         if expected_size.is_some() {

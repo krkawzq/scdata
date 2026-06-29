@@ -488,6 +488,30 @@ mod tests {
     }
 
     #[test]
+    fn identity_pipeline_reuses_output_without_expected_size_allocation() {
+        let codec = CodecPipeline::new(vec![
+            Arc::new(UncompressedCodec),
+            Arc::new(UncompressedCodec),
+        ]);
+        let output = Vec::with_capacity(6);
+        let output_ptr = output.as_ptr();
+
+        let decoded = codec
+            .decode_to_vec_grow(b"abcdef", output, None)
+            .expect("identity pipeline decode to reused output");
+
+        assert_eq!(&decoded, b"abcdef");
+        assert_eq!(decoded.as_ptr(), output_ptr);
+
+        let err = codec
+            .decode_to_vec_grow(b"abcdef", Vec::new(), Some(usize::MAX))
+            .expect_err("identity pipeline should validate before huge reserve");
+        assert!(
+            matches!(err, CodecError::SizeMismatch { codec, expected: usize::MAX, actual: 6 } if codec == "none")
+        );
+    }
+
+    #[test]
     fn pipeline_skips_identity_stages_without_losing_size_checks() {
         let raw = b"abcdef";
         let encoded = crc32_encode(raw);

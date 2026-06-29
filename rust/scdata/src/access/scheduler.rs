@@ -971,7 +971,7 @@ fn try_scheduled_decode_inline(state: &StateHandle, request: &ScheduledDecodeReq
         &request.item.codec,
         request.item.expected_size,
     );
-    let cached_decoded = state_ref
+    state_ref
         .cache
         .pin_and_get(&request.item.key)
         .is_some_and(|pinned| {
@@ -994,9 +994,7 @@ fn try_scheduled_decode_inline(state: &StateHandle, request: &ScheduledDecodeReq
                 return true;
             }
             false
-        });
-
-    cached_decoded
+        })
 }
 
 fn register_decode_waiter_after_raw_load(state: &StateHandle, item: &AccessItem) -> DecodeRegister {
@@ -1064,7 +1062,7 @@ fn try_prefetch_inline(
 ) -> Result<(), PrefetchRequest> {
     let result = {
         let state_ref = state.borrow();
-        if state_ref.cache.contains(&request.key) {
+        if state_ref.cache.contains_raw(&request.key) {
             Some(Ok(()))
         } else if request.key.len > state_ref.cache.capacity() {
             Some(Err(AccessError::OutOfMemory))
@@ -1776,7 +1774,7 @@ fn finish_successful_raw_read(
             Ok(outcome) => {
                 state_ref
                     .budget
-                    .release(outcome.evicted_bytes + outcome.replaced_bytes);
+                    .release(outcome.evicted_bytes.saturating_add(outcome.replaced_bytes));
                 let existing = state_ref
                     .cache
                     .pin_and_get(&key)
@@ -1791,9 +1789,9 @@ fn finish_successful_raw_read(
                         .insert_or_replace(key, CachePayload::Raw(Arc::clone(&data)))
                     {
                         Ok(outcome) => {
-                            state_ref
-                                .budget
-                                .release(outcome.evicted_bytes + outcome.replaced_bytes);
+                            state_ref.budget.release(
+                                outcome.evicted_bytes.saturating_add(outcome.replaced_bytes),
+                            );
                             Some(
                                 state_ref
                                     .cache
@@ -1862,11 +1860,13 @@ async fn try_cache_decoded(
         Ok(outcome) => {
             state_ref
                 .budget
-                .release(outcome.evicted_bytes + outcome.replaced_bytes);
+                .release(outcome.evicted_bytes.saturating_add(outcome.replaced_bytes));
             state_ref.cache.pin_and_get(&key)
         }
         Err(err) => {
-            state_ref.budget.release(err.evicted_bytes + data.len());
+            state_ref
+                .budget
+                .release(err.evicted_bytes.saturating_add(data.len()));
             None
         }
     }
@@ -1878,7 +1878,7 @@ async fn prefetch_key(
     key: ChunkKey,
     priority: u8,
 ) -> Result<(), AccessError> {
-    if state.borrow().cache.contains(&key) {
+    if state.borrow().cache.contains_raw(&key) {
         return Ok(());
     }
     if key.len > state.borrow().cache.capacity() {
@@ -2310,7 +2310,10 @@ async fn make_ready_direct(
     let data = match materialize_source(deps.cpu.as_ref(), source, plan).await {
         Ok(data) => data,
         Err(err) => {
-            state.borrow_mut().budget.release(source_bytes + bytes);
+            state
+                .borrow_mut()
+                .budget
+                .release(source_bytes.saturating_add(bytes));
             return Err(err);
         }
     };
@@ -2357,7 +2360,10 @@ async fn make_ready_from_staged_data(
                 let data = match cpu.materialize(data, plan).await {
                     Ok(data) => data,
                     Err(err) => {
-                        state.borrow_mut().budget.release(staged_bytes + bytes);
+                        state
+                            .borrow_mut()
+                            .budget
+                            .release(staged_bytes.saturating_add(bytes));
                         return Err(err);
                     }
                 };
@@ -2388,7 +2394,10 @@ async fn make_ready_from_staged_data(
     let data = match result {
         Ok(data) => data,
         Err(err) => {
-            state.borrow_mut().budget.release(staged_bytes + bytes);
+            state
+                .borrow_mut()
+                .budget
+                .release(staged_bytes.saturating_add(bytes));
             return Err(err);
         }
     };
@@ -3120,30 +3129,31 @@ mod tests {
     }
 
     #[test]
-    fn standalone_prefetch_keeps_existing_decoded_cache() {
+    fn standalone_prefetch_loads_raw_when_only_decoded_is_cached() {
         let (io, reads) = StaticIo::counted(b"x");
         let (decode, decodes) = CodecBackedDecode::counted();
         let mut config = test_config();
         config.keep_decoded = true;
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 1);
-        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
+        let first_codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
+        let second_codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'b' });
 
-        let (request, rx) = request_with_codec(key, Arc::clone(&codec), None);
+        let (request, rx) = request_with_codec(key, first_codec, None);
         handle.send(request).expect("send request");
         assert_eq!(recv_reply(rx).expect("first"), b"ax");
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
 
         recv_prefetch(handle.prefetch(key).expect("prefetch submit")).expect("prefetch");
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
 
-        let (second, second_rx) = request_with_codec(key, codec, None);
+        let (second, second_rx) = request_with_codec(key, second_codec, None);
         handle.send(second).expect("send second");
-        assert_eq!(recv_reply(second_rx).expect("second"), b"ax");
-        assert_eq!(reads.load(Ordering::SeqCst), 1);
-        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(recv_reply(second_rx).expect("second"), b"bx");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(decodes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

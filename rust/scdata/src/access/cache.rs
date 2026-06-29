@@ -285,9 +285,13 @@ impl ChunkCache {
         }
     }
 
-    /// Return whether any representation for the key is already cached.
-    pub(crate) fn contains(&self, key: &ChunkKey) -> bool {
-        self.inner.borrow().entries.contains_key(key)
+    /// Return whether raw bytes for the key are already cached.
+    pub(crate) fn contains_raw(&self, key: &ChunkKey) -> bool {
+        self.inner
+            .borrow()
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.payload.kind() == CachePayloadKind::Raw)
     }
 
     /// Pin and clone the cached bytes in one synchronous operation.

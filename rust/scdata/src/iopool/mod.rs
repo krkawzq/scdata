@@ -766,6 +766,7 @@ impl ActiveLimiter {
         debug_assert!(previous > 0);
     }
 
+    #[cfg(any(feature = "uring", test))]
     fn release_many(&self, count: usize) {
         if count == 0 {
             return;

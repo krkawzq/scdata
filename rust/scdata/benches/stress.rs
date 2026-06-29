@@ -38,8 +38,9 @@ use _scdata::iopool::{BaseIoConfig, IoCommand, IoConfig, IoOutput, IoPool, Threa
 use support::backends::{CodecDecode, SliceIo};
 use support::chunks::{
     make_csr_u32_f32_chunked_raw, make_csr_u32_f32_chunks, make_csr_u32_f32_chunks_lz4,
-    make_dense1d_u32_chunks, make_dense_u32_chunks, make_dense_u32_chunks_zstd, write_chunks_file,
-    write_dense_u32_directory, write_dense_u32_file,
+    make_dense1d_u32_chunks, make_dense_u32_chunks, make_dense_u32_chunks_padded,
+    make_dense_u32_chunks_zstd, write_chunks_file, write_dense_u32_directory, write_dense_u32_file,
+    write_dense_u32_file_cropped,
 };
 use support::codecs::{blosc_encode, crc32_encode, decode_into_checksum, encode_for_spec};
 use support::data::{DataDist, DataProfile};
@@ -1074,6 +1075,89 @@ fn stress_databank(config: BenchConfig) {
         );
     }
 
+    // Non-divisible edge chunks: compare padded memory chunks against cropped
+    // legacy file-offset chunks under the same access pattern.
+    let edge_cells = 35usize;
+    let edge_genes = 70usize;
+    let edge_chunk_rows = 16usize;
+    let edge_chunk_cols = 32usize;
+    let edge_grid = vec![
+        edge_cells.div_ceil(edge_chunk_rows),
+        edge_genes.div_ceil(edge_chunk_cols),
+    ];
+    let edge_selected = vec![0usize, 15, 16, 34];
+    let edge_mem_chunks =
+        make_dense_u32_chunks_padded(edge_cells, edge_genes, edge_chunk_rows, edge_chunk_cols);
+    let edge_mem_id = bank
+        .register_dense_2d(Dense2DMeta {
+            gene_names: (0..edge_genes)
+                .map(|idx| format!("edge_gene_{idx}"))
+                .collect(),
+            data: ArrayMeta {
+                shape: vec![edge_cells, edge_genes],
+                chunk_shape: vec![edge_chunk_rows, edge_chunk_cols],
+                chunk_grid_shape: edge_grid.clone(),
+                dtype: DType::U32,
+                order: ArrayOrder::C,
+                codec: ArrayCodecMeta::Uncompressed,
+                chunks: ChunkStoreMeta::Memory {
+                    chunks: edge_mem_chunks,
+                },
+                variable_chunks: false,
+                chunk_boundaries: None,
+            },
+        })
+        .expect("register edge memory dataset");
+    let edge_fo_path =
+        support::bench_data_dir().join(format!("stress-edge-fo-{}.bin", std::process::id()));
+    let edge_fo_locations = write_dense_u32_file_cropped(
+        &edge_fo_path,
+        edge_cells,
+        edge_genes,
+        edge_chunk_rows,
+        edge_chunk_cols,
+    );
+    let edge_fo_id = bank
+        .register_dense_2d(Dense2DMeta {
+            gene_names: (0..edge_genes)
+                .map(|idx| format!("edge_gene_{idx}"))
+                .collect(),
+            data: ArrayMeta {
+                shape: vec![edge_cells, edge_genes],
+                chunk_shape: vec![edge_chunk_rows, edge_chunk_cols],
+                chunk_grid_shape: edge_grid,
+                dtype: DType::U32,
+                order: ArrayOrder::C,
+                codec: ArrayCodecMeta::Uncompressed,
+                chunks: ChunkStoreMeta::FileOffset {
+                    path: edge_fo_path.clone(),
+                    locations: edge_fo_locations,
+                },
+                variable_chunks: false,
+                chunk_boundaries: None,
+            },
+        })
+        .expect("register edge fileoffset dataset");
+    for (label, id) in [
+        ("memory_padded_edges", edge_mem_id),
+        ("fileoffset_cropped_edges", edge_fo_id),
+    ] {
+        let mut edge_out = vec![0u32; edge_selected.len() * edge_genes];
+        support::bench(
+            config,
+            &format!("databank/ST_dense2d_{label}_4x70"),
+            512,
+            Some(edge_out.len() * 4),
+            || {
+                bank.access_cells(id, &edge_selected, &mut edge_out, None)
+                    .expect("access edge dataset");
+                edge_out
+                    .iter()
+                    .fold(0usize, |acc, v| acc ^ usize::try_from(*v).unwrap_or(0))
+            },
+        );
+    }
+
     // Dense1D register + ST access.
     let d1_cells = 1024usize;
     let d1_genes = 1024usize;
@@ -1579,6 +1663,7 @@ fn stress_databank(config: BenchConfig) {
         chunk_rows,
         chunk_cols,
     );
+    stress_databank_mt_lifecycle(config);
 
     // --- scatter-focused: large output to isolate databank-side scatter
     // (copy decoded bytes into caller `out`). This runs on the caller thread,
@@ -1667,6 +1752,7 @@ fn stress_databank(config: BenchConfig) {
     }
 
     let _ = std::fs::remove_file(fo_path);
+    let _ = std::fs::remove_file(edge_fo_path);
     let _ = std::fs::remove_dir_all(dir_dir);
 }
 
@@ -2010,6 +2096,76 @@ fn stress_databank_mt_scheduled_by_gene_names(
         let mib = bytes_per_op as f64 * total_ops as f64 / (1024.0 * 1024.0);
         println!(
             "databank/MT_instances_scheduled_by_gene_names_zero_missing/t{threads}    threads={threads} ops={total_ops:<8} elapsed_s={seconds:.4} throughput_mib_s={:.1} kops={:.1}",
+            mib / seconds,
+            total_ops as f64 / seconds / 1000.0
+        );
+    }
+}
+
+fn stress_databank_mt_lifecycle(config: BenchConfig) {
+    let cells = 64usize;
+    let genes = 64usize;
+    let chunk_rows = 16usize;
+    let chunk_cols = 16usize;
+    let chunks = Arc::new(make_dense_u32_chunks(cells, genes, chunk_rows, chunk_cols));
+    let selected = Arc::new(vec![0usize, 7, 31, 63]);
+    let bytes_per_op = selected.len() * genes * std::mem::size_of::<u32>();
+
+    for &threads in [2usize, 4].iter() {
+        let per_thread = (config.iterations(16) / threads).max(1);
+        let barrier = Arc::new(Barrier::new(threads));
+        let chunks = Arc::clone(&chunks);
+        let selected = Arc::clone(&selected);
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let chunks = Arc::clone(&chunks);
+                let selected = Arc::clone(&selected);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let t0 = Instant::now();
+                    let mut sum = 0usize;
+                    for _ in 0..per_thread {
+                        let mut bank = DataBank::new(DataBankConfig::default()).expect("bank");
+                        let id = bank
+                            .register_dense_2d(Dense2DMeta {
+                                gene_names: (0..genes).map(|i| format!("g{i}")).collect(),
+                                data: ArrayMeta {
+                                    shape: vec![cells, genes],
+                                    chunk_shape: vec![chunk_rows, chunk_cols],
+                                    chunk_grid_shape: vec![cells / chunk_rows, genes / chunk_cols],
+                                    dtype: DType::U32,
+                                    order: ArrayOrder::C,
+                                    codec: ArrayCodecMeta::Uncompressed,
+                                    chunks: ChunkStoreMeta::Memory {
+                                        chunks: (*chunks).clone(),
+                                    },
+                                    variable_chunks: false,
+                                    chunk_boundaries: None,
+                                },
+                            })
+                            .expect("register lifecycle dataset");
+                        let mut out = vec![0u32; selected.len() * genes];
+                        bank.access_cells(id, &selected, &mut out, None)
+                            .expect("lifecycle access");
+                        sum ^= out[0] as usize ^ out.len();
+                    }
+                    (sum, t0.elapsed())
+                })
+            })
+            .collect();
+        let results: Vec<(usize, std::time::Duration)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("lifecycle thread"))
+            .collect();
+        let checksum: usize = results.iter().map(|(s, _)| *s).fold(0, |a, b| a ^ b);
+        black_box(checksum);
+        let elapsed = results.iter().map(|(_, e)| *e).max().unwrap_or_default();
+        let total_ops = per_thread * threads;
+        let seconds = elapsed.as_secs_f64();
+        let mib = bytes_per_op as f64 * total_ops as f64 / (1024.0 * 1024.0);
+        println!(
+            "databank/MT_lifecycle_create_register_drop_4x64/t{threads}    threads={threads} ops={total_ops:<8} elapsed_s={seconds:.4} throughput_mib_s={:.1} kops={:.1}",
             mib / seconds,
             total_ops as f64 / seconds / 1000.0
         );

@@ -25,16 +25,29 @@ fn zstd_decoded_size(codec: &str, encoded: &[u8]) -> CodecResult<Option<usize>> 
     }
 }
 
+fn zstd_output_size(
+    codec: &str,
+    encoded: &[u8],
+    expected_size: Option<usize>,
+) -> CodecResult<Option<usize>> {
+    match (zstd_decoded_size(codec, encoded)?, expected_size) {
+        (Some(actual), Some(expected)) => {
+            verify_size(codec, actual, Some(expected))?;
+            Ok(Some(actual))
+        }
+        (Some(actual), None) => Ok(Some(actual)),
+        (None, Some(expected)) => Ok(Some(expected)),
+        (None, None) => Ok(None),
+    }
+}
+
 impl ChunkCodec for ZstdCodec {
     fn name(&self) -> &str {
         "zstd"
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
-        let decoded_size = match expected_size {
-            Some(size) => Some(size),
-            None => zstd_decoded_size(self.name(), encoded)?,
-        };
+        let decoded_size = zstd_output_size(self.name(), encoded, expected_size)?;
         if let Some(decoded_size) = decoded_size {
             let mut decoded = vec_with_decode_capacity(self.name(), decoded_size)?;
             set_vec_len_for_decode(&mut decoded, decoded_size);
@@ -56,10 +69,7 @@ impl ChunkCodec for ZstdCodec {
         encoded: &[u8],
         expected_size: Option<usize>,
     ) -> CodecResult<Option<usize>> {
-        match expected_size {
-            Some(size) => Ok(Some(size)),
-            None => zstd_decoded_size(self.name(), encoded),
-        }
+        zstd_output_size(self.name(), encoded, expected_size)
     }
 
     fn decode_into(
@@ -68,12 +78,8 @@ impl ChunkCodec for ZstdCodec {
         mut output: DecodeBuffer<'_>,
         expected_size: Option<usize>,
     ) -> CodecResult<usize> {
-        let decoded_size = match expected_size {
-            Some(size) => Some(size),
-            None => zstd_decoded_size(self.name(), encoded)?,
-        };
+        let decoded_size = zstd_output_size(self.name(), encoded, expected_size)?;
         if let Some(decoded_size) = decoded_size {
-            verify_size(self.name(), decoded_size, expected_size)?;
             output.ensure_capacity(self.name(), decoded_size)?;
             let written = zstd_decompress_into_slice(
                 self.name(),
@@ -95,15 +101,11 @@ impl ChunkCodec for ZstdCodec {
         mut output: Vec<u8>,
         expected_size: Option<usize>,
     ) -> CodecResult<Vec<u8>> {
-        let decoded_size = match expected_size {
-            Some(size) => Some(size),
-            None => zstd_decoded_size(self.name(), encoded)?,
-        };
+        let decoded_size = zstd_output_size(self.name(), encoded, expected_size)?;
         let Some(decoded_size) = decoded_size else {
             return self.decode(encoded, expected_size);
         };
 
-        verify_size(self.name(), decoded_size, expected_size)?;
         if output.capacity() < decoded_size {
             return Err(output_too_small(
                 self.name(),
@@ -125,10 +127,7 @@ impl ChunkCodec for ZstdCodec {
         output: Vec<u8>,
         expected_size: Option<usize>,
     ) -> CodecResult<Vec<u8>> {
-        let decoded_size = match expected_size {
-            Some(size) => Some(size),
-            None => zstd_decoded_size(self.name(), encoded)?,
-        };
+        let decoded_size = zstd_output_size(self.name(), encoded, expected_size)?;
         let Some(decoded_size) = decoded_size else {
             return self.decode(encoded, expected_size);
         };
@@ -173,12 +172,26 @@ mod tests {
     #[test]
     fn rejects_impossible_expected_size_before_allocating() {
         let codec = ZstdCodec;
+        let encoded = zstd::bulk::compress(b"abc", 1).expect("zstd test encode");
+
         let err = codec
-            .decode(b"not a zstd frame", Some(usize::MAX))
-            .expect_err("impossible expected size should fail");
+            .decode(&encoded, Some(usize::MAX))
+            .expect_err("mismatched expected size should fail before allocation");
 
         assert!(
-            matches!(err, super::super::super::CodecError::Decode { codec, message } if codec == "zstd" && message.contains("reserve decode buffer"))
+            matches!(err, super::super::super::CodecError::SizeMismatch { codec, expected: usize::MAX, actual: 3 } if codec == "zstd")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_frame_before_reserving_expected_size() {
+        let codec = ZstdCodec;
+        let err = codec
+            .decode(b"not a zstd frame", Some(usize::MAX))
+            .expect_err("invalid frame should fail before allocation");
+
+        assert!(
+            matches!(err, super::super::super::CodecError::Decode { codec, message } if codec == "zstd" && !message.contains("reserve decode buffer"))
         );
     }
 }

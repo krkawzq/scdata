@@ -47,6 +47,75 @@ pub fn make_dense_u32_chunks(
     chunks
 }
 
+/// Dense2D chunks with full physical chunk shape at the array edges. Values
+/// outside the logical array are zero padding.
+pub fn make_dense_u32_chunks_padded(
+    cells: usize,
+    genes: usize,
+    chunk_rows: usize,
+    chunk_cols: usize,
+) -> Vec<Arc<[u8]>> {
+    let row_chunks = cells.div_ceil(chunk_rows);
+    let col_chunks = genes.div_ceil(chunk_cols);
+    let mut chunks = Vec::with_capacity(row_chunks * col_chunks);
+
+    for row_chunk in 0..row_chunks {
+        for col_chunk in 0..col_chunks {
+            let mut bytes =
+                Vec::with_capacity(chunk_rows * chunk_cols * std::mem::size_of::<u32>());
+            for row_in_chunk in 0..chunk_rows {
+                let cell = row_chunk * chunk_rows + row_in_chunk;
+                for col_in_chunk in 0..chunk_cols {
+                    let gene = col_chunk * chunk_cols + col_in_chunk;
+                    let value = if cell < cells && gene < genes {
+                        ((cell as u32) << 16) ^ gene as u32
+                    } else {
+                        0
+                    };
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+            chunks.push(Arc::from(bytes.into_boxed_slice()));
+        }
+    }
+
+    chunks
+}
+
+/// Dense2D chunks cropped to their logical extent at the array edges. This is
+/// the physical layout used by legacy file-offset stores.
+pub fn make_dense_u32_chunks_cropped(
+    cells: usize,
+    genes: usize,
+    chunk_rows: usize,
+    chunk_cols: usize,
+) -> Vec<Arc<[u8]>> {
+    let row_chunks = cells.div_ceil(chunk_rows);
+    let col_chunks = genes.div_ceil(chunk_cols);
+    let mut chunks = Vec::with_capacity(row_chunks * col_chunks);
+
+    for row_chunk in 0..row_chunks {
+        for col_chunk in 0..col_chunks {
+            let row_start = row_chunk * chunk_rows;
+            let col_start = col_chunk * chunk_cols;
+            let rows = (cells - row_start).min(chunk_rows);
+            let cols = (genes - col_start).min(chunk_cols);
+            let mut bytes = Vec::with_capacity(rows * cols * std::mem::size_of::<u32>());
+            for row_in_chunk in 0..rows {
+                let cell = row_start + row_in_chunk;
+                for col_in_chunk in 0..cols {
+                    let gene = col_start + col_in_chunk;
+                    let value = ((cell as u32) << 16) ^ gene as u32;
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+            chunks.push(Arc::from(bytes.into_boxed_slice()));
+        }
+    }
+
+    chunks
+}
+
 pub fn make_dense_u32_chunks_zstd(
     cells: usize,
     genes: usize,
@@ -139,6 +208,63 @@ pub fn make_csr_u32_f32_chunks(
             let gene = ((cell * nnz_per_cell + k) % genes) as u32;
             let value = cell as f32 + k as f32 * 0.1;
             indices_bytes.extend_from_slice(&gene.to_ne_bytes());
+            data_bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        indptr.push(indptr.last().copied().unwrap() + nnz_per_cell as u64);
+    }
+    (
+        indptr,
+        Arc::from(indices_bytes.into_boxed_slice()),
+        Arc::from(data_bytes.into_boxed_slice()),
+    )
+}
+
+pub fn make_csr_i32_f32_chunks(
+    cells: usize,
+    genes: usize,
+    nnz_per_cell: usize,
+) -> (Vec<u64>, Arc<[u8]>, Arc<[u8]>) {
+    make_csr_index_f32_chunks(cells, genes, nnz_per_cell, |gene, out| {
+        out.extend_from_slice(&(gene as i32).to_ne_bytes());
+    })
+}
+
+pub fn make_csr_u64_f32_chunks(
+    cells: usize,
+    genes: usize,
+    nnz_per_cell: usize,
+) -> (Vec<u64>, Arc<[u8]>, Arc<[u8]>) {
+    make_csr_index_f32_chunks(cells, genes, nnz_per_cell, |gene, out| {
+        out.extend_from_slice(&(gene as u64).to_ne_bytes());
+    })
+}
+
+pub fn make_csr_i64_f32_chunks(
+    cells: usize,
+    genes: usize,
+    nnz_per_cell: usize,
+) -> (Vec<u64>, Arc<[u8]>, Arc<[u8]>) {
+    make_csr_index_f32_chunks(cells, genes, nnz_per_cell, |gene, out| {
+        out.extend_from_slice(&(gene as i64).to_ne_bytes());
+    })
+}
+
+fn make_csr_index_f32_chunks(
+    cells: usize,
+    genes: usize,
+    nnz_per_cell: usize,
+    mut push_index: impl FnMut(usize, &mut Vec<u8>),
+) -> (Vec<u64>, Arc<[u8]>, Arc<[u8]>) {
+    let nnz = cells * nnz_per_cell;
+    let mut indptr = Vec::with_capacity(cells + 1);
+    let mut indices_bytes = Vec::new();
+    let mut data_bytes = Vec::with_capacity(nnz * std::mem::size_of::<f32>());
+    indptr.push(0);
+    for cell in 0..cells {
+        for k in 0..nnz_per_cell {
+            let gene = (cell * nnz_per_cell + k) % genes;
+            let value = cell as f32 + k as f32 * 0.1;
+            push_index(gene, &mut indices_bytes);
             data_bytes.extend_from_slice(&value.to_ne_bytes());
         }
         indptr.push(indptr.last().copied().unwrap() + nnz_per_cell as u64);
@@ -327,6 +453,29 @@ pub fn write_dense_u32_file(
     locations
 }
 
+pub fn write_dense_u32_file_cropped(
+    path: &Path,
+    cells: usize,
+    genes: usize,
+    chunk_rows: usize,
+    chunk_cols: usize,
+) -> Vec<FileChunkLocation> {
+    let chunks = make_dense_u32_chunks_cropped(cells, genes, chunk_rows, chunk_cols);
+    let mut file = std::fs::File::create(path).expect("create cropped dense file");
+    let mut offset = 0u64;
+    let mut locations = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        file.write_all(chunk).expect("write cropped dense chunk");
+        locations.push(FileChunkLocation {
+            offset,
+            len: chunk.len(),
+        });
+        offset += chunk.len() as u64;
+    }
+    file.sync_all().expect("sync cropped dense file");
+    locations
+}
+
 pub fn write_dense_u32_directory(
     dir: &Path,
     cells: usize,
@@ -345,5 +494,25 @@ pub fn write_dense_u32_directory(
             len: chunk.len(),
         });
     }
+    locations
+}
+
+pub fn write_chunks_directory_offsets(
+    path: &Path,
+    chunks: &[Arc<[u8]>],
+) -> Vec<DirectoryChunkLocationMeta> {
+    let mut file = std::fs::File::create(path).expect("create offset directory payload");
+    let mut offset = 0u64;
+    let mut locations = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        file.write_all(chunk).expect("write offset directory chunk");
+        locations.push(DirectoryChunkLocationMeta {
+            path: path.to_path_buf(),
+            offset,
+            len: chunk.len(),
+        });
+        offset += chunk.len() as u64;
+    }
+    file.sync_all().expect("sync offset directory payload");
     locations
 }

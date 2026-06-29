@@ -763,8 +763,7 @@ def _validate_absent_chunk_fill_value(
     if _fill_value_is_zero(fill_value):
         return
     raise StoreError(
-        f"{context}: absent chunks require zero fill_value for databank access; "
-        f"got {fill_value!r}"
+        f"{context}: absent chunks require zero fill_value for databank access; got {fill_value!r}"
     )
 
 

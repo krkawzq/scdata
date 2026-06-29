@@ -17,6 +17,13 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(feature = "pybind-bench")]
+use numpy::IntoPyArray;
+#[cfg(feature = "pybind-bench")]
+use pyo3::prelude::*;
+#[cfg(feature = "pybind-bench")]
+use pyo3::types::{PyBytes, PyList, PyModule};
+
 use _scdata::access::{
     AccessConfig, AccessCpuConfig, AccessHandle, AccessItem, AccessRequest, AccessScheduler,
     ChunkKey, FileRef, PrefetchRequest, ScheduledAccessConfig,
@@ -40,9 +47,11 @@ use _scdata::iopool::{
 };
 use support::backends::{CodecDecode, SliceIo};
 use support::chunks::{
-    make_csr_u32_f32_chunks, make_dense1d_u32_chunks, make_dense1d_u32_variable_chunks,
-    make_dense_u32_chunks, make_dense_u32_chunks_zstd, write_dense_u32_directory,
-    write_dense_u32_file,
+    make_csr_i32_f32_chunks, make_csr_i64_f32_chunks, make_csr_u32_f32_chunks,
+    make_csr_u64_f32_chunks, make_dense1d_u32_chunks, make_dense1d_u32_variable_chunks,
+    make_dense_u32_chunks, make_dense_u32_chunks_padded, make_dense_u32_chunks_zstd,
+    write_chunks_directory_offsets, write_dense_u32_directory, write_dense_u32_file,
+    write_dense_u32_file_cropped,
 };
 use support::codecs::{
     blosc_encode, bz2_encode, crc32_encode, decode_into_checksum, encode_for_spec, gzip_encode,
@@ -64,6 +73,8 @@ fn main() {
     bench_iopool(config);
     bench_access(config);
     bench_databank(config);
+    #[cfg(feature = "pybind-bench")]
+    bench_pybind(config);
     bench_data_pipeline(config);
     bench_missing_rate(config);
     bench_scale_sweep(config);
@@ -613,12 +624,62 @@ fn bench_decode_pool(config: BenchConfig) {
             })
         },
     );
+    bench(
+        config,
+        "codecs/decode_pool_drop_future_zstd_64k",
+        512,
+        Some(raw.len()),
+        || {
+            let request = DecodeRequest::new(Arc::clone(&zstd_codec), Arc::clone(&zstd_encoded))
+                .with_expected_size(raw.len());
+            let future = pool.submit(request).expect("submit dropped decode");
+            drop(future);
+            let request = DecodeRequest::new(Arc::clone(&zstd_codec), Arc::clone(&zstd_encoded))
+                .with_expected_size(raw.len());
+            let decoded = pool
+                .submit(request)
+                .expect("submit follow-up decode")
+                .blocking_recv()
+                .expect("follow-up decode");
+            decoded.len() ^ decoded[decoded.len() / 2] as usize
+        },
+    );
 
     // 1 MiB comparison: does the owned-buffer penalty scale with payload size
     // (data migration / page faults) or stay flat (fixed scheduling overhead)?
     let raw_1m: Arc<[u8]> = Arc::from(payload(1024 * 1024));
     let zstd_encoded_1m: Arc<[u8]> =
         Arc::from(zstd::encode_all(Cursor::new(&raw_1m[..]), 3).expect("zstd encode 1m"));
+    bench(
+        config,
+        "codecs/decode_pool_try_submit_queue_full",
+        32,
+        None,
+        || {
+            let small_pool = DecodePool::new(DecodePoolConfig {
+                num_workers: 1,
+                queue_capacity: 1,
+                cpus: None,
+            })
+            .expect("small decode pool");
+            let mut futures = Vec::new();
+            let mut queue_full = 0usize;
+            for _ in 0..32 {
+                let request =
+                    DecodeRequest::new(Arc::clone(&zstd_codec), Arc::clone(&zstd_encoded_1m))
+                        .with_expected_size(raw_1m.len());
+                match small_pool.try_submit(request) {
+                    Ok(future) => futures.push(future),
+                    Err(CodecError::QueueFull { .. }) => queue_full += 1,
+                    Err(err) => panic!("unexpected try_submit error: {err}"),
+                }
+            }
+            for future in futures {
+                let _ = future.blocking_recv();
+            }
+            queue_full
+        },
+    );
     bench(
         config,
         "codecs/decode_pool_submit_zstd_1m",
@@ -855,6 +916,24 @@ fn bench_iopool(config: BenchConfig) {
             .expect("metadata output")
             .len as usize
     });
+    bench(
+        config,
+        "iopool/threaded_drop_future_read_64k",
+        1024,
+        Some(64 * 1024),
+        || {
+            let future = pool
+                .submit(IoCommand::read(file, 0, 64 * 1024, 0))
+                .expect("submit dropped read");
+            drop(future);
+            let bytes = pool
+                .submit(IoCommand::read(file, 0, 64 * 1024, 0))
+                .expect("submit follow-up read")
+                .blocking_recv_read()
+                .expect("follow-up read");
+            bytes.len() ^ bytes[bytes.len() / 2] as usize
+        },
+    );
     pool.unregister_file(trunc_file)
         .expect("unregister trunc file");
     let _ = std::fs::remove_file(trunc_path);
@@ -1748,6 +1827,33 @@ fn bench_databank(config: BenchConfig) {
                 .fold(0usize, |acc, value| acc ^ value.to_bits() as usize)
         },
     );
+    bench_sparse_csr_index_dtype(
+        config,
+        "i32",
+        DType::I32,
+        make_csr_i32_f32_chunks(csr_cells, csr_genes, nnz_per_cell),
+        csr_cells,
+        csr_genes,
+        nnz_per_cell,
+    );
+    bench_sparse_csr_index_dtype(
+        config,
+        "u64",
+        DType::U64,
+        make_csr_u64_f32_chunks(csr_cells, csr_genes, nnz_per_cell),
+        csr_cells,
+        csr_genes,
+        nnz_per_cell,
+    );
+    bench_sparse_csr_index_dtype(
+        config,
+        "i64",
+        DType::I64,
+        make_csr_i64_f32_chunks(csr_cells, csr_genes, nnz_per_cell),
+        csr_cells,
+        csr_genes,
+        nnz_per_cell,
+    );
 
     // File-backed dense2d (uncompressed): real IO through the IoPool.
     let fo_path = support::bench_data_dir().join(format!("databank-fo-{}.bin", std::process::id()));
@@ -1823,6 +1929,177 @@ fn bench_databank(config: BenchConfig) {
         },
     );
     let _ = std::fs::remove_dir_all(&dir_dir);
+
+    // Non-divisible dense2d edges: memory/directory stores are physically
+    // padded; legacy file-offset stores are physically cropped.
+    let edge_cells = 35usize;
+    let edge_genes = 70usize;
+    let edge_chunk_rows = 16usize;
+    let edge_chunk_cols = 32usize;
+    let edge_grid = vec![
+        edge_cells.div_ceil(edge_chunk_rows),
+        edge_genes.div_ceil(edge_chunk_cols),
+    ];
+    let edge_selected = vec![0usize, 15, 16, 34];
+    let padded_chunks =
+        make_dense_u32_chunks_padded(edge_cells, edge_genes, edge_chunk_rows, edge_chunk_cols);
+    let edge_mem_id = bank
+        .register_dense_2d(Dense2DMeta {
+            gene_names: (0..edge_genes)
+                .map(|idx| format!("edge_gene_{idx}"))
+                .collect(),
+            data: ArrayMeta {
+                shape: vec![edge_cells, edge_genes],
+                chunk_shape: vec![edge_chunk_rows, edge_chunk_cols],
+                chunk_grid_shape: edge_grid.clone(),
+                dtype: DType::U32,
+                order: ArrayOrder::C,
+                codec: ArrayCodecMeta::Uncompressed,
+                chunks: ChunkStoreMeta::Memory {
+                    chunks: padded_chunks.clone(),
+                },
+                variable_chunks: false,
+                chunk_boundaries: None,
+            },
+        })
+        .expect("register padded edge memory dataset");
+    let mut edge_mem_out = vec![0u32; edge_selected.len() * edge_genes];
+    bench(
+        config,
+        "databank/dense2d_memory_padded_edges_4x70",
+        512,
+        Some(edge_mem_out.len() * std::mem::size_of::<u32>()),
+        || {
+            bank.access_cells(edge_mem_id, &edge_selected, &mut edge_mem_out, None)
+                .expect("access padded edges");
+            edge_mem_out.iter().fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
+        },
+    );
+
+    let edge_fo_path =
+        support::bench_data_dir().join(format!("databank-edge-fo-{}.bin", std::process::id()));
+    let edge_fo_locations = write_dense_u32_file_cropped(
+        &edge_fo_path,
+        edge_cells,
+        edge_genes,
+        edge_chunk_rows,
+        edge_chunk_cols,
+    );
+    let edge_fo_id = bank
+        .register_dense_2d(Dense2DMeta {
+            gene_names: (0..edge_genes)
+                .map(|idx| format!("edge_gene_{idx}"))
+                .collect(),
+            data: ArrayMeta {
+                shape: vec![edge_cells, edge_genes],
+                chunk_shape: vec![edge_chunk_rows, edge_chunk_cols],
+                chunk_grid_shape: edge_grid.clone(),
+                dtype: DType::U32,
+                order: ArrayOrder::C,
+                codec: ArrayCodecMeta::Uncompressed,
+                chunks: ChunkStoreMeta::FileOffset {
+                    path: edge_fo_path.clone(),
+                    locations: edge_fo_locations,
+                },
+                variable_chunks: false,
+                chunk_boundaries: None,
+            },
+        })
+        .expect("register cropped edge fileoffset dataset");
+    let mut edge_fo_out = vec![0u32; edge_selected.len() * edge_genes];
+    bench(
+        config,
+        "databank/dense2d_fileoffset_cropped_edges_4x70",
+        256,
+        Some(edge_fo_out.len() * std::mem::size_of::<u32>()),
+        || {
+            bank.access_cells(edge_fo_id, &edge_selected, &mut edge_fo_out, None)
+                .expect("access cropped edges");
+            edge_fo_out.iter().fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
+        },
+    );
+
+    let zipstyle_path =
+        support::bench_data_dir().join(format!("databank-zipstyle-{}.bin", std::process::id()));
+    let zipstyle_locations = write_chunks_directory_offsets(&zipstyle_path, &padded_chunks);
+    let zipstyle_id = bank
+        .register_dense_2d(Dense2DMeta {
+            gene_names: (0..edge_genes)
+                .map(|idx| format!("edge_gene_{idx}"))
+                .collect(),
+            data: ArrayMeta {
+                shape: vec![edge_cells, edge_genes],
+                chunk_shape: vec![edge_chunk_rows, edge_chunk_cols],
+                chunk_grid_shape: edge_grid.clone(),
+                dtype: DType::U32,
+                order: ArrayOrder::C,
+                codec: ArrayCodecMeta::Uncompressed,
+                chunks: ChunkStoreMeta::Directory {
+                    locations: zipstyle_locations,
+                },
+                variable_chunks: false,
+                chunk_boundaries: None,
+            },
+        })
+        .expect("register zip-style directory dataset");
+    let mut zipstyle_out = vec![0u32; edge_selected.len() * edge_genes];
+    bench(
+        config,
+        "databank/dense2d_directory_offset_zipstyle_edges_4x70",
+        256,
+        Some(zipstyle_out.len() * std::mem::size_of::<u32>()),
+        || {
+            bank.access_cells(zipstyle_id, &edge_selected, &mut zipstyle_out, None)
+                .expect("access zip-style directory");
+            zipstyle_out.iter().fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
+        },
+    );
+
+    let rect_rows = vec![0usize, 16, edge_cells];
+    let rect_cols = vec![0usize, 32, edge_genes];
+    let rect_chunks =
+        make_dense_u32_rectilinear_chunks(edge_cells, edge_genes, &rect_rows, &rect_cols);
+    let rect_gene_names: Vec<String> = (0..edge_genes)
+        .map(|idx| format!("edge_gene_{idx}"))
+        .collect();
+    let rect_grid = vec![rect_rows.len() - 1, rect_cols.len() - 1];
+    let mut rect_bank = DataBank::new(DataBankConfig::default()).expect("rectilinear error bank");
+    bench(
+        config,
+        "databank/error_dense2d_rectilinear_grid",
+        2048,
+        None,
+        || {
+            rect_bank
+                .register_dense_2d(Dense2DMeta {
+                    gene_names: rect_gene_names.clone(),
+                    data: ArrayMeta {
+                        shape: vec![edge_cells, edge_genes],
+                        chunk_shape: vec![edge_chunk_rows, edge_chunk_cols],
+                        chunk_grid_shape: rect_grid.clone(),
+                        dtype: DType::U32,
+                        order: ArrayOrder::C,
+                        codec: ArrayCodecMeta::Uncompressed,
+                        chunks: ChunkStoreMeta::Memory {
+                            chunks: rect_chunks.clone(),
+                        },
+                        variable_chunks: true,
+                        chunk_boundaries: Some(vec![rect_rows.clone(), rect_cols.clone()]),
+                    },
+                })
+                .expect_err("dense2d rectilinear is unsupported")
+                .to_string()
+                .len()
+        },
+    );
+    let _ = std::fs::remove_file(&edge_fo_path);
+    let _ = std::fs::remove_file(&zipstyle_path);
 
     // by-gene-names: select a column subset by name, Zero / Error policies.
     let by_names: Vec<String> = (0..32)
@@ -2001,6 +2278,28 @@ fn bench_databank(config: BenchConfig) {
             })
         },
     );
+    bench(
+        config,
+        "databank/prefetch_scheduled_drop_after_first_batch",
+        128,
+        Some(scheduled_batches[0].len() * genes * std::mem::size_of::<u32>()),
+        || {
+            let mut prefetch = bank
+                .prefetch_cells_scheduled::<u32, _>(
+                    id,
+                    scheduled_batches.clone(),
+                    ScheduledPrefetchConfig::default(),
+                )
+                .expect("scheduled prefetch");
+            let first = prefetch
+                .next()
+                .expect("first scheduled batch")
+                .expect("first scheduled batch result");
+            let checksum = first.buffer.len() ^ first.cells.len() ^ first.num_genes;
+            drop(prefetch);
+            checksum
+        },
+    );
 
     // dataset_genes: borrow gene-name views.
     bench(config, "databank/dataset_genes_len", 10_000, None, || {
@@ -2052,10 +2351,59 @@ fn bench_databank(config: BenchConfig) {
             cycle_id.slot as usize
         },
     );
+    let lifecycle_cells = 64usize;
+    let lifecycle_genes = 64usize;
+    let lifecycle_chunk_rows = 16usize;
+    let lifecycle_chunk_cols = 16usize;
+    let lifecycle_chunks = Arc::new(make_dense_u32_chunks(
+        lifecycle_cells,
+        lifecycle_genes,
+        lifecycle_chunk_rows,
+        lifecycle_chunk_cols,
+    ));
+    bench(
+        config,
+        "databank/lifecycle_create_register_drop_cycle",
+        32,
+        None,
+        || {
+            let mut local_bank = DataBank::new(DataBankConfig::default()).expect("local bank");
+            let local_id = local_bank
+                .register_dense_2d(Dense2DMeta {
+                    gene_names: (0..lifecycle_genes)
+                        .map(|idx| format!("life_gene_{idx}"))
+                        .collect(),
+                    data: ArrayMeta {
+                        shape: vec![lifecycle_cells, lifecycle_genes],
+                        chunk_shape: vec![lifecycle_chunk_rows, lifecycle_chunk_cols],
+                        chunk_grid_shape: vec![
+                            lifecycle_cells / lifecycle_chunk_rows,
+                            lifecycle_genes / lifecycle_chunk_cols,
+                        ],
+                        dtype: DType::U32,
+                        order: ArrayOrder::C,
+                        codec: ArrayCodecMeta::Uncompressed,
+                        chunks: ChunkStoreMeta::Memory {
+                            chunks: (*lifecycle_chunks).clone(),
+                        },
+                        variable_chunks: false,
+                        chunk_boundaries: None,
+                    },
+                })
+                .expect("register lifecycle dataset");
+            let mut local_out = vec![0u32; 4 * lifecycle_genes];
+            local_bank
+                .access_cells(local_id, &[0, 7, 31, 63], &mut local_out, None)
+                .expect("lifecycle access");
+            local_out[0] as usize ^ local_out.len()
+        },
+    );
 
     // Multi-dtype dense2d access: 1/2/4/8-byte integer and float dtypes.
     bench_typed_dense2d::<u8>(config, DType::U8, "u8");
+    bench_typed_dense2d::<i8>(config, DType::I8, "i8");
     bench_typed_dense2d::<u16>(config, DType::U16, "u16");
+    bench_typed_dense2d::<i16>(config, DType::I16, "i16");
     bench_typed_dense2d::<u32>(config, DType::U32, "u32");
     bench_typed_dense2d::<u64>(config, DType::U64, "u64");
     bench_typed_dense2d::<i32>(config, DType::I32, "i32");
@@ -2125,6 +2473,422 @@ fn bench_databank(config: BenchConfig) {
     let _ = std::fs::remove_file(fo_path);
 }
 
+// ---------------------------------------------------------------------------
+// pybind: Rust-side PyO3 binding coverage. This does not call the Python
+// wrapper layer; it registers the PyO3 classes/functions into an in-process
+// module and exercises the Python-facing fast paths from the Rust bench target.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pybind-bench")]
+fn bench_pybind(config: BenchConfig) {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let module = PyModule::new(py, "_scdata_bench").expect("create pybind bench module");
+        _scdata::pybind::register(&module).expect("register pybind module");
+        let fixture = make_pybind_fixture(py, &module);
+
+        bench(config, "pybind/register_module_classes", 1000, None, || {
+            let module = PyModule::new(py, "_scdata_bench_iter").expect("create module");
+            _scdata::pybind::register(&module).expect("register module");
+            module.dict().len()
+        });
+
+        bench(
+            config,
+            "pybind/config_get_set_roundtrip",
+            5000,
+            None,
+            || {
+                let cfg = module
+                    .getattr("_DataBankConfig")
+                    .expect("DataBankConfig class")
+                    .call0()
+                    .expect("DataBankConfig()");
+                let access = cfg.getattr("access_config").expect("access_config");
+                let queue_capacity: usize = access
+                    .getattr("queue_capacity")
+                    .expect("queue_capacity")
+                    .extract()
+                    .expect("extract queue_capacity");
+                access
+                    .setattr("queue_capacity", queue_capacity)
+                    .expect("set queue_capacity");
+                queue_capacity
+            },
+        );
+
+        bench(config, "pybind/register_dense_fileoffset", 64, None, || {
+            let bank = module
+                .getattr("_DataBank")
+                .expect("DataBank class")
+                .call0()
+                .expect("DataBank()");
+            let id = bank
+                .call_method1("register_dense", (fixture.dataset.clone_ref(py), ""))
+                .expect("register_dense");
+            bank.call_method1("dataset_num_cells", (id,))
+                .expect("dataset_num_cells")
+                .extract::<usize>()
+                .expect("extract cells")
+        });
+
+        bench(
+            config,
+            "pybind/access_cells_vec_16x64",
+            256,
+            Some(fixture.cells.len() * fixture.genes * std::mem::size_of::<u32>()),
+            || {
+                let arr = fixture
+                    .bank
+                    .call_method1(
+                        py,
+                        "access_cells",
+                        (fixture.id.clone_ref(py), fixture.cells.clone()),
+                    )
+                    .expect("access_cells");
+                arr.bind(py).len().expect("numpy len")
+            },
+        );
+
+        bench(
+            config,
+            "pybind/access_cells_array_16x64",
+            256,
+            Some(fixture.cells.len() * fixture.genes * std::mem::size_of::<u32>()),
+            || {
+                let arr = fixture
+                    .bank
+                    .call_method1(
+                        py,
+                        "access_cells_array",
+                        (fixture.id.clone_ref(py), fixture.cells_array.clone_ref(py)),
+                    )
+                    .expect("access_cells_array");
+                arr.bind(py).len().expect("numpy len")
+            },
+        );
+
+        bench(
+            config,
+            "pybind/access_cells_by_gene_names_array_zero_missing",
+            192,
+            Some(fixture.cells.len() * fixture.by_names.len() * std::mem::size_of::<u32>()),
+            || {
+                let arr = fixture
+                    .bank
+                    .call_method1(
+                        py,
+                        "access_cells_by_gene_names_array",
+                        (
+                            fixture.id.clone_ref(py),
+                            fixture.cells_array.clone_ref(py),
+                            fixture.by_names.clone(),
+                        ),
+                    )
+                    .expect("access_cells_by_gene_names_array");
+                arr.bind(py).len().expect("numpy len")
+            },
+        );
+
+        bench(config, "pybind/prefetch_cells_lists", 128, None, || {
+            let prefetch = fixture
+                .bank
+                .call_method1(
+                    py,
+                    "prefetch_cells",
+                    (fixture.id.clone_ref(py), fixture.batches.clone_ref(py)),
+                )
+                .expect("prefetch_cells");
+            drain_py_prefetch(py, &prefetch)
+        });
+
+        bench(config, "pybind/prefetch_cells_arrays", 128, None, || {
+            let prefetch = fixture
+                .bank
+                .call_method1(
+                    py,
+                    "prefetch_cells_arrays",
+                    (
+                        fixture.id.clone_ref(py),
+                        fixture.batches_arrays.clone_ref(py),
+                    ),
+                )
+                .expect("prefetch_cells_arrays");
+            drain_py_prefetch(py, &prefetch)
+        });
+
+        bench(
+            config,
+            "pybind/prefetch_cells_by_gene_names_arrays_zero_missing",
+            96,
+            None,
+            || {
+                let prefetch = fixture
+                    .bank
+                    .call_method1(
+                        py,
+                        "prefetch_cells_by_gene_names_arrays",
+                        (
+                            fixture.id.clone_ref(py),
+                            fixture.batches_arrays.clone_ref(py),
+                            fixture.by_names.clone(),
+                        ),
+                    )
+                    .expect("prefetch_cells_by_gene_names_arrays");
+                drain_py_prefetch(py, &prefetch)
+            },
+        );
+
+        bench(
+            config,
+            "pybind/decode_index_payload_u32",
+            1024,
+            None,
+            || {
+                let payload = PyBytes::new(py, &fixture.index_payload);
+                let arr = fixture
+                    .decode_index_payload
+                    .call1(
+                        py,
+                        (
+                            payload,
+                            fixture.index_offsets.clone(),
+                            fixture.index_lengths.clone(),
+                            fixture.dtype.clone_ref(py),
+                            fixture.codec.clone_ref(py),
+                            fixture.index_count,
+                        ),
+                    )
+                    .expect("decode_index_payload");
+                arr.bind(py).len().expect("numpy len")
+            },
+        );
+
+        bench(config, "pybind/decode_index_chunks_u32", 1024, None, || {
+            let first = PyBytes::new(
+                py,
+                &fixture.index_payload[..fixture.index_payload.len() / 2],
+            );
+            let second = PyBytes::new(
+                py,
+                &fixture.index_payload[fixture.index_payload.len() / 2..],
+            );
+            let chunks = PyList::empty(py);
+            chunks.append(first).expect("append first index chunk");
+            chunks.append(second).expect("append second index chunk");
+            let arr = fixture
+                .decode_index_chunks
+                .call1(
+                    py,
+                    (
+                        chunks,
+                        fixture.dtype.clone_ref(py),
+                        fixture.codec.clone_ref(py),
+                        fixture.index_count,
+                    ),
+                )
+                .expect("decode_index_chunks");
+            arr.bind(py).len().expect("numpy len")
+        });
+
+        let _ = std::fs::remove_file(&fixture.path);
+    });
+}
+
+#[cfg(feature = "pybind-bench")]
+struct PyBindFixture {
+    path: std::path::PathBuf,
+    bank: Py<PyAny>,
+    id: Py<PyAny>,
+    dataset: Py<PyAny>,
+    dtype: Py<PyAny>,
+    codec: Py<PyAny>,
+    cells: Vec<usize>,
+    cells_array: Py<PyAny>,
+    batches: Py<PyAny>,
+    batches_arrays: Py<PyAny>,
+    by_names: Vec<String>,
+    genes: usize,
+    decode_index_payload: Py<PyAny>,
+    decode_index_chunks: Py<PyAny>,
+    index_payload: Vec<u8>,
+    index_offsets: Vec<u64>,
+    index_lengths: Vec<u64>,
+    index_count: usize,
+}
+
+#[cfg(feature = "pybind-bench")]
+fn make_pybind_fixture<'py>(py: Python<'py>, module: &Bound<'py, PyModule>) -> PyBindFixture {
+    let cells = 128usize;
+    let genes = 64usize;
+    let chunk_rows = 16usize;
+    let chunk_cols = 16usize;
+    let path = support::bench_data_dir().join(format!("pybind-dense-{}.bin", std::process::id()));
+    let locations = write_dense_u32_file(&path, cells, genes, chunk_rows, chunk_cols);
+    let offsets = locations.iter().map(|loc| loc.offset).collect::<Vec<_>>();
+    let lengths = locations
+        .iter()
+        .map(|loc| loc.len as u64)
+        .collect::<Vec<_>>();
+    let dtype = py_dtype(py, "u32");
+    let codec = py_uncompressed_codec(py);
+
+    let data = py_namespace(py);
+    data.setattr("shape", vec![cells, genes])
+        .expect("set shape");
+    data.setattr("chunk_shape", vec![chunk_rows, chunk_cols])
+        .expect("set chunk_shape");
+    data.setattr("dtype", dtype.clone_ref(py))
+        .expect("set dtype");
+    data.setattr("codec", codec.clone_ref(py))
+        .expect("set codec");
+    data.setattr("store_kind", "file").expect("set store_kind");
+    data.setattr("payload_path", "").expect("set payload_path");
+    data.setattr("payload_file_path", path.to_string_lossy().to_string())
+        .expect("set payload_file_path");
+    data.setattr("chunk_offsets", offsets)
+        .expect("set chunk_offsets");
+    data.setattr("chunk_lengths", lengths)
+        .expect("set chunk_lengths");
+    data.setattr("variable_chunks", false)
+        .expect("set variable_chunks");
+
+    let dataset = py_namespace(py);
+    dataset
+        .setattr(
+            "gene_names",
+            (0..genes)
+                .map(|idx| format!("gene_{idx}"))
+                .collect::<Vec<_>>(),
+        )
+        .expect("set gene_names");
+    dataset.setattr("data", data).expect("set data");
+    let dataset = dataset.unbind();
+
+    let bank = module
+        .getattr("_DataBank")
+        .expect("DataBank class")
+        .call0()
+        .expect("DataBank()")
+        .unbind();
+    let id = bank
+        .call_method1(py, "register_dense", (dataset.clone_ref(py), ""))
+        .expect("register_dense");
+    let cells_vec = (0..16).map(|idx| idx * 7 % cells).collect::<Vec<_>>();
+    let cells_array = cells_vec
+        .iter()
+        .map(|&cell| cell as isize)
+        .collect::<Vec<_>>()
+        .into_pyarray(py)
+        .into_any()
+        .unbind();
+    let batches = PyList::new(
+        py,
+        [
+            vec![0usize, 7, 14, 21],
+            vec![3usize, 5],
+            Vec::<usize>::new(),
+        ],
+    )
+    .expect("batches list")
+    .into_any()
+    .unbind();
+    let batches_arrays = PyList::empty(py);
+    for batch in [
+        vec![0isize, 7, 14, 21],
+        vec![3isize, 5],
+        Vec::<isize>::new(),
+    ] {
+        batches_arrays
+            .append(batch.into_pyarray(py))
+            .expect("append batch array");
+    }
+    let batches_arrays = batches_arrays.into_any().unbind();
+    let by_names = vec![
+        "gene_1".to_string(),
+        "missing_gene".to_string(),
+        "gene_3".to_string(),
+        "gene_5".to_string(),
+    ];
+    let decode_index_payload = module
+        .getattr("_decode_index_payload")
+        .expect("decode index payload fn")
+        .unbind();
+    let decode_index_chunks = module
+        .getattr("_decode_index_chunks")
+        .expect("decode index chunks fn")
+        .unbind();
+    let index_count = 32usize;
+    let mut index_payload = Vec::with_capacity(index_count * std::mem::size_of::<u32>());
+    for value in 0..index_count as u32 {
+        index_payload.extend_from_slice(&value.to_ne_bytes());
+    }
+    let half = (index_payload.len() / 2) as u64;
+
+    PyBindFixture {
+        path,
+        bank,
+        id,
+        dataset,
+        dtype,
+        codec,
+        cells: cells_vec,
+        cells_array,
+        batches,
+        batches_arrays,
+        by_names,
+        genes,
+        decode_index_payload,
+        decode_index_chunks,
+        index_payload,
+        index_offsets: vec![0, half],
+        index_lengths: vec![half, half],
+        index_count,
+    }
+}
+
+#[cfg(feature = "pybind-bench")]
+fn py_namespace<'py>(py: Python<'py>) -> Bound<'py, PyAny> {
+    py.import("types")
+        .expect("import types")
+        .getattr("SimpleNamespace")
+        .expect("SimpleNamespace")
+        .call0()
+        .expect("SimpleNamespace()")
+}
+
+#[cfg(feature = "pybind-bench")]
+fn py_dtype(py: Python<'_>, code: &str) -> Py<PyAny> {
+    let dtype = py_namespace(py);
+    dtype.setattr("value", code).expect("set dtype value");
+    dtype.unbind()
+}
+
+#[cfg(feature = "pybind-bench")]
+fn py_uncompressed_codec(py: Python<'_>) -> Py<PyAny> {
+    let codec = py_namespace(py);
+    codec
+        .setattr("is_uncompressed", true)
+        .expect("set codec flag");
+    codec.unbind()
+}
+
+#[cfg(feature = "pybind-bench")]
+fn drain_py_prefetch(py: Python<'_>, prefetch: &Py<PyAny>) -> usize {
+    let mut sum = 0usize;
+    loop {
+        let item = prefetch
+            .call_method0(py, "__next__")
+            .expect("prefetch __next__");
+        let item = item.bind(py);
+        if item.is_none() {
+            break;
+        }
+        sum ^= item.len().expect("prefetch tuple len");
+    }
+    sum
+}
+
 /// Deterministic dense2D chunk bytes for an arbitrary item size, so the
 /// multi-dtype bench can stay generic over `T: DataValue`.
 fn make_dense_bytes(
@@ -2148,6 +2912,103 @@ fn make_dense_bytes(
         }
     }
     out
+}
+
+fn make_dense_u32_rectilinear_chunks(
+    cells: usize,
+    genes: usize,
+    row_boundaries: &[usize],
+    col_boundaries: &[usize],
+) -> Vec<Arc<[u8]>> {
+    assert_eq!(row_boundaries.first().copied(), Some(0));
+    assert_eq!(row_boundaries.last().copied(), Some(cells));
+    assert_eq!(col_boundaries.first().copied(), Some(0));
+    assert_eq!(col_boundaries.last().copied(), Some(genes));
+
+    let mut chunks = Vec::with_capacity((row_boundaries.len() - 1) * (col_boundaries.len() - 1));
+    for row_window in row_boundaries.windows(2) {
+        for col_window in col_boundaries.windows(2) {
+            let row_start = row_window[0];
+            let row_end = row_window[1];
+            let col_start = col_window[0];
+            let col_end = col_window[1];
+            let mut bytes = Vec::with_capacity(
+                (row_end - row_start) * (col_end - col_start) * std::mem::size_of::<u32>(),
+            );
+            for cell in row_start..row_end {
+                for gene in col_start..col_end {
+                    let value = ((cell as u32) << 16) ^ gene as u32;
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+            chunks.push(Arc::from(bytes.into_boxed_slice()));
+        }
+    }
+    chunks
+}
+
+fn bench_sparse_csr_index_dtype(
+    config: BenchConfig,
+    label: &str,
+    index_dtype: DType,
+    chunks: (Vec<u64>, Arc<[u8]>, Arc<[u8]>),
+    cells: usize,
+    genes: usize,
+    nnz_per_cell: usize,
+) {
+    let (indptr, indices_chunk, data_chunk) = chunks;
+    let nnz = cells * nnz_per_cell;
+    let mut bank = DataBank::new(DataBankConfig::default()).expect("csr index bank");
+    let id = bank
+        .register_sparse_csr(SparseCsrDatasetMeta {
+            gene_names: (0..genes).map(|idx| format!("gene_{idx}")).collect(),
+            indptr,
+            indices: ArrayMeta {
+                shape: vec![nnz],
+                chunk_shape: vec![nnz],
+                chunk_grid_shape: vec![1],
+                dtype: index_dtype,
+                order: ArrayOrder::C,
+                codec: ArrayCodecMeta::Uncompressed,
+                chunks: ChunkStoreMeta::Memory {
+                    chunks: vec![indices_chunk],
+                },
+                variable_chunks: false,
+                chunk_boundaries: None,
+            },
+            data: ArrayMeta {
+                shape: vec![nnz],
+                chunk_shape: vec![nnz],
+                chunk_grid_shape: vec![1],
+                dtype: DType::F32,
+                order: ArrayOrder::C,
+                codec: ArrayCodecMeta::Uncompressed,
+                chunks: ChunkStoreMeta::Memory {
+                    chunks: vec![data_chunk],
+                },
+                variable_chunks: false,
+                chunk_boundaries: None,
+            },
+            index_dtype,
+            num_cells: cells,
+            num_genes: genes,
+        })
+        .expect("register csr index dataset");
+    let selected = (0..32).map(|idx| idx * 3 % cells).collect::<Vec<_>>();
+    let mut out = vec![0.0f32; selected.len() * genes];
+    bench(
+        config,
+        &format!("databank/sparse_csr_index_{label}_checked_32x256"),
+        256,
+        Some(out.len() * std::mem::size_of::<f32>()),
+        || {
+            bank.access_cells(id, &selected, &mut out, None)
+                .expect("access csr index dtype");
+            out.iter()
+                .step_by(251)
+                .fold(0usize, |acc, value| acc ^ value.to_bits() as usize)
+        },
+    );
 }
 
 fn bench_typed_dense2d<T: DataValue>(config: BenchConfig, dtype: DType, label: &str) {

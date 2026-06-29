@@ -272,7 +272,9 @@ pub fn plan_dense_1d_selected_sources(
             }
 
             let range_start = row_start.checked_add(run_start).ok_or_else(|| {
-                DataBankError::InvalidArrayMeta("1D dense selected range start overflow".to_string())
+                DataBankError::InvalidArrayMeta(
+                    "1D dense selected range start overflow".to_string(),
+                )
             })?;
             let range_end = range_start.checked_add(run_len).ok_or_else(|| {
                 DataBankError::InvalidArrayMeta("1D dense selected range end overflow".to_string())
@@ -286,13 +288,14 @@ pub fn plan_dense_1d_selected_sources(
                     chunk: range.chunk,
                     source: range.source,
                 });
-                output_col_start = output_col_start
-                    .checked_add(range.elements)
-                    .ok_or_else(|| {
-                        DataBankError::InvalidArrayMeta(
-                            "1D dense selected output column overflow".to_string(),
-                        )
-                    })?;
+                output_col_start =
+                    output_col_start
+                        .checked_add(range.elements)
+                        .ok_or_else(|| {
+                            DataBankError::InvalidArrayMeta(
+                                "1D dense selected output column overflow".to_string(),
+                            )
+                        })?;
             }
         }
     }

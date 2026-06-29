@@ -5763,12 +5763,12 @@ fn plan_batch<'a>(
     }
     match dataset {
         Dataset::Dense1D(d) => {
-            let mut segments = plan::plan_dense_1d(d, &cells)?;
-            project_dense_segments_for_projection(
-                &mut segments,
-                gene_axis,
-                d.data.dtype.item_size(),
-            )?;
+            let segments = match gene_axis.projection() {
+                Some(projection) => {
+                    plan::plan_dense_1d_selected_sources(d, &cells, &projection.selected_sources)?
+                }
+                None => plan::plan_dense_1d(d, &cells)?,
+            };
             let groups = group_dense_segments(&segments)?;
             let items = dense_group_access_items(&groups)?;
             Ok((
@@ -7012,14 +7012,14 @@ mod tests {
         let genes = ["g6", "g1", "g2"];
         let gene_axis = super::GeneAxisPlan::requested(dataset, &genes, MissingGenePolicy::Zero)
             .expect("gene projection");
-        let mut segments = super::plan::plan_dense_2d(dense, &[0]).expect("dense plan");
+        let projection = match gene_axis {
+            super::GeneAxisPlan::Requested(projection) => projection,
+            super::GeneAxisPlan::DatasetOrder => panic!("subset should remain projected"),
+        };
 
-        super::project_dense_segments_for_projection(
-            &mut segments,
-            &gene_axis,
-            DType::U32.item_size(),
-        )
-        .expect("project dense segments");
+        let segments =
+            super::plan::plan_dense_2d_selected_sources(dense, &[0], &projection.selected_sources)
+                .expect("selected dense plan");
 
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].output_col_start, 1);
@@ -7034,6 +7034,60 @@ mod tests {
         let out = bank
             .access_cells_owned_by_gene_names::<u32, _>(id, &[0], &genes, MissingGenePolicy::Zero)
             .expect("projected dense access");
+        assert_eq!(out, vec![6, 1, 2]);
+    }
+
+    #[test]
+    fn projected_dense_1d_planning_visits_only_selected_ranges() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let id = bank
+            .register_dense_1d(Dense1DMeta {
+                gene_names: (0..8).map(|g| format!("g{g}")).collect(),
+                data: ArrayMeta {
+                    shape: vec![8],
+                    chunk_shape: vec![4],
+                    chunk_grid_shape: vec![2],
+                    dtype: DType::U32,
+                    order: ArrayOrder::C,
+                    codec: ArrayCodecMeta::Uncompressed,
+                    chunks: ChunkStoreMeta::Memory {
+                        chunks: vec![arc_u32_bytes(&[0, 1, 2, 3]), arc_u32_bytes(&[4, 5, 6, 7])],
+                    },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
+                },
+            })
+            .expect("register dense 1d");
+        let dataset = bank.registry.get(id).expect("dataset");
+        let dense = match dataset {
+            Dataset::Dense1D(dense) => dense,
+            _ => panic!("expected dense 1d dataset"),
+        };
+        let genes = ["g6", "g1", "g2"];
+        let gene_axis = super::GeneAxisPlan::requested(dataset, &genes, MissingGenePolicy::Zero)
+            .expect("gene projection");
+        let projection = match gene_axis {
+            super::GeneAxisPlan::Requested(projection) => projection,
+            super::GeneAxisPlan::DatasetOrder => panic!("subset should remain projected"),
+        };
+
+        let segments =
+            super::plan::plan_dense_1d_selected_sources(dense, &[0], &projection.selected_sources)
+                .expect("selected dense 1d plan");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].output_col_start, 1);
+        assert_eq!(segments[0].output_cols, 2);
+        assert_eq!(segments[0].source.start, 4);
+        assert_eq!(segments[0].source.end, 12);
+        assert_eq!(segments[1].output_col_start, 6);
+        assert_eq!(segments[1].output_cols, 1);
+        assert_eq!(segments[1].source.start, 8);
+        assert_eq!(segments[1].source.end, 12);
+
+        let out = bank
+            .access_cells_owned_by_gene_names::<u32, _>(id, &[0], &genes, MissingGenePolicy::Zero)
+            .expect("projected dense 1d access");
         assert_eq!(out, vec![6, 1, 2]);
     }
 

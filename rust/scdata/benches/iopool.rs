@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -86,7 +86,7 @@ fn run() -> Result<(), String> {
 fn bench_threaded(
     config: BenchConfig,
     args: &Args,
-    path: &PathBuf,
+    path: &Path,
     data_len: usize,
 ) -> Result<(), String> {
     let pool = Arc::new(
@@ -109,7 +109,7 @@ fn bench_threaded(
 fn bench_uring(
     config: BenchConfig,
     args: &Args,
-    path: &PathBuf,
+    path: &Path,
     data_len: usize,
 ) -> Result<(), String> {
     let pool = match IoPool::new(IoConfig::Uring(UringConfig {
@@ -144,7 +144,7 @@ fn bench_pool(
     config: BenchConfig,
     backend: &str,
     pool: Arc<IoPool>,
-    path: &PathBuf,
+    path: &Path,
     data_len: usize,
     args: &Args,
 ) -> Result<(), String> {
