@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::Notify;
+use tokio::sync::{futures::OwnedNotified, Notify};
 
 use super::key::ChunkKey;
 
@@ -23,7 +23,7 @@ pub(crate) enum RegisterResult {
     /// The caller owns the read and must submit IO.
     First,
     /// Another task owns the read; wait for this notification and retry.
-    Waiter(Arc<Notify>),
+    Waiter(OwnedNotified),
 }
 
 impl InflightTable {
@@ -33,7 +33,7 @@ impl InflightTable {
 
     pub(crate) fn try_register(&mut self, key: ChunkKey) -> RegisterResult {
         if let Some(entry) = self.entries.get(&key) {
-            return RegisterResult::Waiter(Arc::clone(&entry.notify));
+            return RegisterResult::Waiter(Arc::clone(&entry.notify).notified_owned());
         }
 
         self.entries.insert(
@@ -80,5 +80,24 @@ mod tests {
         table.complete(&key);
         assert!(table.is_empty());
         assert!(matches!(table.try_register(key), RegisterResult::First));
+    }
+
+    #[test]
+    fn waiter_registered_before_complete_observes_wake() {
+        let mut table = InflightTable::new();
+        let key = ChunkKey::new(FileRef(1), 8, 4);
+
+        assert!(matches!(table.try_register(key), RegisterResult::First));
+        let waiter = match table.try_register(key) {
+            RegisterResult::Waiter(waiter) => waiter,
+            RegisterResult::First => panic!("second registration should wait"),
+        };
+        table.complete(&key);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(waiter);
     }
 }

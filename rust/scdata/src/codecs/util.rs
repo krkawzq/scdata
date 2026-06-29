@@ -31,6 +31,22 @@ pub(crate) fn decode_error(codec: &str, message: impl Into<String>) -> CodecErro
     }
 }
 
+pub(crate) fn reserve_decode_buffer(
+    codec: &str,
+    output: &mut Vec<u8>,
+    additional: usize,
+) -> CodecResult<()> {
+    output
+        .try_reserve_exact(additional)
+        .map_err(|err| decode_error(codec, format!("failed to reserve decode buffer: {err}")))
+}
+
+pub(crate) fn vec_with_decode_capacity(codec: &str, capacity: usize) -> CodecResult<Vec<u8>> {
+    let mut output = Vec::new();
+    reserve_decode_buffer(codec, &mut output, capacity)?;
+    Ok(output)
+}
+
 pub(crate) fn optional_string(
     value: Option<&Value>,
     codec: &str,

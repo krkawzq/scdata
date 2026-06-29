@@ -40,12 +40,14 @@ use support::{bench_data_dir, env_flag, env_usize, payload, BenchConfig};
 
 fn main() {
     let config = BenchConfig::from_env();
-    let Some(fc) = FullchainConfig::from_env(config) else {
+    let explicit_fullchain =
+        env_flag("SCDATA_FULLCHAIN_PREFETCH") || env_flag("SCDATA_FULLCHAIN_MATRIX");
+    let fc = FullchainConfig::from_env(config, explicit_fullchain);
+    if !explicit_fullchain {
         println!(
-            "databank/fullchain_scheduled_prefetch skipped; set SCDATA_FULLCHAIN_PREFETCH=1 or SCDATA_FULLCHAIN_MATRIX=1 to enable"
+            "databank/fullchain_scheduled_prefetch running quick default; set SCDATA_FULLCHAIN_PREFETCH=1 for larger env-driven runs or SCDATA_FULLCHAIN_MATRIX=1 for the matrix"
         );
-        return;
-    };
+    }
 
     if env_flag("SCDATA_FULLCHAIN_MATRIX") {
         run_fullchain_matrix(&fc);
@@ -231,19 +233,33 @@ struct FullchainConfig {
 }
 
 impl FullchainConfig {
-    fn from_env(config: BenchConfig) -> Option<Self> {
-        if !env_flag("SCDATA_FULLCHAIN_PREFETCH") && !env_flag("SCDATA_FULLCHAIN_MATRIX") {
-            return None;
-        }
-        let batch_cells = env_usize("SCDATA_FULLCHAIN_BATCH_CELLS").unwrap_or(128);
-        let genes = env_usize("SCDATA_FULLCHAIN_GENES").unwrap_or(4096);
-        let nnz_per_cell = env_usize("SCDATA_FULLCHAIN_NNZ_PER_CELL").unwrap_or(64);
+    fn from_env(config: BenchConfig, explicit_fullchain: bool) -> Self {
+        let default_batch_cells = if explicit_fullchain { 128 } else { 16 };
+        let default_genes = if explicit_fullchain { 4096 } else { 512 };
+        let default_nnz_per_cell = if explicit_fullchain { 64 } else { 16 };
+        let default_batches = if explicit_fullchain { 64 } else { 8 };
+        let default_chunk_nnz = if explicit_fullchain { 1024 } else { 256 };
+        let default_prefetch_step = if explicit_fullchain { 2 } else { 1 };
+        let default_access_prefetch = if explicit_fullchain { 4 } else { 2 };
+        let default_decode_ahead = if explicit_fullchain { 2 } else { 1 };
+        let default_io_workers = if explicit_fullchain { 8 } else { 2 };
+        let default_io_shards = if explicit_fullchain { 2 } else { 1 };
+        let default_io_inflight = if explicit_fullchain { 256 } else { 64 };
+        let default_scheduler_shards = if explicit_fullchain { 2 } else { 1 };
+        let default_access_cpu_workers = if explicit_fullchain { 4 } else { 2 };
+        let default_decode_workers = if explicit_fullchain { 8 } else { 2 };
+        let default_fill_workers = if explicit_fullchain { 4 } else { 2 };
+        let batch_cells = env_usize("SCDATA_FULLCHAIN_BATCH_CELLS").unwrap_or(default_batch_cells);
+        let genes = env_usize("SCDATA_FULLCHAIN_GENES").unwrap_or(default_genes);
+        let nnz_per_cell =
+            env_usize("SCDATA_FULLCHAIN_NNZ_PER_CELL").unwrap_or(default_nnz_per_cell);
         let batches = env_usize("SCDATA_FULLCHAIN_BATCHES")
             .or_else(|| batches_from_file_mib(batch_cells, nnz_per_cell))
-            .unwrap_or(64);
+            .unwrap_or(default_batches);
         let chunks_per_batch =
             env_usize("SCDATA_FULLCHAIN_CHUNKS_PER_BATCH").unwrap_or_else(|| {
-                let chunk_nnz = env_usize("SCDATA_FULLCHAIN_CHUNK_NNZ").unwrap_or(1024);
+                let chunk_nnz =
+                    env_usize("SCDATA_FULLCHAIN_CHUNK_NNZ").unwrap_or(default_chunk_nnz);
                 (batch_cells * nnz_per_cell)
                     .div_ceil(chunk_nnz.max(1))
                     .max(1)
@@ -253,8 +269,14 @@ impl FullchainConfig {
                 .div_ceil(chunks_per_batch.max(1))
                 .max(1)
         });
-        Some(Self {
-            label: env_str("SCDATA_FULLCHAIN_LABEL").unwrap_or_else(|| "single".to_string()),
+        Self {
+            label: env_str("SCDATA_FULLCHAIN_LABEL").unwrap_or_else(|| {
+                if explicit_fullchain {
+                    "single".to_string()
+                } else {
+                    "quick".to_string()
+                }
+            }),
             codec: FullchainCodec::from_env(),
             batches,
             batch_cells,
@@ -270,25 +292,32 @@ impl FullchainConfig {
                 "SCDATA_FULLCHAIN_DATABANK_PREFETCH_STEP",
                 "SCDATA_FULLCHAIN_PREFETCH_STEP",
             ])
-            .unwrap_or(2),
-            access_prefetch_step: env_usize("SCDATA_FULLCHAIN_ACCESS_PREFETCH_STEP").unwrap_or(4),
-            access_decode_ahead: env_usize("SCDATA_FULLCHAIN_ACCESS_DECODE_AHEAD").unwrap_or(2),
+            .unwrap_or(default_prefetch_step),
+            access_prefetch_step: env_usize("SCDATA_FULLCHAIN_ACCESS_PREFETCH_STEP")
+                .unwrap_or(default_access_prefetch),
+            access_decode_ahead: env_usize("SCDATA_FULLCHAIN_ACCESS_DECODE_AHEAD")
+                .unwrap_or(default_decode_ahead),
             access_ready_ahead: env_usize("SCDATA_FULLCHAIN_ACCESS_READY_AHEAD").unwrap_or(1),
             io_backend: FullchainIoBackend::from_env(),
-            io_workers: env_usize("SCDATA_FULLCHAIN_IO_WORKERS").unwrap_or(8),
-            io_shards: env_usize("SCDATA_FULLCHAIN_IO_SHARDS").unwrap_or(2),
-            io_inflight: env_usize("SCDATA_FULLCHAIN_IO_INFLIGHT").unwrap_or(256),
+            io_workers: env_usize("SCDATA_FULLCHAIN_IO_WORKERS").unwrap_or(default_io_workers),
+            io_shards: env_usize("SCDATA_FULLCHAIN_IO_SHARDS").unwrap_or(default_io_shards),
+            io_inflight: env_usize("SCDATA_FULLCHAIN_IO_INFLIGHT").unwrap_or(default_io_inflight),
             #[cfg(feature = "uring")]
-            uring_entries: env_usize("SCDATA_FULLCHAIN_URING_ENTRIES").unwrap_or(512) as u32,
+            uring_entries: env_usize("SCDATA_FULLCHAIN_URING_ENTRIES")
+                .unwrap_or(default_io_inflight.max(64)) as u32,
             #[cfg(feature = "uring")]
             uring_drivers: env_usize("SCDATA_FULLCHAIN_URING_DRIVERS").unwrap_or(1),
             #[cfg(feature = "uring")]
             uring_registered_files: env_usize("SCDATA_FULLCHAIN_URING_REGISTERED_FILES")
                 .unwrap_or(64) as u32,
-            scheduler_shards: env_usize("SCDATA_FULLCHAIN_SCHEDULER_SHARDS").unwrap_or(2),
-            access_cpu_workers: env_usize("SCDATA_FULLCHAIN_ACCESS_CPU_WORKERS").unwrap_or(4),
-            decode_workers: env_usize("SCDATA_FULLCHAIN_DECODE_WORKERS").unwrap_or(8),
-            fill_workers: env_usize("SCDATA_FULLCHAIN_FILL_WORKERS").unwrap_or(4),
+            scheduler_shards: env_usize("SCDATA_FULLCHAIN_SCHEDULER_SHARDS")
+                .unwrap_or(default_scheduler_shards),
+            access_cpu_workers: env_usize("SCDATA_FULLCHAIN_ACCESS_CPU_WORKERS")
+                .unwrap_or(default_access_cpu_workers),
+            decode_workers: env_usize("SCDATA_FULLCHAIN_DECODE_WORKERS")
+                .unwrap_or(default_decode_workers),
+            fill_workers: env_usize("SCDATA_FULLCHAIN_FILL_WORKERS")
+                .unwrap_or(default_fill_workers),
             bg_cpu_threads: env_usize("SCDATA_FULLCHAIN_BG_CPU_THREADS").unwrap_or(0),
             bg_io_readers: env_usize("SCDATA_FULLCHAIN_BG_IO_READERS").unwrap_or(0),
             bg_io_file_mib: env_usize("SCDATA_FULLCHAIN_BG_IO_FILE_MIB").unwrap_or(64),
@@ -296,8 +325,14 @@ impl FullchainConfig {
             bg_io_same_file: env_flag("SCDATA_FULLCHAIN_BG_IO_SAME_FILE"),
             bg_io_drop_cache: env_flag("SCDATA_FULLCHAIN_BG_IO_DROP_CACHE"),
             data_dir: env_path("SCDATA_FULLCHAIN_DIR").unwrap_or_else(bench_data_dir),
-            warmups: env_usize("SCDATA_FULLCHAIN_WARMUP_BATCHES").unwrap_or(config.warmups),
-        })
+            warmups: env_usize("SCDATA_FULLCHAIN_WARMUP_BATCHES").unwrap_or_else(|| {
+                if explicit_fullchain {
+                    config.warmups
+                } else {
+                    config.warmups.min(1)
+                }
+            }),
+        }
     }
 }
 

@@ -121,9 +121,7 @@ impl DecodeRequest {
     /// Provide caller-owned output capacity for the worker to fill.
     ///
     /// When the final decoded size is known, the vector's capacity is used as
-    /// writable memory so callers can pass `Vec::with_capacity(size)`. Codecs
-    /// that do not provide an internal capacity-safe path will initialize the
-    /// writable range before decoding.
+    /// writable memory so callers can pass `Vec::with_capacity(size)`.
     pub fn with_reuse_capacity_output(mut self, output: Vec<u8>) -> Self {
         self.output = DecodeOutput::ReuseCapacity(output);
         self

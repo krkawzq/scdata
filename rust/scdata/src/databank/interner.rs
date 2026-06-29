@@ -36,6 +36,8 @@ struct InternedGene {
 pub struct DatasetGeneRefs {
     names: Vec<Arc<str>>,
     views: Vec<GeneNameView>,
+    by_name: HashMap<Arc<str>, usize>,
+    duplicate_name: Option<Arc<str>>,
 }
 
 impl GeneInterner {
@@ -46,8 +48,10 @@ impl GeneInterner {
     pub fn intern_dataset(&mut self, names: &[String]) -> DatasetGeneRefs {
         let mut interned = Vec::with_capacity(names.len());
         let mut views = Vec::with_capacity(names.len());
+        let mut by_name = HashMap::with_capacity(names.len());
+        let mut duplicate_name = None;
 
-        for name in names {
+        for (index, name) in names.iter().enumerate() {
             let value = if let Some(existing) = self.strings.get_mut(name.as_str()) {
                 existing.refcount += 1;
                 Arc::clone(&existing.value)
@@ -66,12 +70,17 @@ impl GeneInterner {
                 ptr: value.as_ptr(),
                 len: value.len(),
             });
+            if by_name.insert(Arc::clone(&value), index).is_some() && duplicate_name.is_none() {
+                duplicate_name = Some(Arc::clone(&value));
+            }
             interned.push(value);
         }
 
         DatasetGeneRefs {
             names: interned,
             views,
+            by_name,
+            duplicate_name,
         }
     }
 
@@ -116,5 +125,13 @@ impl DatasetGeneRefs {
 
     pub(crate) fn names(&self) -> &[Arc<str>] {
         &self.names
+    }
+
+    pub(crate) fn index_of(&self, name: &str) -> Option<usize> {
+        self.by_name.get(name).copied()
+    }
+
+    pub(crate) fn duplicate_name(&self) -> Option<&str> {
+        self.duplicate_name.as_ref().map(|name| name.as_ref())
     }
 }

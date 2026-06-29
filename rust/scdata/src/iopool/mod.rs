@@ -67,9 +67,9 @@ pub struct BaseIoConfig {
     pub priority_levels: usize,
     /// Number of independent internal queues. Default: 1.
     ///
-    /// Values greater than 1 reduce lock contention for high-throughput,
-    /// non-overlapping IO workloads. Cross-request ordering and deduplication
-    /// are only guaranteed within a shard.
+    /// Values greater than 1 reduce lock contention across independent files.
+    /// Requests for the same file are routed to the same shard so per-file
+    /// ordering barriers and read deduplication remain intact.
     pub queue_shards: usize,
     /// Enable a read-optimized queue path for workloads where reads are known
     /// not to overlap with writes/truncates. Default: false.
@@ -188,6 +188,10 @@ impl ThreadedConfig {
         self.num_workers.max(1)
     }
 
+    pub(super) fn effective_worker_count(&self) -> usize {
+        self.worker_count().min(self.base.in_flight_limit()).max(1)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.base.validate()?;
 
@@ -255,11 +259,12 @@ impl IoConfig {
 
     pub(super) fn queue_shards(&self) -> usize {
         let requested = self.base().queue_shards();
+        let max_active = self.base().in_flight_limit();
         let consumers = match self {
             Self::Uring(config) => config.drivers.max(1),
-            Self::Threaded(config) => config.worker_count(),
+            Self::Threaded(config) => config.effective_worker_count(),
         };
-        requested.min(consumers).max(1)
+        requested.min(consumers).min(max_active).max(1)
     }
 }
 
@@ -606,11 +611,17 @@ pub(super) struct FixedFileUpdate {
 #[derive(Debug)]
 pub(super) enum FileSlot {
     Open(Arc<File>),
-    Closing { _handle: Arc<File> },
+    Closing { handle: Arc<File>, reopenable: bool },
     Closed,
 }
 
 pub(super) type FileTable = RwLock<Vec<FileSlot>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosingMark {
+    NewlyMarked,
+    AlreadyClosing,
+}
 
 impl FileSlot {
     fn open_file(&self) -> Option<Arc<File>> {
@@ -701,6 +712,10 @@ struct Inner {
     ready_refresh: Vec<WorkId>,
     #[cfg(feature = "uring")]
     fixed_file_updates: Vec<FixedFileUpdate>,
+    #[cfg(feature = "uring")]
+    fixed_file_update_base: usize,
+    #[cfg(feature = "uring")]
+    fixed_file_update_cursors: HashMap<RawFd, usize>,
     table: HashMap<WorkId, Inflight>,
     dedup: HashMap<RequestKey, WorkId>,
     active_by_file: Vec<Option<FileActive>>,
@@ -712,9 +727,60 @@ struct Inner {
 }
 
 #[derive(Debug)]
+struct ActiveLimiter {
+    max: usize,
+    active: AtomicUsize,
+}
+
+impl ActiveLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(&self) -> io::Result<()> {
+        let mut current = self.active.load(Ordering::Relaxed);
+        loop {
+            if current >= self.max {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("IO queue reached max_in_flight={}", self.max),
+                ));
+            }
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn release(&self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+
+    fn release_many(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let previous = self.active.fetch_sub(count, Ordering::AcqRel);
+        debug_assert!(previous >= count);
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct QueueCore {
     inner: Mutex<Inner>,
+    active_limiter: Arc<ActiveLimiter>,
     available: Condvar,
+    inactive_waiters: AtomicUsize,
     #[cfg(feature = "uring")]
     wake_fds: Mutex<Vec<RawFd>>,
     #[cfg(feature = "uring")]
@@ -727,10 +793,25 @@ impl QueueCore {
         Self::new_with_fast_read_path(priority_levels, max_active, false)
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_fast_read_path(
         priority_levels: usize,
         max_active: usize,
         fast_read_path: bool,
+    ) -> Self {
+        Self::new_with_limiter(
+            priority_levels,
+            max_active,
+            fast_read_path,
+            Arc::new(ActiveLimiter::new(max_active)),
+        )
+    }
+
+    fn new_with_limiter(
+        priority_levels: usize,
+        max_active: usize,
+        fast_read_path: bool,
+        active_limiter: Arc<ActiveLimiter>,
     ) -> Self {
         let priority_levels = priority_levels.max(1);
         Self {
@@ -744,6 +825,10 @@ impl QueueCore {
                 ready_refresh: Vec::new(),
                 #[cfg(feature = "uring")]
                 fixed_file_updates: Vec::new(),
+                #[cfg(feature = "uring")]
+                fixed_file_update_base: 0,
+                #[cfg(feature = "uring")]
+                fixed_file_update_cursors: HashMap::new(),
                 table: HashMap::with_capacity(max_active),
                 dedup: HashMap::with_capacity(max_active),
                 active_by_file: Vec::new(),
@@ -753,7 +838,9 @@ impl QueueCore {
                 shutdown: false,
                 failure: None,
             }),
+            active_limiter,
             available: Condvar::new(),
+            inactive_waiters: AtomicUsize::new(0),
             #[cfg(feature = "uring")]
             wake_fds: Mutex::new(Vec::new()),
             #[cfg(feature = "uring")]
@@ -797,6 +884,14 @@ impl QueueCore {
             ));
         }
 
+        if let Some(output) = immediate_operation_output(&operation) {
+            if Self::can_complete_immediately_locked(&inner, access) {
+                drop(inner);
+                let _ = tx.send(Ok(output));
+                return Ok(IoFuture::detached(rx));
+            }
+        }
+
         if let Some(key) = key {
             if let Some(id) = inner.dedup.get(&key).copied() {
                 if inner
@@ -804,6 +899,13 @@ impl QueueCore {
                     .get(&id)
                     .is_some_and(|inflight| Self::can_dedup_locked(&inner, id, inflight, access))
                 {
+                    if inner
+                        .table
+                        .get(&id)
+                        .is_some_and(|inflight| inflight.refcount == usize::MAX)
+                    {
+                        return Err(refcount_overflow());
+                    }
                     Self::promote_priority_locked(&mut inner, id, priority);
                     let inflight = inner
                         .table
@@ -835,6 +937,7 @@ impl QueueCore {
             io::Error::new(io::ErrorKind::OutOfMemory, "IO sequence counter overflowed")
         })?;
 
+        self.active_limiter.try_acquire()?;
         let fast_read = Self::can_use_fast_read_locked(&inner, access);
 
         inner.table.insert(
@@ -895,14 +998,14 @@ impl QueueCore {
             if inner.shutdown {
                 return QueueWake::Shutdown;
             }
-            if inner.fixed_file_updates.len() > fixed_file_update_cursor {
+            if Self::fixed_file_update_tail_locked(&inner) > fixed_file_update_cursor {
                 return QueueWake::Notified;
             }
 
             inner = self.available.wait(inner).unwrap();
             if !inner.shutdown
                 && inner.ready.is_empty()
-                && inner.fixed_file_updates.len() > fixed_file_update_cursor
+                && Self::fixed_file_update_tail_locked(&inner) > fixed_file_update_cursor
             {
                 return QueueWake::Notified;
             }
@@ -924,19 +1027,22 @@ impl QueueCore {
     }
 
     pub(super) fn complete(&self, id: WorkId, result: io::Result<IoOutput>) {
-        let (waiters, ready_count) = {
+        let (waiters, ready_count, file_inactive) = {
             let mut inner = self.inner.lock().unwrap();
             let Some(inflight) = Self::remove_locked(&mut inner, id) else {
                 return;
             };
             let access = inflight.access;
+            let file = access.file();
             let waiters = inflight.waiters;
             let ready_count = Self::refresh_ready_after_removed_locked(&mut inner, access);
-            (waiters, ready_count)
+            let file_inactive = !Self::file_active_locked(&inner, file);
+            (waiters, ready_count, file_inactive)
         };
 
+        self.active_limiter.release();
         self.notify_ready_count(ready_count);
-        self.available.notify_all();
+        self.notify_file_inactive(file_inactive);
         let result = result.map_err(SharedIoError::from);
         waiters.send(result);
     }
@@ -950,13 +1056,16 @@ impl QueueCore {
         inflight.refcount = inflight.refcount.saturating_sub(1);
         let should_remove = inflight.refcount == 0 && inflight.state == InflightState::Queued;
         let access = inflight.access;
+        let file = access.file();
         if should_remove {
             inner.queued = inner.queued.saturating_sub(1);
             Self::remove_locked(&mut inner, id);
             let ready_count = Self::refresh_ready_after_removed_locked(&mut inner, access);
+            let file_inactive = !Self::file_active_locked(&inner, file);
             drop(inner);
+            self.active_limiter.release();
             self.notify_ready_count(ready_count);
-            self.available.notify_all();
+            self.notify_file_inactive(file_inactive);
         }
     }
 
@@ -970,13 +1079,15 @@ impl QueueCore {
     #[cfg(any(feature = "uring", test))]
     pub(super) fn fail(&self, err: io::Error) {
         let failure = SharedIoError::from(err);
-        let waiters = {
+        let (waiters, released) = {
             let mut inner = self.inner.lock().unwrap();
             inner.shutdown = true;
             inner.failure = Some(failure.clone());
-            Self::drain_locked(&mut inner)
+            let released = inner.table.len();
+            (Self::drain_locked(&mut inner), released)
         };
 
+        self.active_limiter.release_many(released);
         for waiters in waiters {
             waiters.send(Err(failure.clone()));
         }
@@ -1010,15 +1121,29 @@ impl QueueCore {
         }
     }
 
+    fn notify_file_inactive(&self, file_inactive: bool) {
+        if file_inactive && self.inactive_waiters.load(Ordering::Acquire) > 0 {
+            self.available.notify_all();
+        }
+    }
+
     #[cfg(feature = "uring")]
     #[allow(dead_code)]
     pub(super) fn register_wake_fd(&self, fd: RawFd) {
+        let mut inner = self.inner.lock().unwrap();
+        let base = inner.fixed_file_update_base;
+        inner.fixed_file_update_cursors.insert(fd, base);
+        drop(inner);
         self.wake_fds.lock().unwrap().push(fd);
     }
 
     #[cfg(feature = "uring")]
     #[allow(dead_code)]
     pub(super) fn unregister_wake_fd(&self, fd: RawFd) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.fixed_file_update_cursors.remove(&fd);
+        Self::compact_fixed_file_updates_locked(&mut inner);
+        drop(inner);
         let mut wake_fds = self.wake_fds.lock().unwrap();
         if let Some(index) = wake_fds.iter().position(|wake_fd| *wake_fd == fd) {
             wake_fds.swap_remove(index);
@@ -1044,13 +1169,39 @@ impl QueueCore {
     #[cfg(feature = "uring")]
     pub(super) fn fixed_file_updates_since(
         &self,
+        reader_fd: RawFd,
         cursor: usize,
         out: &mut Vec<FixedFileUpdate>,
     ) -> usize {
-        let inner = self.inner.lock().unwrap();
-        let cursor = cursor.min(inner.fixed_file_updates.len());
-        out.extend_from_slice(&inner.fixed_file_updates[cursor..]);
-        inner.fixed_file_updates.len()
+        let mut inner = self.inner.lock().unwrap();
+        let base = inner.fixed_file_update_base;
+        let tail = Self::fixed_file_update_tail_locked(&inner);
+        let cursor = cursor.max(base).min(tail);
+        let offset = cursor - base;
+        out.extend_from_slice(&inner.fixed_file_updates[offset..]);
+        inner.fixed_file_update_cursors.insert(reader_fd, tail);
+        Self::compact_fixed_file_updates_locked(&mut inner);
+        tail
+    }
+
+    #[cfg(feature = "uring")]
+    fn fixed_file_update_tail_locked(inner: &Inner) -> usize {
+        inner.fixed_file_update_base + inner.fixed_file_updates.len()
+    }
+
+    #[cfg(feature = "uring")]
+    fn compact_fixed_file_updates_locked(inner: &mut Inner) {
+        let Some(min_cursor) = inner.fixed_file_update_cursors.values().copied().min() else {
+            return;
+        };
+        let drain_len = min_cursor
+            .saturating_sub(inner.fixed_file_update_base)
+            .min(inner.fixed_file_updates.len());
+        if drain_len == 0 {
+            return;
+        }
+        inner.fixed_file_updates.drain(..drain_len);
+        inner.fixed_file_update_base += drain_len;
     }
 
     #[cfg(feature = "uring")]
@@ -1099,6 +1250,22 @@ impl QueueCore {
             .get(access.file())
             .and_then(Option::as_ref)
             .map_or(true, |active| active.barriers.is_empty())
+    }
+
+    fn can_complete_immediately_locked(inner: &Inner, access: Access) -> bool {
+        let Some(active) = inner
+            .active_by_file
+            .get(access.file())
+            .and_then(Option::as_ref)
+        else {
+            return true;
+        };
+
+        match access {
+            Access::Read { .. } => active.barriers.is_empty(),
+            Access::Write { .. } => active.barriers.is_empty() && active.metadata.is_empty(),
+            Access::Sync { .. } | Access::Truncate { .. } | Access::Metadata { .. } => false,
+        }
     }
 
     fn insert_fast_read_locked(inner: &mut Inner, file: FileId, priority: usize, id: WorkId) {
@@ -1214,6 +1381,13 @@ impl QueueCore {
         inner.ready_refresh.clear();
         #[cfg(feature = "uring")]
         inner.fixed_file_updates.clear();
+        #[cfg(feature = "uring")]
+        {
+            inner.fixed_file_update_base = 0;
+            for cursor in inner.fixed_file_update_cursors.values_mut() {
+                *cursor = 0;
+            }
+        }
         for ready in &mut inner.fast_ready {
             ready.clear();
         }
@@ -1353,6 +1527,11 @@ impl QueueCore {
         if priority >= inflight.priority {
             return;
         }
+        if inflight.state != InflightState::Queued {
+            let inflight = inner.table.get_mut(&id).expect("entry checked above");
+            inflight.priority = priority;
+            return;
+        }
         if inflight.fast_read {
             let inflight = inner.table.get_mut(&id).expect("entry checked above");
             inflight.priority = priority;
@@ -1434,9 +1613,14 @@ impl QueueCore {
 
     fn wait_until_file_inactive(&self, file: FileId) {
         let mut inner = self.inner.lock().unwrap();
+        if !Self::file_active_locked(&inner, file) {
+            return;
+        }
+        self.inactive_waiters.fetch_add(1, Ordering::AcqRel);
         while Self::file_active_locked(&inner, file) {
             inner = self.available.wait(inner).unwrap();
         }
+        self.inactive_waiters.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn file_active_locked(inner: &Inner, file: FileId) -> bool {
@@ -1470,6 +1654,18 @@ impl QueueCore {
         let inner = self.inner.lock().unwrap();
         Self::fast_active_read_count(&inner, file)
     }
+
+    #[cfg(test)]
+    fn debug_fast_ready_count(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.fast_ready.iter().map(VecDeque::len).sum()
+    }
+
+    #[cfg(all(test, feature = "uring"))]
+    fn debug_fixed_file_update_count(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.fixed_file_updates.len()
+    }
 }
 
 /// Future returned by [`IoPool::submit`].
@@ -1496,6 +1692,15 @@ impl IoFuture {
             queue,
             id,
             released: false,
+        }
+    }
+
+    fn detached(rx: tokio::sync::oneshot::Receiver<SharedIoResult>) -> Self {
+        Self {
+            rx: Some(rx),
+            queue: Weak::new(),
+            id: WorkId(0),
+            released: true,
         }
     }
 
@@ -1556,21 +1761,26 @@ impl Future for IoFuture {
     type Output = io::Result<IoOutput>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Some(rx) = self.rx.as_mut() else {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "IO future was already consumed",
-            )));
+        let poll_result = {
+            let Some(rx) = self.rx.as_mut() else {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "IO future was already consumed",
+                )));
+            };
+            Pin::new(rx).poll(cx)
         };
 
-        match Pin::new(rx).poll(cx) {
+        match poll_result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(result)) => {
                 self.released = true;
+                self.rx = None;
                 Poll::Ready(shared_to_io_result(result))
             }
             Poll::Ready(Err(_)) => {
                 self.released = true;
+                self.rx = None;
                 Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "IO result sender was dropped",
@@ -1595,8 +1805,8 @@ impl Drop for IoFuture {
 /// The IO execution pool.
 pub struct IoPool {
     queues: Vec<Arc<QueueCore>>,
-    submit_cursor: AtomicUsize,
     file_table: Arc<FileTable>,
+    free_file_ids: Mutex<Vec<FileId>>,
     threads: Vec<thread::JoinHandle<()>>,
     #[cfg(feature = "uring")]
     uses_uring: bool,
@@ -1609,14 +1819,16 @@ impl IoPool {
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
 
         let queue_count = config.queue_shards();
-        let per_queue_limit = split_limit(config.in_flight_limit(), queue_count);
+        let in_flight_limit = config.in_flight_limit();
+        let active_limiter = Arc::new(ActiveLimiter::new(in_flight_limit));
         let fast_read_path = config.base().assume_non_overlapping_reads;
         let queues = (0..queue_count)
             .map(|_| {
-                Arc::new(QueueCore::new_with_fast_read_path(
+                Arc::new(QueueCore::new_with_limiter(
                     config.priority_levels(),
-                    per_queue_limit,
+                    in_flight_limit,
                     fast_read_path,
+                    Arc::clone(&active_limiter),
                 ))
             })
             .collect::<Vec<_>>();
@@ -1633,8 +1845,8 @@ impl IoPool {
 
         Ok(Self {
             queues,
-            submit_cursor: AtomicUsize::new(0),
             file_table,
+            free_file_ids: Mutex::new(Vec::new()),
             threads,
             #[cfg(feature = "uring")]
             uses_uring,
@@ -1677,8 +1889,22 @@ impl IoPool {
         let fd = file.as_raw_fd();
         let file = Arc::new(file);
         let mut table = self.file_table.write().unwrap();
-        let id = table.len();
-        table.push(FileSlot::Open(file));
+        let mut free_file_ids = self.free_file_ids.lock().unwrap();
+        let id = loop {
+            let Some(candidate) = free_file_ids.pop() else {
+                let id = table.len();
+                table.push(FileSlot::Open(Arc::clone(&file)));
+                break id;
+            };
+            if table
+                .get(candidate)
+                .is_some_and(|slot| matches!(slot, FileSlot::Closed))
+            {
+                table[candidate] = FileSlot::Open(Arc::clone(&file));
+                break candidate;
+            }
+        };
+        drop(free_file_ids);
         drop(table);
         #[cfg(feature = "uring")]
         self.update_fixed_file(id, fd);
@@ -1686,37 +1912,84 @@ impl IoPool {
     }
 
     pub fn unregister_file(&self, file: FileId) -> io::Result<()> {
-        self.mark_file_closing(file)?;
+        self.mark_file_closing(file, false)?;
         for queue in &self.queues {
             queue.wait_until_file_inactive(file);
         }
         self.finish_unregister_file(file)
     }
 
+    /// Try to unregister a file without waiting for active IO.
+    ///
+    /// If this returns `WouldBlock`, the file is restored to the open state when
+    /// this call was the one that marked it closing.
     pub fn try_unregister_file(&self, file: FileId) -> io::Result<()> {
-        self.mark_file_closing(file)?;
+        let mark = self.mark_file_closing(file, true)?;
+        if mark == ClosingMark::AlreadyClosing {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("file_id {file} is already closing"),
+            ));
+        }
         if self.queues.iter().any(|queue| queue.has_active_file(file)) {
+            let _ = self.reopen_file_if_reopenable(file)?;
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("file_id {file} still has active IO"),
             ));
         }
-        self.finish_unregister_file(file)
+        if self.finish_unregister_file_if_reopenable(file)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("file_id {file} is already closing"),
+            ))
+        }
     }
 
-    fn mark_file_closing(&self, file: FileId) -> io::Result<()> {
+    fn mark_file_closing(&self, file: FileId, reopenable: bool) -> io::Result<ClosingMark> {
         let mut table = self.file_table.write().unwrap();
         let Some(slot) = table.get_mut(file) else {
             return Err(invalid_file_id(file));
         };
         match slot {
             FileSlot::Open(handle) => {
-                *slot = FileSlot::Closing {
-                    _handle: Arc::clone(handle),
-                };
-                Ok(())
+                let handle = Arc::clone(handle);
+                *slot = FileSlot::Closing { handle, reopenable };
+                Ok(ClosingMark::NewlyMarked)
             }
-            FileSlot::Closing { .. } => Ok(()),
+            FileSlot::Closing {
+                reopenable: current,
+                ..
+            } => {
+                if !reopenable {
+                    *current = false;
+                }
+                Ok(ClosingMark::AlreadyClosing)
+            }
+            FileSlot::Closed => Err(invalid_file_id(file)),
+        }
+    }
+
+    fn reopen_file_if_reopenable(&self, file: FileId) -> io::Result<bool> {
+        let mut table = self.file_table.write().unwrap();
+        let Some(slot) = table.get_mut(file) else {
+            return Err(invalid_file_id(file));
+        };
+        match slot {
+            FileSlot::Closing {
+                handle,
+                reopenable: true,
+            } => {
+                let handle = Arc::clone(handle);
+                *slot = FileSlot::Open(handle);
+                Ok(true)
+            }
+            FileSlot::Closing {
+                reopenable: false, ..
+            } => Ok(false),
+            FileSlot::Open(_) => Ok(true),
             FileSlot::Closed => Err(invalid_file_id(file)),
         }
     }
@@ -1741,7 +2014,37 @@ impl IoPool {
         drop(table);
         #[cfg(feature = "uring")]
         self.update_fixed_file(file, -1);
+        self.free_file_ids.lock().unwrap().push(file);
         Ok(())
+    }
+
+    fn finish_unregister_file_if_reopenable(&self, file: FileId) -> io::Result<bool> {
+        let mut table = self.file_table.write().unwrap();
+        let Some(slot) = table.get_mut(file) else {
+            return Err(invalid_file_id(file));
+        };
+        match slot {
+            FileSlot::Open(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("file_id {file} is not closing"),
+                ));
+            }
+            FileSlot::Closing {
+                reopenable: true, ..
+            } => {
+                *slot = FileSlot::Closed;
+            }
+            FileSlot::Closing {
+                reopenable: false, ..
+            } => return Ok(false),
+            FileSlot::Closed => return Err(invalid_file_id(file)),
+        }
+        drop(table);
+        #[cfg(feature = "uring")]
+        self.update_fixed_file(file, -1);
+        self.free_file_ids.lock().unwrap().push(file);
+        Ok(true)
     }
 
     pub fn submit(&self, cmd: IoCommand) -> io::Result<IoFuture> {
@@ -1755,29 +2058,19 @@ impl IoPool {
     }
 
     fn select_queue(&self, cmd: &IoCommand) -> &Arc<QueueCore> {
-        if self.queues.len() == 1 {
-            return &self.queues[0];
-        }
-
-        let shard = match cmd {
-            IoCommand::Read {
-                file, offset, len, ..
-            } if *len != 0 => {
-                let block = (*offset / *len as u64) as usize;
-                block.wrapping_add(file.wrapping_mul(0x9e37_79b1)) % self.queues.len()
-            }
-            _ => self.submit_cursor.fetch_add(1, Ordering::Relaxed) % self.queues.len(),
-        };
-        &self.queues[shard]
+        self.queue_for_file(cmd.file())
     }
 
     #[cfg(feature = "uring")]
     fn update_fixed_file(&self, file: FileId, fd: RawFd) {
         if self.uses_uring {
-            for queue in &self.queues {
-                queue.push_fixed_file_update(FixedFileUpdate { file, fd });
-            }
+            self.queue_for_file(file)
+                .push_fixed_file_update(FixedFileUpdate { file, fd });
         }
+    }
+
+    fn queue_for_file(&self, file: FileId) -> &Arc<QueueCore> {
+        &self.queues[file % self.queues.len()]
     }
 
     #[cfg(feature = "uring")]
@@ -1813,11 +2106,6 @@ impl Drop for IoPool {
             }
         }
     }
-}
-
-fn split_limit(total: usize, shards: usize) -> usize {
-    let shards = shards.max(1);
-    (total / shards + usize::from(total % shards != 0)).max(1)
 }
 
 pub(super) fn execute_work(file_table: &Arc<FileTable>, op: IoOperation) -> io::Result<IoOutput> {
@@ -1869,6 +2157,19 @@ pub(super) fn execute_work(file_table: &Arc<FileTable>, op: IoOperation) -> io::
     }
 }
 
+fn immediate_operation_output(op: &IoOperation) -> Option<IoOutput> {
+    match op {
+        IoOperation::Read { len: 0, .. } => Some(IoOutput::Read(Arc::from(Vec::new()))),
+        IoOperation::Write { buf, .. } if buf.is_empty() => Some(IoOutput::Write { bytes: 0 }),
+        IoOperation::Read { .. }
+        | IoOperation::Write { .. }
+        | IoOperation::Fsync { .. }
+        | IoOperation::SyncData { .. }
+        | IoOperation::Truncate { .. }
+        | IoOperation::Metadata { .. } => None,
+    }
+}
+
 fn operation_file(
     file_table: &Arc<FileTable>,
     file_id: FileId,
@@ -1906,7 +2207,7 @@ fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
             }
             n => {
                 buf = &buf[n..];
-                offset += n as u64;
+                offset = offset.checked_add(n as u64).ok_or_else(offset_overflow)?;
             }
         }
     }
@@ -1915,7 +2216,10 @@ fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
 
 pub(super) fn uninit_read_buffer(len: usize) -> Box<[MaybeUninit<u8>]> {
     let mut buf = Vec::with_capacity(len);
-    buf.resize_with(len, MaybeUninit::uninit);
+    // `MaybeUninit<u8>` does not require initialization before becoming live.
+    unsafe {
+        buf.set_len(len);
+    }
     buf.into_boxed_slice()
 }
 
@@ -1928,6 +2232,17 @@ fn invalid_file_id(file_id: FileId) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         format!("invalid file_id {file_id}"),
+    )
+}
+
+fn offset_overflow() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "IO offset overflowed")
+}
+
+fn refcount_overflow() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        "IO waiter reference count overflowed",
     )
 }
 
@@ -1983,17 +2298,442 @@ mod tests {
         .expect("create pool")
     }
 
+    fn make_unstarted_pool(queue_count: usize, max_active: usize) -> IoPool {
+        let active_limiter = Arc::new(ActiveLimiter::new(max_active));
+        IoPool {
+            queues: (0..queue_count)
+                .map(|_| {
+                    Arc::new(QueueCore::new_with_limiter(
+                        3,
+                        max_active,
+                        false,
+                        Arc::clone(&active_limiter),
+                    ))
+                })
+                .collect(),
+            file_table: Arc::new(RwLock::new(Vec::new())),
+            free_file_ids: Mutex::new(Vec::new()),
+            threads: Vec::new(),
+            #[cfg(feature = "uring")]
+            uses_uring: false,
+        }
+    }
+
+    #[cfg(feature = "uring")]
+    fn make_unstarted_uring_pool(queue_count: usize, max_active: usize) -> IoPool {
+        let active_limiter = Arc::new(ActiveLimiter::new(max_active));
+        IoPool {
+            queues: (0..queue_count)
+                .map(|_| {
+                    Arc::new(QueueCore::new_with_limiter(
+                        3,
+                        max_active,
+                        false,
+                        Arc::clone(&active_limiter),
+                    ))
+                })
+                .collect(),
+            file_table: Arc::new(RwLock::new(Vec::new())),
+            free_file_ids: Mutex::new(Vec::new()),
+            threads: Vec::new(),
+            uses_uring: true,
+        }
+    }
+
+    #[cfg(feature = "uring")]
+    fn test_eventfd() -> RawFd {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(fd >= 0, "create eventfd: {}", io::Error::last_os_error());
+        fd
+    }
+
+    #[cfg(feature = "uring")]
+    fn close_test_fd(fd: RawFd) {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn global_in_flight_limit_spans_shards() {
+        let path_a = temp_file("global_limit_a", b"abcdefgh");
+        let path_b = temp_file("global_limit_b", b"ABCDEFGH");
+        let pool = make_unstarted_pool(2, 2);
+        let file_a = pool.register_readonly_file(&path_a).expect("register a");
+        let file_b = pool.register_readonly_file(&path_b).expect("register b");
+
+        let first = pool
+            .submit(IoCommand::read(file_a, 0, 1, 0))
+            .expect("first read");
+        let second = pool
+            .submit(IoCommand::read(file_b, 0, 1, 0))
+            .expect("second read");
+        let err = pool
+            .submit(IoCommand::read(file_a, 1, 1, 0))
+            .expect_err("global limit should reject third unique read");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        drop(first);
+        let third = pool
+            .submit(IoCommand::read(file_a, 1, 1, 0))
+            .expect("released permit should allow another read");
+        drop(second);
+        drop(third);
+    }
+
+    #[test]
+    fn same_file_can_use_full_global_in_flight_limit() {
+        let path = temp_file("same_file_full_limit", b"abcdefghijklmnopqrstuvwxyz");
+        let pool = make_unstarted_pool(2, 4);
+        let file = pool.register_readonly_file(&path).expect("register");
+
+        let reads = (0..4)
+            .map(|offset| {
+                pool.submit(IoCommand::read(file, offset, 1, 0))
+                    .expect("same-file read within global limit")
+            })
+            .collect::<Vec<_>>();
+        let err = pool
+            .submit(IoCommand::read(file, 4, 1, 0))
+            .expect_err("fifth read should exceed global limit");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        for read in reads {
+            drop(read);
+        }
+    }
+
+    #[test]
+    fn zero_length_read_and_write_bypass_in_flight_limit() {
+        let path = temp_file("zero_len_bypass", b"abcdef");
+        let pool = make_unstarted_pool(1, 1);
+        let file = pool.register_readonly_file(&path).expect("register");
+        let held = pool
+            .submit(IoCommand::read(file, 0, 1, 0))
+            .expect("occupy in-flight permit");
+
+        let empty = pool
+            .submit(IoCommand::read(file, 3, 0, 0))
+            .expect("zero-length read should complete immediately")
+            .blocking_recv_read()
+            .expect("zero read");
+        assert!(empty.is_empty());
+
+        let written = pool
+            .submit(IoCommand::write(file, 3, Vec::new(), 0))
+            .expect("zero-length write should complete immediately")
+            .blocking_recv()
+            .expect("zero write");
+        assert_eq!(written.bytes_written(), Some(0));
+
+        let err = pool
+            .submit(IoCommand::read(file, 1, 1, 0))
+            .expect_err("detached zero-length futures must not release active permits");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        drop(held);
+        let next = pool
+            .submit(IoCommand::read(file, 1, 1, 0))
+            .expect("dropping held read releases permit");
+        drop(next);
+    }
+
+    #[test]
+    fn zero_length_operations_respect_prior_barrier() {
+        let queue = Arc::new(QueueCore::new(2, 8));
+        let sync = queue.submit(IoCommand::sync_all(0, 0)).expect("sync");
+        let sync_work = queue.pop().expect("dispatch sync");
+
+        let mut read = queue
+            .submit(IoCommand::read(0, 42, 0, 0))
+            .expect("zero read behind barrier");
+        let mut write = queue
+            .submit(IoCommand::write(0, 42, Vec::new(), 0))
+            .expect("zero write behind barrier");
+
+        assert!(read.try_recv().expect("read pending").is_none());
+        assert!(write.try_recv().expect("write pending").is_none());
+
+        queue.complete(sync_work.id, Ok(IoOutput::SyncAll));
+        assert!(matches!(
+            sync.blocking_recv().expect("sync"),
+            IoOutput::SyncAll
+        ));
+
+        let read_work = queue.pop().expect("zero read dispatches after barrier");
+        match read_work.op {
+            IoOperation::Read { len, .. } => assert_eq!(len, 0),
+            _ => panic!("expected zero read"),
+        }
+        queue.complete(read_work.id, Ok(IoOutput::Read(Arc::from(Vec::new()))));
+        assert!(read.blocking_recv_read().expect("zero read").is_empty());
+
+        let write_work = queue.pop().expect("zero write dispatches after barrier");
+        match write_work.op {
+            IoOperation::Write { buf, .. } => assert!(buf.is_empty()),
+            _ => panic!("expected zero write"),
+        }
+        queue.complete(write_work.id, Ok(IoOutput::Write { bytes: 0 }));
+        assert_eq!(
+            write.blocking_recv().expect("zero write").bytes_written(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn queue_shards_respect_consumers_and_max_in_flight() {
+        let config = IoConfig::Threaded(ThreadedConfig {
+            base: BaseIoConfig {
+                max_in_flight: 1,
+                priority_levels: 2,
+                queue_shards: 4,
+                assume_non_overlapping_reads: false,
+            },
+            num_workers: 4,
+            cpus: None,
+        });
+
+        assert_eq!(config.queue_shards(), 1);
+    }
+
+    #[test]
+    fn same_file_commands_route_to_same_shard() {
+        let pool = make_unstarted_pool(2, 4);
+        let read = Arc::as_ptr(pool.select_queue(&IoCommand::read(3, 0, 1, 0)));
+        let sync = Arc::as_ptr(pool.select_queue(&IoCommand::sync_all(3, 0)));
+        let metadata = Arc::as_ptr(pool.select_queue(&IoCommand::metadata(3, 0)));
+        let other_file = Arc::as_ptr(pool.select_queue(&IoCommand::read(4, 0, 1, 0)));
+
+        assert_eq!(read, sync);
+        assert_eq!(read, metadata);
+        assert_ne!(read, other_file);
+    }
+
+    #[test]
+    fn excessive_shards_do_not_leave_work_without_worker() {
+        let path = temp_file("excessive_shards", b"abcdefghijklmnopqrstuvwxyz");
+        let pool = IoPool::new(IoConfig::Threaded(ThreadedConfig {
+            base: BaseIoConfig {
+                max_in_flight: 1,
+                priority_levels: 2,
+                queue_shards: 4,
+                assume_non_overlapping_reads: false,
+            },
+            num_workers: 4,
+            cpus: None,
+        }))
+        .expect("create constrained pool");
+
+        assert_eq!(pool.queues.len(), 1);
+        let file = pool.register_readonly_file(&path).expect("register");
+        let bytes = pool
+            .submit(IoCommand::read(file, 3, 4, 0))
+            .expect("submit")
+            .blocking_recv_read()
+            .expect("read");
+        assert_eq!(&*bytes, b"defg");
+    }
+
+    #[test]
+    fn try_unregister_file_restores_open_file_on_would_block() {
+        let path = temp_file("try_unregister_rollback", b"hello");
+        let pool = make_unstarted_pool(1, 4);
+        let file = pool.register_readonly_file(&path).expect("register");
+        let future = pool
+            .submit(IoCommand::read(file, 0, 5, 0))
+            .expect("submit queued read");
+
+        let err = pool
+            .try_unregister_file(file)
+            .expect_err("active file should not unregister");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        drop(future);
+        let second = pool
+            .submit(IoCommand::read(file, 0, 5, 0))
+            .expect("file should be open after failed try_unregister");
+        drop(second);
+        pool.unregister_file(file)
+            .expect("unregister after releases");
+    }
+
+    #[test]
+    fn blocking_unregister_claim_prevents_try_unregister_reopen() {
+        let path = temp_file("try_unregister_claimed", b"hello");
+        let pool = make_unstarted_pool(1, 4);
+        let file = pool.register_readonly_file(&path).expect("register");
+        let future = pool
+            .submit(IoCommand::read(file, 0, 5, 0))
+            .expect("submit queued read");
+
+        assert_eq!(
+            pool.mark_file_closing(file, true)
+                .expect("try mark closing"),
+            ClosingMark::NewlyMarked
+        );
+        assert_eq!(
+            pool.mark_file_closing(file, false)
+                .expect("blocking unregister claims closing file"),
+            ClosingMark::AlreadyClosing
+        );
+        assert!(!pool
+            .reopen_file_if_reopenable(file)
+            .expect("try unregister should not reopen claimed closing file"));
+
+        drop(future);
+        pool.finish_unregister_file(file)
+            .expect("blocking unregister can finish");
+        let err = pool
+            .submit(IoCommand::read(file, 0, 1, 0))
+            .expect_err("file should remain closed");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn try_unregister_does_not_finish_file_already_closing() {
+        let path = temp_file("try_unregister_already_closing", b"hello");
+        let pool = make_unstarted_pool(1, 4);
+        let file = pool.register_readonly_file(&path).expect("register");
+
+        pool.mark_file_closing(file, false)
+            .expect("blocking unregister marks closing");
+        let err = pool
+            .try_unregister_file(file)
+            .expect_err("try unregister should not claim an already closing file");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        pool.finish_unregister_file(file)
+            .expect("original unregister can finish");
+        let err = pool
+            .submit(IoCommand::read(file, 0, 1, 0))
+            .expect_err("file should be closed");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn try_unregister_finish_loses_to_blocking_claim() {
+        let path = temp_file("try_unregister_finish_claimed", b"hello");
+        let pool = make_unstarted_pool(1, 4);
+        let file = pool.register_readonly_file(&path).expect("register");
+
+        assert_eq!(
+            pool.mark_file_closing(file, true)
+                .expect("try unregister marks closing"),
+            ClosingMark::NewlyMarked
+        );
+        assert_eq!(
+            pool.mark_file_closing(file, false)
+                .expect("blocking unregister claims closing"),
+            ClosingMark::AlreadyClosing
+        );
+        assert!(!pool
+            .finish_unregister_file_if_reopenable(file)
+            .expect("try unregister should not finish claimed file"));
+
+        pool.finish_unregister_file(file)
+            .expect("blocking unregister can finish");
+        let err = pool
+            .submit(IoCommand::read(file, 0, 1, 0))
+            .expect_err("file should be closed");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn unregister_reuses_closed_file_id() {
+        let path = temp_file("reuse_file_id", b"hello");
+        let pool = make_pool();
+
+        let first = pool.register_readonly_file(&path).expect("register first");
+        pool.unregister_file(first).expect("unregister first");
+        let second = pool.register_readonly_file(&path).expect("register second");
+
+        assert_eq!(first, second);
+    }
+
     #[cfg(feature = "uring")]
     #[test]
     fn fixed_file_update_wakes_empty_queue() {
         let queue = Arc::new(QueueCore::new(1, 1));
+        let fd = test_eventfd();
+        queue.register_wake_fd(fd);
         queue.push_fixed_file_update(FixedFileUpdate { file: 7, fd: -1 });
 
         assert!(matches!(queue.pop_or_notification(0), QueueWake::Notified));
 
         let mut updates = Vec::new();
-        assert_eq!(queue.fixed_file_updates_since(0, &mut updates), 1);
+        assert_eq!(queue.fixed_file_updates_since(fd, 0, &mut updates), 1);
         assert_eq!(updates, vec![FixedFileUpdate { file: 7, fd: -1 }]);
+        queue.unregister_wake_fd(fd);
+        close_test_fd(fd);
+    }
+
+    #[cfg(feature = "uring")]
+    #[test]
+    fn fixed_file_updates_compact_after_all_readers_advance() {
+        let queue = Arc::new(QueueCore::new(1, 1));
+        let first_fd = test_eventfd();
+        let second_fd = test_eventfd();
+        queue.register_wake_fd(first_fd);
+        queue.register_wake_fd(second_fd);
+
+        queue.push_fixed_file_update(FixedFileUpdate { file: 3, fd: 10 });
+
+        let mut first_updates = Vec::new();
+        let first_cursor = queue.fixed_file_updates_since(first_fd, 0, &mut first_updates);
+        assert_eq!(first_cursor, 1);
+        assert_eq!(first_updates, vec![FixedFileUpdate { file: 3, fd: 10 }]);
+        assert_eq!(queue.debug_fixed_file_update_count(), 1);
+
+        let mut second_updates = Vec::new();
+        let second_cursor = queue.fixed_file_updates_since(second_fd, 0, &mut second_updates);
+        assert_eq!(second_cursor, 1);
+        assert_eq!(second_updates, vec![FixedFileUpdate { file: 3, fd: 10 }]);
+        assert_eq!(queue.debug_fixed_file_update_count(), 0);
+
+        queue.push_fixed_file_update(FixedFileUpdate { file: 4, fd: -1 });
+
+        first_updates.clear();
+        assert_eq!(
+            queue.fixed_file_updates_since(first_fd, first_cursor, &mut first_updates),
+            2
+        );
+        assert_eq!(first_updates, vec![FixedFileUpdate { file: 4, fd: -1 }]);
+        assert_eq!(queue.debug_fixed_file_update_count(), 1);
+
+        second_updates.clear();
+        assert_eq!(
+            queue.fixed_file_updates_since(second_fd, second_cursor, &mut second_updates),
+            2
+        );
+        assert_eq!(second_updates, vec![FixedFileUpdate { file: 4, fd: -1 }]);
+        assert_eq!(queue.debug_fixed_file_update_count(), 0);
+
+        queue.unregister_wake_fd(first_fd);
+        queue.unregister_wake_fd(second_fd);
+        close_test_fd(first_fd);
+        close_test_fd(second_fd);
+    }
+
+    #[cfg(feature = "uring")]
+    #[test]
+    fn fixed_file_updates_only_target_file_shard() {
+        let path_a = temp_file("fixed_update_shard_a", b"a");
+        let path_b = temp_file("fixed_update_shard_b", b"b");
+        let pool = make_unstarted_uring_pool(2, 4);
+
+        let file_a = pool.register_readonly_file(&path_a).expect("register a");
+        assert_eq!(file_a, 0);
+        assert_eq!(pool.queues[0].debug_fixed_file_update_count(), 1);
+        assert_eq!(pool.queues[1].debug_fixed_file_update_count(), 0);
+
+        let file_b = pool.register_readonly_file(&path_b).expect("register b");
+        assert_eq!(file_b, 1);
+        assert_eq!(pool.queues[0].debug_fixed_file_update_count(), 1);
+        assert_eq!(pool.queues[1].debug_fixed_file_update_count(), 1);
+
+        pool.unregister_file(file_a).expect("unregister a");
+        assert_eq!(pool.queues[0].debug_fixed_file_update_count(), 2);
+        assert_eq!(pool.queues[1].debug_fixed_file_update_count(), 1);
     }
 
     #[test]
@@ -2035,8 +2775,9 @@ mod tests {
     }
 
     #[test]
-    fn sharded_threaded_pool_reads_from_multiple_queues() {
-        let path = temp_file("sharded_threaded_reads", b"abcdefghijklmnopqrstuvwxyz");
+    fn sharded_threaded_pool_reads_from_multiple_files() {
+        let path_a = temp_file("sharded_threaded_reads_a", b"abcdefghijklmnopqrstuvwxyz");
+        let path_b = temp_file("sharded_threaded_reads_b", b"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
         let pool = IoPool::new(IoConfig::Threaded(ThreadedConfig {
             base: BaseIoConfig {
                 max_in_flight: 8,
@@ -2048,19 +2789,29 @@ mod tests {
             cpus: None,
         }))
         .expect("create sharded pool");
-        let file = pool.register_file(&path).expect("register");
+        let file_a = pool.register_file(&path_a).expect("register file a");
+        let file_b = pool.register_file(&path_b).expect("register file b");
 
-        let reads = (0..8)
+        assert_ne!(
+            Arc::as_ptr(pool.select_queue(&IoCommand::read(file_a, 0, 2, 0))),
+            Arc::as_ptr(pool.select_queue(&IoCommand::read(file_b, 0, 2, 0)))
+        );
+
+        let reads = (0..4)
             .map(|index| {
-                pool.submit(IoCommand::read(file, index * 2, 2, 0))
+                pool.submit(IoCommand::read(file_a, index * 2, 2, 0))
                     .expect("submit read")
             })
+            .chain((0..4).map(|index| {
+                pool.submit(IoCommand::read(file_b, index * 2, 2, 0))
+                    .expect("submit read")
+            }))
             .collect::<Vec<_>>();
         let mut out = Vec::new();
         for future in reads {
             out.extend_from_slice(&future.blocking_recv_read().expect("read"));
         }
-        assert_eq!(&out, b"abcdefghijklmnop");
+        assert_eq!(&out, b"abcdefghABCDEFGH");
     }
 
     #[test]
@@ -2139,6 +2890,39 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_read_refcount_overflow_is_rejected() {
+        let queue = Arc::new(QueueCore::new(3, 8));
+        let first = queue
+            .submit(IoCommand::read(0, 10, 4, 2))
+            .expect("first submit");
+
+        {
+            let mut inner = queue.inner.lock().unwrap();
+            inner
+                .table
+                .get_mut(&WorkId(0))
+                .expect("first work")
+                .refcount = usize::MAX;
+        }
+
+        let err = queue
+            .submit(IoCommand::read(0, 10, 4, 0))
+            .expect_err("overflowing duplicate should be rejected");
+        assert_eq!(err.kind(), ErrorKind::OutOfMemory);
+
+        {
+            let mut inner = queue.inner.lock().unwrap();
+            inner
+                .table
+                .get_mut(&WorkId(0))
+                .expect("first work")
+                .refcount = 1;
+        }
+        drop(first);
+        assert_eq!(queue.debug_counts(), (0, 0));
+    }
+
+    #[test]
     fn writes_are_not_deduplicated() {
         let queue = Arc::new(QueueCore::new(3, 8));
         let first = queue
@@ -2201,6 +2985,28 @@ mod tests {
             IoOperation::Read { offset, .. } => assert_eq!(offset, 10),
             _ => panic!("expected read"),
         }
+    }
+
+    #[test]
+    fn dispatched_fast_read_duplicate_does_not_leave_stale_ready_entry() {
+        let queue = Arc::new(QueueCore::new_with_fast_read_path(3, 8, true));
+        let first = queue
+            .submit(IoCommand::read(0, 10, 4, 2))
+            .expect("first read");
+        let work = queue.pop().expect("dispatch first read");
+        assert_eq!(queue.debug_fast_ready_count(), 0);
+
+        let duplicate = queue
+            .submit(IoCommand::read(0, 10, 4, 0))
+            .expect("dedup dispatched read");
+        assert_eq!(queue.debug_fast_ready_count(), 0);
+
+        queue.complete(work.id, Ok(IoOutput::Read(Arc::from(b"rust".to_vec()))));
+        assert_eq!(&*first.blocking_recv_read().expect("first result"), b"rust");
+        assert_eq!(
+            &*duplicate.blocking_recv_read().expect("duplicate result"),
+            b"rust"
+        );
     }
 
     #[test]

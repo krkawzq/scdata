@@ -65,7 +65,10 @@ impl SliceSpec {
     }
 
     pub(crate) fn from_optional_triples_deferred(slice: Option<Vec<usize>>) -> Self {
-        Self::from_optional_triples(slice).unwrap_or_else(|err| Self::Invalid(err.to_string()))
+        Self::from_optional_triples(slice).unwrap_or_else(|err| match err {
+            AccessError::InvalidSlice(message) => Self::Invalid(message),
+            err => Self::Invalid(err.to_string()),
+        })
     }
 
     pub(crate) fn plan(&self, data_len: usize) -> Result<SlicePlan, AccessError> {

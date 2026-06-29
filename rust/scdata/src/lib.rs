@@ -5,7 +5,8 @@ pub mod codecs;
 pub mod databank;
 pub mod iopool;
 
-mod pybind;
+#[doc(hidden)]
+pub mod pybind;
 
 #[pyfunction]
 fn kernel_name() -> &'static str {

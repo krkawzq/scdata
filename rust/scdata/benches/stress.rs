@@ -30,7 +30,7 @@ use _scdata::codecs::{
 };
 use _scdata::databank::{
     ArrayCodecMeta, ArrayMeta, ArrayOrder, ChunkStoreMeta, DType, DataBank, DataBankConfig,
-    Dense1DMeta, Dense2DMeta, MissingGenePolicy, SparseCsrDatasetMeta,
+    Dense1DMeta, Dense2DMeta, MissingGenePolicy, ScheduledPrefetchConfig, SparseCsrDatasetMeta,
 };
 #[cfg(feature = "uring")]
 use _scdata::iopool::UringConfig;
@@ -797,6 +797,73 @@ fn stress_access(config: BenchConfig) {
             );
         }
     }
+
+    let handle_oom = Arc::new(
+        AccessScheduler::spawn(
+            AccessConfig {
+                queue_capacity: 64,
+                scheduler_shards: 1,
+                cache_capacity_bytes: 1024,
+                memory_budget_bytes: 1024,
+                default_io_priority: 0,
+                keep_decoded: true,
+                cpu: AccessCpuConfig {
+                    num_workers: 1,
+                    queue_capacity: 64,
+                    cpus: None,
+                },
+            },
+            Box::new(SliceIo::new(Arc::clone(&backing))),
+            Box::new(CodecDecode),
+        )
+        .expect("oom access scheduler"),
+    );
+    let codec = CodecSpec::None.build();
+    for &threads in [2usize, 4, 8].iter() {
+        let handle = Arc::clone(&handle_oom);
+        let codec = Arc::clone(&codec);
+        stress_mt(
+            config,
+            &format!("access/MT_error_memory_budget_exhausted_64k/t{threads}"),
+            threads,
+            512,
+            None,
+            move |_| send_read_error(&handle, 0, chunk, &codec, None),
+        );
+    }
+
+    let handle_invalid = Arc::new(
+        AccessScheduler::spawn(
+            AccessConfig {
+                queue_capacity: 64,
+                scheduler_shards: 2,
+                cache_capacity_bytes: 4 * 1024 * 1024,
+                memory_budget_bytes: 8 * 1024 * 1024,
+                default_io_priority: 0,
+                keep_decoded: true,
+                cpu: AccessCpuConfig {
+                    num_workers: 2,
+                    queue_capacity: 64,
+                    cpus: None,
+                },
+            },
+            Box::new(SliceIo::new(Arc::clone(&backing))),
+            Box::new(CodecDecode),
+        )
+        .expect("invalid-slice access scheduler"),
+    );
+    for &threads in [2usize, 4, 8].iter() {
+        let handle = Arc::clone(&handle_invalid);
+        let codec = Arc::clone(&codec);
+        stress_mt(
+            config,
+            &format!("access/MT_error_invalid_slice_64k/t{threads}"),
+            threads,
+            512,
+            None,
+            move |_| send_read_error(&handle, 0, chunk, &codec, Some(vec![0, 0, chunk + 1])),
+        );
+    }
 }
 
 fn send_read(handle: &AccessHandle, start: usize, chunk: usize, codec: &SharedCodec) -> usize {
@@ -853,6 +920,29 @@ fn send_read_with_slice(
         .expect("access reply")
         .expect("access result");
     bytes.len() ^ bytes[0] as usize
+}
+
+fn send_read_error(
+    handle: &AccessHandle,
+    start: usize,
+    chunk: usize,
+    codec: &SharedCodec,
+    slice: Option<Vec<usize>>,
+) -> usize {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let request = AccessRequest::new(
+        ChunkKey::new(FileRef(1), start as u64, chunk),
+        Arc::clone(codec),
+        Some(chunk),
+        tx,
+    )
+    .with_slice(slice);
+    handle.send(request).expect("send error request");
+    rx.blocking_recv()
+        .expect("access error reply")
+        .expect_err("access request should fail")
+        .to_string()
+        .len()
 }
 
 fn scheduled_run(handle: &AccessHandle, items: &[AccessItem]) -> usize {
@@ -1481,6 +1571,14 @@ fn stress_databank(config: BenchConfig) {
         chunk_rows,
         chunk_cols,
     );
+    stress_databank_mt_scheduled_by_gene_names(
+        config,
+        mem_chunks.clone(),
+        cells,
+        genes,
+        chunk_rows,
+        chunk_cols,
+    );
 
     // --- scatter-focused: large output to isolate databank-side scatter
     // (copy decoded bytes into caller `out`). This runs on the caller thread,
@@ -1812,6 +1910,106 @@ fn stress_databank_mt_owned(
         let mib = bytes_per_op as f64 * total_ops as f64 / (1024.0 * 1024.0);
         println!(
             "databank/MT_instances_owned_32x1024/t{threads}    threads={threads} ops={total_ops:<8} elapsed_s={seconds:.4} throughput_mib_s={:.1} kops={:.1}",
+            mib / seconds,
+            total_ops as f64 / seconds / 1000.0
+        );
+    }
+}
+
+/// Per-instance scheduled projected prefetch scaling: each thread owns a
+/// DataBank and repeatedly builds a small scheduled prefetcher with a missing
+/// gene that must be zero-filled.
+fn stress_databank_mt_scheduled_by_gene_names(
+    config: BenchConfig,
+    chunks: Vec<Arc<[u8]>>,
+    cells: usize,
+    genes: usize,
+    chunk_rows: usize,
+    chunk_cols: usize,
+) {
+    let batches: Vec<Vec<usize>> = vec![
+        (0..8).map(|i| i * 7 % cells).collect(),
+        (0..4).map(|i| i * 11 % cells).collect(),
+        Vec::new(),
+    ];
+    let by_names: Vec<String> = vec![
+        "g1".to_string(),
+        "missing_gene".to_string(),
+        format!("g{}", genes / 2),
+        format!("g{}", genes - 1),
+    ];
+    let chunk_grid = vec![cells / chunk_rows, genes / chunk_cols];
+    let bytes_per_op = batches.iter().map(Vec::len).sum::<usize>() * by_names.len() * 4;
+
+    for &threads in [2usize, 4, 8].iter() {
+        let per_thread = (config.iterations(32) / threads).max(1);
+        let barrier = Arc::new(Barrier::new(threads));
+        let chunks = Arc::new(chunks.clone());
+        let batches = Arc::new(batches.clone());
+        let by_names = Arc::new(by_names.clone());
+        let chunk_grid = Arc::new(chunk_grid.clone());
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let chunks = Arc::clone(&chunks);
+                let batches = Arc::clone(&batches);
+                let by_names = Arc::clone(&by_names);
+                let chunk_grid = Arc::clone(&chunk_grid);
+                thread::spawn(move || {
+                    let mut bank = DataBank::new(DataBankConfig::default()).expect("bank");
+                    let id = bank
+                        .register_dense_2d(Dense2DMeta {
+                            gene_names: (0..genes).map(|i| format!("g{i}")).collect(),
+                            data: ArrayMeta {
+                                shape: vec![cells, genes],
+                                chunk_shape: vec![chunk_rows, chunk_cols],
+                                chunk_grid_shape: (*chunk_grid).clone(),
+                                dtype: DType::U32,
+                                order: ArrayOrder::C,
+                                codec: ArrayCodecMeta::Uncompressed,
+                                chunks: ChunkStoreMeta::Memory {
+                                    chunks: (*chunks).clone(),
+                                },
+                                variable_chunks: false,
+                                chunk_boundaries: None,
+                            },
+                        })
+                        .expect("register");
+                    barrier.wait();
+                    let t0 = Instant::now();
+                    let mut sum = 0usize;
+                    for _ in 0..per_thread {
+                        let prefetch = bank
+                            .prefetch_cells_scheduled_by_gene_names::<u32, _, _>(
+                                id,
+                                (*batches).clone(),
+                                by_names.as_slice(),
+                                MissingGenePolicy::Zero,
+                                ScheduledPrefetchConfig::default(),
+                            )
+                            .expect("scheduled projected prefetch");
+                        for batch in prefetch {
+                            let batch = batch.expect("prefetch batch");
+                            sum ^= batch.buffer.len() ^ batch.num_genes ^ batch.cells.len();
+                        }
+                    }
+                    (sum, t0.elapsed())
+                })
+            })
+            .collect();
+        let results: Vec<(usize, std::time::Duration)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("scheduled by-gene thread"))
+            .collect();
+        let checksum: usize = results.iter().map(|(s, _)| *s).fold(0, |a, b| a ^ b);
+        black_box(checksum);
+        let elapsed = results.iter().map(|(_, e)| *e).max().unwrap_or_default();
+        let total_ops = per_thread * threads;
+        let seconds = elapsed.as_secs_f64();
+        let mib = bytes_per_op as f64 * total_ops as f64 / (1024.0 * 1024.0);
+        println!(
+            "databank/MT_instances_scheduled_by_gene_names_zero_missing/t{threads}    threads={threads} ops={total_ops:<8} elapsed_s={seconds:.4} throughput_mib_s={:.1} kops={:.1}",
             mib / seconds,
             total_ops as f64 / seconds / 1000.0
         );

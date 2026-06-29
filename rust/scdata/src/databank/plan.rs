@@ -90,11 +90,105 @@ pub fn plan_dense_2d(
             })?;
             let cols = (*chunk_cols).min(dataset.num_genes - col_start);
             let row_bytes =
-                row_slice_bytes(&dataset.data, chunk_row, chunk_col, row_in_chunk, cols)?;
+                row_slice_bytes(&dataset.data, chunk_row, chunk_col, row_in_chunk, 0, cols)?;
             segments.push(DenseSegment {
                 output_row,
                 output_col_start: col_start,
                 output_cols: cols,
+                chunk: chunk_ref(&dataset.data, chunk_index)?,
+                source: ByteRange::new(row_bytes.0, row_bytes.1)?,
+            });
+        }
+    }
+    Ok(segments)
+}
+
+pub fn plan_dense_2d_selected_sources(
+    dataset: &Dense2DDataset,
+    cells: &[usize],
+    selected_sources: &[usize],
+) -> DataBankResult<Vec<DenseSegment>> {
+    if selected_sources.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let chunk_shape = dataset
+        .data
+        .regular_chunk_shape_required("Dense2D projected planning")?;
+    let [chunk_rows, chunk_cols] = chunk_shape else {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "Dense2D data must have 2D chunks, got {chunk_shape:?}"
+        )));
+    };
+    let grid_shape = dataset.data.chunk_grid_shape();
+    let [_, grid_cols] = grid_shape else {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "Dense2D data must have 2D chunk grid, got {grid_shape:?}"
+        )));
+    };
+
+    let segment_capacity = cells
+        .len()
+        .checked_mul(selected_sources.len())
+        .ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("Dense2D selected segment count overflow".to_string())
+        })?;
+    let mut segments = Vec::with_capacity(segment_capacity);
+    for (output_row, &cell) in cells.iter().enumerate() {
+        validate_cell(cell, dataset.num_cells)?;
+        let chunk_row = cell / *chunk_rows;
+        let row_in_chunk = cell % *chunk_rows;
+        let mut selected_pos = 0usize;
+
+        while let Some(&run_start) = selected_sources.get(selected_pos) {
+            if run_start >= dataset.num_genes {
+                return Err(DataBankError::GeneIndexOutOfRange {
+                    gene: run_start,
+                    num_genes: dataset.num_genes,
+                });
+            }
+            let chunk_col = run_start / *chunk_cols;
+            if chunk_col >= *grid_cols {
+                return Err(DataBankError::InvalidArrayMeta(format!(
+                    "Dense2D selected chunk column {chunk_col} exceeds grid columns {grid_cols}"
+                )));
+            }
+            let col_start = chunk_col.checked_mul(*chunk_cols).ok_or_else(|| {
+                DataBankError::InvalidArrayMeta("Dense2D column start overflow".to_string())
+            })?;
+            let col_end = col_start
+                .checked_add((*chunk_cols).min(dataset.num_genes - col_start))
+                .ok_or_else(|| {
+                    DataBankError::InvalidArrayMeta("Dense2D column end overflow".to_string())
+                })?;
+
+            let mut run_len = 1usize;
+            selected_pos += 1;
+            while let Some(&source) = selected_sources.get(selected_pos) {
+                if source >= col_end || source != run_start + run_len {
+                    break;
+                }
+                run_len += 1;
+                selected_pos += 1;
+            }
+
+            let local_col = run_start - col_start;
+            let row_bytes = row_slice_bytes(
+                &dataset.data,
+                chunk_row,
+                chunk_col,
+                row_in_chunk,
+                local_col,
+                run_len,
+            )?;
+            let chunk_index = dataset
+                .data
+                .grid
+                .logical_chunk_index(&[chunk_row, chunk_col])?;
+            segments.push(DenseSegment {
+                output_row,
+                output_col_start: run_start,
+                output_cols: run_len,
                 chunk: chunk_ref(&dataset.data, chunk_index)?,
                 source: ByteRange::new(row_bytes.0, row_bytes.1)?,
             });
@@ -131,6 +225,75 @@ pub fn plan_dense_1d(
                 .ok_or_else(|| {
                     DataBankError::InvalidArrayMeta("1D dense output column overflow".to_string())
                 })?;
+        }
+    }
+    Ok(segments)
+}
+
+pub fn plan_dense_1d_selected_sources(
+    dataset: &Dense1DDataset,
+    cells: &[usize],
+    selected_sources: &[usize],
+) -> DataBankResult<Vec<DenseSegment>> {
+    if selected_sources.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let segment_capacity = cells
+        .len()
+        .checked_mul(selected_sources.len())
+        .ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("Dense1D selected segment count overflow".to_string())
+        })?;
+    let mut segments = Vec::with_capacity(segment_capacity);
+    for (output_row, &cell) in cells.iter().enumerate() {
+        validate_cell(cell, dataset.num_cells)?;
+        let row_start = cell.checked_mul(dataset.num_genes).ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("1D dense row start overflow".to_string())
+        })?;
+        let mut selected_pos = 0usize;
+
+        while let Some(&run_start) = selected_sources.get(selected_pos) {
+            if run_start >= dataset.num_genes {
+                return Err(DataBankError::GeneIndexOutOfRange {
+                    gene: run_start,
+                    num_genes: dataset.num_genes,
+                });
+            }
+
+            let mut run_len = 1usize;
+            selected_pos += 1;
+            while let Some(&source) = selected_sources.get(selected_pos) {
+                if source >= dataset.num_genes || source != run_start + run_len {
+                    break;
+                }
+                run_len += 1;
+                selected_pos += 1;
+            }
+
+            let range_start = row_start.checked_add(run_start).ok_or_else(|| {
+                DataBankError::InvalidArrayMeta("1D dense selected range start overflow".to_string())
+            })?;
+            let range_end = range_start.checked_add(run_len).ok_or_else(|| {
+                DataBankError::InvalidArrayMeta("1D dense selected range end overflow".to_string())
+            })?;
+            let mut output_col_start = run_start;
+            for range in plan_1d_range(&dataset.data, range_start, range_end)? {
+                segments.push(DenseSegment {
+                    output_row,
+                    output_col_start,
+                    output_cols: range.elements,
+                    chunk: range.chunk,
+                    source: range.source,
+                });
+                output_col_start = output_col_start
+                    .checked_add(range.elements)
+                    .ok_or_else(|| {
+                        DataBankError::InvalidArrayMeta(
+                            "1D dense selected output column overflow".to_string(),
+                        )
+                    })?;
+            }
         }
     }
     Ok(segments)
@@ -238,6 +401,7 @@ fn row_slice_bytes(
     chunk_row: usize,
     chunk_col: usize,
     row_in_chunk: usize,
+    col_offset: usize,
     cols: usize,
 ) -> DataBankResult<(usize, usize)> {
     let item_size = array.dtype.item_size();
@@ -247,11 +411,20 @@ fn row_slice_bytes(
     let row_width = physical_cols
         .checked_mul(item_size)
         .ok_or_else(|| DataBankError::InvalidArrayMeta("row byte width overflow".to_string()))?;
+    let logical_cols_end = col_offset
+        .checked_add(cols)
+        .ok_or_else(|| DataBankError::InvalidArrayMeta("row column range overflow".to_string()))?;
+    if logical_cols_end > physical_cols {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "row column range [{col_offset}, {logical_cols_end}) exceeds physical width {physical_cols}"
+        )));
+    }
     let logical_width = cols
         .checked_mul(item_size)
         .ok_or_else(|| DataBankError::InvalidArrayMeta("row byte length overflow".to_string()))?;
     let start = row_in_chunk
         .checked_mul(row_width)
+        .and_then(|row_start| row_start.checked_add(col_offset.checked_mul(item_size)?))
         .ok_or_else(|| DataBankError::InvalidArrayMeta("row byte offset overflow".to_string()))?;
     let end = start
         .checked_add(logical_width)

@@ -25,14 +25,21 @@ impl ScheduledStore {
     }
 
     pub(crate) fn insert(&mut self, id: u64, stage: ScheduledStage) -> Option<ScheduledStage> {
-        if stage.is_evictable() {
+        let is_evictable = stage.is_evictable();
+        let old = self.entries.insert(id, stage);
+        if is_evictable {
             self.evictable.push_back(id);
+            self.compact_evictable_if_needed();
         }
-        self.entries.insert(id, stage)
+        old
     }
 
     pub(crate) fn remove(&mut self, id: &u64) -> Option<ScheduledStage> {
-        self.entries.remove(id)
+        let stage = self.entries.remove(id);
+        if self.entries.is_empty() {
+            self.evictable.clear();
+        }
+        stage
     }
 
     pub(crate) fn evict_one_buffer(&mut self) -> Option<usize> {
@@ -50,6 +57,30 @@ impl ScheduledStore {
             }
         }
         None
+    }
+
+    fn compact_evictable_if_needed(&mut self) {
+        let threshold = self.entries.len().saturating_mul(4).max(64);
+        if self.evictable.len() <= threshold {
+            return;
+        }
+
+        let mut compacted = VecDeque::with_capacity(self.entries.len().min(self.evictable.len()));
+        while let Some(id) = self.evictable.pop_front() {
+            if self
+                .entries
+                .get(&id)
+                .is_some_and(ScheduledStage::is_evictable)
+            {
+                compacted.push_back(id);
+            }
+        }
+        self.evictable = compacted;
+    }
+
+    #[cfg(test)]
+    fn evictable_len(&self) -> usize {
+        self.evictable.len()
     }
 }
 
@@ -81,5 +112,29 @@ impl StagedBytes {
             Self::Owned(data) => data.as_slice(),
             Self::Shared(data) => data.as_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evictable_queue_does_not_grow_with_removed_entries() {
+        let mut store = ScheduledStore::new();
+
+        for id in 0..256 {
+            store.insert(
+                id,
+                ScheduledStage::Ready {
+                    data: Vec::new(),
+                    bytes: 0,
+                },
+            );
+            store.remove(&id);
+        }
+
+        assert!(store.evictable_len() <= 64);
+        assert!(store.entries.is_empty());
     }
 }

@@ -6,7 +6,9 @@ use std::os::raw::c_void;
 
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
 use super::super::spec::{sealed, ChunkCodec};
-use super::super::util::{decode_error, output_too_small, verify_size};
+use super::super::util::{
+    decode_error, output_too_small, reserve_decode_buffer, vec_with_decode_capacity, verify_size,
+};
 use super::super::CodecResult;
 use header::{blosc_decoded_size, blosc_header};
 use lz4_fast::try_blosc_lz4_decode_into;
@@ -26,7 +28,7 @@ impl ChunkCodec for BloscCodec {
         let decoded_size = header.decoded_size;
         verify_size(self.name(), decoded_size, expected_size)?;
 
-        let mut decoded = Vec::with_capacity(decoded_size);
+        let mut decoded = vec_with_decode_capacity(self.name(), decoded_size)?;
         set_vec_len_for_decode(&mut decoded, decoded_size);
         let written = blosc_decode_header_into_output(self.name(), encoded, header, &mut decoded)?;
         decoded.truncate(written);
@@ -87,7 +89,8 @@ impl ChunkCodec for BloscCodec {
         verify_size(self.name(), decoded_size, expected_size)?;
         output.clear();
         if output.capacity() < decoded_size {
-            output.reserve_exact(decoded_size - output.capacity());
+            let additional = decoded_size - output.capacity();
+            reserve_decode_buffer(self.name(), &mut output, additional)?;
         }
         set_vec_len_for_decode(&mut output, decoded_size);
 
@@ -144,4 +147,132 @@ fn blosc_decode_header_into_output(
     }
 
     Ok(decoded_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+
+    use super::*;
+
+    #[test]
+    fn lz4_fast_path_decodes_valid_blosc_lz4_buffers() {
+        let codec = BloscCodec;
+        let raw = (0..4096)
+            .flat_map(|value: u32| value.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        for (shuffle, typesize) in [
+            (blosc_src::BLOSC_NOSHUFFLE as i32, 1usize),
+            (blosc_src::BLOSC_SHUFFLE as i32, 4usize),
+        ] {
+            let encoded = blosc_lz4_encode(&raw, shuffle, typesize, 1024);
+            let decoded = codec
+                .decode(&encoded, Some(raw.len()))
+                .expect("valid Blosc LZ4 buffer should decode");
+            assert_eq!(decoded, raw);
+        }
+    }
+
+    #[test]
+    fn lz4_fast_path_rejects_block_offsets_inside_header_table() {
+        let codec = BloscCodec;
+        let mut encoded = vec![0u8; 24];
+        encoded[0] = blosc_src::BLOSC_VERSION_FORMAT as u8;
+        encoded[1] = blosc_src::BLOSC_LZ4_VERSION_FORMAT as u8;
+        encoded[2] = (blosc_src::BLOSC_LZ4_FORMAT << 5) as u8;
+        encoded[3] = 1;
+        encoded[4..8].copy_from_slice(&4u32.to_le_bytes());
+        encoded[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let encoded_len = encoded.len() as u32;
+        encoded[12..16].copy_from_slice(&encoded_len.to_le_bytes());
+        encoded[16..20].copy_from_slice(&4i32.to_le_bytes());
+
+        let err = codec
+            .decode(&encoded, Some(4))
+            .expect_err("block offset inside header/table should fail");
+
+        assert!(
+            matches!(err, super::super::super::CodecError::Decode { codec, message } if codec == "blosc" && message.contains("block offset"))
+        );
+    }
+
+    #[test]
+    fn lz4_fast_path_rejects_overlapping_block_offsets() {
+        let codec = BloscCodec;
+        let mut encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let first_block = i32::from_le_bytes(encoded[16..20].try_into().unwrap());
+        encoded[20..24].copy_from_slice(&first_block.to_le_bytes());
+
+        let err = codec
+            .decode(&encoded, Some(8))
+            .expect_err("overlapping block offsets should fail");
+
+        assert!(
+            matches!(err, super::super::super::CodecError::Decode { codec, message } if codec == "blosc" && message.contains("block offset"))
+        );
+    }
+
+    #[test]
+    fn lz4_fast_path_decodes_manual_raw_blocks() {
+        let codec = BloscCodec;
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+
+        let decoded = codec
+            .decode(&encoded, Some(8))
+            .expect("manual Blosc LZ4 raw blocks should decode");
+
+        assert_eq!(&decoded, b"abcdefgh");
+    }
+
+    fn blosc_lz4_encode(raw: &[u8], shuffle: i32, typesize: usize, blocksize: usize) -> Vec<u8> {
+        let compressor = CString::new("lz4").expect("static compressor name");
+        let mut encoded = vec![0u8; raw.len() + blosc_src::BLOSC_MAX_OVERHEAD as usize];
+        let written = unsafe {
+            blosc_src::blosc_compress_ctx(
+                5,
+                shuffle,
+                typesize,
+                raw.len(),
+                raw.as_ptr().cast::<c_void>(),
+                encoded.as_mut_ptr().cast::<c_void>(),
+                encoded.len(),
+                compressor.as_ptr(),
+                blocksize,
+                1,
+            )
+        };
+        assert!(written > 0, "Blosc compression failed with {written}");
+        encoded.truncate(written as usize);
+        encoded
+    }
+
+    fn manual_blosc_lz4_raw_blocks(blocks: &[&[u8]]) -> Vec<u8> {
+        assert!(!blocks.is_empty());
+        let blocksize = blocks[0].len();
+        assert!(blocks.iter().all(|block| block.len() == blocksize));
+        let decoded_size = blocks.iter().map(|block| block.len()).sum::<usize>();
+        let table_bytes = blocks.len() * 4;
+        let compressed_size =
+            blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + table_bytes + decoded_size + table_bytes;
+        let mut encoded = vec![0u8; blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + table_bytes];
+        encoded[0] = blosc_src::BLOSC_VERSION_FORMAT as u8;
+        encoded[1] = blosc_src::BLOSC_LZ4_VERSION_FORMAT as u8;
+        encoded[2] = (blosc_src::BLOSC_LZ4_FORMAT << 5) as u8;
+        encoded[3] = 1;
+        encoded[4..8].copy_from_slice(&(decoded_size as u32).to_le_bytes());
+        encoded[8..12].copy_from_slice(&(blocksize as u32).to_le_bytes());
+        encoded[12..16].copy_from_slice(&(compressed_size as u32).to_le_bytes());
+
+        let mut offset = blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + table_bytes;
+        for (idx, block) in blocks.iter().enumerate() {
+            let table_offset = blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + idx * 4;
+            encoded[table_offset..table_offset + 4].copy_from_slice(&(offset as i32).to_le_bytes());
+            encoded.extend_from_slice(&(block.len() as i32).to_le_bytes());
+            encoded.extend_from_slice(block);
+            offset += 4 + block.len();
+        }
+        assert_eq!(encoded.len(), compressed_size);
+        encoded
+    }
 }

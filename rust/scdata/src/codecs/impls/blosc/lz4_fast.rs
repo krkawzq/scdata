@@ -1,6 +1,9 @@
 use std::cell::RefCell;
 
-use super::super::super::util::{decode_error, output_too_small, verify_size};
+use super::super::super::buffer::set_vec_len_for_decode;
+use super::super::super::util::{
+    decode_error, output_too_small, reserve_decode_buffer, verify_size,
+};
 use super::super::super::CodecResult;
 use super::super::lz4_decompress_raw_into;
 use super::header::BloscHeader;
@@ -86,8 +89,14 @@ fn blosc_lz4_decode_into(
 
     BLOSC_LZ4_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        if header.is_byte_shuffled() && scratch.len() < header.blocksize {
-            scratch.resize(header.blocksize, 0);
+        if header.is_byte_shuffled() {
+            if scratch.capacity() < header.blocksize {
+                let additional = header.blocksize - scratch.capacity();
+                reserve_decode_buffer(codec, &mut scratch, additional)?;
+            }
+            if scratch.len() < header.blocksize {
+                set_vec_len_for_decode(&mut scratch, header.blocksize);
+            }
         }
 
         let leftover = header.decoded_size % header.blocksize;
@@ -99,10 +108,18 @@ fn blosc_lz4_decode_into(
             } else {
                 header.blocksize
             };
-            let bstart_offset = blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + block_idx * 4;
-            let src_offset = read_i32_le(&encoded[bstart_offset..bstart_offset + 4], codec)?;
-            let src_offset = usize::try_from(src_offset)
-                .map_err(|_| decode_error(codec, "negative Blosc block offset"))?;
+            let src_offset = block_start(codec, encoded, block_idx)?;
+            if src_offset < bstarts_bytes {
+                return Err(decode_error(codec, "invalid Blosc block offset"));
+            }
+            let src_limit = if is_last {
+                header.compressed_size
+            } else {
+                block_start(codec, encoded, block_idx + 1)?
+            };
+            if src_offset >= src_limit || src_limit > header.compressed_size {
+                return Err(decode_error(codec, "invalid Blosc block offset"));
+            }
             let output_block = &mut output[decoded_offset..decoded_offset + bsize];
 
             if header.is_byte_shuffled() {
@@ -114,6 +131,7 @@ fn blosc_lz4_decode_into(
                     bsize,
                     is_last && leftover > 0,
                     src_offset,
+                    src_limit,
                     scratch_block,
                 )?;
                 unshuffle_bytes(header.typesize, scratch_block, output_block);
@@ -125,6 +143,7 @@ fn blosc_lz4_decode_into(
                     bsize,
                     is_last && leftover > 0,
                     src_offset,
+                    src_limit,
                     output_block,
                 )?;
             }
@@ -142,6 +161,7 @@ fn decode_blosc_lz4_block(
     blocksize: usize,
     leftover_block: bool,
     mut src_offset: usize,
+    src_limit: usize,
     output: &mut [u8],
 ) -> CodecResult<()> {
     let nsplits = if !header.dont_split()
@@ -156,14 +176,14 @@ fn decode_blosc_lz4_block(
     let split_size = split_size(codec, blocksize, nsplits)?;
     let mut output_offset = 0usize;
     for _ in 0..nsplits {
-        if src_offset + 4 > header.compressed_size {
+        if src_offset + 4 > src_limit {
             return Err(decode_error(codec, "invalid Blosc split offset"));
         }
         let compressed_size = read_i32_le(&encoded[src_offset..src_offset + 4], codec)?;
         src_offset += 4;
         let compressed_size = usize::try_from(compressed_size)
             .map_err(|_| decode_error(codec, "negative Blosc split size"))?;
-        if compressed_size > header.compressed_size - src_offset {
+        if compressed_size > src_limit - src_offset {
             return Err(decode_error(codec, "invalid Blosc split size"));
         }
 
@@ -187,10 +207,19 @@ fn decode_blosc_lz4_block(
         src_offset += compressed_size;
         output_offset = next_output_offset;
     }
+    if src_offset != src_limit {
+        return Err(decode_error(codec, "invalid Blosc block size"));
+    }
     if output_offset != blocksize {
         return Err(decode_error(codec, "invalid Blosc split block size"));
     }
     Ok(())
+}
+
+fn block_start(codec: &str, encoded: &[u8], block_idx: usize) -> CodecResult<usize> {
+    let bstart_offset = blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + block_idx * 4;
+    let src_offset = read_i32_le(&encoded[bstart_offset..bstart_offset + 4], codec)?;
+    usize::try_from(src_offset).map_err(|_| decode_error(codec, "negative Blosc block offset"))
 }
 
 fn split_size(codec: &str, blocksize: usize, nsplits: usize) -> CodecResult<usize> {
@@ -224,5 +253,27 @@ mod tests {
     #[test]
     fn split_size_accepts_divisible_full_block() {
         assert_eq!(split_size("blosc", 384, 3).expect("split size"), 128);
+    }
+
+    #[test]
+    fn fast_path_skips_all_bitshuffle_headers() {
+        let header = BloscHeader {
+            compversion: blosc_src::BLOSC_LZ4_VERSION_FORMAT as u8,
+            flags: (blosc_src::BLOSC_LZ4_FORMAT << 5) as u8 | blosc_src::BLOSC_DOBITSHUFFLE as u8,
+            typesize: 8,
+            decoded_size: 4,
+            blocksize: 4,
+            compressed_size: blosc_src::BLOSC_MIN_HEADER_LENGTH as usize,
+        };
+        let mut output = [0u8; 4];
+
+        assert!(try_blosc_lz4_decode_into(
+            "blosc",
+            &[0u8; blosc_src::BLOSC_MIN_HEADER_LENGTH as usize],
+            header,
+            &mut output,
+            Some(4),
+        )
+        .is_none());
     }
 }

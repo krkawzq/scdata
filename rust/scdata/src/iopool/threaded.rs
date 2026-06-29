@@ -12,7 +12,7 @@ pub(super) fn start(
     file_table: Arc<FileTable>,
 ) -> io::Result<Vec<thread::JoinHandle<()>>> {
     let affinity_cpus = resolve_cpu_affinity(&config)?;
-    let worker_count = effective_worker_count(&config);
+    let worker_count = config.effective_worker_count();
     let queues = queues.to_vec();
 
     let mut handles = Vec::with_capacity(worker_count);
@@ -55,10 +55,6 @@ fn worker_loop(queue: Arc<QueueCore>, file_table: Arc<FileTable>) {
         let result = execute_work(&file_table, work.op);
         queue.complete(id, result);
     }
-}
-
-fn effective_worker_count(config: &ThreadedConfig) -> usize {
-    config.worker_count().min(config.base.in_flight_limit())
 }
 
 fn resolve_cpu_affinity(config: &ThreadedConfig) -> io::Result<Vec<core_affinity::CoreId>> {

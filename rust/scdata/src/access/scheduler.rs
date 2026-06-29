@@ -10,7 +10,7 @@ use std::thread;
 
 use flume::TrySendError;
 use tokio::runtime::Builder;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{futures::OwnedNotified, oneshot, Notify};
 use tokio::task::{JoinError, JoinSet, LocalSet};
 
 #[cfg(test)]
@@ -26,7 +26,7 @@ use super::scheduled::{ScheduledStage, ScheduledStore, StagedBytes};
 #[cfg(test)]
 use super::slice::RangeCopy;
 use super::slice::{SlicePlan, SliceSpec};
-use crate::codecs::SharedCodec;
+use crate::codecs::{CodecError, SharedCodec};
 
 type StateHandle = Rc<RefCell<SchedulerState>>;
 
@@ -974,14 +974,64 @@ fn try_scheduled_decode_inline(state: &StateHandle, request: &ScheduledDecodeReq
     let cached_decoded = state_ref
         .cache
         .pin_and_get(&request.item.key)
-        .is_some_and(|pinned| is_matching_decoded(&pinned, decode_key));
-    if cached_decoded {
-        state_ref
-            .scheduled
-            .insert(request.id, ScheduledStage::Complete);
-    }
+        .is_some_and(|pinned| {
+            if is_matching_decoded(&pinned, decode_key) {
+                state_ref
+                    .scheduled
+                    .insert(request.id, ScheduledStage::Complete);
+                return true;
+            }
+            if pinned.kind == CachePayloadKind::Raw && request.item.codec.is_identity() {
+                let stage = match validate_identity_decoded_size(
+                    &request.item.codec,
+                    pinned.data.len(),
+                    request.item.expected_size,
+                ) {
+                    Ok(()) => ScheduledStage::Complete,
+                    Err(err) => ScheduledStage::Failed(err.to_string()),
+                };
+                state_ref.scheduled.insert(request.id, stage);
+                return true;
+            }
+            false
+        });
 
     cached_decoded
+}
+
+fn register_decode_waiter_after_raw_load(state: &StateHandle, item: &AccessItem) -> DecodeRegister {
+    register_decode_waiter_inner(state, item, false)
+}
+
+#[cfg(test)]
+fn register_decode_waiter(state: &StateHandle, item: &AccessItem) -> DecodeRegister {
+    register_decode_waiter_inner(state, item, true)
+}
+
+fn register_decode_waiter_inner(
+    state: &StateHandle,
+    item: &AccessItem,
+    check_cache: bool,
+) -> DecodeRegister {
+    let mut state_ref = state.borrow_mut();
+    let key = DecodeKey::new(item.key, &item.codec, item.expected_size);
+    if check_cache {
+        if let Some(pinned) = state_ref.cache.pin_and_get(&item.key) {
+            if is_matching_decoded(&pinned, key) {
+                return DecodeRegister::Ready(pinned);
+            }
+            drop(pinned);
+        }
+    }
+
+    if let Some(notify) = state_ref.decode_inflight.get(&key) {
+        return DecodeRegister::Wait(Arc::clone(notify).notified_owned());
+    }
+
+    state_ref
+        .decode_inflight
+        .insert(key, Arc::new(Notify::new()));
+    DecodeRegister::First(key)
 }
 
 enum EnsureInline {
@@ -1220,7 +1270,7 @@ enum DecodedOutput {
     Owned(Vec<u8>),
     Shared {
         data: Arc<[u8]>,
-        _pin: Option<PinGuard>,
+        _guard: Option<DecodedGuard>,
     },
 }
 
@@ -1231,6 +1281,21 @@ impl DecodedOutput {
             Self::Shared { data, .. } => data.as_ref(),
         }
     }
+
+    fn has_budget_guard(&self) -> bool {
+        matches!(
+            self,
+            Self::Shared {
+                _guard: Some(_),
+                ..
+            }
+        )
+    }
+}
+
+enum DecodedGuard {
+    Pin { _pin: PinGuard },
+    Reservation { _reservation: MemoryReservation },
 }
 
 enum MaterializeSource {
@@ -1255,10 +1320,10 @@ async fn materialize_decoded_planned(
     match decoded {
         DecodedOutput::Owned(data) if plan.ranges.is_none() => Ok(data),
         DecodedOutput::Owned(data) => cpu.materialize_owned(data, plan).await,
-        DecodedOutput::Shared { data, _pin } => {
+        DecodedOutput::Shared { data, _guard } => {
             let input = Arc::clone(&data);
             let result = cpu.materialize(input, plan).await;
-            drop(_pin);
+            drop(_guard);
             result
         }
     }
@@ -1279,8 +1344,8 @@ async fn materialize_source(
 fn into_materialize_source(decoded: DecodedOutput) -> MaterializeSource {
     match decoded {
         DecodedOutput::Owned(data) => MaterializeSource::Owned(data),
-        DecodedOutput::Shared { data, _pin } => {
-            drop(_pin);
+        DecodedOutput::Shared { data, _guard } => {
+            drop(_guard);
             MaterializeSource::Shared(data)
         }
     }
@@ -1308,10 +1373,18 @@ async fn decoded_item_data(
 
         match chunk.kind {
             CachePayloadKind::Decoded => {
-                let LoadedChunk { data, _pin, .. } = chunk;
-                return Ok(DecodedOutput::Shared { data, _pin });
+                return Ok(chunk.into_decoded_output());
             }
             CachePayloadKind::Raw => {
+                if item.codec.is_identity() {
+                    validate_identity_decoded_size(
+                        &item.codec,
+                        chunk.data.len(),
+                        item.expected_size,
+                    )?;
+                    return Ok(chunk.into_decoded_output());
+                }
+
                 if !keep_decoded {
                     let decode_task: DecodeTask = decode.submit_decode(
                         Arc::clone(&item.codec),
@@ -1322,16 +1395,16 @@ async fn decoded_item_data(
                     return Ok(DecodedOutput::Owned(decoded));
                 }
 
-                match register_decode_waiter(&state, item) {
+                match register_decode_waiter_after_raw_load(&state, item) {
                     DecodeRegister::Ready(pinned) => {
                         return Ok(DecodedOutput::Shared {
                             data: pinned.data,
-                            _pin: Some(pinned.guard),
+                            _guard: Some(DecodedGuard::Pin { _pin: pinned.guard }),
                         });
                     }
-                    DecodeRegister::Wait(notify) => {
+                    DecodeRegister::Wait(wait) => {
                         drop(chunk);
-                        notify.notified().await;
+                        wait.await;
                     }
                     DecodeRegister::First(key) => {
                         let decode_task: DecodeTask = decode.submit_decode(
@@ -1362,12 +1435,12 @@ async fn decoded_item_data(
                         {
                             Ok(DecodedOutput::Shared {
                                 data: pinned.data,
-                                _pin: Some(pinned.guard),
+                                _guard: Some(DecodedGuard::Pin { _pin: pinned.guard }),
                             })
                         } else {
                             Ok(DecodedOutput::Shared {
                                 data: decoded,
-                                _pin: None,
+                                _guard: None,
                             })
                         };
                         finish_decode_waiter(&state, &key);
@@ -1381,28 +1454,8 @@ async fn decoded_item_data(
 
 enum DecodeRegister {
     Ready(PinnedChunk),
-    Wait(Arc<Notify>),
+    Wait(OwnedNotified),
     First(DecodeKey),
-}
-
-fn register_decode_waiter(state: &StateHandle, item: &AccessItem) -> DecodeRegister {
-    let mut state_ref = state.borrow_mut();
-    let key = DecodeKey::new(item.key, &item.codec, item.expected_size);
-    if let Some(pinned) = state_ref.cache.pin_and_get(&item.key) {
-        if is_matching_decoded(&pinned, key) {
-            return DecodeRegister::Ready(pinned);
-        }
-        drop(pinned);
-    }
-
-    if let Some(notify) = state_ref.decode_inflight.get(&key) {
-        return DecodeRegister::Wait(Arc::clone(notify));
-    }
-
-    state_ref
-        .decode_inflight
-        .insert(key, Arc::new(Notify::new()));
-    DecodeRegister::First(key)
 }
 
 fn finish_decode_waiter(state: &StateHandle, key: &DecodeKey) {
@@ -1431,9 +1484,26 @@ fn is_matching_decoded(pinned: &PinnedChunk, decode_key: DecodeKey) -> bool {
     pinned.kind == CachePayloadKind::Decoded && pinned.decode_key == Some(decode_key)
 }
 
+fn validate_identity_decoded_size(
+    codec: &SharedCodec,
+    actual: usize,
+    expected_size: Option<usize>,
+) -> Result<(), AccessError> {
+    if let Some(expected) = expected_size {
+        if expected != actual {
+            return Err(AccessError::Codec(CodecError::SizeMismatch {
+                codec: codec.name().to_string(),
+                expected,
+                actual,
+            }));
+        }
+    }
+    Ok(())
+}
+
 enum LoadAction {
     Hit(PinnedChunk),
-    Wait(Arc<Notify>),
+    Wait(OwnedNotified),
     Read,
 }
 
@@ -1462,6 +1532,46 @@ impl LoadedChunk {
             _reservation: Some(MemoryReservation { state, bytes }),
         }
     }
+
+    fn is_cached(&self) -> bool {
+        self._pin.is_some()
+    }
+
+    fn into_decoded_output(self) -> DecodedOutput {
+        let Self {
+            data,
+            _pin,
+            _reservation,
+            ..
+        } = self;
+        let _guard = match (_pin, _reservation) {
+            (Some(pin), None) => Some(DecodedGuard::Pin { _pin: pin }),
+            (None, Some(reservation)) => Some(DecodedGuard::Reservation {
+                _reservation: reservation,
+            }),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("loaded chunk cannot be both cached and uncached"),
+        };
+        DecodedOutput::Shared { data, _guard }
+    }
+
+    fn into_staged_shared(self) -> (StagedBytes, usize) {
+        let Self {
+            data,
+            _pin,
+            _reservation,
+            ..
+        } = self;
+        debug_assert!(
+            _pin.is_none(),
+            "cached identity chunks should complete from cache"
+        );
+        if let Some(reservation) = _reservation {
+            reservation.commit();
+        }
+        let bytes = data.len();
+        (StagedBytes::Shared(data), bytes)
+    }
 }
 
 struct MemoryReservation {
@@ -1477,6 +1587,12 @@ impl Drop for MemoryReservation {
         if let Some(state) = self.state.upgrade() {
             state.borrow_mut().budget.release(self.bytes);
         }
+    }
+}
+
+impl MemoryReservation {
+    fn commit(mut self) {
+        self.bytes = 0;
     }
 }
 
@@ -1511,7 +1627,7 @@ async fn load_chunk(
 
         match action {
             LoadAction::Hit(pinned) => return Ok(LoadedChunk::cached(pinned)),
-            LoadAction::Wait(notify) => notify.notified().await,
+            LoadAction::Wait(notify) => notify.await,
             LoadAction::Read => {
                 return read_first(state, io, key, priority, allow_uncached, cache_use).await;
             }
@@ -1563,7 +1679,7 @@ async fn reserve_bytes(state: StateHandle, bytes: usize) -> Result<(), AccessErr
     }
 
     loop {
-        let notify = {
+        let wait = {
             let mut state = state.borrow_mut();
             if bytes > state.budget.capacity() {
                 return Err(AccessError::OutOfMemory);
@@ -1591,10 +1707,10 @@ async fn reserve_bytes(state: StateHandle, bytes: usize) -> Result<(), AccessErr
                 return Ok(());
             }
 
-            state.budget.release_notifier()
+            state.budget.release_notifier().notified_owned()
         };
 
-        notify.notified().await;
+        wait.await;
     }
 }
 
@@ -1884,6 +2000,14 @@ async fn decode_for_schedule(
         if chunk.kind == CachePayloadKind::Decoded {
             return Ok(StageDecodeOutput::Cached);
         }
+        if item.codec.is_identity() {
+            validate_identity_decoded_size(&item.codec, chunk.data.len(), item.expected_size)?;
+            if chunk.is_cached() {
+                return Ok(StageDecodeOutput::Cached);
+            }
+            let (data, bytes) = chunk.into_staged_shared();
+            return Ok(StageDecodeOutput::Staged { data, bytes });
+        }
 
         if !keep_decoded {
             let decode_task: DecodeTask = decode.submit_decode(
@@ -1902,11 +2026,11 @@ async fn decode_for_schedule(
             });
         }
 
-        match register_decode_waiter(&state, &item) {
+        match register_decode_waiter_after_raw_load(&state, &item) {
             DecodeRegister::Ready(_) => return Ok(StageDecodeOutput::Cached),
-            DecodeRegister::Wait(notify) => {
+            DecodeRegister::Wait(wait) => {
                 drop(chunk);
-                notify.notified().await;
+                wait.await;
                 continue;
             }
             DecodeRegister::First(key) => {
@@ -1954,7 +2078,7 @@ async fn decode_for_schedule(
 }
 
 enum ReadyAction {
-    Wait(Arc<Notify>),
+    Wait(OwnedNotified),
     ConvertDecoded {
         data: StagedBytes,
         bytes: usize,
@@ -2011,10 +2135,11 @@ async fn handle_scheduled_ensure_ready(
             let mut state_ref = state.borrow_mut();
             match state_ref.scheduled.remove(&request.id) {
                 Some(ScheduledStage::Pending(notify)) => {
+                    let wait = Arc::clone(&notify).notified_owned();
                     state_ref
                         .scheduled
                         .insert(request.id, ScheduledStage::Pending(Arc::clone(&notify)));
-                    ReadyAction::Wait(notify)
+                    ReadyAction::Wait(wait)
                 }
                 Some(ScheduledStage::Decoded { data, bytes }) => {
                     let notify = Arc::new(Notify::new());
@@ -2051,7 +2176,7 @@ async fn handle_scheduled_ensure_ready(
         };
 
         match action {
-            ReadyAction::Wait(notify) => notify.notified().await,
+            ReadyAction::Wait(wait) => wait.await,
             ReadyAction::ConvertDecoded {
                 data,
                 bytes,
@@ -2152,9 +2277,7 @@ async fn make_ready_direct(
     let plan = item.slice.plan(decoded.as_slice().len())?;
     let bytes = plan.output_len;
 
-    if matches!(&decoded, DecodedOutput::Shared { _pin: Some(_), .. })
-        && try_reserve_bytes(&state, bytes)
-    {
+    if decoded.has_budget_guard() && try_reserve_bytes(&state, bytes) {
         let data = match materialize_decoded_planned(deps.cpu.as_ref(), decoded, plan).await {
             Ok(data) => data,
             Err(err) => {
@@ -2284,10 +2407,11 @@ async fn scheduled_take(
             let mut state_ref = state.borrow_mut();
             match state_ref.scheduled.remove(&id) {
                 Some(ScheduledStage::Pending(notify)) => {
+                    let wait = Arc::clone(&notify).notified_owned();
                     state_ref
                         .scheduled
                         .insert(id, ScheduledStage::Pending(Arc::clone(&notify)));
-                    ReadyAction::Wait(notify)
+                    ReadyAction::Wait(wait)
                 }
                 Some(ScheduledStage::Ready { data, bytes }) => {
                     state_ref.budget.release(bytes);
@@ -2305,7 +2429,7 @@ async fn scheduled_take(
         };
 
         match action {
-            ReadyAction::Wait(notify) => notify.notified().await,
+            ReadyAction::Wait(wait) => wait.await,
             ReadyAction::Direct => {
                 return access_item(
                     state,
@@ -2799,9 +2923,10 @@ mod tests {
             .expect("send request");
 
         let err = recv_reply(rx).expect_err("invalid slice should fail");
-        assert!(err
-            .to_string()
-            .contains("slice spec must contain off/start/end triples"));
+        assert_eq!(
+            err.to_string(),
+            "invalid slice spec: slice spec must contain off/start/end triples"
+        );
     }
 
     #[test]
@@ -2827,24 +2952,52 @@ mod tests {
 
     #[test]
     fn keep_decoded_reuses_decoded_cache() {
-        let (io, reads) = StaticIo::counted(b"abcdef");
-        let (decode, decodes) = IdentityDecode::counted();
+        let (io, reads) = StaticIo::counted(b"x");
+        let (decode, decodes) = CodecBackedDecode::counted();
         let mut config = test_config();
         config.keep_decoded = true;
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
-        let key = ChunkKey::new(FileRef(1), 0, 6);
-        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let key = ChunkKey::new(FileRef(1), 0, 1);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
 
-        let (first, first_rx) = request_with_codec(key, Arc::clone(&codec), Some(6));
+        let (first, first_rx) = request_with_codec(key, Arc::clone(&codec), None);
         handle.send(first).expect("send first");
-        assert_eq!(recv_reply(first_rx).expect("first"), b"abcdef");
+        assert_eq!(recv_reply(first_rx).expect("first"), b"ax");
 
-        let (second, second_rx) = request_with_codec(key, Arc::clone(&codec), Some(6));
+        let (second, second_rx) = request_with_codec(key, Arc::clone(&codec), None);
         handle.send(second).expect("send second");
-        assert_eq!(recv_reply(second_rx).expect("second"), b"abcdef");
+        assert_eq!(recv_reply(second_rx).expect("second"), b"ax");
 
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn decode_waiter_registered_before_finish_observes_wake() {
+        let config = test_config();
+        let state = Rc::new(RefCell::new(SchedulerState::new(&config)));
+        let key = ChunkKey::new(FileRef(1), 0, 1);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
+        let item = AccessItem::new(key, Arc::clone(&codec), None);
+
+        assert!(matches!(
+            register_decode_waiter(&state, &item),
+            DecodeRegister::First(_)
+        ));
+        let waiter = match register_decode_waiter(&state, &item) {
+            DecodeRegister::Wait(waiter) => waiter,
+            DecodeRegister::Ready(_) | DecodeRegister::First(_) => {
+                panic!("second decode registration should wait")
+            }
+        };
+        let decode_key = DecodeKey::new(key, &codec, None);
+        finish_decode_waiter(&state, &decode_key);
+
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(waiter);
     }
 
     #[test]
@@ -2872,19 +3025,20 @@ mod tests {
 
     #[test]
     fn keep_decoded_disabled_decodes_every_access() {
-        let (io, reads) = StaticIo::counted(b"abcdef");
-        let (decode, decodes) = IdentityDecode::counted();
+        let (io, reads) = StaticIo::counted(b"x");
+        let (decode, decodes) = CodecBackedDecode::counted();
         let handle =
             AccessScheduler::spawn(test_config(), Box::new(io), Box::new(decode)).expect("spawn");
-        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let key = ChunkKey::new(FileRef(1), 0, 1);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
 
-        let (first, first_rx) = request(key);
+        let (first, first_rx) = request_with_codec(key, Arc::clone(&codec), None);
         handle.send(first).expect("send first");
-        assert_eq!(recv_reply(first_rx).expect("first"), b"abcdef");
+        assert_eq!(recv_reply(first_rx).expect("first"), b"ax");
 
-        let (second, second_rx) = request(key);
+        let (second, second_rx) = request_with_codec(key, codec, None);
         handle.send(second).expect("send second");
-        assert_eq!(recv_reply(second_rx).expect("second"), b"abcdef");
+        assert_eq!(recv_reply(second_rx).expect("second"), b"ax");
 
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 2);
@@ -2906,7 +3060,41 @@ mod tests {
         handle.send(request).expect("send request");
         assert_eq!(recv_reply(rx).expect("decode"), b"abcdef");
         assert_eq!(reads.load(Ordering::SeqCst), 1);
-        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn identity_codec_bypasses_decode_pool_on_raw_hit() {
+        let (io, reads) = StaticIo::counted(b"abcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let handle =
+            AccessScheduler::spawn(test_config(), Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let (request, rx) = request_with_codec(key, codec, Some(6));
+
+        handle.send(request).expect("send request");
+
+        assert_eq!(recv_reply(rx).expect("identity fast path"), b"abcdef");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn identity_codec_size_mismatch_fails_without_decode_pool() {
+        let (io, _reads) = StaticIo::counted(b"abcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let handle =
+            AccessScheduler::spawn(test_config(), Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let (request, rx) = request_with_codec(key, codec, Some(5));
+
+        handle.send(request).expect("send request");
+
+        let err = recv_reply(rx).expect_err("identity size mismatch");
+        assert!(err.to_string().contains("expected 5 bytes, got 6"));
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2933,17 +3121,17 @@ mod tests {
 
     #[test]
     fn standalone_prefetch_keeps_existing_decoded_cache() {
-        let (io, reads) = StaticIo::counted(b"abcdef");
-        let (decode, decodes) = IdentityDecode::counted();
+        let (io, reads) = StaticIo::counted(b"x");
+        let (decode, decodes) = CodecBackedDecode::counted();
         let mut config = test_config();
         config.keep_decoded = true;
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
-        let key = ChunkKey::new(FileRef(1), 0, 6);
-        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let key = ChunkKey::new(FileRef(1), 0, 1);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
 
-        let (request, rx) = request_with_codec(key, Arc::clone(&codec), Some(6));
+        let (request, rx) = request_with_codec(key, Arc::clone(&codec), None);
         handle.send(request).expect("send request");
-        assert_eq!(recv_reply(rx).expect("first"), b"abcdef");
+        assert_eq!(recv_reply(rx).expect("first"), b"ax");
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
 
@@ -2951,9 +3139,9 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
 
-        let (second, second_rx) = request_with_codec(key, codec, Some(6));
+        let (second, second_rx) = request_with_codec(key, codec, None);
         handle.send(second).expect("send second");
-        assert_eq!(recv_reply(second_rx).expect("second"), b"abcdef");
+        assert_eq!(recv_reply(second_rx).expect("second"), b"ax");
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
     }
@@ -2993,7 +3181,7 @@ mod tests {
         handle.send(hot_request).expect("send hot raw request");
         assert_eq!(recv_reply(hot_rx).expect("hot raw"), b"data");
         assert_eq!(reads.load(Ordering::SeqCst), 2);
-        assert_eq!(decodes.load(Ordering::SeqCst), 2);
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3085,8 +3273,8 @@ mod tests {
 
     #[test]
     fn scheduled_ready_reports_oom_when_decoded_cache_fills_budget() {
-        let (io, reads) = StaticIo::counted(b"abcdef");
-        let (decode, decodes) = IdentityDecode::counted();
+        let (io, reads) = StaticIo::counted(b"bcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
         let config = AccessConfig {
             queue_capacity: 32,
             scheduler_shards: 1,
@@ -3097,9 +3285,9 @@ mod tests {
             cpu: test_cpu_config(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
-        let key = ChunkKey::new(FileRef(1), 0, 6);
-        let codec: SharedCodec = Arc::new(UncompressedCodec);
-        let item = AccessItem::new(key, codec, Some(6));
+        let key = ChunkKey::new(FileRef(1), 0, 5);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
+        let item = AccessItem::new(key, codec, None);
 
         let scheduled = handle
             .scheduled(
@@ -3204,8 +3392,8 @@ mod tests {
 
     #[test]
     fn scheduled_ready_keeps_decoded_cache_when_output_budget_fits() {
-        let (io, reads) = StaticIo::counted(b"abcdef");
-        let (decode, decodes) = IdentityDecode::counted();
+        let (io, reads) = StaticIo::counted(b"bcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
         let config = AccessConfig {
             queue_capacity: 32,
             scheduler_shards: 1,
@@ -3216,10 +3404,10 @@ mod tests {
             cpu: test_cpu_config(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
-        let key = ChunkKey::new(FileRef(1), 0, 6);
-        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let key = ChunkKey::new(FileRef(1), 0, 5);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
         let scheduled_item =
-            AccessItem::new(key, Arc::clone(&codec), Some(6)).with_slice(Some(vec![0, 0, 3]));
+            AccessItem::new(key, Arc::clone(&codec), None).with_slice(Some(vec![0, 0, 3]));
 
         let scheduled = handle
             .scheduled(
@@ -3239,7 +3427,7 @@ mod tests {
             b"abc"
         );
 
-        let (request, rx) = request_with_codec(key, codec, Some(6));
+        let (request, rx) = request_with_codec(key, codec, None);
         handle.send(request).expect("send cached request");
         assert_eq!(recv_reply(rx).expect("cached full chunk"), b"abcdef");
         assert_eq!(reads.load(Ordering::SeqCst), 1);
@@ -3453,16 +3641,15 @@ mod tests {
 
     #[test]
     fn scheduled_iterator_returns_ready_results() {
-        let (io, reads) = StaticIo::counted(b"abcdef");
-        let (decode, decodes) = IdentityDecode::counted();
+        let (io, reads) = StaticIo::counted(b"bcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
         let handle =
             AccessScheduler::spawn(test_config(), Box::new(io), Box::new(decode)).expect("spawn");
-        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let key = ChunkKey::new(FileRef(1), 0, 5);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
         let items = vec![
-            AccessItem::new(key, Arc::new(UncompressedCodec), Some(6))
-                .with_slice(Some(vec![0, 0, 3])),
-            AccessItem::new(key, Arc::new(UncompressedCodec), Some(6))
-                .with_slice(Some(vec![0, 3, 6])),
+            AccessItem::new(key, Arc::clone(&codec), None).with_slice(Some(vec![0, 0, 3])),
+            AccessItem::new(key, Arc::clone(&codec), None).with_slice(Some(vec![0, 3, 6])),
         ];
 
         let mut scheduled = handle
@@ -3487,17 +3674,89 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_iterator_reuses_decoded_cache_when_enabled() {
+    fn scheduled_identity_iterator_bypasses_decode_pool() {
         let (io, reads) = StaticIo::counted(b"abcdef");
-        let (decode, decodes) = IdentityDecode::counted();
-        let mut config = test_config();
-        config.keep_decoded = true;
-        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let handle =
+            AccessScheduler::spawn(test_config(), Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 6);
         let codec: SharedCodec = Arc::new(UncompressedCodec);
         let items = vec![
             AccessItem::new(key, Arc::clone(&codec), Some(6)).with_slice(Some(vec![0, 0, 3])),
             AccessItem::new(key, Arc::clone(&codec), Some(6)).with_slice(Some(vec![0, 3, 6])),
+        ];
+
+        let mut scheduled = handle
+            .scheduled(
+                items,
+                ScheduledAccessConfig {
+                    prefetch_step: 1,
+                    decode_ahead_steps: 1,
+                    ready_ahead_steps: 1,
+                },
+            )
+            .expect("scheduled");
+
+        assert_eq!(scheduled.next().expect("first").expect("first ok"), b"abc");
+        assert_eq!(
+            scheduled.next().expect("second").expect("second ok"),
+            b"def"
+        );
+        assert!(scheduled.next().is_none());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn scheduled_uncached_identity_decode_bypasses_decode_pool() {
+        let (io, reads) = StaticIo::counted(b"abcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let config = AccessConfig {
+            queue_capacity: 32,
+            scheduler_shards: 1,
+            cache_capacity_bytes: 1,
+            memory_budget_bytes: 12,
+            default_io_priority: 0,
+            keep_decoded: false,
+            cpu: test_cpu_config(),
+        };
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let item = AccessItem::new(key, codec, Some(6));
+
+        let mut scheduled = handle
+            .scheduled(
+                vec![item],
+                ScheduledAccessConfig {
+                    prefetch_step: 0,
+                    decode_ahead_steps: 0,
+                    ready_ahead_steps: 0,
+                },
+            )
+            .expect("scheduled");
+
+        assert_eq!(
+            scheduled.next().expect("first").expect("first ok"),
+            b"abcdef"
+        );
+        assert!(scheduled.next().is_none());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn scheduled_iterator_reuses_decoded_cache_when_enabled() {
+        let (io, reads) = StaticIo::counted(b"bcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let mut config = test_config();
+        config.keep_decoded = true;
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 5);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
+        let items = vec![
+            AccessItem::new(key, Arc::clone(&codec), None).with_slice(Some(vec![0, 0, 3])),
+            AccessItem::new(key, Arc::clone(&codec), None).with_slice(Some(vec![0, 3, 6])),
         ];
 
         let mut scheduled = handle

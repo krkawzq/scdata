@@ -403,8 +403,8 @@ class ArrayMeta:
             )
         if len(self.shape) == 0:
             raise ValueError("array shape must be non-empty")
-        if any(s <= 0 for s in self.shape):
-            raise ValueError(f"shape must be positive, got {self.shape}")
+        if any(s < 0 for s in self.shape):
+            raise ValueError(f"shape must be non-negative, got {self.shape}")
         if any(c <= 0 for c in self.chunk_shape):
             raise ValueError(f"chunk_shape must be positive, got {self.chunk_shape}")
         if self.store_kind not in ("file", "dir"):

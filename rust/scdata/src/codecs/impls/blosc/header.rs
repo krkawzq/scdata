@@ -25,7 +25,7 @@ impl BloscHeader {
     }
 
     pub(super) fn is_bit_shuffled(self) -> bool {
-        self.flags & blosc_src::BLOSC_DOBITSHUFFLE as u8 != 0 && self.blocksize >= self.typesize
+        self.flags & blosc_src::BLOSC_DOBITSHUFFLE as u8 != 0
     }
 
     pub(super) fn dont_split(self) -> bool {

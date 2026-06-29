@@ -114,6 +114,53 @@ def test_config_dynamic_routing_and_validation() -> None:
         DataBankConfig.make(backend="bad")
 
 
+def test_config_accepts_dict_and_nested_dicts() -> None:
+    cfg = DataBankConfig.from_dict(
+        {
+            "io": {
+                "backend": "uring",
+                "uring": {"entries": 1024, "base": {"max_in_flight": 2048}},
+            },
+            "access_config": {
+                "cache_capacity_bytes": 16 * 1024**2,
+                "memory_budget_bytes": 32 * 1024**2,
+                "cpu": {"num_workers": 2},
+            },
+            "decode": {"num_workers": 3},
+            "fill__num_workers": 4,
+        }
+    )
+
+    assert cfg.io_config.backend == "uring"
+    assert cfg.io_config.uring_config.entries == 1024
+    assert cfg.io_config.uring_config.base.max_in_flight == 2048
+    assert cfg.access_config.cpu.num_workers == 2
+    assert cfg.decode_config.num_workers == 3
+    assert cfg.fill_config.num_workers == 4
+
+    cfg.update({"io": {"uring": {"drivers": 2}}, "fill": {"queue_capacity": 16}})
+    assert cfg.io_config.uring_config.drivers == 2
+    assert cfg.fill_config.queue_capacity == 16
+
+    direct = DataBankConfig(
+        io_config={"backend": "threaded", "threaded": {"num_workers": 9}},
+        access_config={"cpu": {"queue_capacity": 7}},
+    )
+    assert isinstance(direct.io_config, IoConfig)
+    assert direct.io_config.threaded_config.num_workers == 9
+    assert direct.access_config.cpu.queue_capacity == 7
+
+    io = IoConfig.uring({"entries": 256, "base": {"priority_levels": 5}})
+    assert io.backend == "uring"
+    assert io.uring_config.entries == 256
+    assert io.uring_config.base.priority_levels == 5
+
+    bank = ScDataBank(
+        {"access": {"cache_capacity_bytes": 16 * 1024**2, "memory_budget_bytes": 32 * 1024**2}}
+    )
+    bank.close()
+
+
 def test_access_dense_values(tmp_path: Path) -> None:
     root, ds, expected, _ = _dense_store(
         tmp_path, "acc", (5, 6), np.float32, [f"g{i}" for i in range(6)]
@@ -299,7 +346,7 @@ def test_prefetch(tmp_path: Path) -> None:
     bank = ScDataBank()
     did = bank.register_dense(ds, str(root))
     batches = [[0, 1], [2, 3, 4]]
-    pf = bank.prefetch(did, batches)
+    pf = bank.prefetch(did, batches, config={"prefetch_step": 2, "access": {"prefetch_step": 2}})
     seen = 0
     for batch in pf:
         assert hasattr(batch, "cells") and hasattr(batch, "data") and hasattr(batch, "num_genes")

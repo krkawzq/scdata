@@ -1,6 +1,6 @@
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
 use super::super::spec::{sealed, ChunkCodec};
-use super::super::util::{decode_error, output_too_small, verify_size};
+use super::super::util::{decode_error, output_too_small, reserve_decode_buffer, verify_size};
 use super::super::CodecResult;
 
 #[derive(Debug)]
@@ -108,6 +108,10 @@ impl ChunkCodec for Crc32Codec {
         Ok(encoded)
     }
 
+    fn prefers_decode_owned(&self) -> bool {
+        true
+    }
+
     fn decode_to_vec(
         &self,
         encoded: &[u8],
@@ -170,7 +174,8 @@ impl ChunkCodec for Crc32Codec {
         verify_size(self.name(), payload.len(), expected_size)?;
         output.clear();
         if output.capacity() < payload.len() {
-            output.reserve_exact(payload.len() - output.capacity());
+            let additional = payload.len() - output.capacity();
+            reserve_decode_buffer(self.name(), &mut output, additional)?;
         }
         set_vec_len_for_decode(&mut output, payload.len());
         output.copy_from_slice(payload);
@@ -184,9 +189,5 @@ impl ChunkCodec for Crc32Codec {
         expected_size: Option<usize>,
     ) -> CodecResult<Vec<u8>> {
         self.decode_to_vec(encoded, output, expected_size)
-    }
-
-    fn prefers_decode_owned(&self) -> bool {
-        true
     }
 }

@@ -1,6 +1,8 @@
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
 use super::super::spec::{sealed, ChunkCodec};
-use super::super::util::{decode_error, output_too_small, verify_size};
+use super::super::util::{
+    decode_error, output_too_small, reserve_decode_buffer, vec_with_decode_capacity, verify_size,
+};
 use super::super::CodecResult;
 
 #[derive(Debug)]
@@ -15,7 +17,15 @@ fn lz4_decoded_size(codec: &str, encoded: &[u8]) -> CodecResult<usize> {
             "LZ4 buffer is shorter than size header",
         ));
     }
-    Ok(u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize)
+    let decoded_size =
+        u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+    if decoded_size > i32::MAX as usize {
+        return Err(decode_error(
+            codec,
+            format!("LZ4 decoded payload is too large: {decoded_size}"),
+        ));
+    }
+    Ok(decoded_size)
 }
 
 impl ChunkCodec for Lz4Codec {
@@ -26,7 +36,7 @@ impl ChunkCodec for Lz4Codec {
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
         let decoded_size = lz4_decoded_size(self.name(), encoded)?;
         verify_size(self.name(), decoded_size, expected_size)?;
-        let mut decoded = Vec::with_capacity(decoded_size);
+        let mut decoded = vec_with_decode_capacity(self.name(), decoded_size)?;
         set_vec_len_for_decode(&mut decoded, decoded_size);
         let written = lz4_decompress_known_size(self.name(), encoded, &mut decoded, decoded_size)?;
         decoded.truncate(written);
@@ -89,7 +99,8 @@ impl ChunkCodec for Lz4Codec {
         verify_size(self.name(), decoded_size, expected_size)?;
         output.clear();
         if output.capacity() < decoded_size {
-            output.reserve_exact(decoded_size - output.capacity());
+            let additional = decoded_size - output.capacity();
+            reserve_decode_buffer(self.name(), &mut output, additional)?;
         }
         set_vec_len_for_decode(&mut output, decoded_size);
         let written = lz4_decompress_known_size(self.name(), encoded, &mut output, decoded_size)?;
@@ -155,4 +166,22 @@ pub(crate) fn lz4_decompress_raw_into(
     }
     verify_size(codec, written as usize, Some(output.len()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_decoded_size_that_exceeds_lz4_ffi_limit() {
+        let codec = Lz4Codec;
+        let encoded = [0x00, 0x00, 0x00, 0x80, 0x00];
+        let err = codec
+            .decode(&encoded, None)
+            .expect_err("oversized LZ4 payload should fail before allocation");
+
+        assert!(
+            matches!(err, super::super::super::CodecError::Decode { codec, message } if codec == "lz4" && message.contains("too large"))
+        );
+    }
 }

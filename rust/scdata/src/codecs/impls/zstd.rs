@@ -2,7 +2,9 @@ use std::io::Cursor;
 
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
 use super::super::spec::{sealed, ChunkCodec};
-use super::super::util::{decode_error, output_too_small, verify_size};
+use super::super::util::{
+    decode_error, output_too_small, reserve_decode_buffer, vec_with_decode_capacity, verify_size,
+};
 use super::super::CodecResult;
 
 #[derive(Debug)]
@@ -34,7 +36,7 @@ impl ChunkCodec for ZstdCodec {
             None => zstd_decoded_size(self.name(), encoded)?,
         };
         if let Some(decoded_size) = decoded_size {
-            let mut decoded = Vec::with_capacity(decoded_size);
+            let mut decoded = vec_with_decode_capacity(self.name(), decoded_size)?;
             set_vec_len_for_decode(&mut decoded, decoded_size);
             let written = zstd_decompress_into_slice(self.name(), encoded, &mut decoded)?;
             verify_size(self.name(), written, Some(decoded_size))?;
@@ -134,7 +136,8 @@ impl ChunkCodec for ZstdCodec {
         let mut output = output;
         output.clear();
         if output.capacity() < decoded_size {
-            output.reserve_exact(decoded_size - output.capacity());
+            let additional = decoded_size - output.capacity();
+            reserve_decode_buffer(self.name(), &mut output, additional)?;
         }
         set_vec_len_for_decode(&mut output, decoded_size);
         let written = zstd_decompress_into_slice(self.name(), encoded, &mut output)?;
@@ -161,4 +164,21 @@ fn zstd_decompress_into_slice(
 ) -> CodecResult<usize> {
     zstd::zstd_safe::decompress(output, encoded)
         .map_err(|err| decode_error(codec, zstd::zstd_safe::get_error_name(err).to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_impossible_expected_size_before_allocating() {
+        let codec = ZstdCodec;
+        let err = codec
+            .decode(b"not a zstd frame", Some(usize::MAX))
+            .expect_err("impossible expected size should fail");
+
+        assert!(
+            matches!(err, super::super::super::CodecError::Decode { codec, message } if codec == "zstd" && message.contains("reserve decode buffer"))
+        );
+    }
 }

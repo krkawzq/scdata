@@ -11,7 +11,7 @@ use super::impls::{
 use super::registry::cached_codec;
 use super::util::{
     optional_blosc_shuffle, optional_bool, optional_i32, optional_string, optional_u32,
-    optional_u8, optional_usize,
+    optional_u8, optional_usize, reserve_decode_buffer,
 };
 use super::{CodecError, CodecResult, SharedCodec};
 
@@ -64,7 +64,8 @@ pub trait ChunkCodec: sealed::Sealed + Send + Sync + fmt::Debug + 'static {
 
         output.clear();
         if output.capacity() < required {
-            output.reserve_exact(required - output.capacity());
+            let additional = required - output.capacity();
+            reserve_decode_buffer(self.name(), &mut output, additional)?;
         }
         self.decode_to_vec(encoded, output, expected_size)
     }
@@ -483,6 +484,23 @@ mod tests {
         assert_eq!(&decoded, b"abcdef");
 
         let err = codec.decode(b"abcdef", Some(5)).expect_err("size mismatch");
+        assert!(matches!(err, CodecError::SizeMismatch { codec, .. } if codec == "none"));
+    }
+
+    #[test]
+    fn pipeline_skips_identity_stages_without_losing_size_checks() {
+        let raw = b"abcdef";
+        let encoded = crc32_encode(raw);
+        let codec = CodecPipeline::from_specs(&[CodecSpec::None, CodecSpec::Crc32]);
+
+        let decoded = codec
+            .decode(&encoded, Some(raw.len()))
+            .expect("pipeline decode");
+        assert_eq!(decoded, raw);
+
+        let err = codec
+            .decode(&encoded, Some(raw.len() + 1))
+            .expect_err("identity stage should still validate propagated size");
         assert!(matches!(err, CodecError::SizeMismatch { codec, .. } if codec == "none"));
     }
 

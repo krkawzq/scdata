@@ -113,11 +113,18 @@ def write_zarr(
     _enable_rectilinear()
 
     root = Path(os.fspath(path))
-    _erase_destination(root, store)
+    _validate_write_options(
+        format=format,
+        layer_format=layer_format,
+        chunk_size=chunk_size,
+        store=store,
+    )
     if store == "zip":
+        _prepare_zip_target(root)
         zstore = MemoryStore()
     else:
-        zstore = _make_zarr_store(root, store)
+        tmp_root = _make_temp_dir(root)
+        zstore = _make_zarr_store(tmp_root, store)
 
     try:
         g = zarr.open_group(zstore, mode="w", zarr_format=3)
@@ -153,10 +160,14 @@ def write_zarr(
             _zip_store(zstore, root)
         else:
             zarr.consolidate_metadata(g.store)
+            _replace_directory(tmp_root, root)
+            tmp_root = None
     finally:
         close = getattr(zstore, "close", None)
         if close is not None:
             close()
+        if store == "dir" and tmp_root is not None:
+            _remove_path(tmp_root)
     return root
 
 
@@ -418,7 +429,7 @@ def _resolve_sparse_chunk_target(chunk_size: int | list[int] | tuple[int, ...]) 
     else:
         target = int(chunk_size)
     if target <= 0:
-        raise StoreError(f"sparse chunk_size int must be positive, got {target}")
+        raise StoreError(f"sparse chunk_size must be positive, got {target}")
     return target
 
 
@@ -464,7 +475,6 @@ def _write_rectilinear_array(
     chunk files by hand because zarr's ``create_array`` only accepts regular
     chunk grids.
     """
-    runs = [boundaries[i + 1] - boundaries[i] for i in range(len(boundaries) - 1)]
     total = int(values.shape[0])
     np_dtype = np.dtype(dtype)
     attrs = {
@@ -473,6 +483,17 @@ def _write_rectilinear_array(
         _SCDATA_MATRIX_ATTR: "sparse-vlen",
         _SCDATA_X_ATTR: "sparse-vlen",
     }
+    if total == 0:
+        _create_dense_array(
+            g,
+            name,
+            np.asarray(values, dtype=np_dtype),
+            (1,),
+            attrs=attrs,
+        )
+        return
+
+    runs = [boundaries[i + 1] - boundaries[i] for i in range(len(boundaries) - 1)]
     zarray = _v3_array_json(
         shape=[total],
         data_type=_v3_dtype_name(np_dtype),
@@ -518,7 +539,10 @@ def _resolve_chunk_size_2d(
     if isinstance(chunk_size, (list, tuple)):
         if len(chunk_size) != 2:
             raise StoreError(f"dense2d chunk_size list must have 2 entries, got {len(chunk_size)}")
-        return (int(chunk_size[0]), int(chunk_size[1]))
+        size = (int(chunk_size[0]), int(chunk_size[1]))
+        if any(value <= 0 for value in size):
+            raise StoreError(f"dense2d chunk_size entries must be positive, got {size}")
+        return size
     return _broadcast_int_chunk_size(int(chunk_size), 2, (n_obs, n_var))
 
 
@@ -539,10 +563,10 @@ def _resolve_chunk_size_1d(
         size = int(chunk_size[0])
     else:
         size = int(chunk_size)
+    if size <= 0:
+        raise StoreError(f"dense1d chunk_size must be positive, got {size}")
     if align_cells and gene_count > 0:
         size = _ceil_div(size, gene_count) * gene_count
-        if size <= 0:
-            size = gene_count
     return (size,)
 
 
@@ -660,12 +684,58 @@ def _group_store_key(g: Any, key: str) -> str:
     return f"{group_path}/{key}" if group_path else key
 
 
+def _validate_write_options(
+    *,
+    format: str,
+    layer_format: str,
+    chunk_size: int | list[int] | tuple[int, ...],
+    store: str,
+) -> None:
+    """Validate cheap write options before touching the output path."""
+    if store not in ("zip", "dir"):
+        raise StoreError(f"unsupported store kind: {store!r}")
+    if format not in ("dense2d", "dense1d", "sparse"):
+        raise StoreError(f"unsupported X format: {format!r}")
+    if layer_format not in ("preserve", "auto", "dense2d", "dense1d", "sparse"):
+        raise StoreError(f"unsupported layer_format {layer_format!r}")
+    _validate_chunk_size_values(chunk_size)
+
+
+def _validate_chunk_size_values(chunk_size: int | list[int] | tuple[int, ...]) -> None:
+    """Validate the numeric part of ``chunk_size`` independent of layout rank."""
+    values = chunk_size if isinstance(chunk_size, (list, tuple)) else (chunk_size,)
+    if not values:
+        raise StoreError("chunk_size must not be empty")
+    for value in values:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as err:
+            raise StoreError(f"chunk_size entries must be integers, got {value!r}") from err
+        if parsed <= 0:
+            raise StoreError(f"chunk_size entries must be positive, got {parsed}")
+
+
 def _make_zarr_store(root: Path, store: _Store) -> Any:
     if store == "zip":
         raise StoreError("internal error: zip writes must use a memory store")
     if store == "dir":
         return str(root)
     raise StoreError(f"unsupported store kind: {store!r}")
+
+
+def _prepare_zip_target(root: Path) -> None:
+    """Validate and prepare a zip target without deleting existing files."""
+    if root.is_dir():
+        raise StoreError(f"zip output path is a directory: {root}")
+    root.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _make_temp_dir(target: Path) -> Path:
+    """Create a sibling temporary directory for an output directory store."""
+    import tempfile
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent))
 
 
 def _zip_store(store: Any, target: Path) -> None:
@@ -687,21 +757,42 @@ def _zip_store(store: Any, target: Path) -> None:
             pass
 
 
-def _erase_destination(root: Path, store: _Store) -> None:
-    """Create or erase the destination before opening a fresh store."""
-    if store == "zip":
-        if root.is_dir():
-            raise StoreError(f"zip output path is a directory: {root}")
-        root.parent.mkdir(parents=True, exist_ok=True)
-    else:  # dir
-        import shutil
+def _replace_directory(source: Path, target: Path) -> None:
+    """Replace ``target`` with completed ``source``, rolling back on failure."""
+    backup: Path | None = None
+    if target.exists() or target.is_symlink():
+        backup = _make_temp_backup_path(target)
+        os.replace(target, backup)
+    try:
+        os.replace(source, target)
+    except Exception:
+        if backup is not None and backup.exists():
+            os.replace(backup, target)
+        raise
+    if backup is not None:
+        _remove_path(backup)
 
-        if root.exists():
-            if root.is_dir() and not root.is_symlink():
-                shutil.rmtree(root)
-            else:
-                root.unlink()
-        root.mkdir(parents=True, exist_ok=True)
+
+def _make_temp_backup_path(target: Path) -> Path:
+    """Reserve a sibling path for temporarily moving an existing target."""
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix=f".{target.name}.", suffix=".bak", dir=target.parent))
+    tmp.rmdir()
+    return tmp
+
+
+def _remove_path(path: Path) -> None:
+    """Remove a file, symlink, or directory tree if it still exists."""
+    import shutil
+
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
 use super::super::spec::{sealed, ChunkCodec};
-use super::super::util::{output_too_small, verify_size};
+use super::super::util::{output_too_small, reserve_decode_buffer, verify_size};
 use super::super::CodecResult;
 
 #[derive(Debug, Default)]
@@ -73,7 +73,8 @@ impl ChunkCodec for UncompressedCodec {
         verify_size(self.name(), encoded.len(), expected_size)?;
         output.clear();
         if output.capacity() < encoded.len() {
-            output.reserve_exact(encoded.len() - output.capacity());
+            let additional = encoded.len() - output.capacity();
+            reserve_decode_buffer(self.name(), &mut output, additional)?;
         }
         set_vec_len_for_decode(&mut output, encoded.len());
         unsafe {

@@ -103,12 +103,13 @@ fn run_synth(args: &Args, bench_args: &ManifestBenchArgs) -> Result<(), String> 
         .unwrap_or_else(|| support::bench_data_dir().join("codec-manifest-synth"));
     let codecs = default_codec_matrix();
     let dtypes = if args.synth_dtypes.is_empty() {
-        vec![
-            "u32".to_string(),
-            "f32".to_string(),
-            "u64".to_string(),
-            "f64".to_string(),
-        ]
+        default_synth_dtypes()
+    } else if args
+        .synth_dtypes
+        .iter()
+        .any(|dtype| dtype.eq_ignore_ascii_case("all"))
+    {
+        all_synth_dtypes()
     } else {
         args.synth_dtypes.clone()
     };
@@ -164,6 +165,22 @@ fn run_synth(args: &Args, bench_args: &ManifestBenchArgs) -> Result<(), String> 
         output_dir.display(),
     );
     manifest::bench_matrix(&runs, bench_args, &output_dir)
+}
+
+fn default_synth_dtypes() -> Vec<String> {
+    ["u32", "f32", "u64", "f64"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn all_synth_dtypes() -> Vec<String> {
+    [
+        "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f16", "bf16", "f32", "f64",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn parse_dtype(name: &str) -> Result<DType, String> {
@@ -292,7 +309,7 @@ fn print_help() {
         "codec_manifest [--manifest <manifest.json|matrix_manifest.json>] [--output-dir <dir>]\n\
          \x20             [--repeats N] [--warmups N] [--verify all|first|none]\n\
          \x20             [--decode-order sequential|random] [--seed N]\n\
-         \x20             [--synth-dtypes u32,f32,...] [--synth-dists uniform,counting,...]\n\
+         \x20             [--synth-dtypes u32,f32,...|all] [--synth-dists uniform,counting,...]\n\
          \x20             [--synth-missing 0,250,500,950] [--synth-chunk-bytes 65536,1048576]\n\
          \x20             [--synth-num-chunks N]\n\
          \n\

@@ -83,15 +83,12 @@ impl CacheInner {
         }
     }
 
-    fn touch(&mut self, key: ChunkKey) {
-        let stamp = {
-            let Some(entry) = self.entries.get_mut(&key) else {
-                return;
-            };
-            self.clock = self.clock.wrapping_add(1);
-            entry.stamp = self.clock;
-            entry.stamp
-        };
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn record_touch(&mut self, key: ChunkKey, stamp: u64) {
         self.lru.push_back((key, stamp));
         self.compact_lru_if_needed();
     }
@@ -154,11 +151,14 @@ impl CacheInner {
         skip_key: Option<ChunkKey>,
     ) -> Result<usize, CacheInsertError> {
         let mut evicted_bytes = 0;
-        while self.used.saturating_add(additional_bytes) > self.capacity {
+        while match self.used.checked_add(additional_bytes) {
+            Some(total) => total > self.capacity,
+            None => true,
+        } {
             let Some(evicted) = self.evict_one_except(skip_key) else {
                 return Err(CacheInsertError::all_pinned(evicted_bytes));
             };
-            evicted_bytes += evicted.bytes;
+            evicted_bytes = evicted_bytes.saturating_add(evicted.bytes);
         }
         Ok(evicted_bytes)
     }
@@ -293,12 +293,23 @@ impl ChunkCache {
     /// Pin and clone the cached bytes in one synchronous operation.
     pub(crate) fn pin_and_get(&self, key: &ChunkKey) -> Option<PinnedChunk> {
         let mut inner = self.inner.borrow_mut();
-        let entry = inner.entries.get_mut(key)?;
-        entry.refcount += 1;
-        let kind = entry.payload.kind();
-        let data = entry.payload.data();
-        let decode_key = entry.payload.decode_key();
-        inner.touch(*key);
+        let (kind, data, decode_key, stamp) = {
+            let inner = &mut *inner;
+            let entries = &mut inner.entries;
+            let clock = &mut inner.clock;
+            let entry = entries.get_mut(key)?;
+            *clock = clock.wrapping_add(1);
+            let stamp = *clock;
+            entry.refcount += 1;
+            entry.stamp = stamp;
+            (
+                entry.payload.kind(),
+                entry.payload.data(),
+                entry.payload.decode_key(),
+                stamp,
+            )
+        };
+        inner.record_touch(*key, stamp);
         Some(PinnedChunk {
             data,
             kind,
@@ -324,8 +335,20 @@ impl ChunkCache {
             return Err(CacheInsertError::item_too_large());
         }
 
-        if inner.entries.contains_key(&key) {
-            inner.touch(key);
+        if let Some(stamp) = {
+            let inner = &mut *inner;
+            let entries = &mut inner.entries;
+            let clock = &mut inner.clock;
+            if let Some(entry) = entries.get_mut(&key) {
+                *clock = clock.wrapping_add(1);
+                let stamp = *clock;
+                entry.stamp = stamp;
+                Some(stamp)
+            } else {
+                None
+            }
+        } {
+            inner.record_touch(key, stamp);
             return Ok(InsertOutcome {
                 inserted: false,
                 evicted_bytes: 0,
@@ -334,16 +357,20 @@ impl ChunkCache {
         }
 
         let evicted_bytes = inner.evict_until_fits(size, None)?;
-        inner.used += size;
+        let stamp = inner.next_stamp();
+        inner.used = inner
+            .used
+            .checked_add(size)
+            .expect("cache usage checked before insert");
         inner.entries.insert(
             key,
             CacheEntry {
                 payload,
                 refcount: 0,
-                stamp: 0,
+                stamp,
             },
         );
-        inner.touch(key);
+        inner.record_touch(key, stamp);
         Ok(InsertOutcome {
             inserted: true,
             evicted_bytes,
@@ -374,38 +401,51 @@ impl ChunkCache {
         };
 
         if replaced_bytes > 0 {
-            inner.used = inner.used.saturating_sub(replaced_bytes);
+            inner.used = inner
+                .used
+                .checked_sub(replaced_bytes)
+                .expect("replacement bytes are part of cache usage");
         }
 
         let evicted = match inner.evict_until_fits(size, Some(key)) {
             Ok(evicted) => evicted,
             Err(err) => {
                 if replaced_bytes > 0 {
-                    inner.used += replaced_bytes;
+                    inner.used = inner
+                        .used
+                        .checked_add(replaced_bytes)
+                        .expect("rollback restores prior cache usage");
                 }
                 return Err(err);
             }
         };
 
         if replaced_bytes > 0 {
+            let stamp = inner.next_stamp();
             let entry = inner
                 .entries
                 .get_mut(&key)
                 .expect("replacement target checked above");
             entry.payload = payload;
             entry.refcount = 0;
+            entry.stamp = stamp;
+            inner.record_touch(key, stamp);
         } else {
+            let stamp = inner.next_stamp();
             inner.entries.insert(
                 key,
                 CacheEntry {
                     payload,
                     refcount: 0,
-                    stamp: 0,
+                    stamp,
                 },
             );
+            inner.record_touch(key, stamp);
         }
-        inner.used += size;
-        inner.touch(key);
+        inner.used = inner
+            .used
+            .checked_add(size)
+            .expect("cache usage checked before replace");
 
         Ok(InsertOutcome {
             inserted: true,

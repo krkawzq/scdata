@@ -111,12 +111,10 @@ impl DataBank {
     }
 
     pub fn unregister(&mut self, id: DatasetId) -> DataBankResult<()> {
-        self.registry
-            .get(id)?
-            .unregister_files(self.io_pool.as_ref())?;
         let dataset = self.registry.remove(id)?;
+        let result = dataset.unregister_files(self.io_pool.as_ref());
         self.interner.release_dataset(dataset.genes());
-        Ok(())
+        result
     }
 
     pub fn access_cells<T: DataValue>(
@@ -303,6 +301,7 @@ impl DataBank {
         config: ScheduledAccessConfig,
     ) -> DataBankResult<Vec<T>> {
         let dataset = self.registry.get(id)?;
+        batch::validate_dtype_and_cells::<T>(dataset, cells)?;
         let total = cells
             .len()
             .checked_mul(dataset.num_genes())

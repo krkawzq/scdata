@@ -483,7 +483,7 @@ def _v3_codec_id(name: str) -> str | None:
         "blosc": "blosc",
         "lz4": "lz4",
         "gzip": "gzip",
-        "zlib": "gzip",
+        "zlib": "zlib",
     }.get(name)
 
 
@@ -517,6 +517,8 @@ def _v3_to_numcodecs(codec_id: str, cfg: dict[str, Any], context: str) -> dict[s
         }
     if codec_id == "gzip":
         return {"id": "gzip", "level": int(cfg.get("level", 5))}
+    if codec_id == "zlib":
+        return {"id": "zlib", "level": int(cfg.get("level", 5))}
     raise StoreError(f"{context}: cannot translate codec {codec_id!r} to numcodecs")
 
 
@@ -629,8 +631,10 @@ def _v3_rectilinear_edges(
                 raise StoreError(f"{context}: bad rectilinear edge {e!r}")
     else:
         raise StoreError(f"{context}: bad rectilinear axis spec {axis!r}")
-    if any(edge < 0 for edge in edges):
-        raise StoreError(f"{context}: rectilinear edge lengths must be non-negative")
+    if not edges:
+        raise StoreError(f"{context}: rectilinear edge lengths must not be empty")
+    if any(edge <= 0 for edge in edges):
+        raise StoreError(f"{context}: rectilinear edge lengths must be positive")
     total = sum(edges)
     expected = shape[0] if shape else 0
     if total != expected:
@@ -725,6 +729,7 @@ def _parse_v3_array(store: Store, array_key: str) -> _V3Array:
 
     if len(shape) != len(chunk_shape):
         raise StoreError(f"{key}: shape rank {len(shape)} != chunks rank {len(chunk_shape)}")
+    _validate_absent_chunk_fill_value(meta.get("fill_value"), chunk_lengths, key)
     dtype = _v3_dtype(meta, key)
     order = _parse_order(meta.get("order"), key)
     codec = _v3_codec_pipeline(meta.get("codecs"), key)
@@ -745,6 +750,35 @@ def _parse_v3_array(store: Store, array_key: str) -> _V3Array:
         chunk_boundaries=chunk_boundaries,
         rectilinear=rectilinear,
     )
+
+
+def _validate_absent_chunk_fill_value(
+    fill_value: object,
+    chunk_lengths: tuple[int, ...],
+    context: str,
+) -> None:
+    """Reject absent chunks when their zarr fill value is not zero."""
+    if not any(length == 0 for length in chunk_lengths):
+        return
+    if _fill_value_is_zero(fill_value):
+        return
+    raise StoreError(
+        f"{context}: absent chunks require zero fill_value for databank access; "
+        f"got {fill_value!r}"
+    )
+
+
+def _fill_value_is_zero(value: object) -> bool:
+    """Whether a zarr JSON fill_value represents numeric zero."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value is False
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, list):
+        return all(_fill_value_is_zero(item) for item in value)
+    return False
 
 
 def _v3_array_to_meta(arr: _V3Array, store: Store) -> ArrayMeta:

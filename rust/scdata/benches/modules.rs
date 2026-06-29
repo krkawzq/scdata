@@ -40,8 +40,9 @@ use _scdata::iopool::{
 };
 use support::backends::{CodecDecode, SliceIo};
 use support::chunks::{
-    make_csr_u32_f32_chunks, make_dense1d_u32_chunks, make_dense_u32_chunks,
-    make_dense_u32_chunks_zstd, write_dense_u32_directory, write_dense_u32_file,
+    make_csr_u32_f32_chunks, make_dense1d_u32_chunks, make_dense1d_u32_variable_chunks,
+    make_dense_u32_chunks, make_dense_u32_chunks_zstd, write_dense_u32_directory,
+    write_dense_u32_file,
 };
 use support::codecs::{
     blosc_encode, bz2_encode, crc32_encode, decode_into_checksum, encode_for_spec, gzip_encode,
@@ -779,6 +780,20 @@ fn bench_iopool(config: BenchConfig) {
             bytes.len() ^ bytes[bytes.len() / 2] as usize
         },
     );
+    bench(
+        config,
+        "iopool/threaded_error_read_past_eof",
+        1024,
+        None,
+        || {
+            pool.submit(IoCommand::read(file, data.len() as u64 + 1, 4096, 0))
+                .expect("submit eof read")
+                .blocking_recv_read()
+                .expect_err("read past EOF")
+                .to_string()
+                .len()
+        },
+    );
 
     let rw_file = pool
         .register_readwrite_file(&path)
@@ -1148,6 +1163,35 @@ fn bench_access(config: BenchConfig) {
         Some(chunk),
         || send_read_with_slice(&handle_keep, 0, chunk, &codec),
     );
+    bench(config, "access/error_invalid_slice", 2048, None, || {
+        send_read_error(&handle_keep, 0, chunk, &codec, Some(vec![0, 0, chunk + 1]))
+    });
+
+    let handle_oom = AccessScheduler::spawn(
+        AccessConfig {
+            queue_capacity: 16,
+            scheduler_shards: 1,
+            cache_capacity_bytes: 1024,
+            memory_budget_bytes: 1024,
+            default_io_priority: 0,
+            keep_decoded: true,
+            cpu: AccessCpuConfig {
+                num_workers: 1,
+                queue_capacity: 16,
+                cpus: None,
+            },
+        },
+        Box::new(SliceIo::new(Arc::clone(&backing))),
+        Box::new(CodecDecode),
+    )
+    .expect("access scheduler (oom)");
+    bench(
+        config,
+        "access/error_memory_budget_exhausted",
+        512,
+        None,
+        || send_read_error(&handle_oom, 0, chunk, &codec, None),
+    );
 
     // Prefetch cold: rotating keys evict from the 2 MiB cache, so each
     // prefetch performs real IO + cache insert.
@@ -1348,6 +1392,29 @@ fn send_read_with_slice(
     bytes.len() ^ bytes[0] as usize
 }
 
+fn send_read_error(
+    handle: &AccessHandle,
+    start: usize,
+    chunk: usize,
+    codec: &SharedCodec,
+    slice: Option<Vec<usize>>,
+) -> usize {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let request = AccessRequest::new(
+        ChunkKey::new(FileRef(1), start as u64, chunk),
+        Arc::clone(codec),
+        Some(chunk),
+        tx,
+    )
+    .with_slice(slice);
+    handle.send(request).expect("send error request");
+    rx.blocking_recv()
+        .expect("access error reply")
+        .expect_err("access request should fail")
+        .to_string()
+        .len()
+}
+
 // ---------------------------------------------------------------------------
 // databank: dense1d, compressed dense2d, sparse csr, file-backed store,
 // directory store, multi-dtype, by-gene-names, owned/alloc, prefetch,
@@ -1389,6 +1456,37 @@ fn bench_databank(config: BenchConfig) {
         || {
             bank.access_cells(id, &selected, &mut out, None)
                 .expect("access cells");
+            out.iter().step_by(257).fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
+        },
+    );
+    bench(
+        config,
+        "databank/dense2d_access_values_wrapper_32x1024",
+        256,
+        Some(out.len() * std::mem::size_of::<u32>()),
+        || {
+            bank.access_cells_values(id, &selected, &mut out)
+                .expect("access cells values");
+            out.iter().step_by(257).fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
+        },
+    );
+    let tuned_access = ScheduledAccessConfig {
+        prefetch_step: 8,
+        decode_ahead_steps: 4,
+        ready_ahead_steps: 2,
+    };
+    bench(
+        config,
+        "databank/dense2d_access_with_config_32x1024",
+        192,
+        Some(out.len() * std::mem::size_of::<u32>()),
+        || {
+            bank.access_cells_with_config(id, &selected, &mut out, None, tuned_access)
+                .expect("access cells with config");
             out.iter().step_by(257).fold(0usize, |acc, value| {
                 acc ^ usize::try_from(*value).unwrap_or(0)
             })
@@ -1517,6 +1615,43 @@ fn bench_databank(config: BenchConfig) {
         },
     );
 
+    // Dense1D with explicit rectilinear variable chunks.
+    let v_cells = 8usize;
+    let v_genes = 5usize;
+    let v_boundaries = vec![0usize, 7, 13, 25, v_cells * v_genes];
+    let v_chunks = make_dense1d_u32_variable_chunks(v_cells, v_genes, &v_boundaries);
+    let v_id = bank
+        .register_dense_1d(Dense1DMeta {
+            gene_names: (0..v_genes).map(|idx| format!("vg{idx}")).collect(),
+            data: ArrayMeta {
+                shape: vec![v_cells * v_genes],
+                chunk_shape: vec![v_boundaries[1] - v_boundaries[0]],
+                chunk_grid_shape: vec![v_boundaries.len() - 1],
+                dtype: DType::U32,
+                order: ArrayOrder::C,
+                codec: ArrayCodecMeta::Uncompressed,
+                chunks: ChunkStoreMeta::Memory { chunks: v_chunks },
+                variable_chunks: true,
+                chunk_boundaries: Some(vec![v_boundaries]),
+            },
+        })
+        .expect("register variable dense1d dataset");
+    let v_selected = vec![0usize, 3, 7, 2];
+    let mut v_out = vec![0u32; v_selected.len() * v_genes];
+    bench(
+        config,
+        "databank/dense1d_variable_chunks_4x5",
+        1024,
+        Some(v_out.len() * std::mem::size_of::<u32>()),
+        || {
+            bank.access_cells(v_id, &v_selected, &mut v_out, None)
+                .expect("access variable dense1d");
+            v_out.iter().fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
+        },
+    );
+
     // Sparse CSR: checked vs unchecked scatter.
     let csr_cells = 128usize;
     let csr_genes = 256usize;
@@ -1584,6 +1719,28 @@ fn bench_databank(config: BenchConfig) {
             unsafe {
                 bank.access_cells_unchecked(csr_id, &csr_selected, &mut csr_out, None)
                     .expect("access cells unchecked");
+            }
+            csr_out
+                .iter()
+                .step_by(251)
+                .fold(0usize, |acc, value| acc ^ value.to_bits() as usize)
+        },
+    );
+    bench(
+        config,
+        "databank/sparse_csr_unchecked_with_config_32x256",
+        384,
+        Some(csr_out.len() * std::mem::size_of::<f32>()),
+        || {
+            unsafe {
+                bank.access_cells_unchecked_with_config(
+                    csr_id,
+                    &csr_selected,
+                    &mut csr_out,
+                    None,
+                    tuned_access,
+                )
+                .expect("access cells unchecked with config");
             }
             csr_out
                 .iter()
@@ -1713,6 +1870,52 @@ fn bench_databank(config: BenchConfig) {
             })
         },
     );
+    let by_names_missing: Vec<String> = vec![
+        "gene_1".to_string(),
+        "missing_gene".to_string(),
+        "gene_3".to_string(),
+        "gene_5".to_string(),
+    ];
+    let mut by_missing_out = vec![0u32; selected.len() * by_names_missing.len()];
+    bench(
+        config,
+        "databank/dense2d_by_gene_names_zero_missing_32x4",
+        192,
+        Some(by_missing_out.len() * std::mem::size_of::<u32>()),
+        || {
+            bank.access_cells_by_gene_names(
+                id,
+                &selected,
+                &by_names_missing,
+                &mut by_missing_out,
+                None,
+                MissingGenePolicy::Zero,
+            )
+            .expect("access by gene names zero missing");
+            by_missing_out.iter().fold(0usize, |acc, value| {
+                acc ^ usize::try_from(*value).unwrap_or(0)
+            })
+        },
+    );
+    bench(
+        config,
+        "databank/error_by_gene_names_missing",
+        5000,
+        None,
+        || {
+            bank.access_cells_by_gene_names(
+                id,
+                &selected[..1],
+                &by_names_missing,
+                &mut by_missing_out[..by_names_missing.len()],
+                None,
+                MissingGenePolicy::Error,
+            )
+            .expect_err("missing gene should error")
+            .to_string()
+            .len()
+        },
+    );
 
     // Owned / alloc output buffers (databank-allocated).
     bench(
@@ -1722,6 +1925,18 @@ fn bench_databank(config: BenchConfig) {
         Some(selected.len() * genes * std::mem::size_of::<u32>()),
         || {
             let out: Vec<u32> = bank.access_cells_owned(id, &selected).expect("owned");
+            out.len() ^ out[0] as usize
+        },
+    );
+    bench(
+        config,
+        "databank/dense2d_owned_with_config_32x1024",
+        96,
+        Some(selected.len() * genes * std::mem::size_of::<u32>()),
+        || {
+            let out: Vec<u32> = bank
+                .access_cells_owned_with_config(id, &selected, tuned_access)
+                .expect("owned with config");
             out.len() ^ out[0] as usize
         },
     );
@@ -1759,11 +1974,49 @@ fn bench_databank(config: BenchConfig) {
             selected.len()
         },
     );
+    let scheduled_batches = vec![vec![0usize, 7, 14, 21], vec![3, 5], Vec::new()];
+    bench(
+        config,
+        "databank/prefetch_scheduled_by_gene_names_zero_missing",
+        64,
+        Some(
+            scheduled_batches
+                .iter()
+                .map(|batch| batch.len() * by_names_missing.len() * std::mem::size_of::<u32>())
+                .sum(),
+        ),
+        || {
+            let prefetch = bank
+                .prefetch_cells_scheduled_by_gene_names::<u32, _, _>(
+                    id,
+                    scheduled_batches.clone(),
+                    &by_names_missing,
+                    MissingGenePolicy::Zero,
+                    ScheduledPrefetchConfig::default(),
+                )
+                .expect("scheduled by gene names");
+            prefetch.fold(0usize, |acc, batch| {
+                let batch = batch.expect("scheduled batch");
+                acc ^ batch.buffer.len() ^ batch.num_genes
+            })
+        },
+    );
 
     // dataset_genes: borrow gene-name views.
     bench(config, "databank/dataset_genes_len", 10_000, None, || {
         bank.dataset_genes(id).expect("dataset genes").len()
     });
+    bench(
+        config,
+        "databank/dataset_meta_getters",
+        20_000,
+        None,
+        || {
+            bank.dataset_num_cells(id).expect("dataset num cells")
+                ^ bank.dataset_num_genes(id).expect("dataset num genes")
+                ^ bank.dataset_dtype(id).expect("dataset dtype").item_size()
+        },
+    );
     let _genes_view: &[GeneNameView] = bank.dataset_genes(id).expect("dataset genes");
     let _ = _genes_view;
 
@@ -1829,6 +2082,44 @@ fn bench_databank(config: BenchConfig) {
         20_000,
         None,
         || ScheduledPrefetchConfig::default().validate().is_ok() as usize,
+    );
+    bench(
+        config,
+        "databank/error_cell_out_of_range",
+        10_000,
+        None,
+        || {
+            bank.access_cells(id, &[cells], &mut out[..genes], None)
+                .expect_err("cell out of range")
+                .to_string()
+                .len()
+        },
+    );
+    bench(
+        config,
+        "databank/error_dtype_mismatch",
+        10_000,
+        None,
+        || {
+            let mut wrong = vec![0f32; genes];
+            bank.access_cells(id, &[0], &mut wrong, None)
+                .expect_err("dtype mismatch")
+                .to_string()
+                .len()
+        },
+    );
+    bench(
+        config,
+        "databank/error_output_len_mismatch",
+        10_000,
+        None,
+        || {
+            let mut short = vec![0u32; genes - 1];
+            bank.access_cells(id, &[0], &mut short, None)
+                .expect_err("output length mismatch")
+                .to_string()
+                .len()
+        },
     );
 
     let _ = std::fs::remove_file(fo_path);

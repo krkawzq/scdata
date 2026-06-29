@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 
@@ -16,6 +17,14 @@ ad = pytest.importorskip("anndata")
 pd = pytest.importorskip("pandas")
 sp = pytest.importorskip("scipy.sparse")
 pytest.importorskip("zarr")
+
+
+def _read_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, obj) -> None:
+    path.write_text(json.dumps(obj), encoding="utf-8")
 
 
 @pytest.fixture
@@ -118,6 +127,34 @@ def test_write_zarr_sparse_rectilinear_registers_with_databank(
     assert np.array_equal(_registered_matrix(ds), matrix.toarray())
 
 
+def test_write_zarr_sparse_zero_nnz_round_trip(tmp_path: Path) -> None:
+    matrix = sp.csr_matrix((3, 4), dtype=np.float32)
+    adata = ad.AnnData(
+        X=matrix,
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3"]),
+    )
+    root = write_zarr(
+        adata,
+        tmp_path / "sparse_zero.zarr",
+        format="sparse",
+        chunk_size=(4,),
+        align_cells=True,
+        store="dir",
+    )
+
+    ds = launch(root)
+    loaded = read_zarr(root)
+
+    assert isinstance(ds, SparseDataset)
+    assert ds.nnz == 0
+    assert ds.indices.shape == (0,)
+    assert ds.indices.num_chunks == 0
+    assert loaded.X.shape == (3, 4)
+    assert loaded.X.nnz == 0
+    assert np.array_equal(_registered_matrix(ds), matrix.toarray())
+
+
 def test_read_zarr_reshapes_dense1d(tmp_path: Path, dense_adata) -> None:
     root = write_zarr(
         dense_adata,
@@ -130,6 +167,31 @@ def test_read_zarr_reshapes_dense1d(tmp_path: Path, dense_adata) -> None:
     loaded = read_zarr(root)
 
     assert np.array_equal(np.asarray(loaded.X), np.asarray(dense_adata.X))
+
+
+def test_launch_zlib_v3_codec_registers_with_databank(tmp_path: Path, dense_adata) -> None:
+    from numcodecs import Zlib
+
+    root = write_zarr(
+        dense_adata,
+        tmp_path / "zlib_dense.zarr",
+        format="dense2d",
+        chunk_size=(3, 4),
+        store="dir",
+    )
+    raw = np.ascontiguousarray(np.asarray(dense_adata.X)).tobytes()
+    (root / "X" / "c" / "0" / "0").write_bytes(Zlib(level=1).encode(raw))
+    meta = _read_json(root / "X" / "zarr.json")
+    meta["codecs"] = [
+        {"name": "bytes", "configuration": {"endian": "little"}},
+        {"name": "zlib", "configuration": {"level": 1}},
+    ]
+    _write_json(root / "X" / "zarr.json", meta)
+
+    ds = launch(root)
+
+    assert ds.data.codec.compressor == {"id": "zlib", "level": 1}
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
 
 
 def test_dense_layer_launch_read_and_register_all(tmp_path: Path, dense_adata) -> None:

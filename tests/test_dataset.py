@@ -264,9 +264,15 @@ def test_array_meta_empty_shape_rejected():
         ArrayMeta.from_chunks(shape=(), chunk_shape=(), dtype=DType.F32, chunks=())
 
 
-def test_array_meta_nonpositive_shape_rejected():
-    with pytest.raises(ValueError, match="positive"):
-        ArrayMeta.from_chunks(shape=(0,), chunk_shape=(2,), dtype=DType.F32, chunks=())
+def test_array_meta_negative_shape_rejected():
+    with pytest.raises(ValueError, match="non-negative"):
+        ArrayMeta.from_chunks(shape=(-1,), chunk_shape=(2,), dtype=DType.F32, chunks=())
+
+
+def test_array_meta_zero_length_shape_allowed():
+    meta = ArrayMeta.from_chunks(shape=(0,), chunk_shape=(2,), dtype=DType.F32, chunks=())
+    assert meta.shape == (0,)
+    assert meta.num_chunks == 0
 
 
 def test_array_meta_grid_computation():

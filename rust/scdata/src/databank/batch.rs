@@ -125,9 +125,15 @@ impl GeneAxisPlan {
     where
         G: AsRef<str>,
     {
-        Ok(Self::Requested(CompiledGeneProjection::new(
-            dataset, requested, missing,
-        )?))
+        if requested_matches_dataset_order(dataset, requested)? {
+            return Ok(Self::DatasetOrder);
+        }
+        let projection = CompiledGeneProjection::new(dataset, requested, missing)?;
+        if projection.is_identity(dataset.num_genes()) {
+            Ok(Self::DatasetOrder)
+        } else {
+            Ok(Self::Requested(projection))
+        }
     }
 
     fn output_genes(&self, dataset_num_genes: usize) -> usize {
@@ -162,6 +168,32 @@ impl GeneAxisPlan {
             Self::Requested(projection) => Some(projection),
         }
     }
+
+    fn requires_dense_zero_fill(&self) -> bool {
+        match self {
+            Self::DatasetOrder => false,
+            Self::Requested(projection) => projection.has_missing_outputs(),
+        }
+    }
+}
+
+fn requested_matches_dataset_order<G>(dataset: &Dataset, requested: &[G]) -> DataBankResult<bool>
+where
+    G: AsRef<str>,
+{
+    let genes = dataset.genes();
+    if let Some(name) = genes.duplicate_name() {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "duplicate dataset gene name: {name}"
+        )));
+    }
+    if requested.len() != genes.len() {
+        return Ok(false);
+    }
+    Ok(requested
+        .iter()
+        .zip(genes.names())
+        .all(|(requested, dataset_name)| requested.as_ref() == dataset_name.as_ref()))
 }
 
 impl CompiledGeneProjection {
@@ -173,15 +205,11 @@ impl CompiledGeneProjection {
     where
         G: AsRef<str>,
     {
-        let dataset_names = dataset.genes().names();
-        let mut by_name = fast_hash_map_with_capacity(dataset_names.len());
-        for (index, name) in dataset_names.iter().enumerate() {
-            if by_name.insert(name.as_ref(), index).is_some() {
-                return Err(DataBankError::InvalidArrayMeta(format!(
-                    "duplicate dataset gene name: {}",
-                    name.as_ref()
-                )));
-            }
+        let genes = dataset.genes();
+        if let Some(name) = genes.duplicate_name() {
+            return Err(DataBankError::InvalidArrayMeta(format!(
+                "duplicate dataset gene name: {name}"
+            )));
         }
 
         let mut seen = fast_hash_set_with_capacity(requested.len());
@@ -197,10 +225,10 @@ impl CompiledGeneProjection {
                 });
             }
 
-            if let Some(&source) = by_name.get(name) {
+            if let Some(source) = genes.index_of(name) {
                 let output = output_names.len();
                 output_by_source[source] = output;
-                output_names.push(dataset.genes().views()[source]);
+                output_names.push(genes.views()[source]);
                 selected_sources.push(source);
             } else {
                 match missing {
@@ -237,26 +265,34 @@ impl CompiledGeneProjection {
         (output != GENE_NOT_SELECTED).then_some(output)
     }
 
-    fn selected_range_intersects(&self, start: usize, len: usize) -> bool {
-        if len == 0 || self.selected_sources.is_empty() {
-            return false;
+    fn has_missing_outputs(&self) -> bool {
+        self.selected_sources.len() != self.output_names.len()
+    }
+
+    fn is_identity(&self, dataset_num_genes: usize) -> bool {
+        self.output_names.len() == dataset_num_genes
+            && self.contiguous_output_for_source_run(0, dataset_num_genes) == Some(0)
+    }
+
+    fn contiguous_output_for_source_run(&self, source_start: usize, len: usize) -> Option<usize> {
+        if len == 0 {
+            return Some(0);
         }
-        let end = start.saturating_add(len);
-        let pos = self
-            .selected_sources
-            .partition_point(|&source| source < start);
-        self.selected_sources
-            .get(pos)
-            .is_some_and(|&source| source < end)
+        let first_output = self.output_for_source(source_start)?;
+        for offset in 1..len {
+            let source = source_start.checked_add(offset)?;
+            let output = first_output.checked_add(offset)?;
+            if self.output_for_source(source)? != output {
+                return None;
+            }
+        }
+        Some(first_output)
     }
 }
 
-pub fn validate_access<T: DataValue>(
+pub(super) fn validate_dtype_and_cells<T: DataValue>(
     dataset: &Dataset,
     cells: &[usize],
-    out: &[T],
-    names: Option<&[GeneNameView]>,
-    output_genes: usize,
 ) -> DataBankResult<()> {
     if dataset.data_dtype() != T::DTYPE {
         return Err(DataBankError::UnsupportedDType {
@@ -272,6 +308,17 @@ pub fn validate_access<T: DataValue>(
             });
         }
     }
+    Ok(())
+}
+
+pub fn validate_access<T: DataValue>(
+    dataset: &Dataset,
+    cells: &[usize],
+    out: &[T],
+    names: Option<&[GeneNameView]>,
+    output_genes: usize,
+) -> DataBankResult<()> {
+    validate_dtype_and_cells::<T>(dataset, cells)?;
     let expected = cells
         .len()
         .checked_mul(output_genes)
@@ -371,6 +418,7 @@ where
     G: AsRef<str>,
 {
     let gene_axis = GeneAxisPlan::requested(dataset, gene_names, missing)?;
+    validate_dtype_and_cells::<T>(dataset, cells)?;
     let total = cells
         .len()
         .checked_mul(gene_axis.output_genes(dataset.num_genes()))
@@ -541,9 +589,15 @@ fn access_dense_1d_projected<T: DataValue>(
     gene_axis: &GeneAxisPlan,
     out: &mut [T],
 ) -> DataBankResult<()> {
-    zero_values(out);
-    let mut segments = plan::plan_dense_1d(dataset, cells)?;
-    filter_dense_segments_for_projection(&mut segments, gene_axis);
+    if gene_axis.requires_dense_zero_fill() {
+        zero_values(out);
+    }
+    let segments = match gene_axis.projection() {
+        Some(projection) => {
+            plan::plan_dense_1d_selected_sources(dataset, cells, &projection.selected_sources)?
+        }
+        None => plan::plan_dense_1d(dataset, cells)?,
+    };
     access_dense_segments_projected(
         access,
         compute,
@@ -584,9 +638,15 @@ fn access_dense_2d_projected<T: DataValue>(
     gene_axis: &GeneAxisPlan,
     out: &mut [T],
 ) -> DataBankResult<()> {
-    zero_values(out);
-    let mut segments = plan::plan_dense_2d(dataset, cells)?;
-    filter_dense_segments_for_projection(&mut segments, gene_axis);
+    if gene_axis.requires_dense_zero_fill() {
+        zero_values(out);
+    }
+    let segments = match gene_axis.projection() {
+        Some(projection) => {
+            plan::plan_dense_2d_selected_sources(dataset, cells, &projection.selected_sources)?
+        }
+        None => plan::plan_dense_2d(dataset, cells)?,
+    };
     access_dense_segments_projected(
         access,
         compute,
@@ -821,18 +881,6 @@ fn access_dense_groups_sequential_projected<T: DataValue>(
         )?;
     }
     Ok(())
-}
-
-fn filter_dense_segments_for_projection(
-    segments: &mut Vec<DenseSegment>,
-    gene_axis: &GeneAxisPlan,
-) {
-    let Some(projection) = gene_axis.projection() else {
-        return;
-    };
-    segments.retain(|segment| {
-        projection.selected_range_intersects(segment.output_col_start, segment.output_cols)
-    });
 }
 
 fn try_access_dense_1d_memory_identity_direct<T: DataValue>(
@@ -2950,7 +2998,7 @@ fn try_scatter_sparse_rows_parallel_checked_with_group_indices<T: DataValue>(
         skip_unloaded_groups,
     )?;
 
-    let row_pieces = sparse_row_piece_indices(plan, output_rows)?;
+    let row_pieces = sparse_row_piece_ranges(plan, output_rows)?;
     let piece_groups = sparse_piece_group_indices(plan)?;
     let pieces: Arc<[SparseReadPiece]> = Arc::from(plan.data_pieces.clone().into_boxed_slice());
     let piece_groups: Arc<[usize]> = Arc::from(piece_groups.into_boxed_slice());
@@ -3073,7 +3121,7 @@ unsafe fn try_scatter_sparse_rows_parallel_unchecked<T: DataValue>(
     }
     debug_assert_eq!(data_group_bytes.len(), plan.data_groups.len());
 
-    let row_pieces = sparse_row_piece_indices(plan, output_rows)?;
+    let row_pieces = sparse_row_piece_ranges(plan, output_rows)?;
     let piece_groups = sparse_piece_group_indices(plan)?;
     let pieces: Arc<[SparseReadPiece]> = Arc::from(plan.data_pieces.clone().into_boxed_slice());
     let piece_groups: Arc<[usize]> = Arc::from(piece_groups.into_boxed_slice());
@@ -3245,18 +3293,41 @@ fn sparse_loaded_group_indices(
     Ok(group_to_loaded)
 }
 
-fn sparse_row_piece_indices(
+#[derive(Debug, Clone, Copy, Default)]
+struct SparseRowPieceRange {
+    start: usize,
+    end: usize,
+}
+
+fn sparse_row_piece_ranges(
     plan: &SparseBatchPlan,
     output_rows: usize,
-) -> DataBankResult<Vec<Vec<usize>>> {
-    let mut row_pieces = vec![Vec::new(); output_rows];
-    for (piece_index, piece) in plan.data_pieces.iter().enumerate() {
-        let Some(row) = row_pieces.get_mut(piece.output_row) else {
-            return Err(DataBankError::InvalidArrayMeta(
-                "CSR data piece output row is out of range".to_string(),
-            ));
+) -> DataBankResult<Vec<SparseRowPieceRange>> {
+    let mut row_pieces = vec![SparseRowPieceRange::default(); output_rows];
+    let mut piece_index = 0usize;
+    for (output_row, row_range) in row_pieces.iter_mut().enumerate() {
+        let start = piece_index;
+        while let Some(piece) = plan.data_pieces.get(piece_index) {
+            if piece.output_row < output_row {
+                return Err(DataBankError::InvalidArrayMeta(
+                    "CSR data pieces are not ordered by output row".to_string(),
+                ));
+            }
+            if piece.output_row != output_row {
+                break;
+            }
+            piece_index += 1;
+        }
+        *row_range = SparseRowPieceRange {
+            start,
+            end: piece_index,
         };
-        row.push(piece_index);
+    }
+    if let Some(piece) = plan.data_pieces.get(piece_index) {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "CSR data piece output row {} is out of range for {output_rows} rows",
+            piece.output_row
+        )));
     }
     Ok(row_pieces)
 }
@@ -3267,7 +3338,7 @@ fn scatter_sparse_row_range_checked_typed<T, I>(
     pieces: &[SparseReadPiece],
     piece_groups: &[usize],
     group_to_loaded: &[usize],
-    row_pieces: &[Vec<usize>],
+    row_pieces: &[SparseRowPieceRange],
     data_group_bytes: &[Arc<[u8]>],
     index_bytes: &[u8],
     projection: Option<&CompiledGeneProjection>,
@@ -3286,7 +3357,7 @@ where
     let out_ptr = out_addr as *mut T;
 
     for output_row in row_start..row_end {
-        let row_piece_indices = row_pieces.get(output_row).ok_or_else(|| {
+        let row_piece_range = row_pieces.get(output_row).ok_or_else(|| {
             DataBankError::InvalidArrayMeta("CSR row piece index is out of range".to_string())
         })?;
         let row_base = output_row.checked_mul(output_genes).ok_or_else(|| {
@@ -3305,7 +3376,7 @@ where
         // ranges. This task only creates row slices inside its assigned range.
         let row_out =
             unsafe { std::slice::from_raw_parts_mut(out_ptr.add(row_base), output_genes) };
-        for &piece_index in row_piece_indices {
+        for piece_index in row_piece_range.start..row_piece_range.end {
             let piece = pieces.get(piece_index).ok_or_else(|| {
                 DataBankError::InvalidArrayMeta("CSR row piece index is invalid".to_string())
             })?;
@@ -3421,7 +3492,7 @@ unsafe fn scatter_sparse_row_range_unchecked_typed<T, I>(
     output_genes: usize,
     pieces: &[SparseReadPiece],
     piece_groups: &[usize],
-    row_pieces: &[Vec<usize>],
+    row_pieces: &[SparseRowPieceRange],
     data_group_bytes: &[Arc<[u8]>],
     index_bytes: &[u8],
     row_start: usize,
@@ -3439,7 +3510,8 @@ unsafe fn scatter_sparse_row_range_unchecked_typed<T, I>(
         let row_base = output_row * output_genes;
         // SAFETY: jobs are partitioned by disjoint output row ranges.
         let row_ptr = unsafe { out_ptr.add(row_base) };
-        for &piece_index in unsafe { row_pieces.get_unchecked(output_row) } {
+        let row_piece_range = unsafe { row_pieces.get_unchecked(output_row) };
+        for piece_index in row_piece_range.start..row_piece_range.end {
             let piece = unsafe { pieces.get_unchecked(piece_index) };
             let group_index = unsafe { *piece_groups.get_unchecked(piece_index) };
             let data_bytes = unsafe { data_group_bytes.get_unchecked(group_index) };
@@ -5334,6 +5406,32 @@ fn scatter_dense_segment_to_output_projected<T: DataValue>(
     let value_size = mem::size_of::<T>();
     let data_ptr = bytes.as_ptr();
     let out_ptr = out_addr as *mut T;
+    if let Some(output_col_start) =
+        projection.contiguous_output_for_source_run(segment.output_col_start, segment.output_cols)
+    {
+        let dst_start = row_base.checked_add(output_col_start).ok_or_else(|| {
+            DataBankError::InvalidConfig("dense output offset overflow".to_string())
+        })?;
+        let dst_end = dst_start
+            .checked_add(segment.output_cols)
+            .ok_or_else(|| DataBankError::InvalidConfig("dense output end overflow".to_string()))?;
+        if dst_end > row_end {
+            return Err(DataBankError::BufferSizeMismatch {
+                expected: dst_end,
+                actual: out_len,
+            });
+        }
+        // SAFETY: the projected source run maps to the same contiguous output
+        // order, and group-parallel jobs write disjoint output columns.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                out_ptr.add(dst_start).cast::<u8>(),
+                expected_bytes,
+            );
+        }
+        return Ok(());
+    }
     for local_col in 0..segment.output_cols {
         let source_col = segment.output_col_start + local_col;
         let Some(output_col) = projection.output_for_source(source_col) else {
@@ -5434,6 +5532,24 @@ fn scatter_dense_segment_projected<T: DataValue>(
             expected: row_end,
             actual: out.len(),
         });
+    }
+
+    if let Some(output_col_start) =
+        projection.contiguous_output_for_source_run(segment.output_col_start, segment.output_cols)
+    {
+        let dst_start = row_base.checked_add(output_col_start).ok_or_else(|| {
+            DataBankError::InvalidConfig("dense output offset overflow".to_string())
+        })?;
+        let dst_end = dst_start
+            .checked_add(segment.output_cols)
+            .ok_or_else(|| DataBankError::InvalidConfig("dense output end overflow".to_string()))?;
+        if dst_end > row_end {
+            return Err(DataBankError::BufferSizeMismatch {
+                expected: dst_end,
+                actual: out.len(),
+            });
+        }
+        return copy_ne_bytes_to_values(bytes, &mut out[dst_start..dst_end]);
     }
 
     let value_size = mem::size_of::<T>();
@@ -5648,7 +5764,11 @@ fn plan_batch<'a>(
     match dataset {
         Dataset::Dense1D(d) => {
             let mut segments = plan::plan_dense_1d(d, &cells)?;
-            filter_dense_segments_for_projection(&mut segments, gene_axis);
+            project_dense_segments_for_projection(
+                &mut segments,
+                gene_axis,
+                d.data.dtype.item_size(),
+            )?;
             let groups = group_dense_segments(&segments)?;
             let items = dense_group_access_items(&groups)?;
             Ok((
@@ -5662,8 +5782,12 @@ fn plan_batch<'a>(
             ))
         }
         Dataset::Dense2D(d) => {
-            let mut segments = plan::plan_dense_2d(d, &cells)?;
-            filter_dense_segments_for_projection(&mut segments, gene_axis);
+            let segments = match gene_axis.projection() {
+                Some(projection) => {
+                    plan::plan_dense_2d_selected_sources(d, &cells, &projection.selected_sources)?
+                }
+                None => plan::plan_dense_2d(d, &cells)?,
+            };
             let groups = group_dense_segments(&segments)?;
             let items = dense_group_access_items(&groups)?;
             Ok((
@@ -5769,6 +5893,7 @@ where
 {
     rx: Option<flume::Receiver<DataBankResult<PrefetchedBatch<T>>>>,
     output_names: Vec<GeneNameView>,
+    _dataset: Arc<Dataset>,
     prefetch_step: usize,
     cancel: Arc<PrefetchCancel>,
     producer: Option<thread::JoinHandle<()>>,
@@ -6385,6 +6510,7 @@ where
     I::Item: AsRef<[usize]> + Send,
 {
     let output_names = gene_axis.output_names(dataset.as_ref()).to_vec();
+    let retained_dataset = Arc::clone(&dataset);
     let prefetch_step = config.prefetch_step;
     let (tx, rx) = flume::bounded(prefetch_step);
     let cancel = PrefetchCancel::new(access.clone());
@@ -6404,6 +6530,7 @@ where
     Ok(PrefetchCells {
         rx: Some(rx),
         output_names,
+        _dataset: retained_dataset,
         prefetch_step,
         cancel,
         producer: Some(handle),
@@ -6646,7 +6773,7 @@ mod tests {
     }
 
     #[test]
-    fn unregister_failure_keeps_dataset_registered() {
+    fn unregister_failure_unloads_dataset() {
         let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
         let id = register_dense_2d_file(&mut bank, 2, 2, 1);
         let file_id = match bank.registry.get(id).expect("dataset") {
@@ -6665,7 +6792,10 @@ mod tests {
             .expect_err("second unregister should fail");
 
         assert!(matches!(err, crate::databank::DataBankError::Io(_)));
-        assert!(bank.dataset_genes(id).is_ok());
+        assert!(matches!(
+            bank.dataset_genes(id),
+            Err(crate::databank::DataBankError::DatasetUnloaded(unloaded)) if unloaded == id
+        ));
     }
 
     #[test]
@@ -6871,6 +7001,106 @@ mod tests {
     }
 
     #[test]
+    fn projected_dense_segments_keep_only_selected_source_ranges() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let id = register_dense_2d_memory(&mut bank, 1, 8, 1, 8);
+        let dataset = bank.registry.get(id).expect("dataset");
+        let dense = match dataset {
+            Dataset::Dense2D(dense) => dense,
+            _ => panic!("expected dense 2d dataset"),
+        };
+        let genes = ["g6", "g1", "g2"];
+        let gene_axis = super::GeneAxisPlan::requested(dataset, &genes, MissingGenePolicy::Zero)
+            .expect("gene projection");
+        let mut segments = super::plan::plan_dense_2d(dense, &[0]).expect("dense plan");
+
+        super::project_dense_segments_for_projection(
+            &mut segments,
+            &gene_axis,
+            DType::U32.item_size(),
+        )
+        .expect("project dense segments");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].output_col_start, 1);
+        assert_eq!(segments[0].output_cols, 2);
+        assert_eq!(segments[0].source.start, 4);
+        assert_eq!(segments[0].source.end, 12);
+        assert_eq!(segments[1].output_col_start, 6);
+        assert_eq!(segments[1].output_cols, 1);
+        assert_eq!(segments[1].source.start, 24);
+        assert_eq!(segments[1].source.end, 28);
+
+        let out = bank
+            .access_cells_owned_by_gene_names::<u32, _>(id, &[0], &genes, MissingGenePolicy::Zero)
+            .expect("projected dense access");
+        assert_eq!(out, vec![6, 1, 2]);
+    }
+
+    #[test]
+    fn projected_dense_2d_planning_visits_only_selected_chunk_columns() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let id = register_dense_2d_memory(&mut bank, 1, 8, 1, 2);
+        let dataset = bank.registry.get(id).expect("dataset");
+        let dense = match dataset {
+            Dataset::Dense2D(dense) => dense,
+            _ => panic!("expected dense 2d dataset"),
+        };
+        let genes = ["g1", "g6"];
+        let gene_axis = super::GeneAxisPlan::requested(dataset, &genes, MissingGenePolicy::Zero)
+            .expect("gene projection");
+        let projection = match gene_axis {
+            super::GeneAxisPlan::Requested(projection) => projection,
+            super::GeneAxisPlan::DatasetOrder => panic!("subset should remain projected"),
+        };
+
+        let segments =
+            super::plan::plan_dense_2d_selected_sources(dense, &[0], &projection.selected_sources)
+                .expect("selected dense plan");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].output_col_start, 1);
+        assert_eq!(segments[0].output_cols, 1);
+        assert_eq!(segments[0].source.start, 4);
+        assert_eq!(segments[0].source.end, 8);
+        assert_eq!(segments[1].output_col_start, 6);
+        assert_eq!(segments[1].output_cols, 1);
+        assert_eq!(segments[1].source.start, 0);
+        assert_eq!(segments[1].source.end, 4);
+    }
+
+    #[test]
+    fn requested_full_gene_order_collapses_to_dataset_order() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let id = register_dense_2d_memory(&mut bank, 2, 4, 1, 2);
+        let dataset = bank.registry.get(id).expect("dataset");
+        let genes = ["g0", "g1", "g2", "g3"];
+
+        let gene_axis = super::GeneAxisPlan::requested(dataset, &genes, MissingGenePolicy::Zero)
+            .expect("gene projection");
+
+        assert!(matches!(gene_axis, super::GeneAxisPlan::DatasetOrder));
+    }
+
+    #[test]
+    fn projected_gene_runs_detect_contiguous_output_ranges() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let id = register_dense_2d_memory(&mut bank, 1, 8, 1, 8);
+        let dataset = bank.registry.get(id).expect("dataset");
+        let genes = ["g1", "g2", "g6"];
+        let gene_axis = super::GeneAxisPlan::requested(dataset, &genes, MissingGenePolicy::Zero)
+            .expect("gene projection");
+        let projection = match gene_axis {
+            super::GeneAxisPlan::Requested(projection) => projection,
+            super::GeneAxisPlan::DatasetOrder => panic!("subset should remain projected"),
+        };
+
+        assert_eq!(projection.contiguous_output_for_source_run(1, 2), Some(0));
+        assert_eq!(projection.contiguous_output_for_source_run(6, 1), Some(2));
+        assert_eq!(projection.contiguous_output_for_source_run(2, 2), None);
+    }
+
+    #[test]
     fn access_cells_by_gene_names_can_error_on_missing_gene() {
         let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
         let id = register_dense_2d_memory(&mut bank, 2, 3, 1, 2);
@@ -6890,6 +7120,40 @@ mod tests {
         assert!(matches!(
             err,
             crate::databank::DataBankError::GeneNameNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn access_cells_by_gene_names_rejects_duplicate_dataset_gene_names() {
+        let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+        let id = bank
+            .register_dense_2d(Dense2DMeta {
+                gene_names: vec!["g0".to_string(), "g0".to_string()],
+                data: ArrayMeta {
+                    shape: vec![1, 2],
+                    chunk_shape: vec![1, 2],
+                    chunk_grid_shape: vec![1, 1],
+                    dtype: DType::U32,
+                    order: ArrayOrder::C,
+                    codec: ArrayCodecMeta::Uncompressed,
+                    chunks: ChunkStoreMeta::Memory {
+                        chunks: vec![arc_u32_bytes(&[1, 2])],
+                    },
+                    variable_chunks: false,
+                    chunk_boundaries: None,
+                },
+            })
+            .expect("register dense with duplicate gene names");
+        let mut out = vec![0u32; 1];
+
+        let err = bank
+            .access_cells_by_gene_names(id, &[0], &["g0"], &mut out, None, MissingGenePolicy::Zero)
+            .expect_err("duplicate dataset gene names should fail");
+
+        assert!(matches!(
+            err,
+            crate::databank::DataBankError::InvalidArrayMeta(message)
+                if message.contains("duplicate dataset gene name: g0")
         ));
     }
 

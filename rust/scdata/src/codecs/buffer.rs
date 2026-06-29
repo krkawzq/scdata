@@ -45,7 +45,7 @@ pub(crate) fn decode_into_vec_no_grow<C: ChunkCodec + ?Sized>(
         if output.capacity() < required {
             return Err(output_too_small(codec.name(), required, output.capacity()));
         }
-        output.resize(required, 0);
+        set_vec_len_for_decode(&mut output, required);
     }
 
     let written = codec.decode_into(

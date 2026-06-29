@@ -99,6 +99,7 @@ fn driver_loop(
             &ring,
             &mut fixed_files,
             &queue,
+            wake_fd.as_raw_fd(),
             fixed_file_update_cursor,
             &mut fixed_file_updates,
         );
@@ -283,10 +284,11 @@ fn apply_fixed_file_updates(
     ring: &IoUring,
     fixed_files: &mut FixedFileRegistry,
     queue: &QueueCore,
+    reader_fd: RawFd,
     cursor: usize,
     updates: &mut Vec<FixedFileUpdate>,
 ) -> usize {
-    let next_cursor = queue.fixed_file_updates_since(cursor, updates);
+    let next_cursor = queue.fixed_file_updates_since(reader_fd, cursor, updates);
     for update in updates.drain(..) {
         fixed_files.apply_update(ring, update);
     }

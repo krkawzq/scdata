@@ -85,6 +85,43 @@ pub fn make_dense1d_u32_chunks(cells: usize, genes: usize, chunk_len: usize) -> 
     chunks
 }
 
+/// Cell-major 1D layout split by explicit element boundaries. This exercises
+/// the compat `variable_chunks=true` rectilinear path in the DataBank facade.
+pub fn make_dense1d_u32_variable_chunks(
+    cells: usize,
+    genes: usize,
+    boundaries: &[usize],
+) -> Vec<Arc<[u8]>> {
+    let total = cells * genes;
+    assert!(
+        boundaries.len() >= 2,
+        "boundaries must include start and end"
+    );
+    assert_eq!(boundaries[0], 0, "first boundary must be zero");
+    assert_eq!(
+        *boundaries.last().expect("last boundary"),
+        total,
+        "last boundary must equal total element count"
+    );
+
+    boundaries
+        .windows(2)
+        .map(|window| {
+            let start = window[0];
+            let end = window[1];
+            assert!(start < end, "boundaries must be strictly increasing");
+            let mut bytes = Vec::with_capacity((end - start) * std::mem::size_of::<u32>());
+            for idx in start..end {
+                let cell = idx / genes;
+                let gene = idx % genes;
+                let value = ((cell as u32) << 16) ^ gene as u32;
+                bytes.extend_from_slice(&value.to_ne_bytes());
+            }
+            Arc::from(bytes.into_boxed_slice())
+        })
+        .collect()
+}
+
 /// Single-chunk CSR (indices + data each in one chunk). Used by the
 /// `modules`/`stress` single-chunk CSR benches.
 pub fn make_csr_u32_f32_chunks(

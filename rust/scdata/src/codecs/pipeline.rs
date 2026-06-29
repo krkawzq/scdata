@@ -7,7 +7,7 @@ use super::runner::DecodeRunner;
 use super::spec::{
     codec_specs_from_json_str, codec_specs_from_json_value, sealed, ChunkCodec, CodecSpec,
 };
-use super::util::{output_too_small, verify_size};
+use super::util::{output_too_small, reserve_decode_buffer, verify_size};
 use super::{CodecError, CodecResult, SharedCodec};
 
 /// Sequential decode pipeline.
@@ -117,6 +117,13 @@ impl ChunkCodec for CodecPipeline {
             let expected = stage_expected
                 .as_ref()
                 .and_then(|stage_expected| stage_expected[idx]);
+            if codec.is_identity() {
+                let actual = current
+                    .as_ref()
+                    .map_or(encoded.len(), |decoded| decoded.len());
+                verify_size(codec.name(), actual, expected)?;
+                continue;
+            }
             current = Some(match current.take() {
                 Some(input) => {
                     let output = std::mem::take(&mut spare);
@@ -133,7 +140,10 @@ impl ChunkCodec for CodecPipeline {
             });
         }
 
-        current.ok_or_else(|| CodecError::InvalidConfig("empty codec pipeline".to_string()))
+        match current {
+            Some(decoded) => Ok(decoded),
+            None => Ok(encoded.to_vec()),
+        }
     }
 
     fn decode_into(
@@ -166,10 +176,30 @@ impl ChunkCodec for CodecPipeline {
             if is_final {
                 return match current.take() {
                     Some(input) => {
-                        DecodeRunner::decode_into(codec.as_ref(), &input, output, expected)
+                        if codec.is_identity() {
+                            verify_size(codec.name(), input.len(), expected)?;
+                            output.write(codec.name(), &input)
+                        } else {
+                            DecodeRunner::decode_into(codec.as_ref(), &input, output, expected)
+                        }
                     }
-                    None => DecodeRunner::decode_into(codec.as_ref(), encoded, output, expected),
+                    None => {
+                        if codec.is_identity() {
+                            verify_size(codec.name(), encoded.len(), expected)?;
+                            output.write(codec.name(), encoded)
+                        } else {
+                            DecodeRunner::decode_into(codec.as_ref(), encoded, output, expected)
+                        }
+                    }
                 };
+            }
+
+            if codec.is_identity() {
+                let actual = current
+                    .as_ref()
+                    .map_or(encoded.len(), |decoded| decoded.len());
+                verify_size(codec.name(), actual, expected)?;
+                continue;
             }
 
             current = Some(match current.take() {
@@ -243,7 +273,8 @@ impl ChunkCodec for CodecPipeline {
         };
         output.clear();
         if output.capacity() < required {
-            output.reserve_exact(required - output.capacity());
+            let additional = required - output.capacity();
+            reserve_decode_buffer(self.name(), &mut output, additional)?;
         }
         set_vec_len_for_decode(&mut output, required);
         let written = self.decode_into(

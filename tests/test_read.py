@@ -90,6 +90,22 @@ def test_dense2d_dir_metadata(tmp_path: Path) -> None:
     assert np.array_equal(np.asarray(adata.X), data)
 
 
+def test_write_zarr_invalid_options_preserve_existing_directory(tmp_path: Path) -> None:
+    adata, _ = _dense_adata((3, 4), np.float32)
+    root = tmp_path / "existing.zarr"
+    root.mkdir()
+    marker = root / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(StoreError, match="unsupported store kind"):
+        write_zarr(adata, root, store="bad")  # type: ignore[arg-type]
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+    with pytest.raises(StoreError, match="chunk_size"):
+        write_zarr(adata, root, format="dense1d", chunk_size=0, store="dir")
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
 def test_dense1d_layer_and_launch_all(tmp_path: Path) -> None:
     adata, data = _dense_adata((3, 4), np.float32)
     adata.layers["counts"] = data + 100
@@ -219,6 +235,20 @@ def test_shape_entries_must_be_json_integers(tmp_path: Path) -> None:
     _write_json(root / "X" / "zarr.json", meta)
 
     with pytest.raises(StoreError, match="JSON integers"):
+        launch(root)
+
+
+def test_absent_chunk_with_nonzero_fill_value_rejected(tmp_path: Path) -> None:
+    adata, _ = _dense_adata((3, 4), np.float32)
+    root = write_zarr(
+        adata, tmp_path / "nonzero_fill.zarr", format="dense2d", chunk_size=(2, 2), store="dir"
+    )
+    (root / "X" / "c" / "0" / "0").unlink()
+    meta = _read_json(root / "X" / "zarr.json")
+    meta["fill_value"] = 1
+    _write_json(root / "X" / "zarr.json", meta)
+
+    with pytest.raises(StoreError, match="fill_value"):
         launch(root)
 
 

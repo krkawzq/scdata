@@ -25,8 +25,9 @@ the prefetch entry points call it automatically — callers never invoke it.
 
 Flat, dynamic construction
 --------------------------
-Every config inherits :meth:`make` / :meth:`update` from ``_Config``, which
-route flat kwargs onto nested fields so deep attribute paths are optional::
+Every config inherits :meth:`make` / :meth:`from_dict` / :meth:`update` from
+``_Config``.  ``make`` accepts either flat kwargs, a mapping, or both, and
+routes values onto nested fields so deep attribute paths are optional::
 
     cfg = DataBankConfig.make(
         backend="uring",                     # → io_config.backend
@@ -34,11 +35,16 @@ route flat kwargs onto nested fields so deep attribute paths are optional::
         cache_capacity_bytes=512 * 1024**2,  # → access_config.cache_capacity_bytes
         decode__num_workers=16,              # disambiguated by a ``__`` path
     )
+    cfg = DataBankConfig.from_dict({
+        "io": {"backend": "uring", "uring": {"entries": 256}},
+        "access": {"cache_capacity_bytes": 512 * 1024**2},
+    })
     cfg.update(fill__num_workers=8)          # in-place, chainable
 
 Routing rules (see :func:`_apply_dynamic`):
 
-* a bare key matching a direct field is set on this config;
+* a bare key matching a direct field or short ``*_config`` form is set on this
+  config, and nested config fields accept either config objects or mappings;
 * a bare key matching exactly one nested sub-tree's leaf field is routed there
   (``entries`` → ``io_config.uring_config.entries``);
 * a key ambiguous across sub-trees must be qualified with a ``__`` path
@@ -54,7 +60,7 @@ chosen backend's config.
 
 from __future__ import annotations
 
-from collections.abc import Iterable as IterableABC
+from collections.abc import Iterable as IterableABC, Mapping as MappingABC
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from os import PathLike, fspath
@@ -226,21 +232,37 @@ class _Config:
     __slots__ = ()
 
     @classmethod
-    def make(cls: type[_C], **kwargs: Any) -> _C:
-        """Build a config from flat kwargs, dynamically routed to nested fields.
+    def make(cls: type[_C], data: Mapping[str, Any] | None = None, /, **kwargs: Any) -> _C:
+        """Build a config from a mapping and/or flat kwargs.
 
         See the module docstring for the routing rules.
         """
+        values = _merge_mapping_and_kwargs(cls, data, kwargs)
         cfg = cls()
-        _apply_dynamic(cfg, kwargs)
+        _apply_dynamic(cfg, values)
         return cfg
 
-    def update(self: _C, **kwargs: Any) -> _C:
-        """Mutate this config in place from flat kwargs (chainable).
+    @classmethod
+    def from_dict(
+        cls: type[_C],
+        data: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> _C:
+        """Alias for :meth:`make`, for explicit dict-based construction."""
+        return cls.make(data, **kwargs)
+
+    def update(
+        self: _C,
+        data: Mapping[str, Any] | None = None,
+        /,
+        **kwargs: Any,
+    ) -> _C:
+        """Mutate this config in place from a mapping and/or flat kwargs.
 
         See the module docstring for the routing rules.
         """
-        _apply_dynamic(self, kwargs)
+        values = _merge_mapping_and_kwargs(type(self), data, kwargs)
+        _apply_dynamic(self, values)
         return self
 
 
@@ -259,20 +281,26 @@ class UringConfig(_Config):
     """io_uring backend settings."""
 
     entries: int = 256
-    drivers: int = 1
+    drivers: int = 8
     iowq_bounded_workers: int = 0
     iowq_unbounded_workers: int = 0
     registered_files: int = 4096
     base: BaseIoConfig = field(default_factory=BaseIoConfig)
+
+    def __post_init__(self) -> None:
+        self.base = _coerce_config_value(self.base, BaseIoConfig, "base")
 
 
 @dataclass(slots=True)
 class ThreadedConfig(_Config):
     """Thread-pool pread/pwrite backend settings."""
 
-    num_workers: int = 8
+    num_workers: int = 32
     cpus: list[int] | None = None
     base: BaseIoConfig = field(default_factory=BaseIoConfig)
+
+    def __post_init__(self) -> None:
+        self.base = _coerce_config_value(self.base, BaseIoConfig, "base")
 
 
 @dataclass(slots=True)
@@ -290,31 +318,57 @@ class IoConfig(_Config):
     threaded_config: ThreadedConfig = field(default_factory=ThreadedConfig)
 
     def __post_init__(self) -> None:
+        self.uring_config = _coerce_config_value(
+            self.uring_config,
+            UringConfig,
+            "uring_config",
+        )
+        self.threaded_config = _coerce_config_value(
+            self.threaded_config,
+            ThreadedConfig,
+            "threaded_config",
+        )
         if self.backend not in ("uring", "threaded"):
             raise ValueError(
                 f"IoConfig.backend must be 'uring' or 'threaded', got {self.backend!r}"
             )
 
     @classmethod
-    def uring(cls, config: UringConfig | None = None, **kwargs: Any) -> "IoConfig":
+    def uring(
+        cls,
+        config: UringConfig | Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> "IoConfig":
         """Create an IoConfig with the uring backend.
 
         ``config`` optionally supplies a whole :class:`UringConfig`; extra
         kwargs are routed onto it (e.g. ``entries=256``,
         ``base__max_in_flight=2048``).
         """
-        config = UringConfig() if config is None else config
+        config = UringConfig() if config is None else _coerce_config_value(
+            config,
+            UringConfig,
+            "config",
+        )
         _apply_dynamic(config, kwargs)
         return cls(backend="uring", uring_config=config)
 
     @classmethod
-    def threaded(cls, config: ThreadedConfig | None = None, **kwargs: Any) -> "IoConfig":
+    def threaded(
+        cls,
+        config: ThreadedConfig | Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> "IoConfig":
         """Create an IoConfig with the threaded backend.
 
         ``config`` optionally supplies a whole :class:`ThreadedConfig`; extra
         kwargs are routed onto it (e.g. ``num_workers=16``).
         """
-        config = ThreadedConfig() if config is None else config
+        config = ThreadedConfig() if config is None else _coerce_config_value(
+            config,
+            ThreadedConfig,
+            "config",
+        )
         _apply_dynamic(config, kwargs)
         return cls(backend="threaded", threaded_config=config)
 
@@ -327,7 +381,7 @@ class IoConfig(_Config):
 class DecodePoolConfig(_Config):
     """Decode worker pool settings."""
 
-    num_workers: int = 4
+    num_workers: int = 8
     queue_capacity: int = 1024
     cpus: list[int] | None = None
 
@@ -336,7 +390,7 @@ class DecodePoolConfig(_Config):
 class AccessCpuConfig(_Config):
     """Access-side CPU materialization pool settings."""
 
-    num_workers: int = 4
+    num_workers: int = 8
     queue_capacity: int = 1024
     cpus: list[int] | None = None
 
@@ -347,11 +401,14 @@ class AccessConfig(_Config):
 
     queue_capacity: int = 1024
     scheduler_shards: int = 1
-    cache_capacity_bytes: int = 268435456
-    memory_budget_bytes: int = 536870912
-    default_io_priority: int = 0
+    cache_capacity_bytes: int = 256 * 1024**3
+    memory_budget_bytes: int = 512 * 1024**3
+    default_io_priority: int = 1
     keep_decoded: bool = False
     cpu: AccessCpuConfig = field(default_factory=AccessCpuConfig)
+
+    def __post_init__(self) -> None:
+        self.cpu = _coerce_config_value(self.cpu, AccessCpuConfig, "cpu")
 
 
 @dataclass(slots=True)
@@ -359,7 +416,7 @@ class FillConfig(_Config):
     """Compute / fill pool settings."""
 
     parallel: bool = True
-    num_workers: int = 4
+    num_workers: int = 8
     queue_capacity: int = 1024
     min_parallel_rows: int = 16
     min_parallel_bytes: int = 1048576
@@ -390,22 +447,39 @@ class DataBankConfig(_Config):
     access_config: AccessConfig = field(default_factory=AccessConfig)
     fill_config: FillConfig = field(default_factory=FillConfig)
 
+    def __post_init__(self) -> None:
+        self.io_config = _coerce_config_value(self.io_config, IoConfig, "io_config")
+        self.decode_config = _coerce_config_value(
+            self.decode_config,
+            DecodePoolConfig,
+            "decode_config",
+        )
+        self.access_config = _coerce_config_value(
+            self.access_config,
+            AccessConfig,
+            "access_config",
+        )
+        self.fill_config = _coerce_config_value(self.fill_config, FillConfig, "fill_config")
+
 
 @dataclass(slots=True)
 class ScheduledAccessConfig(_Config):
     """Look-ahead distances for scheduled access."""
 
-    prefetch_step: int = 2
-    decode_ahead_steps: int = 1
-    ready_ahead_steps: int = 0
+    prefetch_step: int = 128
+    decode_ahead_steps: int = 64
+    ready_ahead_steps: int = 32
 
 
 @dataclass(slots=True)
 class ScheduledPrefetchConfig(_Config):
     """Per-call settings for scheduled DataBank cell prefetch."""
 
-    prefetch_step: int = 2
+    prefetch_step: int = 32
     access: ScheduledAccessConfig = field(default_factory=ScheduledAccessConfig)
+
+    def __post_init__(self) -> None:
+        self.access = _coerce_config_value(self.access, ScheduledAccessConfig, "access")
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +593,45 @@ def _config_leaf_paths(cls: Any, leaf_name: str) -> tuple[tuple[str, ...], ...]:
     return tuple(paths)
 
 
+def _merge_mapping_and_kwargs(
+    cls: Any,
+    data: Mapping[str, Any] | None,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge optional mapping input with kwargs, validating mapping shape."""
+    if data is None:
+        values: dict[str, Any] = {}
+    elif isinstance(data, MappingABC):
+        values = dict(data)
+    else:
+        raise TypeError(f"{cls.__name__}.make() expected a mapping, got {type(data).__name__}")
+    values.update(kwargs)
+    return values
+
+
+def _coerce_config_value(value: Any, target_cls: type[_C], field_name: str) -> _C:
+    """Coerce nested config mappings into their dataclass config object."""
+    if isinstance(value, target_cls):
+        return value
+    if isinstance(value, MappingABC):
+        return target_cls.from_dict(value)
+    raise TypeError(
+        f"{field_name} must be {target_cls.__name__} or a mapping, "
+        f"got {type(value).__name__}"
+    )
+
+
+def _resolve_field_or_none(cls: Any, segment: str) -> str | None:
+    """Resolve a direct field name or short ``*_config`` alias, if present."""
+    names = {f.name for f in fields(cls)}
+    if segment in names:
+        return segment
+    candidate = f"{segment}_config"
+    if candidate in names:
+        return candidate
+    return None
+
+
 def _resolve_path_field(cls: Any, segment: str) -> str:
     """Match a ``__`` path segment to a config field name.
 
@@ -526,13 +639,24 @@ def _resolve_path_field(cls: Any, segment: str) -> str:
     trailing ``_config`` stripped (``io``), so paths stay readable:
     ``io__uring__entries`` rather than ``io_config__uring_config__entries``.
     """
-    names = {f.name for f in fields(cls)}
-    if segment in names:
-        return segment
-    candidate = f"{segment}_config"
-    if candidate in names:
-        return candidate
+    resolved = _resolve_field_or_none(cls, segment)
+    if resolved is not None:
+        return resolved
     raise TypeError(f"{cls.__name__} has no field matching path segment {segment!r}")
+
+
+def _coerce_config_assignment(cls: Any, field_name: str, value: Any) -> Any:
+    """Coerce a value assigned to ``cls.field_name`` when it is a config field."""
+    hint = _config_type_hints(cls).get(field_name)
+    if hint in _CONFIG_CLASSES:
+        return _coerce_config_value(value, hint, field_name)
+    return value
+
+
+def _assign_config_field(config: Any, field_name: str, value: Any) -> None:
+    """Assign a config field with nested-dict coercion and local validation."""
+    setattr(config, field_name, _coerce_config_assignment(type(config), field_name, value))
+    _validate_config_object(config)
 
 
 def _path_hint(path: Iterable[str]) -> str:
@@ -547,8 +671,7 @@ def _set_config_path(config: Any, path: tuple[str, ...], value: Any) -> None:
         obj = getattr(obj, field_name)
         if type(obj) not in _CONFIG_CLASSES:
             raise TypeError(f"{type(obj).__name__} at {_path_hint(path)} is not a config object")
-    setattr(obj, path[-1], value)
-    _validate_config_object(obj)
+    _assign_config_field(obj, path[-1], value)
 
 
 def _validate_config_object(config: Any) -> None:
@@ -582,12 +705,11 @@ def _apply_dynamic(config: Any, kwargs: dict[str, Any]) -> Any:
                 fname = _resolve_path_field(obj_cls, seg)
                 obj = getattr(obj, fname)
                 obj_cls = type(obj)
-            setattr(obj, _resolve_path_field(obj_cls, segments[-1]), value)
-            _validate_config_object(obj)
+            _assign_config_field(obj, _resolve_path_field(obj_cls, segments[-1]), value)
             continue
-        if key in direct:
-            setattr(config, key, value)
-            _validate_config_object(config)
+        field_name = _resolve_field_or_none(cls, key)
+        if field_name in direct:
+            _assign_config_field(config, field_name, value)
             continue
         hits = [path for path in _config_leaf_paths(cls, key) if len(path) > 1]
         if len(hits) == 1:
@@ -601,6 +723,20 @@ def _apply_dynamic(config: Any, kwargs: dict[str, Any]) -> Any:
                 f"qualify with a path like {_path_hint(hits[0])}"
             )
     return config
+
+
+def _coerce_prefetch_config(
+    config: ScheduledPrefetchConfig | Mapping[str, Any] | None,
+) -> ScheduledPrefetchConfig | None:
+    """Normalize optional prefetch config input before Rust conversion."""
+    if config is None or isinstance(config, ScheduledPrefetchConfig):
+        return config
+    if isinstance(config, MappingABC):
+        return ScheduledPrefetchConfig.from_dict(config)
+    raise TypeError(
+        "config must be ScheduledPrefetchConfig, a mapping, or None; "
+        f"got {type(config).__name__}"
+    )
 
 
 # ===========================================================================
@@ -640,9 +776,11 @@ class ScDataBank:
 
     _inner: _DataBank | None
 
-    def __init__(self, config: DataBankConfig | None = None) -> None:
+    def __init__(self, config: DataBankConfig | Mapping[str, Any] | None = None) -> None:
         if config is None:
             config = DataBankConfig()
+        elif isinstance(config, MappingABC):
+            config = DataBankConfig.from_dict(config)
         self._inner = _DataBank(_config_to_rust(config))
         self._registered_count = 0
         # Per-dataset ``(gene_names, num_genes)`` cache, keyed by DatasetId.
@@ -903,7 +1041,7 @@ class ScDataBank:
         | Literal["zero", "error", "raise", "strict"]
         | str
         | None = None,
-        config: ScheduledPrefetchConfig | None = None,
+        config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
         """Stream decoded cell batches, optionally projected onto ``genes``."""
         if genes is None:
@@ -921,9 +1059,10 @@ class ScDataBank:
         id: DatasetId,
         batches: Iterable[CellAccess | Iterable[int]],
         *,
-        config: ScheduledPrefetchConfig | None = None,
+        config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
         request = PrefetchBatches.from_iterable(batches)
+        config = _coerce_prefetch_config(config)
         rust_config = _config_to_rust(config) if config is not None else None
         core = self._core()
         fast = getattr(core, "prefetch_cells_arrays", None)
@@ -940,11 +1079,12 @@ class ScDataBank:
         genes: Iterable[str],
         *,
         missing: MissingGenePolicy | None = None,
-        config: ScheduledPrefetchConfig | None = None,
+        config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
         request = PrefetchBatches.from_iterable(batches, gene_names=genes)
         names = tuple(request.gene_names) if request.gene_names is not None else ()
         rust_missing = missing._rust if missing is not None else None
+        config = _coerce_prefetch_config(config)
         rust_config = _config_to_rust(config) if config is not None else None
         core = self._core()
         fast = getattr(core, "prefetch_cells_by_gene_names_arrays", None)
