@@ -40,7 +40,7 @@ import numpy as np
 from scdata.io._launch import StoreError
 
 if TYPE_CHECKING:
-    from anndata import AnnData
+    from anndata import AnnData, Raw
 
 __all__ = ["write_zarr", "read_zarr"]
 
@@ -106,7 +106,8 @@ def write_zarr(
         number of cells, so a cell never spans two chunks.  Silently ignored
         for ``dense2d`` (whose cell axis is already chunk-aligned).  For
         ``sparse`` this produces a rectilinear (variable-length) chunk grid
-        aligned to CSR row boundaries.
+        aligned to CSR row boundaries.  Applies to ``X``, sparse ``layers``,
+        and ``raw.X`` alike.
     store:
         ``"zip"`` (default) writes a ``ZIP_STORED`` archive; ``"dir"`` writes
         a directory tree.
@@ -155,7 +156,14 @@ def write_zarr(
                 write_elem(g, "varp", dict(adata.varp))
             write_elem(g, "uns", dict(adata.uns))
             if adata.raw is not None:
-                write_elem(g, "raw", adata.raw)
+                _write_raw(
+                    g,
+                    adata.raw,
+                    format=format,
+                    chunk_size=chunk_size,
+                    align_cells=align_cells,
+                    compressor=compressor,
+                )
 
             _write_x(
                 g,
@@ -246,6 +254,47 @@ def _write_layers(
         )
 
 
+def _write_raw(
+    g: Any,
+    raw: "Raw",
+    *,
+    format: _XFormat,
+    chunk_size: int | list[int] | tuple[int, ...],
+    align_cells: bool,
+    compressor: _Compressor,
+) -> None:
+    """Write ``adata.raw`` so ``raw.X`` uses the same scdata layout as ``X``.
+
+    ``var`` and ``varm`` go through anndata's element writers unchanged; only
+    ``raw.X`` is rerouted through :func:`_write_matrix` so it picks up the same
+    cell-aligned CSR / dense1d layout, compressor, and ``scdata-matrix`` marker
+    as the main ``X``.  The group keeps anndata's ``raw`` encoding-type so stock
+    ``anndata.read_zarr`` still recognizes the group; :func:`read_zarr` reads
+    ``raw/X`` back through its scdata path via :func:`_is_matrix_root`.
+    """
+    from anndata._io.specs import write_elem
+
+    sub = g.require_group("raw")
+    sub.attrs.update({"encoding-type": "raw", "encoding-version": "0.1.0"})
+    write_elem(sub, "var", raw.var)
+    if raw.varm:
+        write_elem(sub, "varm", dict(raw.varm))
+    if raw.X is None:
+        write_elem(sub, "X", None)
+        return
+    _write_matrix(
+        sub,
+        "X",
+        raw.X,
+        n_obs=raw.n_obs,
+        n_var=raw.n_vars,
+        format=format,
+        chunk_size=chunk_size,
+        align_cells=align_cells,
+        compressor=compressor,
+    )
+
+
 def _write_matrix(
     g: Any,
     name: str,
@@ -292,7 +341,13 @@ def _write_matrix(
             compressor=compressor,
         )
     elif format == "sparse":
-        csr = matrix.tocsr() if not _sparse.isspmatrix_csr(matrix) else matrix
+        if _sparse.isspmatrix_csr(matrix):
+            csr = matrix
+        elif _sparse.issparse(matrix):
+            csr = matrix.tocsr()
+        else:
+            # Dense input — ``format="sparse"`` promises a CSR conversion.
+            csr = _sparse.csr_matrix(np.asarray(matrix))
         _write_csr_group(
             g,
             name,
@@ -1060,16 +1115,50 @@ def _remove_path(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def read_zarr(path: str | os.PathLike[str]) -> "AnnData":
+def read_zarr(
+    path: str | os.PathLike[str],
+    *,
+    metadata_only: bool = False,
+) -> "AnnData":
     """Read a scdata zarr v3 store into an :class:`anndata.AnnData`.
 
     Stock ``anndata.read_zarr`` reads ``dense2d`` and regular-grid ``sparse``
     stores directly; this function additionally handles scdata's two
     extensions — the ``dense1d`` flattened X (reshaped to 2D on read) and the
-    rectilinear cell-aligned CSR layout (read chunk-by-chunk).
+    rectilinear cell-aligned CSR layout (read chunk-by-chunk) — and opens
+    ``.zarr.zip`` archives (which stock ``anndata.read_zarr`` cannot, since
+    ``zarr.open`` does not treat a ``.zarr.zip`` as a :class:`ZipStore`).
+
+    The read path mirrors :func:`anndata.read_zarr` for everything outside the
+    scdata matrix extensions, so legacy ``raw.*`` groups, pre-0.7 categorical
+    cleanup, and Array-form ``obs`` are handled the same way stock anndata
+    handles them — no data is dropped on third-party / older stores.
+
+    Parameters
+    ----------
+    path:
+        Store path — a zarr v3 directory or a ``.zarr.zip`` archive.
+    metadata_only:
+        When true, load every annotation (``obs``, ``var``, ``uns``, ``obsm``,
+        ``varm``, ``obsp``, ``varp``) but skip the expression matrices
+        (``X``, ``layers``), which are set to ``None`` / omitted, and drop
+        ``raw`` entirely.  ``n_obs`` / ``n_vars`` come from ``obs`` / ``var``.
+        Useful for inspecting a store without paying the matrix-load cost.
+        ``raw`` is dropped (not just ``raw.X``) because anndata's in-memory
+        :class:`~anndata.Raw` cannot exist without an X — it falls back to
+        ``adata.X``, which is ``None`` in this mode; use a full read for raw.
+        Stock ``anndata.read_zarr`` has no equivalent mode; the closest,
+        :func:`anndata.experimental.read_lazy`, is fully lazy (it backs
+        ``obs`` / ``var`` too) and cannot read scdata's ``dense1d`` or
+        rectilinear layouts.
     """
+    import zarr
+
     import anndata as ad
     from anndata._io.specs import read_elem
+    from anndata._io.utils import _read_legacy_raw
+    from anndata._io.zarr import read_dataframe
+    from anndata.compat import _clean_uns
     from anndata.experimental import read_dispatched
 
     _enable_rectilinear()
@@ -1080,26 +1169,80 @@ def read_zarr(path: str | os.PathLike[str]) -> "AnnData":
             name = elem_name.lstrip("/")
             attrs = _node_attrs(elem)
             kind = _matrix_kind(attrs)
-            if _is_matrix_root(name) and kind in ("dense1d", "sparse", "sparse-vlen"):
-                return _read_matrix_scdata(f, name, kind, attrs)
+            # scdata-extended matrix roots (``X``, ``layers/*``, ``raw/X``):
+            # under ``metadata_only`` every matrix root short-circuits to
+            # ``None`` so no matrix bytes are read; otherwise the scdata layouts
+            # (``dense1d`` / ``sparse`` / ``sparse-vlen``) are rebuilt here, and
+            # non-scdata matrices (e.g. a third-party ``dense2d`` X) fall through
+            # to the default reader below.
+            if _is_matrix_root(name):
+                if metadata_only:
+                    return None
+                if kind in ("dense1d", "sparse", "sparse-vlen"):
+                    return _read_matrix_scdata(f, name, kind, attrs)
             if iospec.encoding_type == "anndata" or elem_name.endswith("/"):
                 # ``read_dispatched`` returns the anndata ``RWAble`` union; the
                 # values are passed straight into the AnnData constructor, whose
                 # own kwargs accept them at runtime.  Annotate as ``dict[str, Any]``
                 # so pyright does not flag each RWAble member against the ctor.
-                kwargs: dict[str, Any] = {
-                    k: read_dispatched(v, callback=callback)
-                    for k, v in dict(elem).items()
-                    if not k.startswith("raw.")
-                }
+                kwargs: dict[str, Any] = {}
+                for k, v in dict(elem).items():
+                    if k.startswith("raw."):
+                        continue
+                    if metadata_only and k == "X":
+                        kwargs["X"] = None
+                        continue
+                    if metadata_only and k == "layers":
+                        # ``AnnData.layers`` cannot hold ``None``; emit an empty
+                        # dict instead of recursing (which would load matrices).
+                        kwargs["layers"] = {}
+                        continue
+                    kwargs[k] = read_dispatched(v, callback=callback)
                 return ad.AnnData(**kwargs)
             if elem_name.startswith("/raw."):
                 return None
             if elem_name in {"/obs", "/var"}:
-                return read_elem(elem)
+                return read_dataframe(elem)
+            if elem_name == "/raw":
+                if metadata_only:
+                    # anndata's in-memory :class:`~anndata.Raw` cannot exist
+                    # without an X — ``Raw.__init__`` falls back to
+                    # ``adata.X.copy()``, which is ``None`` here, and a lazy zarr
+                    # proxy only works for ``dense2d`` / regular-sparse layouts,
+                    # not scdata's ``dense1d`` / rectilinear CSR.  Drop raw
+                    # entirely in metadata-only mode; use a full read for raw.
+                    return None
+                # Modern raw group is read by the default reader (which recurses
+                # through the callback, so ``raw/X`` picks up the scdata matrix
+                # path).  Guard against a coexisting legacy ``raw.*`` layout the
+                # way :func:`anndata.read_zarr` does.
+                modern_raw = read_func(elem)
+                if any(k.startswith("raw.") for k in f):
+                    raise StoreError(
+                        "store has both a modern 'raw' group and legacy 'raw.*' keys"
+                    )
+                return modern_raw
             return read_func(elem)
 
-        return cast("AnnData", read_dispatched(f, callback=callback))
+        adata = cast("AnnData", read_dispatched(f, callback=callback))
+
+        # Legacy raw rebuild: pre-modern-raw-group stores keep ``raw.X`` /
+        # ``raw.var`` / ``raw.varm`` flat at the root.  The root callback skips
+        # ``raw.*`` keys, so rebuild raw here (matches :func:`anndata.read_zarr`).
+        # Skipped under ``metadata_only`` — raw is dropped there (see ``/raw``
+        # branch) and loading legacy ``raw.X`` would defeat the mode.
+        if not metadata_only and "raw.X" in f:
+            raw_kwargs = _read_legacy_raw(f, None, read_dataframe, read_elem)
+            raw = ad.AnnData(**raw_kwargs)
+            raw.obs_names = adata.obs_names
+            adata.raw = raw
+
+        # Pre-0.7 compat: ``obs`` stored as a zarr.Array leaks categoricals into
+        # ``uns``; clean them the way stock anndata does.
+        if isinstance(f["obs"], zarr.Array):
+            _clean_uns(adata)
+
+        return adata
     finally:
         close = getattr(getattr(f, "store", None), "close", None)
         if close is not None:
@@ -1121,7 +1264,12 @@ def _is_matrix_root(name: str) -> bool:
     if name == "X":
         return True
     parts = name.split("/")
-    return len(parts) == 2 and parts[0] == "layers" and bool(parts[1])
+    if len(parts) == 2 and parts[0] == "layers" and bool(parts[1]):
+        return True
+    # ``raw.X`` is written by :func:`_write_raw` in the same scdata layouts as
+    # ``X`` (cell-aligned CSR / dense1d), so read it through the scdata path
+    # too.  ``Raw`` has no layers, so only ``raw/X`` needs handling.
+    return name == "raw/X"
 
 
 def _read_matrix_scdata(f: Any, matrix_key: str, kind: str, attrs: dict[str, Any]) -> Any:

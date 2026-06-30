@@ -1,4 +1,4 @@
-"""High-level AnnData input -> scdata ``.zarr.zip`` conversion."""
+"""High-level conversion of AnnData input into scdata ``.zarr.zip`` stores."""
 
 from __future__ import annotations
 

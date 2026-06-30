@@ -1,17 +1,14 @@
 """Scheduled prefetch input and iterator types for the DataBank.
 
-These are the pure-Python data carriers for the streaming access path:
-:class:`PrefetchBatches` describes what a ``ScDataBank.prefetch`` call consumes
-(a stream of cell-index batches), and :class:`PrefetchIterator` describes what
-it returns (a lazily decoded stream of :class:`~scdata.data._cell.CellBatch`
-objects).
-
-Like :mod:`scdata.data._cell`, this module stays in the data layer — no
-dependency on the Rust extension.  The bank's execution layer
+Pure-Python data carriers for the streaming access path, with no dependency on
+the Rust extension.  :class:`PrefetchBatches` describes what a
+``ScDataBank.prefetch`` call consumes (a stream of cell-index batches), and
+:class:`PrefetchIterator` describes what it returns (a lazily decoded stream
+of :class:`~scdata.data._cell.CellBatch` objects).  The bank's execution layer
 (:mod:`scdata.databank`) builds a :class:`PrefetchBatches` from caller
 arguments and wraps the Rust prefetch producer in a :class:`PrefetchIterator`,
-which is just a thin adapter from ``(cells, data, num_genes)`` tuples (the
-form the Rust iterator yields) to decoded :class:`CellBatch` instances.
+a thin adapter from the ``(cells, data, num_genes)`` tuples the Rust iterator
+yields to decoded :class:`CellBatch` instances.
 
 The input side of the pipeline is a :class:`~scdata.data._cell.CellAccess`
 (cells only, optionally a gene subset applied to every batch); the output side
@@ -19,17 +16,12 @@ is a decoded :class:`CellBatch`.  Keeping the input as ``CellAccess`` and the
 output as ``CellBatch`` means the two representations are distinct types, not
 one overloaded type distinguished by which fields happen to be filled.
 
-Why batches are materialized up front
--------------------------------------
-The Rust prefetch producer runs on its own thread and pulls batch index lists
-from the source.  If that source were a live Python iterable, the producer
-would need the GIL to advance it — while the consumer (which holds the GIL)
-blocks waiting for the producer, a classic deadlock.  :class:`PrefetchBatches`
-therefore materializes every batch into a contiguous ``intp`` numpy array at
-construction time, under the GIL, so the producer stays off the GIL entirely.
-For Python callers the batch list is already in memory, so this costs nothing;
-truly streaming sources should feed Rust directly rather than through this
-wrapper.
+:class:`PrefetchBatches` materializes every batch into a contiguous ``intp``
+numpy array at construction time.  The Rust prefetch producer runs on its own
+thread and pulls batch index lists from this materialized source, so it never
+needs the GIL to advance a live Python iterable.  For Python callers the batch
+list is already in memory, so this costs nothing; truly streaming sources
+should feed Rust directly rather than through this wrapper.
 """
 
 from __future__ import annotations
@@ -115,12 +107,7 @@ class PrefetchBatches:
         return [b.cells for b in self.batches]
 
     def batch_cell_lists(self) -> list[list[int]]:
-        """Return batches as a ``list[list[int]]`` for the Rust binding.
-
-        The Rust ``prefetch_cells`` entry point takes ``Vec<Vec<usize>>``; this
-        is the canonical Python-side shape to hand it.  Centralizing the
-        conversion here keeps the execution layer free of layout details.
-        """
+        """Return batches as Python lists for legacy callers."""
         return [b.cells.tolist() for b in self.batches]
 
 

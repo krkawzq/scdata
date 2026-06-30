@@ -1,10 +1,10 @@
 """Launch a zarr store by parsing metadata for the Rust databank.
 
-This module is the Python-side adapter between zarr/anndata metadata and the
-Rust ``databank`` factories.  It reads metadata, resolves chunk addresses, and
-returns :class:`~scdata.data._dataset.Dataset` objects; it does not decode
-numeric chunks.  Dense/sparse dataset semantics are interpreted here, while the
-Rust core receives normalized array metadata plus per-chunk file/off/len
+Python-side adapter between zarr/anndata metadata and the Rust ``databank``
+factories.  It reads metadata, resolves chunk addresses, and returns
+:class:`~scdata.data._dataset.Dataset` objects; it does not decode numeric
+chunks.  Dense/sparse dataset semantics are interpreted here — the Rust core
+receives normalized array metadata plus per-chunk file/offset/length
 locations.
 
 Supported inputs:
@@ -1249,7 +1249,9 @@ def launch(
 
     This parses metadata only; numeric chunks are not decoded here.  By
     default the returned dataset describes ``X``.  Pass ``layer="counts"`` or
-    ``matrix="layers/counts"`` to parse one AnnData layer instead.
+    ``matrix="layers/counts"`` to parse one AnnData layer instead.  Pass
+    ``matrix="raw/X"`` (or ``"raw"``) to parse the ``raw.X`` matrix, which
+    carries its own ``raw.var`` gene space.
     """
     store_root = os.fspath(path)
     matrix_key = _resolve_matrix_key(layer=layer, matrix=matrix)
@@ -1258,7 +1260,11 @@ def launch(
 
 
 def launch_all(path: str | os.PathLike[str]) -> DatasetCollection:
-    """Launch ``X`` and every direct child under ``layers`` from a store."""
+    """Launch ``X``, every direct child under ``layers``, and ``raw.X`` from a store.
+
+    ``raw.X`` is included only when the store has a ``raw`` group; its dataset
+    carries the ``raw.var`` gene space (which may differ from ``X``'s).
+    """
     store_root = os.fspath(path)
     with _open_store(store_root) as store:
         return launch_store_all(store, store_root=store_root)
@@ -1306,13 +1312,17 @@ def _resolve_matrix_key(*, layer: str | None, matrix: str | None) -> str:
     key = matrix.strip("/")
     if key == "X":
         return "X"
+    if key in ("raw", "raw/X"):
+        return "raw/X"
     if "/" not in key:
         return _layer_matrix_key(key)
     if key.startswith("layers/"):
         name = key[len("layers/") :]
         if name and "/" not in name:
             return key
-    raise ValueError(f"unsupported matrix key {matrix!r}; expected 'X' or 'layers/<name>'")
+    raise ValueError(
+        f"unsupported matrix key {matrix!r}; expected 'X', 'layers/<name>', or 'raw/X'"
+    )
 
 
 def _layer_matrix_key(layer: str) -> str:
@@ -1325,6 +1335,9 @@ def _layer_matrix_key(layer: str) -> str:
 def _launch_v3(store: Store, *, store_root: str, matrix_key: str = "X") -> Dataset:
     """Launch one matrix from a zarr v3 store."""
     gene_names = _v3_prepare_store(store)
+    if matrix_key == "raw/X":
+        # raw has its own gene space (raw.var); do not reuse the primary var.
+        gene_names = _v3_read_gene_names(store, "raw/var")
     return _launch_v3_matrix(store, matrix_key, gene_names, store_root)
 
 
@@ -1336,7 +1349,11 @@ def _launch_v3_all(store: Store, *, store_root: str) -> DatasetCollection:
         name: _launch_v3_matrix(store, f"layers/{name}", gene_names, store_root)
         for name in _v3_layer_names(store)
     }
-    return DatasetCollection(x=x, layers=layers, store_root=store_root)
+    raw = None
+    if store.exists("raw/X/zarr.json") and store.exists("raw/var/zarr.json"):
+        raw_gene_names = _v3_read_gene_names(store, "raw/var")
+        raw = _launch_v3_matrix(store, "raw/X", raw_gene_names, store_root)
+    return DatasetCollection(x=x, layers=layers, raw=raw, store_root=store_root)
 
 
 def _v3_prepare_store(store: Store) -> tuple[str, ...]:

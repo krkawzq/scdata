@@ -1,4 +1,4 @@
-"""Python interface for scdata."""
+"""scdata: a Rust-backed store and torch data pipeline for single-cell data."""
 
 from __future__ import annotations
 
@@ -30,9 +30,11 @@ except ModuleNotFoundError as exc:
 from scdata.data import (  # noqa: E402
     ArrayMeta,
     ArrayOrder,
+    BankConfigSummary,
     CellAccess,
     CellBatch,
     CellData,
+    CellIndexDataset,
     ChunkLocation,
     CodecPipeline,
     DataError,
@@ -42,8 +44,10 @@ from scdata.data import (  # noqa: E402
     DatasetCollection,
     DtypeParseError,
     CodecConfigError,
+    LoaderStats,
     ScDataLoader,
     SparseDataset,
+    stitch_dense_collate,
 )
 from scdata.io import (  # noqa: E402
     AnnDataZarrZipConverter,
@@ -61,6 +65,23 @@ from scdata.io import (  # noqa: E402
 # Rust extension).  When the extension is missing, the Rust-backed names raise
 # on use; the pure-Python ``CellAccess`` / ``CellBatch`` / ``CellData`` above
 # remain usable regardless.
+def _missing(name: str):
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(
+            f"{name} requires the scdata Rust extension. Install the package "
+            "with `maturin develop` or `uv pip install -e .`."
+        ) from _MISSING_EXTENSION_ERROR
+
+    return _raise
+
+
+def _missing_tools(name: str):
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(f"{name} requires the scdata.tools module to be installed.")
+
+    return _raise
+
+
 try:
     from scdata.databank import (
         AccessConfig,
@@ -79,17 +100,9 @@ try:
         ThreadedConfig,
         UringConfig,
     )
-except ModuleNotFoundError:
-
-    def _missing(name: str):
-        def _raise(*args: object, **kwargs: object) -> None:
-            raise RuntimeError(
-                f"{name} requires the scdata Rust extension. Install the package "
-                "with `maturin develop` or `uv pip install -e .`."
-            ) from _MISSING_EXTENSION_ERROR
-
-        return _raise
-
+except ModuleNotFoundError as exc:
+    if exc.name != "scdata._scdata":
+        raise
     ScDataBank = _missing("ScDataBank")  # type: ignore[assignment, misc]
     DataBankConfig = _missing("DataBankConfig")  # type: ignore[assignment, misc]
     DatasetId = _missing("DatasetId")  # type: ignore[assignment, misc]
@@ -105,6 +118,22 @@ except ModuleNotFoundError:
     FillConfig = _missing("FillConfig")  # type: ignore[assignment, misc]
     ScheduledAccessConfig = _missing("ScheduledAccessConfig")  # type: ignore[assignment, misc]
     ScheduledPrefetchConfig = _missing("ScheduledPrefetchConfig")  # type: ignore[assignment, misc]
+
+try:
+    from scdata.corpus import Corpus
+except ModuleNotFoundError as exc:
+    if exc.name != "scdata._scdata":
+        raise
+    Corpus = _missing("Corpus")  # type: ignore[assignment, misc]
+
+try:
+    from scdata.tools import TuneConfigResult, TuneResult, tune
+except ModuleNotFoundError as exc:
+    if exc.name != "scdata.tools":
+        raise
+    tune = _missing_tools("tune")  # type: ignore[assignment, misc]
+    TuneResult = _missing_tools("TuneResult")  # type: ignore[assignment, misc]
+    TuneConfigResult = _missing_tools("TuneConfigResult")  # type: ignore[assignment, misc]
 
 __all__ = [
     "__version__",
@@ -126,6 +155,11 @@ __all__ = [
     "FillConfig",
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
+    "Corpus",
+    # tools (Rust-backed workflows: tuning, ...)
+    "tune",
+    "TuneResult",
+    "TuneConfigResult",
     # data (pure Python — usable with or without the Rust extension)
     "CellAccess",
     "CellBatch",
@@ -143,6 +177,10 @@ __all__ = [
     "Dataset",
     "DatasetCollection",
     "SparseDataset",
+    "CellIndexDataset",
+    "stitch_dense_collate",
+    "LoaderStats",
+    "BankConfigSummary",
     # io
     "AnnDataZarrZipConverter",
     "Store",

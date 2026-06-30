@@ -2,31 +2,23 @@
 
 The Rust extension (:mod:`scdata._scdata`) exposes only private pyclasses
 (``_DataBank``, ``_PrefetchCells``, ``_DataBankConfig``, ...).  This module
-wraps every one of them into a public Python class so callers never touch the
+wraps every one of them into a public Python class, so callers never touch the
 Rust layer directly.
 
-Config dataclasses
-------------------
 All config types (``DataBankConfig``, ``IoConfig``, ``AccessConfig``, ...) are
-**pure** Python :func:`dataclasses.dataclass` objects with sensible defaults
-mirroring the Rust constructors.  They carry no Rust conversion logic of their
-own — they support keyword-argument construction, equality comparison,
+pure Python :func:`dataclasses.dataclass` objects with Python-owned defaults.
+Those Python defaults are what get sent to Rust whenever a caller omits an
+explicit config.  They carry no Rust conversion logic of their own — they
+support keyword-argument construction, equality comparison,
 :func:`dataclasses.replace`, and :func:`dataclasses.asdict` like any dataclass.
+A config is **not** a live view into a running ``ScDataBank``: the bank
+deep-copies its config at construction time, and later mutations do not affect
+it.  Rust conversion is centralized in :func:`_config_to_rust`, which walks a
+config tree field-by-field and builds the matching Rust instances; it is
+called automatically by ``ScDataBank.__init__`` and the prefetch entry points.
 
-Config is **not** a live view into a running ``ScDataBank``.  A ``ScDataBank``
-deep-copies its config at construction time; mutations to the config after that
-point do not affect the bank.  This is intentional and matches standard
-dataclass semantics.
-
-Rust conversion is centralized in :func:`_config_to_rust`, which walks any
-config tree reflectively (field-by-field, recursing into nested configs) and
-builds the matching Rust instances in one place.  ``ScDataBank.__init__`` and
-the prefetch entry points call it automatically — callers never invoke it.
-
-Flat, dynamic construction
---------------------------
-Every config inherits :meth:`make` / :meth:`from_dict` / :meth:`update` from
-``_Config``.  ``make`` accepts either flat kwargs, a mapping, or both, and
+Every config also inherits :meth:`make` / :meth:`from_dict` / :meth:`update`
+from ``_Config``.  ``make`` accepts either flat kwargs, a mapping, or both, and
 routes values onto nested fields so deep attribute paths are optional::
 
     cfg = DataBankConfig.make(
@@ -60,7 +52,7 @@ chosen backend's config.
 
 from __future__ import annotations
 
-from collections.abc import Iterable as IterableABC, Mapping as MappingABC
+from collections.abc import Iterable as IterableABC, Mapping as MappingABC, Sequence as SequenceABC
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from os import PathLike, fspath
@@ -68,7 +60,7 @@ from typing import Any, Iterable, Iterator, Literal, Mapping, TypeVar, get_type_
 
 from .data._cell import CellAccess, CellBatch, CellData, _as_cell_index
 from .data._coerce import _as_gene_names
-from .data._dataset import Dataset, DatasetCollection, DenseDataset, DType, SparseDataset
+from .data._dataset import DataError, Dataset, DatasetCollection, DenseDataset, DType, SparseDataset
 from .data._prefetch import PrefetchBatches, PrefetchIterator
 from ._scdata import (
     _AccessConfig,
@@ -107,7 +99,11 @@ __all__ = [
     "FillConfig",
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
+    "ProfileSnapshot",
 ]
+
+
+ProfileSnapshot = dict[str, Any]
 
 
 # ===========================================================================
@@ -203,11 +199,63 @@ def _coerce_dtype(dtype: DType | str | None) -> DType | None:
     return DType.parse(dtype)
 
 
+_FLOAT_DTYPE_RANK = {
+    DType.F16: 1,
+    DType.BF16: 1,
+    DType.F32: 2,
+    DType.F64: 3,
+}
+
+_INT_DTYPE_RANK = {
+    DType.U8: (1, False),
+    DType.I8: (1, True),
+    DType.U16: (2, False),
+    DType.I16: (2, True),
+    DType.U32: (4, False),
+    DType.I32: (4, True),
+    DType.U64: (8, False),
+    DType.I64: (8, True),
+}
+
+
+def _is_float_dtype(dtype: DType) -> bool:
+    return dtype in _FLOAT_DTYPE_RANK
+
+
+def _auto_output_dtype(dtypes: Iterable[DType]) -> DType:
+    values = tuple(dtypes)
+    if not values:
+        raise ValueError("cannot infer output dtype from an empty dataset list")
+    floats = [dtype for dtype in values if _is_float_dtype(dtype)]
+    if floats:
+        if DType.F64 in floats:
+            return DType.F64
+        if DType.F32 in floats:
+            return DType.F32
+        if DType.F16 in floats and DType.BF16 in floats:
+            return DType.F32
+        return floats[0]
+
+    max_size = max(_INT_DTYPE_RANK[dtype][0] for dtype in values)
+    same_width = [dtype for dtype in values if _INT_DTYPE_RANK[dtype][0] == max_size]
+    signed = [dtype for dtype in same_width if _INT_DTYPE_RANK[dtype][1]]
+    return signed[0] if signed else same_width[0]
+
+
+def _coerce_prefetch_dtype(dtype: DType | Literal["auto"] | str | None, ids: Iterable[DatasetId], bank: "ScDataBank") -> DType:
+    if dtype is None or (isinstance(dtype, str) and dtype.strip().lower() == "auto"):
+        return _auto_output_dtype(bank.dataset_dtype(id) for id in ids)
+    value = _coerce_dtype(dtype)
+    if value is None:
+        raise ValueError("dtype must not resolve to None")
+    return value
+
+
 # ===========================================================================
 # Config dataclasses
 # ===========================================================================
-# Every config is a pure `@dataclass` with defaults matching the Rust
-# `_XxxConfig()` constructors.  They carry **no** `_to_rust()` of their own:
+# Every config is a pure `@dataclass` with Python-owned defaults.  They carry
+# **no** `_to_rust()` of their own:
 # `_config_to_rust` below walks any config tree reflectively and builds the
 # matching Rust instances in one place, so adding a field only means adding it
 # to the dataclass (and the Rust pyclass) — no per-class conversion to maintain.
@@ -265,6 +313,10 @@ class _Config:
         values = _merge_mapping_and_kwargs(type(self), data, kwargs)
         _apply_dynamic(self, values)
         return self
+
+    def validate(self) -> None:
+        """Validate this config through the Rust binding."""
+        _config_to_rust(self).validate()
 
 
 @dataclass(slots=True)
@@ -560,6 +612,96 @@ def _config_to_rust(config: Any) -> Any:
     return r
 
 
+def _config_from_rust(config: Any) -> Any:
+    """Convert a Rust config pyclass back into the public Python dataclass."""
+    if isinstance(config, _DataBankConfig):
+        return DataBankConfig(
+            io_config=_config_from_rust(config.io_config),
+            decode_config=_config_from_rust(config.decode_config),
+            access_config=_config_from_rust(config.access_config),
+            fill_config=_config_from_rust(config.fill_config),
+        )
+    if isinstance(config, _IoConfig):
+        if config.kind == "uring":
+            uring = config.uring_config()
+            if uring is None:
+                raise ValueError("Rust IoConfig kind is 'uring' but uring_config() returned None")
+            return IoConfig(backend="uring", uring_config=_config_from_rust(uring))
+        if config.kind == "threaded":
+            threaded = config.threaded_config()
+            if threaded is None:
+                raise ValueError(
+                    "Rust IoConfig kind is 'threaded' but threaded_config() returned None"
+                )
+            return IoConfig(backend="threaded", threaded_config=_config_from_rust(threaded))
+        raise ValueError(f"unknown Rust IoConfig kind {config.kind!r}")
+    if isinstance(config, _BaseIoConfig):
+        return BaseIoConfig(
+            max_in_flight=config.max_in_flight,
+            priority_levels=config.priority_levels,
+            queue_shards=config.queue_shards,
+            assume_non_overlapping_reads=config.assume_non_overlapping_reads,
+        )
+    if isinstance(config, _UringConfig):
+        return UringConfig(
+            entries=config.entries,
+            drivers=config.drivers,
+            iowq_bounded_workers=config.iowq_bounded_workers,
+            iowq_unbounded_workers=config.iowq_unbounded_workers,
+            registered_files=config.registered_files,
+            base=_config_from_rust(config.base),
+        )
+    if isinstance(config, _ThreadedConfig):
+        return ThreadedConfig(
+            num_workers=config.num_workers,
+            cpus=config.cpus,
+            base=_config_from_rust(config.base),
+        )
+    if isinstance(config, _DecodePoolConfig):
+        return DecodePoolConfig(
+            num_workers=config.num_workers,
+            queue_capacity=config.queue_capacity,
+            cpus=config.cpus,
+        )
+    if isinstance(config, _AccessCpuConfig):
+        return AccessCpuConfig(
+            num_workers=config.num_workers,
+            queue_capacity=config.queue_capacity,
+            cpus=config.cpus,
+        )
+    if isinstance(config, _AccessConfig):
+        return AccessConfig(
+            queue_capacity=config.queue_capacity,
+            scheduler_shards=config.scheduler_shards,
+            cache_capacity_bytes=config.cache_capacity_bytes,
+            memory_budget_bytes=config.memory_budget_bytes,
+            default_io_priority=config.default_io_priority,
+            keep_decoded=config.keep_decoded,
+            cpu=_config_from_rust(config.cpu),
+        )
+    if isinstance(config, _FillConfig):
+        return FillConfig(
+            parallel=config.parallel,
+            num_workers=config.num_workers,
+            queue_capacity=config.queue_capacity,
+            min_parallel_rows=config.min_parallel_rows,
+            min_parallel_bytes=config.min_parallel_bytes,
+            cpus=config.cpus,
+        )
+    if isinstance(config, _ScheduledAccessConfig):
+        return ScheduledAccessConfig(
+            prefetch_step=config.prefetch_step,
+            decode_ahead_steps=config.decode_ahead_steps,
+            ready_ahead_steps=config.ready_ahead_steps,
+        )
+    if isinstance(config, _ScheduledPrefetchConfig):
+        return ScheduledPrefetchConfig(
+            prefetch_step=config.prefetch_step,
+            access=_config_from_rust(config.access),
+        )
+    raise TypeError(f"not a Rust config object: {type(config).__name__}")
+
+
 # ---------------------------------------------------------------------------
 # Dynamic flat-kwargs routing (used by _Config.make / _Config.update)
 # ---------------------------------------------------------------------------
@@ -735,14 +877,32 @@ def _apply_dynamic(config: Any, kwargs: dict[str, Any]) -> Any:
 
 def _coerce_prefetch_config(
     config: ScheduledPrefetchConfig | Mapping[str, Any] | None,
-) -> ScheduledPrefetchConfig | None:
+) -> ScheduledPrefetchConfig:
     """Normalize optional prefetch config input before Rust conversion."""
-    if config is None or isinstance(config, ScheduledPrefetchConfig):
+    if config is None:
+        return ScheduledPrefetchConfig()
+    if isinstance(config, ScheduledPrefetchConfig):
         return config
     if isinstance(config, MappingABC):
         return ScheduledPrefetchConfig.from_dict(config)
     raise TypeError(
         f"config must be ScheduledPrefetchConfig, a mapping, or None; got {type(config).__name__}"
+    )
+
+
+def _coerce_access_config(
+    config: ScheduledAccessConfig | Mapping[str, Any] | None,
+) -> ScheduledAccessConfig:
+    """Normalize optional per-access config input before Rust conversion."""
+    if config is None:
+        return ScheduledAccessConfig()
+    if isinstance(config, ScheduledAccessConfig):
+        return config
+    if isinstance(config, MappingABC):
+        return ScheduledAccessConfig.from_dict(config)
+    raise TypeError(
+        f"access_config must be ScheduledAccessConfig, a mapping, or None; "
+        f"got {type(config).__name__}"
     )
 
 
@@ -806,6 +966,23 @@ class ScDataBank:
     def is_closed(self) -> bool:
         """Whether this bank has already released its Rust core."""
         return self._inner is None
+
+    @property
+    def config(self) -> DataBankConfig:
+        """A Python dataclass copy of the running Rust bank config."""
+        return _config_from_rust(self._core().config())
+
+    def profile_snapshot(self) -> ProfileSnapshot:
+        """Return a structured snapshot of DataBank profiling metrics."""
+        return self._core().profile_snapshot()
+
+    def profile_snapshot_and_reset(self) -> ProfileSnapshot:
+        """Return profiling metrics and reset the active counters."""
+        return self._core().profile_snapshot_and_reset()
+
+    def reset_profile(self) -> None:
+        """Reset DataBank profiling metrics."""
+        self._core().reset_profile()
 
     # -- registration --------------------------------------------------------
 
@@ -951,15 +1128,18 @@ class ScDataBank:
 
     def load(
         self,
-        id: DatasetId,
-        cells: CellAccess | Iterable[int],
+        id: DatasetId | SequenceABC[DatasetId],
+        cells: CellAccess
+        | Iterable[int]
+        | Iterable[tuple[int, CellAccess | Iterable[int]]],
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy
         | Literal["zero", "error", "raise", "strict"]
         | str
         | None = None,
-        dtype: DType | str | None = None,
+        dtype: DType | Literal["auto"] | str | None = None,
+        access_config: ScheduledAccessConfig | Mapping[str, Any] | None = None,
     ) -> CellData:
         """Load cells, optionally projected onto a gene subset.
 
@@ -967,20 +1147,74 @@ class ScDataBank:
         dispatches to the Rust projection path and returns columns in the
         requested order.  ``cells`` may also be a :class:`CellAccess`; when
         ``genes`` is omitted, its ``gene_names`` are used.
+
+        Passing a sequence of dataset ids enables cross-dataset access.  In
+        that mode ``cells`` is one multi-part batch of ``(dataset_idx, cells)``
+        pairs, and ``dtype=None``/``"auto"`` selects one output dtype across all
+        datasets.
         """
+        if not isinstance(id, DatasetId):
+            return self._load_multi(
+                id,
+                cells,  # type: ignore[arg-type]
+                genes,
+                missing=_coerce_missing_policy(missing),
+                dtype=dtype,
+                access_config=access_config,
+            )
         if isinstance(cells, CellAccess):
             if genes is None:
                 genes = cells.gene_names
             cells = cells.cells
-        dtype_value = _coerce_dtype(dtype)
+        dtype_value = (
+            None
+            if isinstance(dtype, str) and dtype.strip().lower() == "auto"
+            else _coerce_dtype(dtype)  # type: ignore[arg-type]
+        )
         if genes is None:
-            return self._load_all_genes(id, cells, dtype=dtype_value)
+            return self._load_all_genes(id, cells, dtype=dtype_value, access_config=access_config)
         return self._load_genes(
             id,
             cells,
             genes,
             missing=_coerce_missing_policy(missing),
             dtype=dtype_value,
+            access_config=access_config,
+        )
+
+    def _load_multi(
+        self,
+        ids: SequenceABC[DatasetId],
+        batch: Iterable[tuple[int, CellAccess | Iterable[int]]],
+        genes: Iterable[str] | None = None,
+        *,
+        missing: MissingGenePolicy | None = None,
+        dtype: DType | Literal["auto"] | str | None = None,
+        access_config: ScheduledAccessConfig | Mapping[str, Any] | None = None,
+    ) -> CellData:
+        prefetch_config = None
+        if access_config is not None:
+            prefetch_config = ScheduledPrefetchConfig(
+                prefetch_step=1,
+                access=_coerce_access_config(access_config),
+            )
+        iterator = self.prefetch(
+            ids,
+            [batch],
+            genes=genes,
+            missing=missing,
+            dtype=dtype,
+            config=prefetch_config,
+        )
+        try:
+            decoded = next(iterator)
+        except StopIteration as exc:
+            raise DataError("multi-dataset load produced no batch") from exc
+        return CellData.from_array(
+            cells=decoded.cells,
+            data=decoded.data,
+            num_genes=decoded.num_genes,
+            gene_names=decoded.var_names,
         )
 
     def _load_all_genes(
@@ -989,15 +1223,13 @@ class ScDataBank:
         cells: Iterable[int],
         *,
         dtype: DType | None = None,
+        access_config: ScheduledAccessConfig | Mapping[str, Any] | None = None,
     ) -> CellData:
         cell_arr = _as_cell_index(cells, "cells")
         gene_names, num_genes = self._meta(id)
         core = self._core()
-        fast = getattr(core, "access_cells_array", None)
-        if fast is not None:
-            data = fast(id._rust, cell_arr, dtype)
-        else:
-            data = core.access_cells(id._rust, cell_arr.tolist(), dtype)
+        rust_config = _config_to_rust(_coerce_access_config(access_config))
+        data = core.access_cells_array(id._rust, cell_arr, dtype, rust_config)
         return CellData.from_array(
             cells=cell_arr,
             data=data,
@@ -1013,22 +1245,21 @@ class ScDataBank:
         *,
         missing: MissingGenePolicy | None = None,
         dtype: DType | None = None,
+        access_config: ScheduledAccessConfig | Mapping[str, Any] | None = None,
     ) -> CellData:
         cell_arr = _as_cell_index(cells, "cells")
         names = _as_gene_names(genes, "genes")
         core = self._core()
         rust_missing = missing._rust if missing is not None else None
-        fast = getattr(core, "access_cells_by_gene_names_array", None)
-        if fast is not None:
-            data = fast(id._rust, cell_arr, list(names), rust_missing, dtype)
-        else:
-            data = core.access_cells_by_gene_names(
-                id._rust,
-                cell_arr.tolist(),
-                list(names),
-                rust_missing,
-                dtype,
-            )
+        rust_config = _config_to_rust(_coerce_access_config(access_config))
+        data = core.access_cells_by_gene_names_array(
+            id._rust,
+            cell_arr,
+            list(names),
+            rust_missing,
+            dtype,
+            rust_config,
+        )
         return CellData.from_array(
             cells=cell_arr,
             data=data,
@@ -1038,28 +1269,116 @@ class ScDataBank:
 
     # -- prefetch ------------------------------------------------------------
 
+    def prefetch_cells_cache(self, id: DatasetId, cells: Iterable[int]) -> None:
+        """Warm the Rust access cache for ``cells`` without returning data."""
+        cell_arr = _as_cell_index(cells, "cells")
+        self._core().prefetch_cells_cache_array(id._rust, cell_arr)
+
     def prefetch(
         self,
-        id: DatasetId,
-        batches: Iterable[CellAccess | Iterable[int]],
+        id: DatasetId | SequenceABC[DatasetId],
+        batches: Iterable[CellAccess | Iterable[int]]
+        | Iterable[Iterable[tuple[int, CellAccess | Iterable[int]]]],
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy
         | Literal["zero", "error", "raise", "strict"]
         | str
         | None = None,
+        dtype: DType | Literal["auto"] | str | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
         """Stream decoded cell batches, optionally projected onto ``genes``."""
-        if genes is None:
-            return self._prefetch_all_genes(id, batches, config=config)
-        return self._prefetch_genes(
-            id,
-            batches,
-            genes,
-            missing=_coerce_missing_policy(missing),
-            config=config,
+        multi_request = not isinstance(id, DatasetId)
+        ids = self._coerce_prefetch_ids(id)
+        stored_dtype = self.dataset_dtype(ids[0]) if not multi_request else None
+        if stored_dtype is not None and (
+            dtype is None or (isinstance(dtype, str) and dtype.strip().lower() == "auto")
+        ):
+            dtype_value = stored_dtype
+        else:
+            dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
+        names = _as_gene_names(genes, "genes") if genes is not None else None
+        rust_missing = _coerce_missing_policy(missing)
+        config = _coerce_prefetch_config(config)
+
+        if stored_dtype is not None and dtype_value == stored_dtype:
+            if names is None:
+                return self._prefetch_all_genes(
+                    ids[0],
+                    batches,  # type: ignore[arg-type]
+                    config=config,
+                )
+            return self._prefetch_genes(
+                ids[0],
+                batches,  # type: ignore[arg-type]
+                names,
+                missing=rust_missing,
+                config=config,
+            )
+
+        if not multi_request:
+            batch_parts = self._single_prefetch_parts(
+                batches,  # type: ignore[arg-type]
+            )
+        else:
+            batch_parts = self._iter_multi_prefetch_parts(
+                batches,  # type: ignore[arg-type]
+            )
+        rust_missing_value = rust_missing._rust if rust_missing is not None else None
+        rust_config = _config_to_rust(config)
+        inner = self._core().prefetch_cells(
+            [dataset_id._rust for dataset_id in ids],
+            batch_parts,
+            dtype_value,
+            list(names) if names is not None else None,
+            rust_missing_value,
+            rust_config,
         )
+        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
+
+    @staticmethod
+    def _coerce_prefetch_ids(id: DatasetId | SequenceABC[DatasetId]) -> tuple[DatasetId, ...]:
+        if isinstance(id, DatasetId):
+            return (id,)
+        if not isinstance(id, SequenceABC) or isinstance(id, (str, bytes, bytearray)):
+            raise TypeError("id must be a DatasetId or a sequence of DatasetId values")
+        ids = tuple(id)
+        if not ids:
+            raise ValueError("id sequence must not be empty")
+        for idx, dataset_id in enumerate(ids):
+            if not isinstance(dataset_id, DatasetId):
+                raise TypeError(f"id[{idx}] must be a DatasetId, got {type(dataset_id).__name__}")
+        return ids
+
+    @staticmethod
+    def _single_prefetch_parts(
+        batches: Iterable[CellAccess | Iterable[int]],
+    ) -> list[list[tuple[int, Any]]]:
+        request = PrefetchBatches.from_iterable(batches)
+        return [[(0, cells)] for cells in request.batch_cell_arrays()]
+
+    @staticmethod
+    def _iter_multi_prefetch_parts(
+        batches: Iterable[Iterable[tuple[int, CellAccess | Iterable[int]]]],
+    ) -> Iterator[list[tuple[int, Any]]]:
+        for batch_index, batch in enumerate(batches):
+            parts: list[tuple[int, Any]] = []
+            for part_index, (dataset_idx, cells) in enumerate(batch):
+                dataset_index = int(dataset_idx)
+                if dataset_index < 0:
+                    raise ValueError(
+                        f"batches[{batch_index}][{part_index}] dataset_idx must be non-negative"
+                    )
+                if isinstance(cells, CellAccess):
+                    cell_array = cells.cells
+                else:
+                    cell_array = _as_cell_index(
+                        cells,
+                        f"batches[{batch_index}][{part_index}].cells",
+                    )
+                parts.append((dataset_index, cell_array))
+            yield parts
 
     def _prefetch_all_genes(
         self,
@@ -1070,14 +1389,9 @@ class ScDataBank:
     ) -> Iterator[CellBatch]:
         request = PrefetchBatches.from_iterable(batches)
         config = _coerce_prefetch_config(config)
-        rust_config = _config_to_rust(config) if config is not None else None
-        core = self._core()
-        fast = getattr(core, "prefetch_cells_arrays", None)
-        if fast is not None:
-            inner = fast(id._rust, request.batch_cell_arrays(), rust_config)
-        else:
-            inner = core.prefetch_cells(id._rust, request.batch_cell_lists(), rust_config)
-        return PrefetchIterator(inner, gene_names=tuple(self._meta(id)[0]))
+        rust_config = _config_to_rust(config)
+        inner = self._core().prefetch_cells_raw(id._rust, request.batch_cell_arrays(), rust_config)
+        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
 
     def _prefetch_genes(
         self,
@@ -1092,22 +1406,15 @@ class ScDataBank:
         names = tuple(request.gene_names) if request.gene_names is not None else ()
         rust_missing = missing._rust if missing is not None else None
         config = _coerce_prefetch_config(config)
-        rust_config = _config_to_rust(config) if config is not None else None
-        core = self._core()
-        fast = getattr(core, "prefetch_cells_by_gene_names_arrays", None)
-        if fast is not None:
-            inner = fast(
-                id._rust, request.batch_cell_arrays(), list(names), rust_missing, rust_config
-            )
-        else:
-            inner = core.prefetch_cells_by_gene_names(
-                id._rust,
-                request.batch_cell_lists(),
-                list(names),
-                rust_missing,
-                rust_config,
-            )
-        return PrefetchIterator(inner, gene_names=names)
+        rust_config = _config_to_rust(config)
+        inner = self._core().prefetch_cells_by_gene_names_raw(
+            id._rust,
+            request.batch_cell_arrays(),
+            list(names),
+            rust_missing,
+            rust_config,
+        )
+        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
 
     def __repr__(self) -> str:
         state = "closed" if self.is_closed else "open"

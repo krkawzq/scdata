@@ -1,9 +1,9 @@
 """Dataset metadata mirroring what the Rust databank needs to read a store.
 
 These types are the Python-side view of a scdata store produced by
-``scdata.io._launch``. They follow Python idioms (dataclasses, enums) rather
-than mirroring the Rust structs field-for-field, but they carry every piece
-of information the Rust :class:`DataBank` consumes from a store:
+:mod:`scdata.io._launch`.  They follow Python idioms (dataclasses, enums)
+rather than mirroring the Rust structs field-for-field, but they carry every
+piece of information the Rust :class:`DataBank` consumes from a store:
 
 * logical ``shape`` / ``chunk_shape`` plus optional rectilinear boundaries,
 * the element dtype (mapped to the Rust ``DType`` enum),
@@ -12,12 +12,11 @@ of information the Rust :class:`DataBank` consumes from a store:
   each encoded chunk, whether the original store was a directory, zip archive,
   or another single-file backing source.
 
-The dataset layer does not open files or decode numeric chunks.  It only keeps
-metadata and chunk addresses so the Rust databank can construct arrays and
-datasets without knowing which upstream container produced them.
+The dataset layer does not open files or decode numeric chunks — it only keeps
+metadata and chunk addresses.
 
-FFI note: the per-chunk index and the CSR ``indptr`` are stored as contiguous
-``uint64`` numpy arrays so the Rust binding can borrow them zero-copy via
+The per-chunk index and the CSR ``indptr`` are stored as contiguous
+``uint64`` numpy arrays, so the Rust binding can borrow them zero-copy via
 ``PyReadonlyArray1::<u64>`` instead of walking a Python tuple element by
 element.  Tuple views (``ArrayMeta.chunks`` / ``SparseDataset.indptr`` as a
 tuple) are still available as derived properties for readability and for any
@@ -407,8 +406,8 @@ class ArrayMeta:
                     raise ValueError(
                         f"chunk_boundaries[{axis}] final boundary {bounds[-1]} != shape {dim}"
                     )
-                if any(a > b for a, b in zip(bounds, bounds[1:])):
-                    raise ValueError(f"chunk_boundaries[{axis}] must be monotonic")
+                if any(a >= b for a, b in zip(bounds, bounds[1:])):
+                    raise ValueError(f"chunk_boundaries[{axis}] must be strictly increasing")
             object.__setattr__(self, "chunk_boundaries", boundaries)
 
         lengths = _as_u64_array(self.chunk_lengths, "chunk_lengths")
@@ -970,12 +969,19 @@ class DatasetCollection(Mapping[str, Dataset]):
 
     ``x`` is the primary ``X`` matrix.  ``layers`` maps AnnData layer names
     (for example ``"counts"``) to the same single-matrix dataset types that the
-    databank already registers.  Item lookup accepts both full matrix keys
-    (``"X"``, ``"layers/counts"``) and layer-name shorthand (``"counts"``).
+    databank already registers.  ``raw`` is the optional ``raw.X`` matrix,
+    which carries its own gene space (``raw.var``) and therefore is kept
+    separate from ``layers`` — unlike layers, it is not required to share
+    ``X``'s ``num_genes`` / ``gene_names``, only its ``num_cells``.
+
+    Item lookup accepts both full matrix keys (``"X"``, ``"layers/counts"``,
+    ``"raw/X"``) and layer-name shorthand (``"counts"``).  ``"raw/X"`` is only
+    present when the store has a ``raw`` matrix.
     """
 
     x: Dataset
     layers: Mapping[str, Dataset] = field(default_factory=dict)
+    raw: Dataset | None = None
     store_root: str = ""
 
     def __post_init__(self) -> None:
@@ -1000,10 +1006,23 @@ class DatasetCollection(Mapping[str, Dataset]):
             if tuple(dataset.gene_names) != tuple(self.x.gene_names):
                 raise ValueError(f"layer {name!r} gene names differ from X")
         object.__setattr__(self, "layers", MappingProxyType(normalized))
+        if self.raw is not None:
+            if not isinstance(self.raw, (DenseDataset, SparseDataset)):
+                raise TypeError(
+                    f"raw has unsupported dataset type {type(self.raw).__name__}"
+                )
+            if self.raw.num_cells != self.x.num_cells:
+                raise ValueError(
+                    f"raw has {self.raw.num_cells} cells, expected {self.x.num_cells}"
+                )
 
     def __getitem__(self, key: str) -> Dataset:
         if key == "X":
             return self.x
+        if key == "raw/X":
+            if self.raw is None:
+                raise KeyError(key)
+            return self.raw
         if key.startswith("layers/"):
             name = key[len("layers/") :]
             if not name:
@@ -1016,6 +1035,8 @@ class DatasetCollection(Mapping[str, Dataset]):
             return False
         if key == "X":
             return True
+        if key == "raw/X":
+            return self.raw is not None
         if key.startswith("layers/"):
             return key[len("layers/") :] in self.layers
         return key in self.layers
@@ -1024,15 +1045,20 @@ class DatasetCollection(Mapping[str, Dataset]):
         return iter(self.keys())
 
     def __len__(self) -> int:
-        return 1 + len(self.layers)
+        return 1 + len(self.layers) + (1 if self.raw is not None else 0)
 
     def keys(self) -> tuple[str, ...]:
-        return ("X", *(f"layers/{name}" for name in self.layers))
+        out: list[str] = ["X", *(f"layers/{name}" for name in self.layers)]
+        if self.raw is not None:
+            out.append("raw/X")
+        return tuple(out)
 
     def items(self) -> Iterator[tuple[str, Dataset]]:
         yield "X", self.x
         for name, dataset in self.layers.items():
             yield f"layers/{name}", dataset
+        if self.raw is not None:
+            yield "raw/X", self.raw
 
     def __repr__(self) -> str:
         return (

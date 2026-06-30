@@ -1,9 +1,7 @@
 """Cell access request, result, and batch types for the DataBank.
 
-These are the pure-Python data carriers for the access and streaming-prefetch
-paths.  They live in the data layer — no dependency on the Rust extension —
-so the bank's execution layer (:mod:`scdata.databank`) is the only place that
-touches the Rust core.
+Pure-Python data carriers for the access and streaming-prefetch paths, with no
+dependency on the Rust extension.
 
 Three value types cover the whole surface:
 
@@ -19,16 +17,13 @@ Three value types cover the whole surface:
   always decoded; the prefetch *input* side is a :class:`CellAccess`, not a
   half-filled batch.
 
-Layout contract
----------------
-``data`` is a 1D row-major numpy array of shape ``[num_cells * num_genes]``;
-cell ``i``'s genes occupy ``data[i*num_genes : (i+1)*num_genes]``.  The
-``matrix`` property reshapes it to ``[num_cells, num_genes]`` — zero-copy when
-``data`` is contiguous, which it always is coming out of Rust.
-
-These types deliberately do **not** carry execution parameters
-(``missing`` / ``dtype`` / ``config``): those belong to the bank's execution
-layer, not to the data description.
+The ``data`` field is a 1D row-major numpy array of shape
+``[num_cells * num_genes]``; cell ``i``'s genes occupy
+``data[i*num_genes : (i+1)*num_genes]``.  The :attr:`matrix` property reshapes
+it to ``[num_cells, num_genes]`` — zero-copy when ``data`` is contiguous,
+which it always is coming out of Rust.  These types deliberately carry no
+execution parameters (``missing`` / ``dtype`` / ``config``); those live on the
+bank, not on the data description.
 """
 
 from __future__ import annotations
@@ -113,8 +108,8 @@ class CellData:
     gene_names: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.num_genes <= 0:
-            raise ValueError(f"num_genes must be positive, got {self.num_genes}")
+        if self.num_genes < 0:
+            raise ValueError(f"num_genes must be non-negative, got {self.num_genes}")
         cells = _as_cell_index(self.cells, "cells")
         data = np.asarray(self.data)
         if data.ndim != 1:
@@ -220,8 +215,8 @@ class CellBatch:
     gene_names: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.num_genes <= 0:
-            raise ValueError(f"num_genes must be positive, got {self.num_genes}")
+        if self.num_genes < 0:
+            raise ValueError(f"num_genes must be non-negative, got {self.num_genes}")
         cells = _as_cell_index(self.cells, "cells")
         data = np.asarray(self.data)
         if data.ndim != 1:

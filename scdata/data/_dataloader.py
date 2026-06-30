@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict, defaultdict
+import time
+from collections import OrderedDict
+from collections.abc import Mapping as MappingABC
 from os import PathLike
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 from typing import TypedDict, cast
@@ -12,6 +14,7 @@ from numpy.typing import NDArray
 
 from scdata.data._coerce import _as_gene_names, _coerce_index_int
 from scdata.data._cell import CellBatch, _as_cell_index
+from scdata.data._stats import BankConfigSummary, LoaderStats, _StatsCollector
 
 try:
     import torch
@@ -26,8 +29,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in torch-free envs.
     _TorchDataLoader = _MissingTorchDataLoader
 
 if TYPE_CHECKING:
+    from scdata.data._dataset import DType
     from scdata.databank import DatasetId, MissingGenePolicy, ScDataBank, ScheduledPrefetchConfig
 else:
+    DType = object
     DatasetId = object
     MissingGenePolicy = object
     ScDataBank = object
@@ -39,11 +44,20 @@ __all__ = ["ScDataLoader"]
 class _SupportsPrefetch(Protocol):
     def prefetch(
         self,
-        id: DatasetId | str | int | PathLike[str],
-        batches: Iterable[Iterable[int] | NDArray[np.intp]],
+        id: DatasetId
+        | str
+        | int
+        | PathLike[str]
+        | Sequence[DatasetId | str | int | PathLike[str]],
+        batches: Iterable[
+            Iterable[int]
+            | NDArray[np.intp]
+            | Iterable[tuple[int, Iterable[int] | NDArray[np.intp]]]
+        ],
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy | str | None = None,
+        dtype: DType | str | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]: ...
 
@@ -58,11 +72,13 @@ class _BatchPlan(TypedDict):
     file_ids: NDArray[np.intp]
     cell_ids: NDArray[np.intp]
     parts: list[_BatchPartPlan]
+    stream_parts: list[_BatchPartPlan]
 
 
 class _ScDataBatchBase(TypedDict):
     file_ids: NDArray[np.intp]
     cell_ids: NDArray[np.intp]
+    batch: CellBatch
     batches: Mapping[int, CellBatch]
     cells: Mapping[int, NDArray[np.intp]]
     positions: Mapping[int, NDArray[np.intp]]
@@ -70,13 +86,77 @@ class _ScDataBatchBase(TypedDict):
 
 class _ScDataSingleFileFields(TypedDict, total=False):
     file_id: int
-    batch: CellBatch
     cells_in_file: NDArray[np.intp]
     positions_in_batch: NDArray[np.intp]
 
 
 class ScDataBatch(_ScDataBatchBase, _ScDataSingleFileFields):
     """Dictionary passed to ``ScDataLoader`` user ``collate_fn``."""
+
+
+def _sequential_positions(positions: NDArray[np.intp], start: int, length: int) -> bool:
+    if positions.shape[0] != length:
+        return False
+    if length == 0:
+        return True
+    if int(positions[0]) != start:
+        return False
+    if int(positions[-1]) != start + length - 1:
+        return False
+    return bool(np.array_equal(positions, np.arange(start, start + length, dtype=np.intp)))
+
+
+def _rows_for_positions(
+    matrix: NDArray[np.generic],
+    positions: NDArray[np.intp],
+) -> NDArray[np.generic]:
+    if positions.shape[0] == 0:
+        return matrix[:0]
+    start = int(positions[0])
+    stop = start + positions.shape[0]
+    if 0 <= start and stop <= matrix.shape[0] and _sequential_positions(
+        positions,
+        start,
+        positions.shape[0],
+    ):
+        return matrix[start:stop]
+    return np.ascontiguousarray(matrix[positions])
+
+
+class _LazyCellBatches(MappingABC[int, CellBatch]):
+    def __init__(self, decoded: CellBatch, parts: Sequence[_BatchPartPlan]) -> None:
+        self._decoded = decoded
+        self._parts = {part["file_id"]: part for part in parts}
+        self._order = [part["file_id"] for part in parts]
+        self._cache: dict[int, CellBatch] = {}
+
+    def __getitem__(self, file_id: int) -> CellBatch:
+        if file_id in self._cache:
+            return self._cache[file_id]
+        part = self._parts[file_id]
+        cells = part["cells"]
+        positions = part["positions"]
+        if _sequential_positions(positions, 0, self._decoded.num_cells) and np.array_equal(
+            cells,
+            self._decoded.cells,
+        ):
+            batch = self._decoded
+        else:
+            rows = _rows_for_positions(self._decoded.to_numpy(), positions)
+            batch = CellBatch.from_array(
+                cells=cells,
+                data=rows.reshape(-1),
+                num_genes=self._decoded.num_genes,
+                gene_names=self._decoded.var_names,
+            )
+        self._cache[file_id] = batch
+        return batch
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self._order)
+
+    def __len__(self) -> int:
+        return len(self._order)
 
 
 def _identity_raw_collate(
@@ -131,7 +211,8 @@ def _batch_plan(
 ) -> _BatchPlan:
     file_ids = np.empty(len(samples), dtype=np.intp)
     cell_ids = np.empty(len(samples), dtype=np.intp)
-    grouped: OrderedDict[int, list[tuple[int, int]]] = OrderedDict()
+    grouped: OrderedDict[int, tuple[list[int], list[int]]] = OrderedDict()
+    stream_rows: list[tuple[int, list[int]]] = []
 
     for pos, sample in enumerate(samples):
         file_id, cell_id = _parse_sample(sample)
@@ -141,19 +222,42 @@ def _batch_plan(
             raise ValueError(f"cell_id values must be non-negative, got {cell_id}")
         file_ids[pos] = file_id
         cell_ids[pos] = cell_id
-        grouped.setdefault(file_id, []).append((pos, cell_id))
+        grouped_entry = grouped.get(file_id)
+        if grouped_entry is None:
+            grouped_entry = ([], [])
+            grouped[file_id] = grouped_entry
+        grouped_entry[0].append(pos)
+        grouped_entry[1].append(cell_id)
+        if stream_rows and stream_rows[-1][0] == file_id:
+            stream_rows[-1][1].append(cell_id)
+        else:
+            stream_rows.append((file_id, [cell_id]))
 
     parts: list[_BatchPartPlan] = []
-    for file_id, rows in grouped.items():
+    for file_id, (positions, cells) in grouped.items():
         parts.append(
             {
                 "file_id": file_id,
-                "positions": np.asarray([pos for pos, _ in rows], dtype=np.intp),
-                "cells": _as_cell_index([cell_id for _, cell_id in rows], "cell_id"),
+                "positions": np.asarray(positions, dtype=np.intp),
+                "cells": _as_cell_index(cells, "cell_id"),
             }
         )
 
-    return {"file_ids": file_ids, "cell_ids": cell_ids, "parts": parts}
+    stream_parts = [
+        {
+            "file_id": file_id,
+            "positions": np.empty(0, dtype=np.intp),
+            "cells": _as_cell_index(cells, "cell_id"),
+        }
+        for file_id, cells in stream_rows
+    ]
+
+    return {
+        "file_ids": file_ids,
+        "cell_ids": cell_ids,
+        "parts": parts,
+        "stream_parts": stream_parts,
+    }
 
 
 def _index_to_int(index: Any) -> int:
@@ -255,16 +359,14 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
 
     Torch still owns sampling, shuffling, ``batch_size``, ``sampler``,
     ``batch_sampler`` and ``drop_last``.  On ``iter(loader)``, this adapter
-    materializes all torch batch indices, groups each batch by ``file_id``,
-    starts one :meth:`ScDataBank.prefetch` stream per file id, and yields
-    decoded dictionaries to ``collate_fn``.
+    materializes all torch batch indices, plans each batch as cross-dataset
+    parts, starts one :meth:`ScDataBank.prefetch` stream, and yields decoded
+    dictionaries to ``collate_fn``.
 
     The dictionary always has ``file_ids`` and ``cell_ids`` in original batch
-    order.  For each file id, ``batches[file_id]`` is an existing
-    :class:`CellBatch`, ``cells[file_id]`` are the requested cells for that
-    file, and ``positions[file_id]`` maps rows back to original batch order.
-    When the batch contains a single file id, convenience keys ``file_id``,
-    ``batch``, ``cells_in_file`` and ``positions_in_batch`` are also present.
+    order plus ``batch``, a single decoded :class:`CellBatch` with the same row
+    order.  ``batches`` / ``cells`` / ``positions`` are retained as
+    compatibility views grouped by file id.
     """
 
     def __init__(
@@ -279,8 +381,11 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         | None = None,
         genes: Iterable[str] | None = None,
         missing: "MissingGenePolicy | str | None" = None,
+        out_dtype: "DType | str | None" = None,
         prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
         collate_fn: Callable[[ScDataBatch], Any] | None = None,
+        collect_stats: bool = False,
+        bank_config_summary: BankConfigSummary | None = None,
         **kwargs: Any,
     ) -> None:
         if torch is None:
@@ -304,48 +409,77 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         )
         self.sc_genes: tuple[str, ...] | None = _as_gene_names(genes, "genes") if genes is not None else None
         self.sc_missing: MissingGenePolicy | str | None = missing
+        self.sc_out_dtype: DType | str | None = out_dtype
         self.sc_prefetch_config: ScheduledPrefetchConfig | Mapping[str, Any] | None = prefetch_config
         self.sc_collate_fn: Callable[[ScDataBatch], Any] = (
             collate_fn if collate_fn is not None else _identity_sc_collate
         )
+        self.sc_collect_stats: bool = collect_stats
+        self._sc_stats: _StatsCollector | None = None
+        if collect_stats:
+            self._sc_stats = _StatsCollector(
+                prefetch_config=prefetch_config,
+                bank_config_summary=bank_config_summary,
+            )
 
     def __iter__(self) -> Iterator[Any]:
         plans = self._sc_build_plans()
         if not plans:
             return iter(())
 
-        requests: dict[int, list[NDArray[np.intp]]] = defaultdict(list)
+        file_to_dataset_idx: OrderedDict[int, int] = OrderedDict()
+        dataset_ids: list[DatasetId | str | int | PathLike[str]] = []
         for plan in plans:
-            for part in plan["parts"]:
-                requests[part["file_id"]].append(part["cells"])
+            for part in plan["stream_parts"]:
+                file_id = part["file_id"]
+                if file_id not in file_to_dataset_idx:
+                    file_to_dataset_idx[file_id] = len(dataset_ids)
+                    dataset_ids.append(self.sc_dataset_id(file_id))
 
-        prefetchers = {
-            file_id: iter(
-                self.sc_bank.prefetch(
-                    self.sc_dataset_id(file_id),
-                    batches,
-                    genes=self.sc_genes,
-                    missing=self.sc_missing,
-                    config=self.sc_prefetch_config,
-                )
-            )
-            for file_id, batches in requests.items()
+        def prefetch_batches() -> Iterator[list[tuple[int, NDArray[np.intp]]]]:
+            for plan in plans:
+                yield [
+                    (file_to_dataset_idx[part["file_id"]], part["cells"])
+                    for part in plan["stream_parts"]
+                ]
+
+        prefetch_kwargs: dict[str, Any] = {
+            "genes": self.sc_genes,
+            "missing": self.sc_missing,
+            "config": self.sc_prefetch_config,
         }
+        if self.sc_out_dtype is not None:
+            prefetch_kwargs["dtype"] = self.sc_out_dtype
+        prefetcher = iter(
+            self.sc_bank.prefetch(
+                dataset_ids,
+                prefetch_batches(),
+                **prefetch_kwargs,
+            )
+        )
 
         def iterator() -> Iterator[Any]:
+            perf_counter = time.perf_counter
+            collect = self.sc_collect_stats
+            collector = self._sc_stats
             for plan in plans:
-                batches: dict[int, CellBatch] = {}
-                cells: dict[int, NDArray[np.intp]] = {}
-                positions: dict[int, NDArray[np.intp]] = {}
-                for part in plan["parts"]:
-                    file_id = part["file_id"]
-                    batches[file_id] = next(prefetchers[file_id])
-                    cells[file_id] = part["cells"]
-                    positions[file_id] = part["positions"]
+                t0 = perf_counter() if collect else 0.0
+                decoded = next(prefetcher)
+                batches = _LazyCellBatches(decoded, plan["parts"])
+                cells: dict[int, NDArray[np.intp]] = {
+                    part["file_id"]: part["cells"] for part in plan["parts"]
+                }
+                positions: dict[int, NDArray[np.intp]] = {
+                    part["file_id"]: part["positions"] for part in plan["parts"]
+                }
+                # ``wait`` covers the ``next()`` calls blocked on the bank;
+                # ``wall`` additionally covers the collate step below.
+                t1 = perf_counter() if collect else 0.0
 
                 batch: ScDataBatch = {
                     "file_ids": plan["file_ids"],
                     "cell_ids": plan["cell_ids"],
+                    "batch": decoded,
                     "batches": batches,
                     "cells": cells,
                     "positions": positions,
@@ -355,14 +489,88 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
                     batch.update(
                         {
                             "file_id": file_id,
-                            "batch": batches[file_id],
                             "cells_in_file": cells[file_id],
                             "positions_in_batch": positions[file_id],
                         }
                     )
-                yield self.sc_collate_fn(batch)
+                result = self.sc_collate_fn(batch)
+                if collect and collector is not None:
+                    t2 = perf_counter()
+                    collector.record_batch(
+                        wait_seconds=t1 - t0,
+                        wall_seconds=t2 - t0,
+                        num_cells=len(plan["cell_ids"]),
+                        num_genes=decoded.num_genes,
+                        bytes_=decoded.data.nbytes,
+                    )
+                yield result
 
         return iter(iterator())
+
+    def stats(self, *, reset: bool = True) -> LoaderStats:
+        """Return consumer-side health metrics collected during iteration.
+
+        Requires ``collect_stats=True`` at construction.  By default the
+        collector is reset after the snapshot, so each call reports a fresh
+        window — pass ``reset=False`` to accumulate across calls.
+
+        Only the most recent ``max_samples`` wait samples feed the
+        percentiles (recent health), while ``batches_seen`` and
+        ``stall_count`` are full-run counters.
+        """
+        if self._sc_stats is None:
+            raise RuntimeError(
+                "stats() requires collect_stats=True at construction"
+            )
+        return self._sc_stats.snapshot(reset=reset)
+
+    @classmethod
+    def from_paths(
+        cls,
+        bank: "ScDataBank",
+        paths: Iterable[str | PathLike[str]],
+        *,
+        layer: str | None = None,
+        matrix: str | None = None,
+        gene_alignment: str = "strict",
+        missing: "MissingGenePolicy | str | None" = None,
+        batch_size: int = 1024,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        out_dtype: "DType | str | None" = None,
+        prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
+        collate_fn: Callable[[ScDataBatch], Any] | None = None,
+        collect_stats: bool = False,
+        **torch_kwargs: Any,
+    ) -> "ScDataLoader":
+        """Build a loader from ``paths`` and an existing ``bank``.
+
+        Convenience entry point: parses and registers the stores via a
+        :class:`~scdata.corpus.Corpus` built on ``bank`` (which the caller
+        owns and must close), then returns the loader.  Use
+        :class:`~scdata.corpus.Corpus` directly when you need bank/dataset
+        access, lifecycle control, or :meth:`~scdata.corpus.Corpus.tune`.
+        """
+        from scdata.corpus import Corpus
+
+        corpus = Corpus.from_bank(
+            bank,
+            paths,
+            layer=layer,
+            matrix=matrix,
+            gene_alignment=gene_alignment,
+            missing=missing,
+        )
+        return corpus.loader(
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            out_dtype=out_dtype,
+            prefetch_config=prefetch_config,
+            collate_fn=collate_fn,
+            collect_stats=collect_stats,
+            **torch_kwargs,
+        )
 
     def _sc_build_plans(self) -> list[_BatchPlan]:
         plans: list[_BatchPlan] = []
