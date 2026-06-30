@@ -469,3 +469,276 @@ def test_converter_explicit_dense2d_and_output_dir(tmp_path: Path, dense_adata) 
     ds = launch(root)
     assert isinstance(ds, DenseDataset)
     assert ds.data.shape == (3, 4)
+
+
+def test_write_zarr_raw_sparse_aligned_round_trip(tmp_path: Path) -> None:
+    """raw.X must use the same cell-aligned CSR layout as X and round-trip."""
+    matrix = sp.csr_matrix(
+        np.array(
+            [
+                [1, 0, 2, 0, 0],
+                [0, 3, 0, 0, 4],
+                [5, 0, 0, 6, 0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    raw_matrix = sp.csr_matrix(
+        np.array(
+            [
+                [7, 0, 8],
+                [0, 9, 0],
+                [1, 0, 2],
+            ],
+            dtype=np.float32,
+        )
+    )
+    adata = ad.AnnData(
+        X=matrix,
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3", "g4"]),
+    )
+    adata.raw = ad.AnnData(
+        X=raw_matrix,
+        var=pd.DataFrame(index=["r0", "r1", "r2"]),
+    )
+
+    root = write_zarr(
+        adata,
+        tmp_path / "raw.zarr",
+        format="sparse",
+        chunk_size=(2,),
+        align_cells=True,
+        store="dir",
+    )
+
+    # raw group keeps anndata's "raw" encoding-type; raw.X carries the scdata
+    # marker and a rectilinear (cell-aligned) chunk grid just like X.
+    raw_meta = _read_json(root / "raw" / "zarr.json")
+    assert raw_meta["attributes"]["encoding-type"] == "raw"
+    x_meta = _read_json(root / "raw" / "X" / "zarr.json")
+    assert x_meta["attributes"]["scdata-matrix"] == "sparse"
+    data_meta = _read_json(root / "raw" / "X" / "data" / "zarr.json")
+    assert data_meta["chunk_grid"]["name"] == "rectilinear"
+    indptr_meta = _read_json(root / "raw" / "X" / "indptr" / "zarr.json")
+    assert indptr_meta["chunk_grid"]["name"] == "regular"
+
+    loaded = read_zarr(root)
+    assert loaded.raw is not None
+    assert tuple(loaded.raw.X.shape) == raw_matrix.shape
+    assert np.array_equal(loaded.raw.X.toarray(), raw_matrix.toarray())
+
+    # zip store (what the convert_cellxgene script produces) round-trips raw.X.
+    zip_root = write_zarr(
+        adata,
+        tmp_path / "raw.zarr.zip",
+        format="sparse",
+        chunk_size=(2,),
+        align_cells=True,
+        store="zip",
+    )
+    zipped = read_zarr(zip_root)
+    assert zipped.raw is not None
+    assert np.array_equal(zipped.raw.X.toarray(), raw_matrix.toarray())
+
+
+def test_write_zarr_raw_dense1d_round_trip(tmp_path: Path) -> None:
+    """raw.X follows the dense1d layout and is reshaped back on read."""
+    raw_matrix = np.arange(6, dtype=np.float32).reshape(3, 2)
+    adata = ad.AnnData(
+        X=np.arange(12, dtype=np.float32).reshape(3, 4),
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3"]),
+    )
+    adata.raw = ad.AnnData(
+        X=raw_matrix,
+        var=pd.DataFrame(index=["r0", "r1"]),
+    )
+
+    root = write_zarr(
+        adata,
+        tmp_path / "raw1d.zarr",
+        format="dense1d",
+        align_cells=True,
+        store="dir",
+    )
+    x_meta = _read_json(root / "raw" / "X" / "zarr.json")
+    assert x_meta["attributes"]["scdata-matrix"] == "dense1d"
+
+    loaded = read_zarr(root)
+    assert loaded.raw is not None
+    assert np.array_equal(np.asarray(loaded.raw.X), raw_matrix)
+
+
+def test_write_zarr_dense_x_and_raw_to_sparse_round_trip(tmp_path: Path) -> None:
+    """``format="sparse"`` converts dense X and dense raw.X to cell-aligned CSR."""
+    x_matrix = np.arange(12, dtype=np.float32).reshape(3, 4)
+    raw_matrix = np.arange(6, dtype=np.float32).reshape(3, 2)
+    adata = ad.AnnData(
+        X=x_matrix,
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3"]),
+    )
+    adata.raw = ad.AnnData(
+        X=raw_matrix,
+        var=pd.DataFrame(index=["r0", "r1"]),
+    )
+
+    root = write_zarr(
+        adata,
+        tmp_path / "dense_to_sparse.zarr",
+        format="sparse",
+        chunk_size=(2,),
+        align_cells=True,
+        store="dir",
+    )
+
+    assert _read_json(root / "X" / "zarr.json")["attributes"]["scdata-matrix"] == "sparse"
+    assert _read_json(root / "raw" / "X" / "zarr.json")["attributes"]["scdata-matrix"] == "sparse"
+
+    loaded = read_zarr(root)
+    assert sp.issparse(loaded.X)
+    assert np.array_equal(loaded.X.toarray(), x_matrix)
+    assert loaded.raw is not None
+    assert sp.issparse(loaded.raw.X)
+    assert np.array_equal(loaded.raw.X.toarray(), raw_matrix)
+
+
+@pytest.fixture
+def rich_adata():
+    """AnnData with every slot populated (obsm/varm/obsp/uns/layers/raw)."""
+    rng = np.random.default_rng(0)
+    n_obs, n_var = 6, 4
+    adata = ad.AnnData(X=rng.normal(size=(n_obs, n_var)).astype(np.float32))
+    adata.obs["cell_type"] = rng.choice(["A", "B"], n_obs).astype(object)
+    adata.var_names = [f"g{i}" for i in range(n_var)]
+    adata.obsm["X_pca"] = rng.normal(size=(n_obs, 2)).astype(np.float32)
+    adata.varm["loadings"] = rng.normal(size=(n_var, 2)).astype(np.float32)
+    adata.obsp["connectivities"] = sp.csr_matrix(
+        rng.random((n_obs, n_obs)).astype(np.float32)
+    )
+    adata.uns["meta"] = {"k": 7, "arr": np.arange(3, dtype=np.float32)}
+    adata.layers["counts"] = sp.csr_matrix(
+        rng.poisson(2, (n_obs, n_var)).astype(np.float32)
+    )
+    adata.raw = ad.AnnData(
+        X=sp.csr_matrix(rng.poisson(1, (n_obs, 3)).astype(np.float32)),
+        var=pd.DataFrame(index=[f"r{i}" for i in range(3)]),
+    )
+    return adata
+
+
+def test_read_zarr_metadata_only_skips_matrices(tmp_path: Path, rich_adata) -> None:
+    """``metadata_only`` leaves X / layers / raw unloaded while shapes come from obs/var."""
+    root = write_zarr(
+        rich_adata,
+        tmp_path / "rich.zarr",
+        format="dense1d",
+        layer_format="auto",
+        store="dir",
+    )
+
+    loaded = read_zarr(root, metadata_only=True)
+
+    assert loaded.X is None
+    assert dict(loaded.layers) == {}
+    assert loaded.raw is None
+    # n_obs / n_vars are still known from obs / var.
+    assert loaded.n_obs == rich_adata.n_obs
+    assert loaded.n_vars == rich_adata.n_vars
+
+
+def test_read_zarr_metadata_only_loads_annotations(tmp_path: Path, rich_adata) -> None:
+    """``metadata_only`` still loads obs / var / uns / obsm / varm / obsp verbatim."""
+    root = write_zarr(
+        rich_adata,
+        tmp_path / "rich_meta.zarr.zip",
+        format="dense1d",
+        layer_format="auto",
+        store="zip",
+    )
+
+    loaded = read_zarr(root, metadata_only=True)
+
+    assert list(loaded.obs["cell_type"]) == list(rich_adata.obs["cell_type"])
+    assert list(loaded.var_names) == list(rich_adata.var_names)
+    assert loaded.uns["meta"]["k"] == rich_adata.uns["meta"]["k"]
+    assert np.array_equal(loaded.uns["meta"]["arr"], rich_adata.uns["meta"]["arr"])
+    assert np.allclose(loaded.obsm["X_pca"], rich_adata.obsm["X_pca"])
+    assert np.allclose(loaded.varm["loadings"], rich_adata.varm["loadings"])
+    assert np.allclose(
+        loaded.obsp["connectivities"].toarray(),
+        rich_adata.obsp["connectivities"].toarray(),
+    )
+
+
+def test_read_zarr_legacy_flat_raw_rebuild(tmp_path: Path, rich_adata) -> None:
+    """Pre-modern-raw stores keep ``raw.X`` / ``raw.var`` flat at the root.
+
+    Mirrors the legacy layout :func:`anndata.read_zarr` rebuilds via
+    ``_read_legacy_raw``; scdata's reader must do the same so older stores do
+    not silently lose ``raw``.
+    """
+    import zarr
+
+    from anndata._io.specs import write_elem
+
+    root = tmp_path / "legacy.zarr"
+    g = zarr.open_group(root, mode="w", zarr_format=3)
+    g.attrs["encoding-type"] = "anndata"
+    g.attrs["encoding-version"] = "0.1.0"
+    write_elem(g, "obs", rich_adata.obs)
+    write_elem(g, "var", rich_adata.var)
+    write_elem(g, "X", rich_adata.X)
+    write_elem(g, "uns", dict(rich_adata.uns))
+    write_elem(g, "raw.X", rich_adata.raw.X)
+    write_elem(g, "raw.var", rich_adata.raw.var)
+
+    loaded = read_zarr(root)
+
+    assert loaded.raw is not None
+    assert loaded.raw.n_vars == rich_adata.raw.n_vars
+    assert list(loaded.raw.var_names) == list(rich_adata.raw.var_names)
+    assert np.array_equal(
+        loaded.raw.X.toarray(),
+        rich_adata.raw.X.toarray(),
+    )
+    # Main X is unaffected by the legacy raw path.
+    assert np.array_equal(
+        loaded.X.toarray() if sp.issparse(loaded.X) else loaded.X,
+        rich_adata.X.toarray() if sp.issparse(rich_adata.X) else rich_adata.X,
+    )
+
+    # metadata_only drops raw on legacy stores too (raw cannot exist without X).
+    meta_only = read_zarr(root, metadata_only=True)
+    assert meta_only.raw is None
+    assert meta_only.X is None
+    assert list(meta_only.obs["cell_type"]) == list(rich_adata.obs["cell_type"])
+
+
+def test_read_zarr_metadata_only_matches_full_read_annotations(
+    tmp_path: Path, rich_adata
+) -> None:
+    """Annotations read under ``metadata_only`` equal those from a full read."""
+    root = write_zarr(
+        rich_adata,
+        tmp_path / "rich_cmp.zarr",
+        format="sparse",
+        layer_format="auto",
+        align_cells=True,
+        store="dir",
+    )
+
+    full = read_zarr(root)
+    meta_only = read_zarr(root, metadata_only=True)
+
+    assert list(meta_only.obs.index) == list(full.obs.index)
+    assert list(meta_only.var_names) == list(full.var_names)
+    assert set(meta_only.obsm.keys()) == set(full.obsm.keys())
+    assert set(meta_only.varm.keys()) == set(full.varm.keys())
+    assert set(meta_only.obsp.keys()) == set(full.obsp.keys())
+    assert set(meta_only.uns.keys()) == set(full.uns.keys())
+    # And the full read still recovers the matrices metadata_only skipped.
+    assert full.X is not None and full.X.shape == rich_adata.X.shape
+    assert "counts" in full.layers
+    assert full.raw is not None

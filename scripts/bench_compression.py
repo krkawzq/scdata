@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """CLI benchmark for compression ratio and single-thread decode throughput.
 
-The default input target is the Tahoe control H5AD used during development.
-The benchmark samples numeric HDF5 datasets, compresses the same raw chunks
-with each codec, then times repeated in-memory decode passes. Timed decode
-does not include HDF5 reads or filesystem I/O.
+The default input target is the Tahoe control H5AD.  The benchmark samples
+numeric HDF5 datasets, compresses the same raw chunks with each codec, then
+times repeated in-memory decode passes.  Timed decode does not include HDF5
+reads or filesystem I/O.
 """
 
 from __future__ import annotations

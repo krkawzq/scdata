@@ -10,11 +10,12 @@ import pytest
 
 from scdata import DataBankConfig, IoConfig, MissingGenePolicy, ScDataBank
 from scdata._scdata import DataBankError
-from scdata.data import DenseDataset, DType
-from scdata.io import launch, write_zarr
+from scdata.data import DatasetCollection, DenseDataset, DType, SparseDataset
+from scdata.io import launch, launch_all, write_zarr
 
 ad = pytest.importorskip("anndata")
 pd = pytest.importorskip("pandas")
+sp = pytest.importorskip("scipy.sparse")
 pytest.importorskip("zarr")
 
 
@@ -290,7 +291,7 @@ def test_register_iterable_rolls_back_on_error(tmp_path: Path) -> None:
 
 
 def test_access_dtype_round_trip(tmp_path: Path) -> None:
-    for np_dt in (np.int32, np.int64, np.uint8, np.float32, np.float64):
+    for np_dt in (np.int32, np.int64, np.uint8, np.float16, np.float32, np.float64):
         root, ds, expected, _ = _dense_store(
             tmp_path,
             f"dt_{np.dtype(np_dt).name}",
@@ -320,6 +321,26 @@ def test_load_by_genes(tmp_path: Path) -> None:
     assert out_single.shape == (2,)
     assert np.array_equal(out_single.reshape(2, 1), expected[[0, 2]][:, [1]])
     bank.unregister(did)
+
+
+def test_empty_gene_projection_returns_zero_columns(tmp_path: Path) -> None:
+    root, ds, _, _ = _dense_store(
+        tmp_path, "empty_genes", (5, 6), np.float32, [f"g{i}" for i in range(6)]
+    )
+    bank = ScDataBank()
+    did = bank.register_dense(ds, str(root))
+    try:
+        loaded = bank.load(did, [0, 2], genes=[])
+        assert loaded.shape == (2, 0)
+        assert loaded.var_names == ()
+        assert loaded.data.shape == (0,)
+
+        prefetched = next(iter(bank.prefetch(did, [[0, 2]], genes=[])))
+        assert prefetched.shape == (2, 0)
+        assert prefetched.var_names == ()
+        assert prefetched.data.shape == (0,)
+    finally:
+        bank.unregister(did)
 
 
 def test_load_by_genes_missing_error(tmp_path: Path) -> None:
@@ -366,6 +387,98 @@ def test_prefetch(tmp_path: Path) -> None:
     bank.unregister(did)
 
 
+def test_prefetch_multi_dataset_casts_to_single_output_dtype(tmp_path: Path) -> None:
+    root16, ds16, expected16, _ = _dense_store(
+        tmp_path,
+        "pf_multi_f16",
+        (4, 3),
+        np.float16,
+        ["g0", "g1", "g2"],
+    )
+    root32, ds32, expected32, _ = _dense_store(
+        tmp_path,
+        "pf_multi_f32",
+        (4, 3),
+        np.float32,
+        ["g0", "g1", "g2"],
+    )
+    bank = ScDataBank()
+    ids = [bank.register_dense(ds16, str(root16)), bank.register_dense(ds32, str(root32))]
+    try:
+        batches = [
+            [(0, np.array([0, 2], dtype=np.intp)), (1, [1])],
+            [(1, [3]), (0, [1])],
+        ]
+        out = list(bank.prefetch(ids, batches, dtype="f32"))
+
+        assert [batch.cells.tolist() for batch in out] == [[0, 2, 1], [3, 1]]
+        assert [batch.data.dtype for batch in out] == [np.dtype("float32"), np.dtype("float32")]
+        assert np.array_equal(
+            out[0].to_numpy(),
+            np.vstack([expected16[[0, 2]].astype(np.float32), expected32[[1]]]),
+        )
+        assert np.array_equal(
+            out[1].to_numpy(),
+            np.vstack([expected32[[3]], expected16[[1]].astype(np.float32)]),
+        )
+
+        auto = next(iter(bank.prefetch(ids, [[(0, [0]), (1, [0])]], dtype="auto")))
+        assert auto.data.dtype == np.dtype("float32")
+        assert np.array_equal(
+            auto.to_numpy(),
+            np.vstack([expected16[[0]].astype(np.float32), expected32[[0]]]),
+        )
+
+        with pytest.raises(DataBankError):
+            list(bank.prefetch(ids, [[(0, [0]), (1, [0])]], dtype="i32"))
+    finally:
+        for did in ids:
+            bank.unregister(did)
+
+
+def test_load_multi_dataset_uses_single_output_dtype(tmp_path: Path) -> None:
+    root16, ds16, expected16, _ = _dense_store(
+        tmp_path,
+        "load_multi_f16",
+        (3, 2),
+        np.float16,
+        ["g0", "g1"],
+    )
+    root32, ds32, expected32, _ = _dense_store(
+        tmp_path,
+        "load_multi_f32",
+        (3, 2),
+        np.float32,
+        ["g0", "g1"],
+    )
+    bank = ScDataBank()
+    ids = [bank.register_dense(ds16, str(root16)), bank.register_dense(ds32, str(root32))]
+    try:
+        out = bank.load(ids, [(0, [2, 0]), (1, np.array([1], dtype=np.intp))])
+
+        assert out.cells.tolist() == [2, 0, 1]
+        assert out.data.dtype == np.dtype("float32")
+        assert out.var_names == ("g0", "g1")
+        assert np.array_equal(
+            out.to_numpy(),
+            np.vstack([expected16[[2, 0]].astype(np.float32), expected32[[1]]]),
+        )
+
+        projected = bank.load(ids, [(1, [2]), (0, [1])], genes=["g1"], dtype="f16")
+        assert projected.data.dtype == np.dtype("float16")
+        assert projected.var_names == ("g1",)
+        assert np.array_equal(
+            projected.to_numpy(),
+            np.vstack([expected32[[2]][:, [1]], expected16[[1]][:, [1]]]).astype(np.float16),
+        )
+
+        with pytest.raises(DataBankError):
+            bank.load(ids, [(0, [0]), (1, [0])], dtype="i32")
+    finally:
+        for did in ids:
+            bank.unregister(did)
+
+
 def test_prefetch_by_genes(tmp_path: Path) -> None:
     root, ds, expected, _ = _dense_store(
         tmp_path, "pfgn", (5, 6), np.float32, [f"g{i}" for i in range(6)]
@@ -407,3 +520,97 @@ def test_closed_bank_raises_runtime_error() -> None:
     assert "closed" in repr(bank)
     with pytest.raises(RuntimeError, match="closed"):
         bank.dataset_num_cells(object())  # type: ignore[arg-type]
+
+
+def _raw_sparse_store(tmp_path: Path) -> tuple[Path, np.ndarray, np.ndarray]:
+    """A sparse store whose raw.X has a different gene count than X."""
+    x_matrix = sp.csr_matrix(
+        np.array([[1, 0, 2, 0, 0], [0, 3, 0, 0, 4], [5, 0, 0, 6, 0]], dtype=np.float32)
+    )
+    raw_matrix = sp.csr_matrix(
+        np.array([[7, 0, 8], [0, 9, 0], [1, 0, 2]], dtype=np.float32)
+    )
+    adata = ad.AnnData(
+        X=x_matrix,
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2", "g3", "g4"]),
+    )
+    adata.raw = ad.AnnData(X=raw_matrix, var=pd.DataFrame(index=["r0", "r1", "r2"]))
+    root = write_zarr(
+        adata,
+        tmp_path / "raw.zarr",
+        format="sparse",
+        chunk_size=(2,),
+        align_cells=True,
+        store="dir",
+    )
+    return root, x_matrix.toarray(), raw_matrix.toarray()
+
+
+def test_launch_all_parses_raw_with_own_gene_space(tmp_path: Path) -> None:
+    root, x_expected, raw_expected = _raw_sparse_store(tmp_path)
+
+    dc = launch_all(root)
+    assert isinstance(dc, DatasetCollection)
+    assert dc.raw is not None
+    assert isinstance(dc.raw, SparseDataset)
+    # raw shares num_cells with X but has its own gene space.
+    assert dc.raw.num_cells == dc.x.num_cells
+    assert dc.raw.num_genes != dc.x.num_genes
+    assert dc.raw.num_genes == 3
+    assert tuple(dc.raw.gene_names) == ("r0", "r1", "r2")
+    # cell-aligned CSR layout, just like X.
+    assert dc.raw.indices.variable_chunks
+    # Mapping interface exposes raw under the "raw/X" key.
+    assert "raw/X" in dc
+    assert "X" in dc
+    assert dc["raw/X"] is dc.raw
+    assert dc.keys() == ("X", "raw/X")
+    assert len(dc) == 2
+
+    bank = ScDataBank()
+    registered = bank.register_all(dc)
+    assert set(registered) == {"X", "raw/X"}
+
+    raw_did = registered["raw/X"]
+    assert bank.dataset_num_cells(raw_did) == 3
+    assert bank.dataset_num_genes(raw_did) == 3
+    assert bank.dataset_genes(raw_did) == ["r0", "r1", "r2"]
+
+    out = np.asarray(bank.load(raw_did, [0, 1, 2], dtype="f32")).reshape(3, 3)
+    assert np.array_equal(out, raw_expected)
+
+    # X still loads correctly alongside raw.
+    x_did = registered["X"]
+    x_out = np.asarray(bank.load(x_did, [0, 1, 2], dtype="f32")).reshape(3, 5)
+    assert np.array_equal(x_out, x_expected)
+
+
+def test_launch_single_matrix_raw_key(tmp_path: Path) -> None:
+    root, _, raw_expected = _raw_sparse_store(tmp_path)
+
+    raw_ds = launch(root, matrix="raw/X")
+    assert isinstance(raw_ds, SparseDataset)
+    assert raw_ds.num_genes == 3
+    assert tuple(raw_ds.gene_names) == ("r0", "r1", "r2")
+
+    # "raw" shorthand resolves to the same matrix.
+    short = launch(root, matrix="raw")
+    assert short.num_genes == raw_ds.num_genes
+    assert tuple(short.gene_names) == tuple(raw_ds.gene_names)
+
+    bank = ScDataBank()
+    did = bank.register(raw_ds)
+    out = np.asarray(bank.load(did, [0, 1, 2], dtype="f32")).reshape(3, 3)
+    assert np.array_equal(out, raw_expected)
+
+
+def test_launch_all_without_raw(tmp_path: Path) -> None:
+    root, _, _, _ = _dense_store(tmp_path, "noraw", (3, 4), np.float32, ["g0", "g1", "g2", "g3"])
+    dc = launch_all(root)
+    assert dc.raw is None
+    assert "raw/X" not in dc
+    assert dc.keys() == ("X",)
+    assert len(dc) == 1
+    with pytest.raises(KeyError):
+        dc["raw/X"]

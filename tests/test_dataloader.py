@@ -14,8 +14,8 @@ from scdata.data._dataloader import ScDataBatch
 
 
 class _PrefetchCall(TypedDict):
-    id: str
-    batches: list[NDArray[np.intp]]
+    id: list[str]
+    batches: list[list[tuple[int, NDArray[np.intp]]]]
     genes: tuple[str, ...] | None
     missing: object | None
     config: object | None
@@ -27,17 +27,25 @@ class _FakeBank:
 
     def prefetch(
         self,
-        id: str,
-        batches: Iterable[NDArray[np.intp]],
+        id: list[str],
+        batches: Iterable[Iterable[tuple[int, NDArray[np.intp]]]],
         genes: Iterable[str] | None = None,
         missing: object | None = None,
+        dtype: object | None = None,
         config: object | None = None,
     ) -> Iterator[CellBatch]:
-        materialized = [np.asarray(batch, dtype=np.intp) for batch in batches]
+        del dtype
+        materialized = [
+            [(int(dataset_idx), np.asarray(cells, dtype=np.intp)) for dataset_idx, cells in batch]
+            for batch in batches
+        ]
         self.calls.append(
             {
-                "id": id,
-                "batches": [batch.copy() for batch in materialized],
+                "id": list(id),
+                "batches": [
+                    [(dataset_idx, cells.copy()) for dataset_idx, cells in batch]
+                    for batch in materialized
+                ],
                 "genes": tuple(genes) if genes is not None else None,
                 "missing": missing,
                 "config": config,
@@ -45,7 +53,12 @@ class _FakeBank:
         )
 
         def iterator() -> Iterator[CellBatch]:
-            for cells in materialized:
+            for batch in materialized:
+                cells = (
+                    np.concatenate([cells for _, cells in batch])
+                    if batch
+                    else np.empty(0, dtype=np.intp)
+                )
                 data = np.stack([cells * 10, cells * 10 + 1], axis=1).reshape(-1)
                 yield CellBatch.from_array(
                     cells=cells,
@@ -113,11 +126,12 @@ def test_sc_dataloader_passes_plain_dict_with_existing_cellbatch(
     )
 
     iterator = iter(loader)
-    assert len(bank.calls) == 2
-    assert bank.calls[0]["id"] == "ds0"
-    assert [batch.tolist() for batch in bank.calls[0]["batches"]] == [[0], [2], [1]]
-    assert bank.calls[1]["id"] == "ds1"
-    assert [batch.tolist() for batch in bank.calls[1]["batches"]] == [[3], [4]]
+    assert len(bank.calls) == 1
+    assert bank.calls[0]["id"] == ["ds0", "ds1"]
+    assert [
+        [(dataset_idx, cells.tolist()) for dataset_idx, cells in batch]
+        for batch in bank.calls[0]["batches"]
+    ] == [[(0, [0]), (1, [3])], [(0, [2]), (1, [4])], [(0, [1])]]
 
     batches = list(iterator)
     assert seen == batches
@@ -129,10 +143,14 @@ def test_sc_dataloader_passes_plain_dict_with_existing_cellbatch(
     )
     assert batches[0]["file_ids"].tolist() == [0, 1]
     assert batches[0]["cell_ids"].tolist() == [0, 3]
+    assert batches[0]["batch"].cells.tolist() == [0, 3]
     assert sorted(batches[0]["batches"]) == [0, 1]
+    assert np.shares_memory(batches[0]["batches"][0].data, batches[0]["batch"].data)
+    assert np.shares_memory(batches[0]["batches"][1].data, batches[0]["batch"].data)
     assert batches[0]["cells"][0].tolist() == [0]
     assert batches[0]["cells"][1].tolist() == [3]
     assert batches[2]["file_id"] == 0
+    assert batches[2]["batches"][0] is batches[2]["batch"]
     assert batches[2]["batch"].cells.tolist() == [1]
     assert batches[2]["batch"].matrix.tolist() == [[10, 11]]
 
