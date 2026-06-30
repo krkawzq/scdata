@@ -56,6 +56,34 @@ pub fn plan_dense_2d(
     dataset: &Dense2DDataset,
     cells: &[usize],
 ) -> DataBankResult<Vec<DenseSegment>> {
+    plan_dense_2d_impl(dataset, cells.iter().copied().enumerate(), cells.len())
+}
+
+pub fn plan_dense_2d_with_output_rows(
+    dataset: &Dense2DDataset,
+    cells: &[usize],
+    output_rows: &[usize],
+) -> DataBankResult<Vec<DenseSegment>> {
+    validate_cell_rows(cells, output_rows, "Dense2D planning")?;
+    plan_dense_2d_impl(
+        dataset,
+        cells
+            .iter()
+            .copied()
+            .zip(output_rows.iter().copied())
+            .map(|(cell, output_row)| (output_row, cell)),
+        cells.len(),
+    )
+}
+
+fn plan_dense_2d_impl<I>(
+    dataset: &Dense2DDataset,
+    rows: I,
+    row_count: usize,
+) -> DataBankResult<Vec<DenseSegment>>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+{
     let chunk_shape = dataset
         .data
         .regular_chunk_shape_required("Dense2D planning")?;
@@ -71,20 +99,22 @@ pub fn plan_dense_2d(
         )));
     };
 
-    let segment_capacity = cells.len().checked_mul(*grid_cols).ok_or_else(|| {
+    let segment_capacity = row_count.checked_mul(*grid_cols).ok_or_else(|| {
         DataBankError::InvalidArrayMeta("Dense2D segment count overflow".to_string())
     })?;
     let mut segments = Vec::with_capacity(segment_capacity);
-    for (output_row, &cell) in cells.iter().enumerate() {
+    for (output_row, cell) in rows {
         validate_cell(cell, dataset.num_cells)?;
         let chunk_row = cell / *chunk_rows;
         let row_in_chunk = cell % *chunk_rows;
 
         for chunk_col in 0..*grid_cols {
-            let chunk_index = dataset
-                .data
-                .grid
-                .logical_chunk_index(&[chunk_row, chunk_col])?;
+            let chunk_index = chunk_row
+                .checked_mul(*grid_cols)
+                .and_then(|base| base.checked_add(chunk_col))
+                .ok_or_else(|| {
+                    DataBankError::InvalidArrayMeta("Dense2D chunk index overflow".to_string())
+                })?;
             let col_start = chunk_col.checked_mul(*chunk_cols).ok_or_else(|| {
                 DataBankError::InvalidArrayMeta("Dense2D column start overflow".to_string())
             })?;
@@ -108,6 +138,42 @@ pub fn plan_dense_2d_selected_sources(
     cells: &[usize],
     selected_sources: &[usize],
 ) -> DataBankResult<Vec<DenseSegment>> {
+    plan_dense_2d_selected_sources_impl(
+        dataset,
+        cells.iter().copied().enumerate(),
+        cells.len(),
+        selected_sources,
+    )
+}
+
+pub fn plan_dense_2d_selected_sources_with_output_rows(
+    dataset: &Dense2DDataset,
+    cells: &[usize],
+    output_rows: &[usize],
+    selected_sources: &[usize],
+) -> DataBankResult<Vec<DenseSegment>> {
+    validate_cell_rows(cells, output_rows, "Dense2D projected planning")?;
+    plan_dense_2d_selected_sources_impl(
+        dataset,
+        cells
+            .iter()
+            .copied()
+            .zip(output_rows.iter().copied())
+            .map(|(cell, output_row)| (output_row, cell)),
+        cells.len(),
+        selected_sources,
+    )
+}
+
+fn plan_dense_2d_selected_sources_impl<I>(
+    dataset: &Dense2DDataset,
+    rows: I,
+    row_count: usize,
+    selected_sources: &[usize],
+) -> DataBankResult<Vec<DenseSegment>>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+{
     if selected_sources.is_empty() {
         return Ok(Vec::new());
     }
@@ -127,14 +193,13 @@ pub fn plan_dense_2d_selected_sources(
         )));
     };
 
-    let segment_capacity = cells
-        .len()
+    let segment_capacity = row_count
         .checked_mul(selected_sources.len())
         .ok_or_else(|| {
             DataBankError::InvalidArrayMeta("Dense2D selected segment count overflow".to_string())
         })?;
     let mut segments = Vec::with_capacity(segment_capacity);
-    for (output_row, &cell) in cells.iter().enumerate() {
+    for (output_row, cell) in rows {
         validate_cell(cell, dataset.num_cells)?;
         let chunk_row = cell / *chunk_rows;
         let row_in_chunk = cell % *chunk_rows;
@@ -181,10 +246,14 @@ pub fn plan_dense_2d_selected_sources(
                 local_col,
                 run_len,
             )?;
-            let chunk_index = dataset
-                .data
-                .grid
-                .logical_chunk_index(&[chunk_row, chunk_col])?;
+            let chunk_index = chunk_row
+                .checked_mul(*grid_cols)
+                .and_then(|base| base.checked_add(chunk_col))
+                .ok_or_else(|| {
+                    DataBankError::InvalidArrayMeta(
+                        "Dense2D selected chunk index overflow".to_string(),
+                    )
+                })?;
             segments.push(DenseSegment {
                 output_row,
                 output_col_start: run_start,
@@ -201,8 +270,36 @@ pub fn plan_dense_1d(
     dataset: &Dense1DDataset,
     cells: &[usize],
 ) -> DataBankResult<Vec<DenseSegment>> {
-    let mut segments = Vec::with_capacity(cells.len());
-    for (output_row, &cell) in cells.iter().enumerate() {
+    plan_dense_1d_impl(dataset, cells.iter().copied().enumerate(), cells.len())
+}
+
+pub fn plan_dense_1d_with_output_rows(
+    dataset: &Dense1DDataset,
+    cells: &[usize],
+    output_rows: &[usize],
+) -> DataBankResult<Vec<DenseSegment>> {
+    validate_cell_rows(cells, output_rows, "Dense1D planning")?;
+    plan_dense_1d_impl(
+        dataset,
+        cells
+            .iter()
+            .copied()
+            .zip(output_rows.iter().copied())
+            .map(|(cell, output_row)| (output_row, cell)),
+        cells.len(),
+    )
+}
+
+fn plan_dense_1d_impl<I>(
+    dataset: &Dense1DDataset,
+    rows: I,
+    row_count: usize,
+) -> DataBankResult<Vec<DenseSegment>>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+{
+    let mut segments = Vec::with_capacity(row_count);
+    for (output_row, cell) in rows {
         validate_cell(cell, dataset.num_cells)?;
         let row_start = cell.checked_mul(dataset.num_genes).ok_or_else(|| {
             DataBankError::InvalidArrayMeta("1D dense row start overflow".to_string())
@@ -212,7 +309,7 @@ pub fn plan_dense_1d(
         })?;
 
         let mut output_col_start = 0usize;
-        for range in plan_1d_range(&dataset.data, row_start, row_end)? {
+        for_each_1d_range(&dataset.data, row_start, row_end, |range| {
             segments.push(DenseSegment {
                 output_row,
                 output_col_start,
@@ -225,7 +322,8 @@ pub fn plan_dense_1d(
                 .ok_or_else(|| {
                     DataBankError::InvalidArrayMeta("1D dense output column overflow".to_string())
                 })?;
-        }
+            Ok(())
+        })?;
     }
     Ok(segments)
 }
@@ -235,18 +333,53 @@ pub fn plan_dense_1d_selected_sources(
     cells: &[usize],
     selected_sources: &[usize],
 ) -> DataBankResult<Vec<DenseSegment>> {
+    plan_dense_1d_selected_sources_impl(
+        dataset,
+        cells.iter().copied().enumerate(),
+        cells.len(),
+        selected_sources,
+    )
+}
+
+pub fn plan_dense_1d_selected_sources_with_output_rows(
+    dataset: &Dense1DDataset,
+    cells: &[usize],
+    output_rows: &[usize],
+    selected_sources: &[usize],
+) -> DataBankResult<Vec<DenseSegment>> {
+    validate_cell_rows(cells, output_rows, "Dense1D projected planning")?;
+    plan_dense_1d_selected_sources_impl(
+        dataset,
+        cells
+            .iter()
+            .copied()
+            .zip(output_rows.iter().copied())
+            .map(|(cell, output_row)| (output_row, cell)),
+        cells.len(),
+        selected_sources,
+    )
+}
+
+fn plan_dense_1d_selected_sources_impl<I>(
+    dataset: &Dense1DDataset,
+    rows: I,
+    row_count: usize,
+    selected_sources: &[usize],
+) -> DataBankResult<Vec<DenseSegment>>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+{
     if selected_sources.is_empty() {
         return Ok(Vec::new());
     }
 
-    let segment_capacity = cells
-        .len()
+    let segment_capacity = row_count
         .checked_mul(selected_sources.len())
         .ok_or_else(|| {
             DataBankError::InvalidArrayMeta("Dense1D selected segment count overflow".to_string())
         })?;
     let mut segments = Vec::with_capacity(segment_capacity);
-    for (output_row, &cell) in cells.iter().enumerate() {
+    for (output_row, cell) in rows {
         validate_cell(cell, dataset.num_cells)?;
         let row_start = cell.checked_mul(dataset.num_genes).ok_or_else(|| {
             DataBankError::InvalidArrayMeta("1D dense row start overflow".to_string())
@@ -280,7 +413,7 @@ pub fn plan_dense_1d_selected_sources(
                 DataBankError::InvalidArrayMeta("1D dense selected range end overflow".to_string())
             })?;
             let mut output_col_start = run_start;
-            for range in plan_1d_range(&dataset.data, range_start, range_end)? {
+            for_each_1d_range(&dataset.data, range_start, range_end, |range| {
                 segments.push(DenseSegment {
                     output_row,
                     output_col_start,
@@ -296,7 +429,8 @@ pub fn plan_dense_1d_selected_sources(
                                 "1D dense selected output column overflow".to_string(),
                             )
                         })?;
-            }
+                Ok(())
+            })?;
         }
     }
     Ok(segments)
@@ -326,6 +460,19 @@ pub fn plan_sparse_rows(
 ) -> DataBankResult<Vec<SparseRowSpan>> {
     let mut rows = Vec::with_capacity(cells.len());
     for (output_row, &cell) in cells.iter().enumerate() {
+        rows.push(plan_sparse_row(dataset, output_row, cell)?);
+    }
+    Ok(rows)
+}
+
+pub fn plan_sparse_rows_with_output_rows(
+    dataset: &SparseCsrDataset,
+    cells: &[usize],
+    output_rows: &[usize],
+) -> DataBankResult<Vec<SparseRowSpan>> {
+    validate_cell_rows(cells, output_rows, "CSR planning")?;
+    let mut rows = Vec::with_capacity(cells.len());
+    for (&cell, &output_row) in cells.iter().zip(output_rows.iter()) {
         rows.push(plan_sparse_row(dataset, output_row, cell)?);
     }
     Ok(rows)
@@ -373,28 +520,53 @@ fn plan_sparse_row(
 }
 
 pub fn plan_1d_range(array: &Array, start: usize, end: usize) -> DataBankResult<Vec<RangeSegment>> {
-    let pieces = array
-        .grid
-        .plan_1d_range(&array.shape, array.dtype, &array.chunks, start, end)?;
-    pieces
-        .into_iter()
-        .map(|piece| {
-            Ok(RangeSegment {
+    let mut ranges = Vec::with_capacity(array.range_piece_count_1d(start, end)?);
+    for_each_1d_range(array, start, end, |range| {
+        ranges.push(range);
+        Ok(())
+    })?;
+    Ok(ranges)
+}
+
+pub fn for_each_1d_range<F>(
+    array: &Array,
+    start: usize,
+    end: usize,
+    mut push: F,
+) -> DataBankResult<()>
+where
+    F: FnMut(RangeSegment) -> DataBankResult<()>,
+{
+    array.grid.for_each_1d_range(
+        &array.shape,
+        array.dtype,
+        &array.chunks,
+        start,
+        end,
+        |piece| {
+            push(RangeSegment {
                 chunk: chunk_ref(array, piece.chunk_index)?,
                 source: ByteRange::new(piece.byte_start, piece.byte_end)?,
                 elements: piece.elements,
             })
-        })
-        .collect()
-}
-
-pub(super) fn range_piece_count(array: &Array, start: usize, end: usize) -> DataBankResult<usize> {
-    array.range_piece_count_1d(start, end)
+        },
+    )
 }
 
 fn validate_cell(cell: usize, num_cells: usize) -> DataBankResult<()> {
     if cell >= num_cells {
         return Err(DataBankError::CellIndexOutOfRange { cell, num_cells });
+    }
+    Ok(())
+}
+
+fn validate_cell_rows(cells: &[usize], output_rows: &[usize], context: &str) -> DataBankResult<()> {
+    if cells.len() != output_rows.len() {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "{context} requires one output row per cell, got {} cells and {} output rows",
+            cells.len(),
+            output_rows.len()
+        )));
     }
     Ok(())
 }

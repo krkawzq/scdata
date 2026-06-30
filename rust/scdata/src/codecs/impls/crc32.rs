@@ -1,5 +1,5 @@
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
-use super::super::spec::{sealed, ChunkCodec};
+use super::super::spec::{sealed, ChunkCodec, CodecCacheKey};
 use super::super::util::{decode_error, output_too_small, reserve_decode_buffer, verify_size};
 use super::super::CodecResult;
 
@@ -11,6 +11,10 @@ impl sealed::Sealed for Crc32Codec {}
 impl ChunkCodec for Crc32Codec {
     fn name(&self) -> &str {
         "crc32"
+    }
+
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Static("crc32")
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {

@@ -1,5 +1,5 @@
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
-use super::super::spec::{sealed, ChunkCodec};
+use super::super::spec::{sealed, ChunkCodec, CodecCacheKey};
 use super::super::util::{output_too_small, reserve_decode_buffer, verify_size};
 use super::super::CodecResult;
 
@@ -11,6 +11,10 @@ impl sealed::Sealed for UncompressedCodec {}
 impl ChunkCodec for UncompressedCodec {
     fn name(&self) -> &str {
         "none"
+    }
+
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Static("none")
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {

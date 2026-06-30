@@ -9,6 +9,8 @@ use std::thread;
 
 use io_uring::{opcode, squeue, types, IoUring};
 
+use crate::profile::ProfileTimer;
+
 use super::{
     assume_init_read_buffer, operation_file, uninit_read_buffer, FileTable, FixedFileUpdate,
     IoMetadata, IoOperation, IoOutput, IoWork, QueueCore, QueueWake, UringConfig, WorkId,
@@ -183,14 +185,15 @@ fn submit_or_complete(
     file_table: &Arc<FileTable>,
 ) {
     let id = work.id;
+    let operation_started = work.operation_started;
     match Pending::prepare(work, file_table) {
         Ok(Prepared::Ring(pending_work)) => {
             if let Err(err) = submit_pending(ring, pending, fixed_files, pending_work) {
-                queue.complete(id, Err(err));
+                queue.complete(id, operation_started, Err(err));
             }
         }
-        Ok(Prepared::Complete(result)) => queue.complete(id, result),
-        Err(err) => queue.complete(id, Err(err)),
+        Ok(Prepared::Complete(result)) => queue.complete(id, operation_started, result),
+        Err(err) => queue.complete(id, operation_started, Err(err)),
     }
 }
 
@@ -264,11 +267,14 @@ fn reap_completions(
             continue;
         };
         match pending_work.on_completion(result) {
-            PendingResult::Complete(id, result) => queue.complete(id, result),
+            PendingResult::Complete(id, operation_started, result) => {
+                queue.complete(id, operation_started, result)
+            }
             PendingResult::Continue(pending_work) => {
                 let id = pending_work.id();
+                let operation_started = pending_work.operation_started();
                 if let Err(err) = submit_pending(ring, pending, fixed_files, pending_work) {
-                    queue.complete(id, Err(err));
+                    queue.complete(id, operation_started, Err(err));
                 }
             }
         }
@@ -301,6 +307,7 @@ fn fail_driver(queue: &QueueCore, pending: &mut PendingSlots, err: io::Error) {
     for pending_work in pending.drain() {
         queue.complete(
             pending_work.id(),
+            pending_work.operation_started(),
             Err(io::Error::new(kind, message.clone())),
         );
     }
@@ -549,6 +556,7 @@ enum Prepared {
 enum Pending {
     Read {
         id: WorkId,
+        operation_started: ProfileTimer,
         file_id: usize,
         file: Arc<File>,
         buf: Box<[MaybeUninit<u8>]>,
@@ -557,6 +565,7 @@ enum Pending {
     },
     Write {
         id: WorkId,
+        operation_started: ProfileTimer,
         file_id: usize,
         file: Arc<File>,
         buf: Vec<u8>,
@@ -565,18 +574,21 @@ enum Pending {
     },
     Fsync {
         id: WorkId,
+        operation_started: ProfileTimer,
         file_id: usize,
         file: Arc<File>,
         data_only: bool,
     },
     Truncate {
         id: WorkId,
+        operation_started: ProfileTimer,
         file_id: usize,
         file: Arc<File>,
         len: u64,
     },
     Metadata {
         id: WorkId,
+        operation_started: ProfileTimer,
         file: Arc<File>,
         statx: Box<libc::statx>,
     },
@@ -584,6 +596,8 @@ enum Pending {
 
 impl Pending {
     fn prepare(work: IoWork, file_table: &Arc<FileTable>) -> io::Result<Prepared> {
+        let id = work.id;
+        let operation_started = work.operation_started;
         match work.op {
             IoOperation::Read {
                 file,
@@ -597,7 +611,8 @@ impl Pending {
                     ))));
                 }
                 Ok(Prepared::Ring(Self::Read {
-                    id: work.id,
+                    id,
+                    operation_started,
                     file_id: file,
                     file: operation_file(file_table, file, handle)?,
                     buf: uninit_read_buffer(len),
@@ -615,7 +630,8 @@ impl Pending {
                     return Ok(Prepared::Complete(Ok(IoOutput::Write { bytes: 0 })));
                 }
                 Ok(Prepared::Ring(Self::Write {
-                    id: work.id,
+                    id,
+                    operation_started,
                     file_id: file,
                     file: operation_file(file_table, file, handle)?,
                     buf,
@@ -624,25 +640,29 @@ impl Pending {
                 }))
             }
             IoOperation::Fsync { file, handle } => Ok(Prepared::Ring(Self::Fsync {
-                id: work.id,
+                id,
+                operation_started,
                 file_id: file,
                 file: operation_file(file_table, file, handle)?,
                 data_only: false,
             })),
             IoOperation::SyncData { file, handle } => Ok(Prepared::Ring(Self::Fsync {
-                id: work.id,
+                id,
+                operation_started,
                 file_id: file,
                 file: operation_file(file_table, file, handle)?,
                 data_only: true,
             })),
             IoOperation::Truncate { file, handle, len } => Ok(Prepared::Ring(Self::Truncate {
-                id: work.id,
+                id,
+                operation_started,
                 file_id: file,
                 file: operation_file(file_table, file, handle)?,
                 len,
             })),
             IoOperation::Metadata { file, handle } => Ok(Prepared::Ring(Self::Metadata {
-                id: work.id,
+                id,
+                operation_started,
                 file: operation_file(file_table, file, handle)?,
                 statx: Box::new(unsafe { std::mem::zeroed() }),
             })),
@@ -656,6 +676,26 @@ impl Pending {
             | Self::Fsync { id, .. }
             | Self::Truncate { id, .. }
             | Self::Metadata { id, .. } => *id,
+        }
+    }
+
+    fn operation_started(&self) -> ProfileTimer {
+        match self {
+            Self::Read {
+                operation_started, ..
+            }
+            | Self::Write {
+                operation_started, ..
+            }
+            | Self::Fsync {
+                operation_started, ..
+            }
+            | Self::Truncate {
+                operation_started, ..
+            }
+            | Self::Metadata {
+                operation_started, ..
+            } => *operation_started,
         }
     }
 
@@ -753,14 +793,25 @@ impl Pending {
         }
 
         match &mut self {
-            Self::Read { id, buf, done, .. } => {
+            Self::Read {
+                id,
+                operation_started,
+                buf,
+                done,
+                ..
+            } => {
                 let n = result as usize;
                 if n > buf.len() - *done {
-                    return PendingResult::Complete(*id, Err(invalid_completion()));
+                    return PendingResult::Complete(
+                        *id,
+                        *operation_started,
+                        Err(invalid_completion()),
+                    );
                 }
                 if n == 0 {
                     return PendingResult::Complete(
                         *id,
+                        *operation_started,
                         Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "failed to fill whole buffer",
@@ -771,19 +822,34 @@ impl Pending {
                 if *done == buf.len() {
                     let buf = std::mem::replace(buf, uninit_read_buffer(0));
                     let buf = unsafe { assume_init_read_buffer(buf) };
-                    PendingResult::Complete(*id, Ok(IoOutput::Read(Arc::from(buf))))
+                    PendingResult::Complete(
+                        *id,
+                        *operation_started,
+                        Ok(IoOutput::Read(Arc::from(buf))),
+                    )
                 } else {
                     PendingResult::Continue(self)
                 }
             }
-            Self::Write { id, buf, done, .. } => {
+            Self::Write {
+                id,
+                operation_started,
+                buf,
+                done,
+                ..
+            } => {
                 let n = result as usize;
                 if n > buf.len() - *done {
-                    return PendingResult::Complete(*id, Err(invalid_completion()));
+                    return PendingResult::Complete(
+                        *id,
+                        *operation_started,
+                        Err(invalid_completion()),
+                    );
                 }
                 if n == 0 {
                     return PendingResult::Complete(
                         *id,
+                        *operation_started,
                         Err(io::Error::new(
                             io::ErrorKind::WriteZero,
                             "failed to write whole buffer",
@@ -792,31 +858,57 @@ impl Pending {
                 }
                 *done += n;
                 if *done == buf.len() {
-                    PendingResult::Complete(*id, Ok(IoOutput::Write { bytes: *done }))
+                    PendingResult::Complete(
+                        *id,
+                        *operation_started,
+                        Ok(IoOutput::Write { bytes: *done }),
+                    )
                 } else {
                     PendingResult::Continue(self)
                 }
             }
-            Self::Fsync { id, data_only, .. } => {
+            Self::Fsync {
+                id,
+                operation_started,
+                data_only,
+                ..
+            } => {
                 let output = if *data_only {
                     IoOutput::SyncData
                 } else {
                     IoOutput::SyncAll
                 };
-                PendingResult::Complete(*id, Ok(output))
+                PendingResult::Complete(*id, *operation_started, Ok(output))
             }
-            Self::Truncate { id, .. } => PendingResult::Complete(*id, Ok(IoOutput::Truncate)),
-            Self::Metadata { id, statx, .. } => {
-                PendingResult::Complete(*id, Ok(IoOutput::Metadata(statx_to_metadata(statx))))
-            }
+            Self::Truncate {
+                id,
+                operation_started,
+                ..
+            } => PendingResult::Complete(*id, *operation_started, Ok(IoOutput::Truncate)),
+            Self::Metadata {
+                id,
+                operation_started,
+                statx,
+                ..
+            } => PendingResult::Complete(
+                *id,
+                *operation_started,
+                Ok(IoOutput::Metadata(statx_to_metadata(statx))),
+            ),
         }
     }
 
     fn on_error(self, err: io::Error) -> PendingResult {
         let pending = match self {
-            Self::Metadata { id, file, .. } => {
+            Self::Metadata {
+                id,
+                operation_started,
+                file,
+                ..
+            } => {
                 return PendingResult::Complete(
                     id,
+                    operation_started,
                     file.metadata()
                         .map(IoMetadata::from)
                         .map(IoOutput::Metadata),
@@ -825,12 +917,20 @@ impl Pending {
             pending => pending,
         };
         let id = pending.id();
+        let operation_started = pending.operation_started();
 
         if is_uring_opcode_unsupported(&err) {
             match pending {
-                Self::Truncate { id, file, len, .. } => {
+                Self::Truncate {
+                    id,
+                    operation_started,
+                    file,
+                    len,
+                    ..
+                } => {
                     return PendingResult::Complete(
                         id,
+                        operation_started,
                         file.set_len(len).map(|_| IoOutput::Truncate),
                     );
                 }
@@ -839,12 +939,12 @@ impl Pending {
             }
         }
 
-        PendingResult::Complete(id, Err(err))
+        PendingResult::Complete(id, operation_started, Err(err))
     }
 }
 
 enum PendingResult {
-    Complete(WorkId, io::Result<IoOutput>),
+    Complete(WorkId, ProfileTimer, io::Result<IoOutput>),
     Continue(Pending),
 }
 

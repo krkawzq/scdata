@@ -1,7 +1,7 @@
 //! Chunk and decode cache keys.
 
 use super::backend::FileRef;
-use crate::codecs::SharedCodec;
+use crate::codecs::{CodecCacheKey, SharedCodec};
 
 /// Unique identity for one compressed chunk read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -17,10 +17,10 @@ impl ChunkKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DecodeKey {
     pub(crate) chunk: ChunkKey,
-    pub(crate) codec: usize,
+    pub(crate) codec: CodecCacheKey,
     pub(crate) expected_size: Option<usize>,
 }
 
@@ -28,7 +28,7 @@ impl DecodeKey {
     pub(crate) fn new(chunk: ChunkKey, codec: &SharedCodec, expected_size: Option<usize>) -> Self {
         Self {
             chunk,
-            codec: std::sync::Arc::as_ptr(codec) as *const () as usize,
+            codec: codec.cache_key(),
             expected_size,
         }
     }

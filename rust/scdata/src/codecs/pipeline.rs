@@ -5,7 +5,8 @@ use serde_json::Value;
 use super::buffer::{set_vec_len_for_decode, DecodeBuffer};
 use super::runner::DecodeRunner;
 use super::spec::{
-    codec_specs_from_json_str, codec_specs_from_json_value, sealed, ChunkCodec, CodecSpec,
+    codec_specs_from_json_str, codec_specs_from_json_value, sealed, ChunkCodec, CodecCacheKey,
+    CodecSpec,
 };
 use super::util::{output_too_small, reserve_decode_buffer, verify_size};
 use super::{CodecError, CodecResult, SharedCodec};
@@ -19,10 +20,15 @@ use super::{CodecError, CodecResult, SharedCodec};
 pub struct CodecPipeline {
     codecs: Vec<SharedCodec>,
     name: String,
+    cache_key: CodecCacheKey,
+    is_identity: bool,
 }
 
 impl CodecPipeline {
     pub fn new(codecs: Vec<SharedCodec>) -> Self {
+        let is_identity = codecs.iter().all(|codec| codec.is_identity());
+        let cache_key =
+            CodecCacheKey::Pipeline(codecs.iter().map(|codec| codec.cache_key()).collect());
         let name = if codecs.is_empty() {
             "identity".to_string()
         } else {
@@ -32,7 +38,12 @@ impl CodecPipeline {
                 .collect::<Vec<_>>()
                 .join("|")
         };
-        Self { codecs, name }
+        Self {
+            codecs,
+            name,
+            cache_key,
+            is_identity,
+        }
     }
 
     pub fn from_specs(specs: &[CodecSpec]) -> Self {
@@ -99,6 +110,10 @@ impl sealed::Sealed for CodecPipeline {}
 impl ChunkCodec for CodecPipeline {
     fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    fn cache_key(&self) -> CodecCacheKey {
+        self.cache_key.clone()
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
@@ -304,6 +319,6 @@ impl ChunkCodec for CodecPipeline {
     }
 
     fn is_identity(&self) -> bool {
-        self.codecs.iter().all(|codec| codec.is_identity())
+        self.is_identity
     }
 }

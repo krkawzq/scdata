@@ -1,7 +1,7 @@
 use std::io::{Cursor, ErrorKind, Read};
 
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
-use super::super::spec::{sealed, ChunkCodec, LzmaCodecConfig};
+use super::super::spec::{sealed, ChunkCodec, CodecCacheKey, LzmaCodecConfig};
 use super::super::util::{decode_error, output_too_small, vec_with_decode_capacity, verify_size};
 use super::super::{CodecError, CodecResult};
 use xz2::stream::Stream;
@@ -14,6 +14,10 @@ impl sealed::Sealed for GzipCodec {}
 impl ChunkCodec for GzipCodec {
     fn name(&self) -> &str {
         "gzip"
+    }
+
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Static("gzip")
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
@@ -49,6 +53,10 @@ impl ChunkCodec for ZlibCodec {
         "zlib"
     }
 
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Static("zlib")
+    }
+
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
         read_all(
             self.name(),
@@ -80,6 +88,10 @@ impl sealed::Sealed for Bz2Codec {}
 impl ChunkCodec for Bz2Codec {
     fn name(&self) -> &str {
         "bz2"
+    }
+
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Static("bz2")
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
@@ -115,6 +127,13 @@ impl sealed::Sealed for LzmaCodec {}
 impl ChunkCodec for LzmaCodec {
     fn name(&self) -> &str {
         "lzma"
+    }
+
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Lzma {
+            format: self.config.format,
+            has_filters: self.config.has_filters,
+        }
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {

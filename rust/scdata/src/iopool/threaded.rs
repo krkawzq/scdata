@@ -52,8 +52,9 @@ pub(super) fn start(
 fn worker_loop(queue: Arc<QueueCore>, file_table: Arc<FileTable>) {
     while let Some(work) = queue.pop() {
         let id = work.id;
+        let operation_started = work.operation_started;
         let result = execute_work(&file_table, work.op);
-        queue.complete(id, result);
+        queue.complete(id, operation_started, result);
     }
 }
 

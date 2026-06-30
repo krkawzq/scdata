@@ -5,7 +5,7 @@ mod shuffle;
 use std::os::raw::c_void;
 
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
-use super::super::spec::{sealed, ChunkCodec};
+use super::super::spec::{sealed, ChunkCodec, CodecCacheKey};
 use super::super::util::{
     decode_error, output_too_small, reserve_decode_buffer, vec_with_decode_capacity, verify_size,
 };
@@ -21,6 +21,10 @@ impl sealed::Sealed for BloscCodec {}
 impl ChunkCodec for BloscCodec {
     fn name(&self) -> &str {
         "blosc"
+    }
+
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Static("blosc")
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {

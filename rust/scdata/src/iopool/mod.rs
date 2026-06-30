@@ -1,3 +1,4 @@
+mod profile;
 mod threaded;
 
 #[cfg(feature = "uring")]
@@ -20,6 +21,14 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
 use std::thread;
 
+use crate::profile::{ProfileRuntime, ProfileSnapshot, ProfileTimer};
+
+use self::profile::{
+    record_iopool_cancelled_before_dispatch, record_iopool_dedup_hit, record_iopool_dispatched,
+    record_iopool_immediate, record_iopool_max_active_rejection, record_iopool_operation,
+    record_iopool_queue_full, record_iopool_submit, IoCommandKind, IoPoolProfile,
+};
+
 const TARGETED_READY_NOTIFIES: usize = 8;
 
 /// Opaque handle returned by [`IoPool::register_file`].
@@ -39,10 +48,6 @@ pub enum BackendKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
     Read,
-    #[deprecated(note = "writes are not deduplicated")]
-    Write,
-    #[deprecated(note = "fsync operations are not deduplicated")]
-    Fsync,
 }
 
 /// Deduplication key for operations that may be shared by multiple callers.
@@ -356,6 +361,18 @@ impl IoCommand {
         }
     }
 
+    #[inline]
+    fn profile_kind(&self) -> IoCommandKind {
+        match self {
+            Self::Read { .. } => IoCommandKind::Read,
+            Self::Write { .. } => IoCommandKind::Write,
+            Self::Fsync { .. } => IoCommandKind::Fsync,
+            Self::SyncData { .. } => IoCommandKind::SyncData,
+            Self::Truncate { .. } => IoCommandKind::Truncate,
+            Self::Metadata { .. } => IoCommandKind::Metadata,
+        }
+    }
+
     pub fn dedup_key(&self) -> Option<RequestKey> {
         match self {
             Self::Read {
@@ -599,6 +616,8 @@ pub(super) struct WorkId(u64);
 pub(super) struct IoWork {
     pub(super) id: WorkId,
     pub(super) op: IoOperation,
+    pub(super) queued_at: ProfileTimer,
+    pub(super) operation_started: ProfileTimer,
 }
 
 #[cfg(feature = "uring")]
@@ -690,6 +709,7 @@ struct Inflight {
     priority: usize,
     seq: u64,
     fast_read: bool,
+    queued_at: ProfileTimer,
 }
 
 #[derive(Debug, Default)]
@@ -780,6 +800,7 @@ impl ActiveLimiter {
 pub(super) struct QueueCore {
     inner: Mutex<Inner>,
     active_limiter: Arc<ActiveLimiter>,
+    profiler: IoPoolProfile,
     available: Condvar,
     inactive_waiters: AtomicUsize,
     #[cfg(feature = "uring")]
@@ -808,11 +829,28 @@ impl QueueCore {
         )
     }
 
+    #[cfg(test)]
     fn new_with_limiter(
         priority_levels: usize,
         max_active: usize,
         fast_read_path: bool,
         active_limiter: Arc<ActiveLimiter>,
+    ) -> Self {
+        Self::new_with_limiter_and_profile(
+            priority_levels,
+            max_active,
+            fast_read_path,
+            active_limiter,
+            IoPoolProfile::disabled(),
+        )
+    }
+
+    fn new_with_limiter_and_profile(
+        priority_levels: usize,
+        max_active: usize,
+        fast_read_path: bool,
+        active_limiter: Arc<ActiveLimiter>,
+        profiler: IoPoolProfile,
     ) -> Self {
         let priority_levels = priority_levels.max(1);
         Self {
@@ -840,6 +878,7 @@ impl QueueCore {
                 failure: None,
             }),
             active_limiter,
+            profiler,
             available: Condvar::new(),
             inactive_waiters: AtomicUsize::new(0),
             #[cfg(feature = "uring")]
@@ -859,6 +898,7 @@ impl QueueCore {
         cmd: IoCommand,
         handle: Option<Arc<File>>,
     ) -> io::Result<IoFuture> {
+        record_iopool_submit(&self.profiler, cmd.profile_kind());
         let priority = cmd.priority();
         let key = cmd.dedup_key();
         let operation = cmd.into_operation(handle);
@@ -888,6 +928,7 @@ impl QueueCore {
         if let Some(output) = immediate_operation_output(&operation) {
             if Self::can_complete_immediately_locked(&inner, access) {
                 drop(inner);
+                record_iopool_immediate(&self.profiler);
                 let _ = tx.send(Ok(output));
                 return Ok(IoFuture::detached(rx));
             }
@@ -914,6 +955,8 @@ impl QueueCore {
                         .expect("deduplicated entry checked above");
                     inflight.refcount += 1;
                     inflight.waiters.push(tx);
+                    drop(inner);
+                    record_iopool_dedup_hit(&self.profiler);
                     return Ok(IoFuture::new(rx, Arc::downgrade(self), id));
                 }
                 if !inner.table.contains_key(&id) {
@@ -923,9 +966,12 @@ impl QueueCore {
         }
 
         if inner.table.len() >= inner.max_active {
+            let max_active = inner.max_active;
+            drop(inner);
+            record_iopool_queue_full(&self.profiler);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!("IO queue reached max_in_flight={}", inner.max_active),
+                format!("IO queue reached max_in_flight={max_active}"),
             ));
         }
 
@@ -938,8 +984,13 @@ impl QueueCore {
             io::Error::new(io::ErrorKind::OutOfMemory, "IO sequence counter overflowed")
         })?;
 
-        self.active_limiter.try_acquire()?;
+        if let Err(err) = self.active_limiter.try_acquire() {
+            drop(inner);
+            record_iopool_max_active_rejection(&self.profiler);
+            return Err(err);
+        }
         let fast_read = Self::can_use_fast_read_locked(&inner, access);
+        let queued_at = self.profiler.queue_timer();
 
         inner.table.insert(
             id,
@@ -953,6 +1004,7 @@ impl QueueCore {
                 priority,
                 seq,
                 fast_read,
+                queued_at,
             },
         );
         if fast_read {
@@ -977,7 +1029,8 @@ impl QueueCore {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if let Some(work) = Self::pop_ready_locked(&mut inner) {
-                return Some(work);
+                drop(inner);
+                return Some(self.profile_dispatched(work));
             }
 
             if inner.shutdown {
@@ -993,7 +1046,8 @@ impl QueueCore {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if let Some(work) = Self::pop_ready_locked(&mut inner) {
-                return QueueWake::Work(work);
+                drop(inner);
+                return QueueWake::Work(self.profile_dispatched(work));
             }
 
             if inner.shutdown {
@@ -1018,6 +1072,7 @@ impl QueueCore {
         if limit == 0 {
             return;
         }
+        let start = out.len();
         let mut inner = self.inner.lock().unwrap();
         for _ in 0..limit {
             let Some(work) = Self::pop_ready_locked(&mut inner) else {
@@ -1025,9 +1080,28 @@ impl QueueCore {
             };
             out.push(work);
         }
+        drop(inner);
+        for work in &mut out[start..] {
+            self.profile_dispatched_in_place(work);
+        }
     }
 
-    pub(super) fn complete(&self, id: WorkId, result: io::Result<IoOutput>) {
+    fn profile_dispatched(&self, mut work: IoWork) -> IoWork {
+        self.profile_dispatched_in_place(&mut work);
+        work
+    }
+
+    fn profile_dispatched_in_place(&self, work: &mut IoWork) {
+        record_iopool_dispatched(&self.profiler, work.queued_at);
+        work.operation_started = self.profiler.operation_timer();
+    }
+
+    pub(super) fn complete(
+        &self,
+        id: WorkId,
+        operation_started: ProfileTimer,
+        result: io::Result<IoOutput>,
+    ) {
         let (waiters, ready_count, file_inactive) = {
             let mut inner = self.inner.lock().unwrap();
             let Some(inflight) = Self::remove_locked(&mut inner, id) else {
@@ -1041,6 +1115,16 @@ impl QueueCore {
             (waiters, ready_count, file_inactive)
         };
 
+        if self.profiler.is_recording() {
+            let (read_bytes, write_bytes) = io_result_profile_bytes(&result);
+            record_iopool_operation(
+                &self.profiler,
+                operation_started,
+                read_bytes,
+                write_bytes,
+                result.is_err(),
+            );
+        }
         self.active_limiter.release();
         self.notify_ready_count(ready_count);
         self.notify_file_inactive(file_inactive);
@@ -1064,6 +1148,7 @@ impl QueueCore {
             let ready_count = Self::refresh_ready_after_removed_locked(&mut inner, access);
             let file_inactive = !Self::file_active_locked(&inner, file);
             drop(inner);
+            record_iopool_cancelled_before_dispatch(&self.profiler);
             self.active_limiter.release();
             self.notify_ready_count(ready_count);
             self.notify_file_inactive(file_inactive);
@@ -1129,7 +1214,6 @@ impl QueueCore {
     }
 
     #[cfg(feature = "uring")]
-    #[allow(dead_code)]
     pub(super) fn register_wake_fd(&self, fd: RawFd) {
         let mut inner = self.inner.lock().unwrap();
         let base = inner.fixed_file_update_base;
@@ -1139,7 +1223,6 @@ impl QueueCore {
     }
 
     #[cfg(feature = "uring")]
-    #[allow(dead_code)]
     pub(super) fn unregister_wake_fd(&self, fd: RawFd) {
         let mut inner = self.inner.lock().unwrap();
         inner.fixed_file_update_cursors.remove(&fd);
@@ -1154,7 +1237,6 @@ impl QueueCore {
     }
 
     #[cfg(feature = "uring")]
-    #[allow(dead_code)]
     pub(super) fn acknowledge_wake(&self) {
         self.wake_pending.store(false, Ordering::Release);
     }
@@ -1432,13 +1514,18 @@ impl QueueCore {
                     continue;
                 }
 
-                let op = {
+                let (queued_at, op) = {
                     let inflight = inner.table.get_mut(&id).expect("fast entry exists");
                     inflight.state = InflightState::Dispatched;
-                    inflight.op.take()
+                    (inflight.queued_at, inflight.op.take())
                 };
                 inner.queued = inner.queued.saturating_sub(1);
-                return op.map(|op| IoWork { id, op });
+                return op.map(|op| IoWork {
+                    id,
+                    op,
+                    queued_at,
+                    operation_started: ProfileTimer::disabled(),
+                });
             }
 
             let key = inner.ready.pop_first().expect("slow key checked above");
@@ -1456,13 +1543,18 @@ impl QueueCore {
                 continue;
             }
 
-            let op = {
+            let (queued_at, op) = {
                 let inflight = inner.table.get_mut(&id).expect("dispatchable entry exists");
                 inflight.state = InflightState::Dispatched;
-                inflight.op.take()
+                (inflight.queued_at, inflight.op.take())
             };
             inner.queued = inner.queued.saturating_sub(1);
-            return op.map(|op| IoWork { id, op });
+            return op.map(|op| IoWork {
+                id,
+                op,
+                queued_at,
+                operation_started: ProfileTimer::disabled(),
+            });
         }
     }
 
@@ -1809,12 +1901,21 @@ pub struct IoPool {
     file_table: Arc<FileTable>,
     free_file_ids: Mutex<Vec<FileId>>,
     threads: Vec<thread::JoinHandle<()>>,
+    profiler: IoPoolProfile,
     #[cfg(feature = "uring")]
     uses_uring: bool,
 }
 
 impl IoPool {
     pub fn new(config: IoConfig) -> io::Result<Self> {
+        Self::new_with_iopool_profile(config, IoPoolProfile::from_env())
+    }
+
+    pub fn new_with_profile(config: IoConfig, profiler: ProfileRuntime) -> io::Result<Self> {
+        Self::new_with_iopool_profile(config, IoPoolProfile::new(profiler))
+    }
+
+    fn new_with_iopool_profile(config: IoConfig, profiler: IoPoolProfile) -> io::Result<Self> {
         config
             .validate()
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
@@ -1825,11 +1926,12 @@ impl IoPool {
         let fast_read_path = config.base().assume_non_overlapping_reads;
         let queues = (0..queue_count)
             .map(|_| {
-                Arc::new(QueueCore::new_with_limiter(
+                Arc::new(QueueCore::new_with_limiter_and_profile(
                     config.priority_levels(),
                     in_flight_limit,
                     fast_read_path,
                     Arc::clone(&active_limiter),
+                    profiler.clone(),
                 ))
             })
             .collect::<Vec<_>>();
@@ -1849,9 +1951,26 @@ impl IoPool {
             file_table,
             free_file_ids: Mutex::new(Vec::new()),
             threads,
+            profiler,
             #[cfg(feature = "uring")]
             uses_uring,
         })
+    }
+
+    pub fn profile(&self) -> &ProfileRuntime {
+        self.profiler.runtime()
+    }
+
+    pub fn profile_snapshot(&self) -> ProfileSnapshot {
+        self.profiler.snapshot()
+    }
+
+    pub fn profile_snapshot_and_reset(&self) -> ProfileSnapshot {
+        self.profiler.snapshot_and_reset()
+    }
+
+    pub fn reset_profile(&self) {
+        self.profiler.reset_metrics();
     }
 
     /// Register a file for positioned IO and return its opaque handle.
@@ -2171,6 +2290,16 @@ fn immediate_operation_output(op: &IoOperation) -> Option<IoOutput> {
     }
 }
 
+#[inline]
+fn io_result_profile_bytes(result: &io::Result<IoOutput>) -> (usize, usize) {
+    match result {
+        Ok(IoOutput::Read(bytes)) => (bytes.len(), 0),
+        Ok(IoOutput::Write { bytes }) => (0, *bytes),
+        Ok(IoOutput::SyncAll | IoOutput::SyncData | IoOutput::Truncate | IoOutput::Metadata(_))
+        | Err(_) => (0, 0),
+    }
+}
+
 fn operation_file(
     file_table: &Arc<FileTable>,
     file_id: FileId,
@@ -2274,7 +2403,28 @@ fn wake_eventfd(fd: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{ErrorKind, Write};
+    #[cfg(feature = "profile")]
+    use crate::iopool::profile::iopool_profile_registry;
+    use crate::iopool::profile::{test_metrics, IoPoolProfile};
+    #[cfg(feature = "profile")]
+    use crate::profile::{ProfileMetricId, ProfileRegistry, ProfileRuntime};
+    use std::io::{self, ErrorKind, Write};
+    #[cfg(feature = "profile")]
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+    #[cfg(feature = "profile")]
+    static PROFILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "profile")]
+    const PROFILE_ENV_KEYS: &[&str] = &[
+        "SCDATA_PROFILE",
+        "SCDATA_PROFILE_LABEL",
+        "SCDATA_PROFILE_COMPONENTS",
+        "SCDATA_PROFILE_COMPONENT_ENABLE",
+        "SCDATA_PROFILE_COMPONENT_DISABLE",
+        "SCDATA_PROFILE_SCOPES",
+        "SCDATA_PROFILE_SCOPE_ENABLE",
+        "SCDATA_PROFILE_SCOPE_DISABLE",
+    ];
 
     fn temp_file(name: &str, content: &[u8]) -> std::path::PathBuf {
         let path =
@@ -2315,8 +2465,58 @@ mod tests {
             file_table: Arc::new(RwLock::new(Vec::new())),
             free_file_ids: Mutex::new(Vec::new()),
             threads: Vec::new(),
+            profiler: IoPoolProfile::disabled(),
             #[cfg(feature = "uring")]
             uses_uring: false,
+        }
+    }
+
+    #[cfg(feature = "profile")]
+    fn enabled_profile(label: &'static str) -> ProfileRuntime {
+        ProfileRuntime::enabled_lazy(label, iopool_profile_registry)
+    }
+
+    #[cfg(feature = "profile")]
+    fn enabled_queue_profile(label: &'static str) -> (ProfileRuntime, IoPoolProfile) {
+        let runtime = enabled_profile(label);
+        let profile = IoPoolProfile::new(runtime.clone());
+        (runtime, profile)
+    }
+
+    #[cfg(feature = "profile")]
+    fn metric(snapshot: &ProfileSnapshot, id: ProfileMetricId) -> u64 {
+        snapshot.metric_value(id).unwrap_or(0)
+    }
+
+    #[cfg(feature = "profile")]
+    fn with_profile_env_enabled<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = PROFILE_ENV_LOCK.lock().unwrap();
+        let saved = PROFILE_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+
+        std::env::set_var("SCDATA_PROFILE", "1");
+        for key in PROFILE_ENV_KEYS
+            .iter()
+            .copied()
+            .filter(|key| *key != "SCDATA_PROFILE")
+        {
+            std::env::remove_var(key);
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(f));
+        for (key, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
         }
     }
 
@@ -2337,6 +2537,7 @@ mod tests {
             file_table: Arc::new(RwLock::new(Vec::new())),
             free_file_ids: Mutex::new(Vec::new()),
             threads: Vec::new(),
+            profiler: IoPoolProfile::disabled(),
             uses_uring: true,
         }
     }
@@ -2455,7 +2656,11 @@ mod tests {
         assert!(read.try_recv().expect("read pending").is_none());
         assert!(write.try_recv().expect("write pending").is_none());
 
-        queue.complete(sync_work.id, Ok(IoOutput::SyncAll));
+        queue.complete(
+            sync_work.id,
+            sync_work.operation_started,
+            Ok(IoOutput::SyncAll),
+        );
         assert!(matches!(
             sync.blocking_recv().expect("sync"),
             IoOutput::SyncAll
@@ -2466,7 +2671,11 @@ mod tests {
             IoOperation::Read { len, .. } => assert_eq!(len, 0),
             _ => panic!("expected zero read"),
         }
-        queue.complete(read_work.id, Ok(IoOutput::Read(Arc::from(Vec::new()))));
+        queue.complete(
+            read_work.id,
+            read_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(Vec::new()))),
+        );
         assert!(read.blocking_recv_read().expect("zero read").is_empty());
 
         let write_work = queue.pop().expect("zero write dispatches after barrier");
@@ -2474,7 +2683,11 @@ mod tests {
             IoOperation::Write { buf, .. } => assert!(buf.is_empty()),
             _ => panic!("expected zero write"),
         }
-        queue.complete(write_work.id, Ok(IoOutput::Write { bytes: 0 }));
+        queue.complete(
+            write_work.id,
+            write_work.operation_started,
+            Ok(IoOutput::Write { bytes: 0 }),
+        );
         assert_eq!(
             write.blocking_recv().expect("zero write").bytes_written(),
             Some(0)
@@ -2815,6 +3028,402 @@ mod tests {
         assert_eq!(&out, b"abcdefghABCDEFGH");
     }
 
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_threaded_io_operations() {
+        let path = temp_file("profile_threaded_io", b"hello world");
+        let profiler = enabled_profile("iopool-threaded-test");
+        let pool = IoPool::new_with_profile(
+            IoConfig::Threaded(ThreadedConfig {
+                base: BaseIoConfig {
+                    max_in_flight: 8,
+                    priority_levels: 2,
+                    queue_shards: 1,
+                    assume_non_overlapping_reads: false,
+                },
+                num_workers: 1,
+                cpus: None,
+            }),
+            profiler.clone(),
+        )
+        .expect("create profiled pool");
+        let round = profiler.start();
+        assert!(pool.profile().is_global_enabled());
+        let file = pool.register_file(&path).expect("register");
+
+        let empty = pool
+            .submit(IoCommand::read(file, 0, 0, 0))
+            .expect("submit empty read")
+            .blocking_recv_read()
+            .expect("empty read");
+        assert!(empty.is_empty());
+        let read = pool
+            .submit(IoCommand::read(file, 0, 5, 0))
+            .expect("submit read")
+            .blocking_recv_read()
+            .expect("read");
+        assert_eq!(&*read, b"hello");
+        let written = pool
+            .submit(IoCommand::write(file, 6, b"rust!".to_vec(), 0))
+            .expect("submit write")
+            .blocking_recv()
+            .expect("write");
+        assert_eq!(written.bytes_written(), Some(5));
+
+        let snapshot = profiler.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 3);
+        assert_eq!(metric(&snapshot, test_metrics::READ_SUBMITS), 2);
+        assert_eq!(metric(&snapshot, test_metrics::WRITE_SUBMITS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::IMMEDIATE_COMPLETIONS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::DISPATCHED), 2);
+        assert_eq!(metric(&snapshot, test_metrics::OPERATION_CALLS), 2);
+        assert_eq!(metric(&snapshot, test_metrics::READ_BYTES), 5);
+        assert_eq!(metric(&snapshot, test_metrics::WRITE_BYTES), 5);
+        assert_eq!(metric(&snapshot, test_metrics::OPERATION_ERRORS), 0);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_queue_dedup_dispatch_and_cancel() {
+        let (runtime, profiler) = enabled_queue_profile("iopool-queue-test");
+        let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            3,
+            8,
+            false,
+            Arc::new(ActiveLimiter::new(8)),
+            profiler.clone(),
+        ));
+        let round = runtime.start();
+
+        let first = queue
+            .submit(IoCommand::read(0, 10, 4, 2))
+            .expect("first submit");
+        let second = queue
+            .submit(IoCommand::read(0, 10, 4, 0))
+            .expect("dedup submit");
+        let cancelled = queue
+            .submit(IoCommand::read(0, 20, 4, 1))
+            .expect("cancelled submit");
+        drop(cancelled);
+
+        let work = queue.pop().expect("dispatch deduplicated read");
+        queue.complete(
+            work.id,
+            work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"rust".to_vec()))),
+        );
+        assert_eq!(&*first.blocking_recv_read().expect("first result"), b"rust");
+        assert_eq!(
+            &*second.blocking_recv_read().expect("second result"),
+            b"rust"
+        );
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 3);
+        assert_eq!(metric(&snapshot, test_metrics::READ_SUBMITS), 3);
+        assert_eq!(metric(&snapshot, test_metrics::DEDUP_HITS), 1);
+        assert_eq!(
+            metric(&snapshot, test_metrics::CANCELLED_BEFORE_DISPATCH),
+            1
+        );
+        assert_eq!(metric(&snapshot, test_metrics::DISPATCHED), 1);
+        assert_eq!(metric(&snapshot, test_metrics::OPERATION_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::READ_BYTES), 4);
+        assert_eq!(metric(&snapshot, test_metrics::OPERATION_ERRORS), 0);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_queue_capacity_rejections() {
+        let (runtime, profiler) = enabled_queue_profile("iopool-capacity-test");
+        let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            2,
+            1,
+            false,
+            Arc::new(ActiveLimiter::new(1)),
+            profiler.clone(),
+        ));
+        let round = runtime.start();
+        let held = queue
+            .submit(IoCommand::read(0, 0, 1, 0))
+            .expect("held submit");
+
+        let err = queue
+            .submit(IoCommand::read(0, 1, 1, 0))
+            .expect_err("queue capacity should reject second unique read");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 2);
+        assert_eq!(metric(&snapshot, test_metrics::QUEUE_FULL), 1);
+        assert_eq!(metric(&snapshot, test_metrics::MAX_ACTIVE_REJECTIONS), 0);
+        drop(held);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_global_active_limit_rejections() {
+        let (runtime, profiler) = enabled_queue_profile("iopool-active-limit-test");
+        let limiter = Arc::new(ActiveLimiter::new(1));
+        let first_queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            2,
+            8,
+            false,
+            Arc::clone(&limiter),
+            profiler.clone(),
+        ));
+        let second_queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            2,
+            8,
+            false,
+            limiter,
+            profiler.clone(),
+        ));
+        let round = runtime.start();
+        let held = first_queue
+            .submit(IoCommand::read(0, 0, 1, 0))
+            .expect("held submit");
+
+        let err = second_queue
+            .submit(IoCommand::read(1, 0, 1, 0))
+            .expect_err("global active limit should reject submit");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 2);
+        assert_eq!(metric(&snapshot, test_metrics::QUEUE_FULL), 0);
+        assert_eq!(metric(&snapshot, test_metrics::MAX_ACTIVE_REJECTIONS), 1);
+        drop(held);
+        round.end();
+    }
+
+    #[test]
+    fn disabled_profile_does_not_record_metrics() {
+        let profiler = IoPoolProfile::disabled();
+        let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            2,
+            4,
+            false,
+            Arc::new(ActiveLimiter::new(4)),
+            profiler.clone(),
+        ));
+
+        let empty = queue
+            .submit(IoCommand::read(0, 0, 0, 0))
+            .expect("submit immediate read");
+        assert!(empty.blocking_recv_read().expect("read").is_empty());
+
+        let snapshot = profiler.snapshot();
+        assert!(!snapshot.global_enabled);
+        assert!(snapshot.metrics.is_empty());
+        assert_eq!(snapshot.metric_value(test_metrics::SUBMIT_CALLS), None);
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_all_submit_kinds() {
+        let (runtime, profiler) = enabled_queue_profile("iopool-submit-kinds-test");
+        let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            2,
+            8,
+            false,
+            Arc::new(ActiveLimiter::new(8)),
+            profiler,
+        ));
+        let round = runtime.start();
+
+        let futures = vec![
+            queue
+                .submit(IoCommand::read(0, 0, 1, 0))
+                .expect("read submit"),
+            queue
+                .submit(IoCommand::write(0, 0, vec![1], 0))
+                .expect("write submit"),
+            queue.submit(IoCommand::fsync(0, 0)).expect("fsync submit"),
+            queue
+                .submit(IoCommand::sync_data(0, 0))
+                .expect("sync data submit"),
+            queue
+                .submit(IoCommand::truncate(0, 1, 0))
+                .expect("truncate submit"),
+            queue
+                .submit(IoCommand::metadata(0, 0))
+                .expect("metadata submit"),
+        ];
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 6);
+        assert_eq!(metric(&snapshot, test_metrics::READ_SUBMITS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::WRITE_SUBMITS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::FSYNC_SUBMITS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::SYNC_DATA_SUBMITS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::TRUNCATE_SUBMITS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::METADATA_SUBMITS), 1);
+
+        drop(futures);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_operation_errors() {
+        let (runtime, profiler) = enabled_queue_profile("iopool-error-test");
+        let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            2,
+            4,
+            false,
+            Arc::new(ActiveLimiter::new(4)),
+            profiler,
+        ));
+        let round = runtime.start();
+
+        let future = queue
+            .submit(IoCommand::read(0, 0, 4, 0))
+            .expect("submit read");
+        let work = queue.pop().expect("dispatch read");
+        queue.complete(
+            work.id,
+            work.operation_started,
+            Err(io::Error::other("profiled failure")),
+        );
+        assert_eq!(
+            future.blocking_recv().expect_err("read should fail").kind(),
+            ErrorKind::Other
+        );
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::DISPATCHED), 1);
+        assert_eq!(metric(&snapshot, test_metrics::OPERATION_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::READ_BYTES), 0);
+        assert_eq!(metric(&snapshot, test_metrics::OPERATION_ERRORS), 1);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn env_auto_profile_snapshot_and_reset_keeps_recording() {
+        with_profile_env_enabled(|| {
+            let path = temp_file("profile_env_auto_reset", b"hello");
+            let pool = IoPool::new(IoConfig::Threaded(ThreadedConfig {
+                base: BaseIoConfig {
+                    max_in_flight: 4,
+                    priority_levels: 2,
+                    queue_shards: 1,
+                    assume_non_overlapping_reads: false,
+                },
+                num_workers: 1,
+                cpus: None,
+            }))
+            .expect("create env-profiled pool");
+            assert!(pool.profile().is_recording());
+
+            let file = pool.register_file(&path).expect("register");
+            let first = pool
+                .submit(IoCommand::read(file, 0, 0, 0))
+                .expect("first submit")
+                .blocking_recv_read()
+                .expect("first read");
+            assert!(first.is_empty());
+
+            let first_snapshot = pool.profile_snapshot_and_reset();
+            assert_eq!(metric(&first_snapshot, test_metrics::SUBMIT_CALLS), 1);
+            assert_eq!(
+                metric(&first_snapshot, test_metrics::IMMEDIATE_COMPLETIONS),
+                1
+            );
+            assert!(pool.profile().is_recording());
+            assert_eq!(
+                metric(&pool.profile_snapshot(), test_metrics::SUBMIT_CALLS),
+                0
+            );
+
+            let second = pool
+                .submit(IoCommand::read(file, 1, 0, 0))
+                .expect("second submit")
+                .blocking_recv_read()
+                .expect("second read");
+            assert!(second.is_empty());
+            pool.reset_profile();
+            assert!(pool.profile().is_recording());
+            assert_eq!(
+                metric(&pool.profile_snapshot(), test_metrics::SUBMIT_CALLS),
+                0
+            );
+        });
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_registers_iopool_scopes_for_active_runtime() {
+        let runtime =
+            ProfileRuntime::enabled_lazy("iopool-late-registry-test", ProfileRegistry::new);
+        let round = runtime.start();
+        let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            2,
+            4,
+            false,
+            Arc::new(ActiveLimiter::new(4)),
+            IoPoolProfile::new(runtime.clone()),
+        ));
+
+        let future = queue
+            .submit(IoCommand::read(0, 0, 4, 0))
+            .expect("submit read");
+        let work = queue.pop().expect("dispatch read");
+        queue.complete(
+            work.id,
+            work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"rust".to_vec()))),
+        );
+        assert_eq!(&*future.blocking_recv_read().expect("read"), b"rust");
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::DISPATCHED), 1);
+        assert_eq!(metric(&snapshot, test_metrics::OPERATION_CALLS), 1);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_cache_refreshes_between_rounds() {
+        let (runtime, profiler) = enabled_queue_profile("iopool-cache-refresh-test");
+        let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
+            2,
+            4,
+            false,
+            Arc::new(ActiveLimiter::new(4)),
+            profiler,
+        ));
+
+        let round = runtime.start();
+        let first = queue
+            .submit(IoCommand::read(0, 0, 0, 0))
+            .expect("first immediate read");
+        assert!(first.blocking_recv_read().expect("first").is_empty());
+        let first_snapshot = round.end();
+        assert_eq!(metric(&first_snapshot, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(
+            metric(&first_snapshot, test_metrics::IMMEDIATE_COMPLETIONS),
+            1
+        );
+
+        let round = runtime.start();
+        let second = queue
+            .submit(IoCommand::read(0, 1, 0, 0))
+            .expect("second immediate read");
+        assert!(second.blocking_recv_read().expect("second").is_empty());
+        let second_snapshot = round.end();
+        assert_eq!(metric(&second_snapshot, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(
+            metric(&second_snapshot, test_metrics::IMMEDIATE_COMPLETIONS),
+            1
+        );
+    }
+
     #[test]
     fn fast_read_path_tracks_active_reads_without_active_index() {
         let queue = Arc::new(QueueCore::new_with_fast_read_path(2, 8, true));
@@ -2831,7 +3440,11 @@ mod tests {
         assert_eq!(queue.debug_counts(), (1, 0));
         assert_eq!(queue.debug_fast_active_read_count(0), 1);
 
-        queue.complete(work.id, Ok(IoOutput::Read(Arc::from(b"rust".to_vec()))));
+        queue.complete(
+            work.id,
+            work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"rust".to_vec()))),
+        );
         assert_eq!(&*future.blocking_recv_read().expect("read"), b"rust");
         assert_eq!(queue.debug_counts(), (0, 0));
         assert_eq!(queue.debug_fast_active_read_count(0), 0);
@@ -3002,7 +3615,11 @@ mod tests {
             .expect("dedup dispatched read");
         assert_eq!(queue.debug_fast_ready_count(), 0);
 
-        queue.complete(work.id, Ok(IoOutput::Read(Arc::from(b"rust".to_vec()))));
+        queue.complete(
+            work.id,
+            work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"rust".to_vec()))),
+        );
         assert_eq!(&*first.blocking_recv_read().expect("first result"), b"rust");
         assert_eq!(
             &*duplicate.blocking_recv_read().expect("duplicate result"),
@@ -3083,7 +3700,11 @@ mod tests {
         assert_eq!(queue.debug_active_index_count(), 1);
 
         let work = queue.pop().expect("work");
-        queue.complete(work.id, Ok(IoOutput::Read(Arc::from(vec![0u8]))));
+        queue.complete(
+            work.id,
+            work.operation_started,
+            Ok(IoOutput::Read(Arc::from(vec![0u8]))),
+        );
         assert_eq!(queue.debug_counts(), (0, 0));
         assert_eq!(queue.debug_active_index_count(), 0);
         drop(second);
@@ -3105,7 +3726,11 @@ mod tests {
             _ => panic!("expected other-file read"),
         }
 
-        queue.complete(sync_work.id, Ok(IoOutput::SyncAll));
+        queue.complete(
+            sync_work.id,
+            sync_work.operation_started,
+            Ok(IoOutput::SyncAll),
+        );
         let work = queue.pop().expect("same-file read should unblock");
         match work.op {
             IoOperation::Read { file, offset, .. } => {

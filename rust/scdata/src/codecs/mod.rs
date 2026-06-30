@@ -9,6 +9,7 @@ mod error;
 mod impls;
 mod pipeline;
 mod pool;
+mod profile;
 mod registry;
 mod runner;
 mod spec;
@@ -21,11 +22,15 @@ pub use error::{CodecError, CodecResult};
 pub use impls::{UncompressedCodec, UnsupportedCodec};
 pub use pipeline::CodecPipeline;
 pub use pool::{DecodeFuture, DecodeOutput, DecodePool, DecodePoolConfig, DecodeRequest};
+pub use profile::{
+    codecs_profile_registry, CodecProfile, CODECS_COMPONENT, CODECS_SUBMIT_SCOPE, CODECS_WORK_SCOPE,
+};
 #[cfg(test)]
 pub(crate) use spec::sealed;
 pub use spec::{
     codec_specs_from_json_str, codec_specs_from_json_value, BloscCodecConfig, BloscShuffle,
-    ChunkCodec, CodecSpec, LevelCodecConfig, Lz4CodecConfig, LzmaCodecConfig, ZstdCodecConfig,
+    ChunkCodec, CodecCacheKey, CodecSpec, LevelCodecConfig, Lz4CodecConfig, LzmaCodecConfig,
+    ZstdCodecConfig,
 };
 
 /// Shared codec implementation used by decode requests.

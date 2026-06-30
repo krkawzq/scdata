@@ -1,4 +1,4 @@
-use super::array::{build_array_from_spec, Array, ArrayMeta, ArraySpec, DType};
+use super::array::{build_array_from_spec, Array, ArraySpec, DType};
 use super::error::{DataBankError, DataBankResult};
 use super::interner::DatasetGeneRefs;
 use crate::iopool::IoPool;
@@ -73,39 +73,39 @@ pub struct Dense2DDataset {
 }
 
 #[derive(Debug)]
-pub struct Dense1DMeta {
+pub struct Dense1DSpec {
     pub gene_names: Vec<String>,
-    pub data: ArrayMeta,
+    pub data: ArraySpec,
 }
 
 #[derive(Debug)]
-pub struct Dense2DMeta {
+pub struct Dense2DSpec {
     pub gene_names: Vec<String>,
-    pub data: ArrayMeta,
+    pub data: ArraySpec,
 }
 
 #[derive(Debug)]
-pub(crate) struct Dense1DSpec {
+pub(crate) struct ResolvedDense1DSpec {
     pub genes: DatasetGeneRefs,
     pub data: ArraySpec,
 }
 
 #[derive(Debug)]
-pub(crate) struct Dense2DSpec {
+pub(crate) struct ResolvedDense2DSpec {
     pub genes: DatasetGeneRefs,
     pub data: ArraySpec,
 }
 
 impl Dense1DDataset {
-    pub fn from_meta(
+    pub fn from_spec(
         genes: DatasetGeneRefs,
-        meta: Dense1DMeta,
+        spec: Dense1DSpec,
         io_pool: &IoPool,
     ) -> DataBankResult<Self> {
         build_dense_1d_dataset(
-            Dense1DSpec {
+            ResolvedDense1DSpec {
                 genes,
-                data: ArraySpec::from_compat_meta(meta.data)?,
+                data: spec.data,
             },
             io_pool,
         )
@@ -113,15 +113,15 @@ impl Dense1DDataset {
 }
 
 impl Dense2DDataset {
-    pub fn from_meta(
+    pub fn from_spec(
         genes: DatasetGeneRefs,
-        meta: Dense2DMeta,
+        spec: Dense2DSpec,
         io_pool: &IoPool,
     ) -> DataBankResult<Self> {
         build_dense_2d_dataset(
-            Dense2DSpec {
+            ResolvedDense2DSpec {
                 genes,
-                data: ArraySpec::from_compat_meta(meta.data)?,
+                data: spec.data,
             },
             io_pool,
         )
@@ -140,18 +140,18 @@ pub struct SparseCsrDataset {
 }
 
 #[derive(Debug)]
-pub struct SparseCsrDatasetMeta {
+pub struct SparseCsrSpec {
     pub gene_names: Vec<String>,
     pub indptr: Vec<u64>,
-    pub indices: ArrayMeta,
-    pub data: ArrayMeta,
+    pub indices: ArraySpec,
+    pub data: ArraySpec,
     pub index_dtype: DType,
     pub num_cells: usize,
     pub num_genes: usize,
 }
 
 #[derive(Debug)]
-pub(crate) struct SparseCsrSpec {
+pub(crate) struct ResolvedSparseCsrSpec {
     pub genes: DatasetGeneRefs,
     pub indptr: Vec<u64>,
     pub indices: ArraySpec,
@@ -162,20 +162,20 @@ pub(crate) struct SparseCsrSpec {
 }
 
 impl SparseCsrDataset {
-    pub fn from_meta(
+    pub fn from_spec(
         genes: DatasetGeneRefs,
-        meta: SparseCsrDatasetMeta,
+        spec: SparseCsrSpec,
         io_pool: &IoPool,
     ) -> DataBankResult<Self> {
         build_sparse_csr_dataset(
-            SparseCsrSpec {
+            ResolvedSparseCsrSpec {
                 genes,
-                indptr: meta.indptr,
-                indices: ArraySpec::from_compat_meta(meta.indices)?,
-                data: ArraySpec::from_compat_meta(meta.data)?,
-                index_dtype: meta.index_dtype,
-                num_cells: meta.num_cells,
-                num_genes: meta.num_genes,
+                indptr: spec.indptr,
+                indices: spec.indices,
+                data: spec.data,
+                index_dtype: spec.index_dtype,
+                num_cells: spec.num_cells,
+                num_genes: spec.num_genes,
             },
             io_pool,
         )
@@ -183,7 +183,7 @@ impl SparseCsrDataset {
 }
 
 pub(crate) fn build_dense_1d_dataset(
-    spec: Dense1DSpec,
+    spec: ResolvedDense1DSpec,
     io_pool: &IoPool,
 ) -> DataBankResult<Dense1DDataset> {
     let num_genes = spec.genes.len();
@@ -216,7 +216,7 @@ pub(crate) fn build_dense_1d_dataset(
 }
 
 pub(crate) fn build_dense_2d_dataset(
-    spec: Dense2DSpec,
+    spec: ResolvedDense2DSpec,
     io_pool: &IoPool,
 ) -> DataBankResult<Dense2DDataset> {
     let &[num_cells, num_genes] = spec.data.shape.as_slice() else {
@@ -251,7 +251,7 @@ pub(crate) fn build_dense_2d_dataset(
 }
 
 pub(crate) fn build_sparse_csr_dataset(
-    spec: SparseCsrSpec,
+    spec: ResolvedSparseCsrSpec,
     io_pool: &IoPool,
 ) -> DataBankResult<SparseCsrDataset> {
     let expected_indptr_len = spec

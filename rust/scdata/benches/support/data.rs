@@ -36,14 +36,6 @@ impl DataDist {
             Self::HighEntropy => "high_entropy",
         }
     }
-
-    pub const ALL: [Self; 5] = [
-        Self::Uniform,
-        Self::Counting,
-        Self::Constant,
-        Self::LowEntropy,
-        Self::HighEntropy,
-    ];
 }
 
 /// A complete description of a synthetic payload.
@@ -107,14 +99,6 @@ impl DataProfile {
         out
     }
 
-    /// Split a raw payload into `num_chunks` owned slices of `chunk_bytes`.
-    pub fn generate_chunks(&self) -> Vec<Vec<u8>> {
-        let raw = self.generate();
-        raw.chunks_exact(self.chunk_bytes)
-            .map(|chunk| chunk.to_vec())
-            .collect()
-    }
-
     fn value_bytes(&self, idx: usize, rng: &mut Rng) -> [u8; 8] {
         let item = self.item_size();
         let raw: u64 = match self.dist {
@@ -147,8 +131,7 @@ impl DataProfile {
     }
 }
 
-/// Format a byte count as a compact human-readable string (e.g. `64k`, `1m`).
-pub fn fmt_bytes(bytes: usize) -> String {
+fn fmt_bytes(bytes: usize) -> String {
     if bytes >= 1 << 20 {
         format!("{}m", bytes >> 20)
     } else if bytes >= 1 << 10 {
@@ -158,7 +141,7 @@ pub fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
-pub fn dtype_label(dtype: DType) -> &'static str {
+fn dtype_label(dtype: DType) -> &'static str {
     match dtype {
         DType::U8 => "u8",
         DType::I8 => "i8",
@@ -176,7 +159,7 @@ pub fn dtype_label(dtype: DType) -> &'static str {
 }
 
 /// SplitMix64 PRNG — deterministic, no std::time / rand dependency.
-pub struct Rng {
+struct Rng {
     state: u64,
 }
 

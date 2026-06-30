@@ -200,7 +200,11 @@ impl Drop for DataBankComputePool {
         self.request_tx.take();
         self.response_tx.take();
         self.wake_tx.take();
+        let current = thread::current().id();
         while let Some(handle) = self.threads.pop() {
+            if handle.thread().id() == current {
+                continue;
+            }
             let _ = handle.join();
         }
     }
@@ -437,5 +441,24 @@ mod tests {
             .expect("response completed");
         assert!(!nested_parallel);
         assert!(pool.should_parallelize(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn dropping_last_pool_reference_from_worker_does_not_self_join() {
+        let pool = Arc::new(DataBankComputePool::new(test_config(1)).expect("pool"));
+        let pool_in_job = Arc::clone(&pool);
+        let (done_tx, done_rx) = mpsc::channel();
+
+        pool.submit_response(Box::new(move || {
+            drop(pool_in_job);
+            done_tx.send(()).expect("done");
+            Ok(())
+        }))
+        .expect("submit response");
+        drop(pool);
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pool dropped from worker without self-join panic");
     }
 }

@@ -27,6 +27,13 @@ pub enum DataBankError {
     #[error("unsupported dtype {dtype:?} for {context}")]
     UnsupportedDType { dtype: DType, context: &'static str },
 
+    #[error("cannot cast {src:?} to {dst:?}: {reason}")]
+    CannotCast {
+        src: DType,
+        dst: DType,
+        reason: &'static str,
+    },
+
     #[error("cell index {cell} is out of range for {num_cells} cells")]
     CellIndexOutOfRange { cell: usize, num_cells: usize },
 

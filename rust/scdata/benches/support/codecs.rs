@@ -1,5 +1,5 @@
 //! Codec encode fixtures and decode helpers shared by the `modules`,
-//! `stress`, and `codec_manifest` benches.
+//! `stress`, and `codec_matrix` benches.
 //!
 //! These produce numcodecs-compatible encoded payloads so the benches can
 //! exercise the decode paths without going through the Python exporter.
@@ -9,7 +9,6 @@
 use std::ffi::CString;
 use std::io::{Cursor, Write};
 use std::os::raw::c_void;
-use std::sync::Arc;
 
 use _scdata::codecs::{
     BloscCodecConfig, BloscShuffle, CodecSpec, DecodeBuffer, LevelCodecConfig, Lz4CodecConfig,
@@ -181,15 +180,4 @@ fn blosc_encode_spec(raw: &[u8], config: &BloscCodecConfig) -> Vec<u8> {
     };
     let clevel = i32::from(config.clevel.unwrap_or(5));
     blosc_encode(raw, typesize, doshuffle, clevel, &config.cname)
-}
-
-/// Build a pipeline payload: `raw -> inner_codec -> crc32` prefix, matching a
-/// `[Crc32, inner]` decode-order pipeline.
-pub fn crc32_wrapped(inner_encoded: &[u8]) -> Vec<u8> {
-    crc32_encode(inner_encoded)
-}
-
-/// Shared zstd-encoded payload used across codec and pool benches.
-pub fn zstd_encoded_arc(raw: &[u8], level: i32) -> Arc<[u8]> {
-    Arc::from(zstd::encode_all(Cursor::new(raw), level).expect("zstd encode"))
 }

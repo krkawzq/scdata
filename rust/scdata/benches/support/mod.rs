@@ -1,14 +1,7 @@
-//! Shared benchmark infrastructure: timing harness, multi-threaded driver,
-//! environment helpers, and payload generators.
+//! Shared benchmark infrastructure.
 //!
-//! Each `[[bench]]` target declares `mod support;` and reuses the helpers
-//! here instead of carrying its own copy of the encode / chunk / mock-backend
-//! plumbing.
-//!
-//! `#![allow(dead_code)]` suppresses per-target unused warnings: every bench
-//! compiles `mod support` as its own crate, so a helper used only by the
-//! `stress` target looks dead to the `modules` target. The whole module is the
-//! shared bench toolbox, so unused-within-one-target members are expected.
+//! Bench targets are compiled as independent crates, so this module deliberately
+//! keeps a broad toolbox and allows per-target dead code.
 
 #![allow(dead_code)]
 
@@ -16,27 +9,30 @@ pub mod backends;
 pub mod chunks;
 pub mod codecs;
 pub mod data;
-pub mod manifest;
 
+use std::env;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
-/// Tunables parsed from the environment.
-///
-/// - `SCDATA_BENCH_WARMUPS` — warm-up rounds before timing (default 3).
-/// - `SCDATA_BENCH_ITERS`   — override per-benchmark iteration counts.
+use _scdata::profile::{
+    bytes_to_mib, ns_to_ms, ProfileConfig, ProfileMetricKind, ProfileRegistry, ProfileRuleSet,
+    ProfileRuntime, ProfileSnapshot,
+};
+
 #[derive(Debug, Clone, Copy)]
 pub struct BenchConfig {
     pub warmups: usize,
+    pub emit_profile: bool,
 }
 
 impl BenchConfig {
     pub fn from_env() -> Self {
         Self {
             warmups: env_usize("SCDATA_BENCH_WARMUPS").unwrap_or(3),
+            emit_profile: env_flag_default("SCDATA_BENCH_EMIT_PROFILE", true),
         }
     }
 
@@ -45,17 +41,57 @@ impl BenchConfig {
     }
 }
 
-/// Time a single-threaded closure, reporting ns/iter and optional throughput.
-///
-/// The closure returns a `usize` checksum that is folded into a black-box sink
-/// so the optimizer cannot elide the work.
+#[derive(Debug, Clone)]
+pub struct BenchReport {
+    pub name: String,
+    pub iterations: usize,
+    pub elapsed_ns: u64,
+    pub bytes_per_iter: Option<usize>,
+}
+
+impl BenchReport {
+    pub fn elapsed_s(&self) -> f64 {
+        self.elapsed_ns as f64 / 1_000_000_000.0
+    }
+
+    pub fn ns_per_iter(&self) -> f64 {
+        self.elapsed_ns as f64 / self.iterations as f64
+    }
+
+    pub fn throughput_mib_s(&self) -> Option<f64> {
+        self.bytes_per_iter.map(|bytes| {
+            bytes_to_mib((bytes as u64).saturating_mul(self.iterations as u64)) / self.elapsed_s()
+        })
+    }
+
+    pub fn print(&self) {
+        match self.throughput_mib_s() {
+            Some(mib_s) => println!(
+                "{:<54} iter={:<8} elapsed_s={:.6} ns_iter={:.1} throughput_mib_s={:.1}",
+                self.name,
+                self.iterations,
+                self.elapsed_s(),
+                self.ns_per_iter(),
+                mib_s
+            ),
+            None => println!(
+                "{:<54} iter={:<8} elapsed_s={:.6} ns_iter={:.1}",
+                self.name,
+                self.iterations,
+                self.elapsed_s(),
+                self.ns_per_iter()
+            ),
+        }
+    }
+}
+
 pub fn bench(
     config: BenchConfig,
     name: &str,
     default_iters: usize,
     bytes_per_iter: Option<usize>,
     mut body: impl FnMut() -> usize,
-) {
+) -> BenchReport {
     let iterations = config.iterations(default_iters);
     for _ in 0..config.warmups {
         black_box(body());
@@ -66,32 +102,92 @@ pub fn bench(
     for _ in 0..iterations {
         checksum ^= black_box(body());
     }
-    let elapsed = started.elapsed();
     black_box(checksum);
 
-    let seconds = elapsed.as_secs_f64();
-    let ns_per_iter = seconds * 1_000_000_000.0 / iterations as f64;
-    match bytes_per_iter {
-        Some(bytes) => {
-            let mib = bytes as f64 * iterations as f64 / (1024.0 * 1024.0);
-            println!(
-                "{name:<42} iter={iterations:<7} elapsed_s={seconds:.6} ns_iter={ns_per_iter:.1} throughput_mib_s={:.1}",
-                mib / seconds
-            );
-        }
-        None => {
-            println!(
-                "{name:<42} iter={iterations:<7} elapsed_s={seconds:.6} ns_iter={ns_per_iter:.1}"
-            );
-        }
-    }
+    let report = BenchReport {
+        name: name.to_string(),
+        iterations,
+        elapsed_ns: duration_ns(started.elapsed()),
+        bytes_per_iter,
+    };
+    report.print();
+    report
 }
 
-/// Multi-threaded stress driver.
-///
-/// Spawns `threads` workers behind a barrier, runs `body(thread_idx)` per
-/// iteration, and reports aggregate throughput plus thread scaling. `body`
-/// receives its thread index so per-thread offsets can avoid false sharing.
+pub fn bench_profiled(
+    config: BenchConfig,
+    name: &str,
+    default_iters: usize,
+    bytes_per_iter: Option<usize>,
+    runtime: &ProfileRuntime,
+    mut body: impl FnMut() -> usize,
+) -> ProfileSnapshot {
+    for _ in 0..config.warmups {
+        let round = runtime.start();
+        black_box(body());
+        black_box(round.end());
+    }
+
+    let iterations = config.iterations(default_iters);
+    let round = runtime.start();
+    let started = Instant::now();
+    let mut checksum = 0usize;
+    for _ in 0..iterations {
+        checksum ^= black_box(body());
+    }
+    black_box(checksum);
+    let snapshot = round.end();
+
+    let report = BenchReport {
+        name: name.to_string(),
+        iterations,
+        elapsed_ns: duration_ns(started.elapsed()),
+        bytes_per_iter,
+    };
+    report.print();
+    if config.emit_profile {
+        print_profile_snapshot(name, &snapshot);
+    }
+    snapshot
+}
+
+pub fn bench_existing_profile_round(
+    config: BenchConfig,
+    name: &str,
+    default_iters: usize,
+    bytes_per_iter: Option<usize>,
+    runtime: &ProfileRuntime,
+    mut body: impl FnMut() -> usize,
+) -> ProfileSnapshot {
+    for _ in 0..config.warmups {
+        runtime.reset_metrics();
+        black_box(body());
+        black_box(runtime.snapshot_and_reset());
+    }
+
+    runtime.reset_metrics();
+    let iterations = config.iterations(default_iters);
+    let started = Instant::now();
+    let mut checksum = 0usize;
+    for _ in 0..iterations {
+        checksum ^= black_box(body());
+    }
+    black_box(checksum);
+    let snapshot = runtime.snapshot_and_reset();
+
+    let report = BenchReport {
+        name: name.to_string(),
+        iterations,
+        elapsed_ns: duration_ns(started.elapsed()),
+        bytes_per_iter,
+    };
+    report.print();
+    if config.emit_profile {
+        print_profile_snapshot(name, &snapshot);
+    }
+    snapshot
+}
+
 pub fn stress_mt<F>(
     config: BenchConfig,
     name: &str,
@@ -99,7 +195,8 @@ pub fn stress_mt<F>(
     default_iters: usize,
     bytes_per_op: Option<usize>,
     body: F,
-) where
+) -> BenchReport
+where
     F: Fn(usize) -> usize + Send + Sync + 'static,
 {
     let threads = threads.max(1);
@@ -111,49 +208,148 @@ pub fn stress_mt<F>(
     }
 
     let barrier = Arc::new(Barrier::new(threads));
-    let start = Instant::now();
-    let handles: Vec<_> = (0..threads)
-        .map(|t| {
+    let started = Instant::now();
+    let handles = (0..threads)
+        .map(|thread_idx| {
             let body = Arc::clone(&body);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                let mut sum = 0usize;
+                let mut checksum = 0usize;
                 for _ in 0..iters_per_thread {
-                    sum ^= black_box(body(t));
+                    checksum ^= black_box(body(thread_idx));
                 }
-                sum
+                checksum
             })
         })
-        .collect();
-    let checksum: usize = handles
+        .collect::<Vec<_>>();
+
+    let checksum = handles
         .into_iter()
-        .map(|h| h.join().expect("stress thread"))
-        .fold(0, |a, b| a ^ b);
+        .map(|handle| handle.join().expect("bench worker"))
+        .fold(0usize, |acc, item| acc ^ item);
     black_box(checksum);
 
-    let elapsed = start.elapsed();
-    let total_ops = iters_per_thread * threads;
-    let seconds = elapsed.as_secs_f64();
-    let ns_per_op = seconds * 1_000_000_000.0 / total_ops as f64;
-    let kops = total_ops as f64 / seconds / 1000.0;
-    match bytes_per_op {
-        Some(b) => {
-            let mib = b as f64 * total_ops as f64 / (1024.0 * 1024.0);
-            println!(
-                "{name:<50} threads={threads:<3} ops={total_ops:<9} elapsed_s={seconds:.4} ns_op={ns_per_op:.1} throughput_mib_s={:.1} kops={kops:.1}",
-                mib / seconds
-            );
-        }
-        None => println!(
-            "{name:<50} threads={threads:<3} ops={total_ops:<9} elapsed_s={seconds:.4} ns_op={ns_per_op:.1} kops={kops:.1}"
-        ),
+    let report = BenchReport {
+        name: format!("{name}/t{threads}"),
+        iterations: iters_per_thread * threads,
+        elapsed_ns: duration_ns(started.elapsed()),
+        bytes_per_iter: bytes_per_op,
+    };
+    report.print();
+    report
+}
+
+pub fn profile_runtime(
+    label: impl Into<String>,
+    registry: impl FnOnce() -> ProfileRegistry,
+) -> ProfileRuntime {
+    ProfileRuntime::new_lazy(
+        ProfileConfig::enabled(label)
+            .with_components(ProfileRuleSet::all())
+            .with_scopes(ProfileRuleSet::all()),
+        registry,
+    )
+}
+
+pub fn selected_scope_profile_runtime(
+    label: impl Into<String>,
+    scopes: impl IntoIterator<Item = impl Into<String>>,
+    registry: impl FnOnce() -> ProfileRegistry,
+) -> ProfileRuntime {
+    let mut rules = ProfileRuleSet::none();
+    for scope in scopes {
+        rules.enable(scope);
+    }
+    ProfileRuntime::new_lazy(
+        ProfileConfig::enabled(label)
+            .with_components(ProfileRuleSet::all())
+            .with_scopes(rules),
+        registry,
+    )
+}
+
+pub fn disabled_profile_runtime(registry: impl FnOnce() -> ProfileRegistry) -> ProfileRuntime {
+    ProfileRuntime::new_lazy(ProfileConfig::disabled(), registry)
+}
+
+pub fn print_profile_snapshot(case: &str, snapshot: &ProfileSnapshot) {
+    println!("profile/{case} {}", snapshot.summary_line());
+    for metric in snapshot.metrics.iter().filter(|metric| metric.value() > 0) {
+        println!(
+            "  {}",
+            format_metric(
+                metric.id.scope.full_name(),
+                metric.id.name,
+                metric.kind(),
+                metric.value()
+            )
+        );
     }
 }
 
-/// Deterministic pseudo-random payload with mixed entropy and periodic zero
-/// runs (every 17th byte). Exercises both compressible and incompressible
-/// regions of every codec under test.
+pub fn maybe_print_profile_snapshot(config: BenchConfig, case: &str, snapshot: &ProfileSnapshot) {
+    if config.emit_profile {
+        print_profile_snapshot(case, snapshot);
+    }
+}
+
+pub fn metric_value(snapshot: &ProfileSnapshot, scope: &str, name: &str) -> u64 {
+    snapshot
+        .metrics
+        .iter()
+        .find(|metric| metric.id.scope.full_name() == scope && metric.id.name == name)
+        .map(|metric| metric.value())
+        .unwrap_or(0)
+}
+
+fn format_metric(scope: String, name: &str, kind: ProfileMetricKind, value: u64) -> String {
+    let key = format!("{scope}.{name}").replace(['.', '-'], "_");
+    match kind {
+        ProfileMetricKind::DurationNs => format!("{key}_ms={:.3}", ns_to_ms(value)),
+        ProfileMetricKind::Bytes => format!("{key}_mib={:.3}", bytes_to_mib(value)),
+        ProfileMetricKind::Count | ProfileMetricKind::Gauge | ProfileMetricKind::Custom(_) => {
+            format!("{key}={value}")
+        }
+        _ => format!("{key}={value}"),
+    }
+}
+
+pub struct ProfileEnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl ProfileEnvGuard {
+    pub fn enabled(label: &str) -> Self {
+        let keys = [
+            "SCDATA_PROFILE",
+            "SCDATA_PROFILE_LABEL",
+            "SCDATA_PROFILE_COMPONENTS",
+            "SCDATA_PROFILE_SCOPES",
+        ];
+        let saved = keys
+            .into_iter()
+            .map(|key| (key, env::var(key).ok()))
+            .collect::<Vec<_>>();
+        env::set_var("SCDATA_PROFILE", "1");
+        env::set_var("SCDATA_PROFILE_LABEL", label);
+        env::set_var("SCDATA_PROFILE_COMPONENTS", "all");
+        env::set_var("SCDATA_PROFILE_SCOPES", "all");
+        Self { saved }
+    }
+}
+
+impl Drop for ProfileEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+    }
+}
+
 pub fn payload(len: usize) -> Vec<u8> {
     (0..len)
         .map(|idx| {
@@ -170,9 +366,6 @@ pub fn payload(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Scratch directory for bench-generated data files, under the crate's
-/// `target/bench-data` so it stays out of the source tree and survives across
-/// bench targets in one run.
 pub fn bench_data_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -182,29 +375,21 @@ pub fn bench_data_dir() -> PathBuf {
 }
 
 pub fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
+    env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
 }
 
-pub fn env_u32(name: &str) -> Option<u32> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-}
-
-pub fn env_i32(name: &str) -> Option<i32> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-}
-
-pub fn env_flag(name: &str) -> bool {
-    match std::env::var(name) {
+pub fn env_flag_default(name: &str, default: bool) -> bool {
+    match env::var(name) {
         Ok(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
         ),
-        Err(_) => false,
+        Err(_) => default,
     }
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }

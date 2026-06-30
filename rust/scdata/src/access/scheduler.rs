@@ -16,17 +16,25 @@ use tokio::task::{JoinError, JoinSet, LocalSet};
 #[cfg(test)]
 use super::backend::FileRef;
 use super::backend::{DecodeBackend, DecodeTask, IoBackend, IoTask};
-use super::cache::{CachePayload, CachePayloadKind, ChunkCache, PinGuard, PinnedChunk};
+use super::cache::{
+    CacheInsertErrorKind, CachePayload, CachePayloadKind, ChunkCache, PinGuard, PinnedChunk,
+};
 use super::cpu::{AccessCpuConfig, AccessCpuPool};
 use super::error::AccessError;
 use super::inflight::{InflightTable, RegisterResult};
 use super::key::{shard_for_key, ChunkKey, DecodeKey};
 use super::membudget::MemBudget;
+use super::profile::{
+    AccessCacheHitKind, AccessCacheInsertFailureKind, AccessCommandKind, AccessCommandRejectKind,
+    AccessProfile, ACCESS_DECODE_SCOPE, ACCESS_INFLIGHT_SCOPE, ACCESS_IO_SCOPE,
+    ACCESS_MATERIALIZE_SCOPE, ACCESS_RESERVE_SCOPE,
+};
 use super::scheduled::{ScheduledStage, ScheduledStore, StagedBytes};
 #[cfg(test)]
 use super::slice::RangeCopy;
 use super::slice::{SlicePlan, SliceSpec};
 use crate::codecs::{CodecError, SharedCodec};
+use crate::profile::{ProfileSnapshot, ProfileTimer};
 
 type StateHandle = Rc<RefCell<SchedulerState>>;
 
@@ -37,6 +45,7 @@ struct SchedulerDeps {
     io: Arc<dyn IoBackend>,
     decode: Arc<dyn DecodeBackend>,
     cpu: Arc<AccessCpuPool>,
+    profile: AccessProfile,
     priority: u8,
     keep_decoded: bool,
 }
@@ -166,6 +175,9 @@ pub struct AccessConfig {
     pub keep_decoded: bool,
     /// CPU worker pool used for access-side copy, scatter-copy, and ready work.
     pub cpu: AccessCpuConfig,
+    /// Optional shared profiler for access-layer events. Disabled by default
+    /// unless `SCDATA_PROFILE` is enabled in the environment.
+    pub profile: AccessProfile,
 }
 
 impl Default for AccessConfig {
@@ -178,6 +190,7 @@ impl Default for AccessConfig {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: AccessCpuConfig::default(),
+            profile: AccessProfile::from_env(),
         }
     }
 }
@@ -266,10 +279,31 @@ pub struct AccessHandle {
 
 #[derive(Debug)]
 struct AccessHandleInner {
-    shards: Vec<flume::Sender<AccessCommand>>,
+    shards: Vec<flume::Sender<AccessCommandEnvelope>>,
+    profile: AccessProfile,
 }
 
 impl AccessHandle {
+    /// Return the profiler shared by all access scheduler shards.
+    pub fn profiler(&self) -> AccessProfile {
+        self.inner.profile.clone()
+    }
+
+    /// Snapshot access scheduler profile metrics.
+    pub fn profile_snapshot(&self) -> ProfileSnapshot {
+        self.inner.profile.snapshot()
+    }
+
+    /// Snapshot and reset access scheduler profile metrics.
+    pub fn profile_snapshot_and_reset(&self) -> ProfileSnapshot {
+        self.inner.profile.snapshot_and_reset()
+    }
+
+    /// Reset access scheduler profile metrics.
+    pub fn reset_profile(&self) {
+        self.inner.profile.reset_metrics();
+    }
+
     /// Submit a request, blocking while the bounded queue is full.
     pub fn send(&self, request: AccessRequest) -> Result<(), AccessError> {
         self.send_command(AccessCommand::Read(request))
@@ -352,28 +386,52 @@ impl AccessHandle {
 
     fn send_command(&self, command: AccessCommand) -> Result<(), AccessError> {
         let shard = self.shard_for_key(command.key());
-        self.inner.shards[shard]
-            .send(command)
-            .map_err(|_| AccessError::Shutdown)
+        let envelope = AccessCommandEnvelope::new(command, &self.inner.profile);
+        match self.inner.shards[shard].send(envelope) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.inner
+                    .profile
+                    .record_command_rejected(AccessCommandRejectKind::Shutdown);
+                Err(AccessError::Shutdown)
+            }
+        }
     }
 
     async fn send_command_async(&self, command: AccessCommand) -> Result<(), AccessError> {
         let shard = self.shard_for_key(command.key());
-        self.inner.shards[shard]
-            .send_async(command)
-            .await
-            .map_err(|_| AccessError::Shutdown)
+        let envelope = AccessCommandEnvelope::new(command, &self.inner.profile);
+        match self.inner.shards[shard].send_async(envelope).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.inner
+                    .profile
+                    .record_command_rejected(AccessCommandRejectKind::Shutdown);
+                Err(AccessError::Shutdown)
+            }
+        }
     }
 
     fn try_send_command(&self, command: AccessCommand) -> Result<(), AccessError> {
         let shard = self.shard_for_key(command.key());
+        let envelope = AccessCommandEnvelope::new(command, &self.inner.profile);
         self.inner.shards[shard]
-            .try_send(command)
+            .try_send(envelope)
             .map_err(|err| match err {
-                TrySendError::Full(_) => AccessError::QueueFull {
-                    capacity: self.inner.shards[shard].capacity().unwrap_or(0),
-                },
-                TrySendError::Disconnected(_) => AccessError::Shutdown,
+                TrySendError::Full(_) => {
+                    self.inner
+                        .profile
+                        .record_command_rejected(AccessCommandRejectKind::QueueFull);
+                    AccessError::QueueFull {
+                        capacity: self.inner.shards[shard].capacity().unwrap_or(0),
+                    }
+                }
+                TrySendError::Disconnected(_) => {
+                    self.inner
+                        .profile
+                        .record_command_rejected(AccessCommandRejectKind::Shutdown);
+                    AccessError::Shutdown
+                }
             })
     }
 
@@ -740,6 +798,7 @@ impl AccessScheduler {
         let io: Arc<dyn IoBackend> = Arc::from(io);
         let decode: Arc<dyn DecodeBackend> = Arc::from(decode);
         let cpu = Arc::new(AccessCpuPool::new(config.cpu.clone())?);
+        let profile = config.profile.clone();
         let shard_count = config.scheduler_shards;
         let mut shards = Vec::with_capacity(shard_count);
 
@@ -768,8 +827,22 @@ impl AccessScheduler {
         }
 
         Ok(AccessHandle {
-            inner: Arc::new(AccessHandleInner { shards }),
+            inner: Arc::new(AccessHandleInner { shards, profile }),
         })
+    }
+}
+
+struct AccessCommandEnvelope {
+    command: AccessCommand,
+    queued_at: ProfileTimer,
+}
+
+impl AccessCommandEnvelope {
+    fn new(command: AccessCommand, profile: &AccessProfile) -> Self {
+        Self {
+            command,
+            queued_at: profile.command_timer(),
+        }
     }
 }
 
@@ -792,6 +865,18 @@ impl AccessCommand {
             Self::ScheduledEnsureReady(request) => request.item.key,
             Self::ScheduledTake(request) => request.item.key,
             Self::ScheduledCancel(request) => request.key,
+        }
+    }
+
+    #[inline]
+    fn profile_kind(&self) -> AccessCommandKind {
+        match self {
+            Self::Read(_) => AccessCommandKind::Read,
+            Self::Prefetch(_) => AccessCommandKind::Prefetch,
+            Self::ScheduledDecode(_) => AccessCommandKind::ScheduledDecode,
+            Self::ScheduledEnsureReady(_) => AccessCommandKind::ScheduledEnsureReady,
+            Self::ScheduledTake(_) => AccessCommandKind::ScheduledTake,
+            Self::ScheduledCancel(_) => AccessCommandKind::ScheduledCancel,
         }
     }
 }
@@ -845,7 +930,7 @@ impl SchedulerState {
 }
 
 async fn run_scheduler(
-    rx: flume::Receiver<AccessCommand>,
+    rx: flume::Receiver<AccessCommandEnvelope>,
     config: AccessConfig,
     io: Arc<dyn IoBackend>,
     decode: Arc<dyn DecodeBackend>,
@@ -856,6 +941,7 @@ async fn run_scheduler(
         io,
         decode,
         cpu,
+        profile: config.profile.clone(),
         priority: config.default_io_priority,
         keep_decoded: config.keep_decoded,
     };
@@ -892,21 +978,27 @@ fn spawn_command(
     tasks: &mut JoinSet<()>,
     state: StateHandle,
     deps: &SchedulerDeps,
-    command: AccessCommand,
+    envelope: AccessCommandEnvelope,
 ) {
+    let AccessCommandEnvelope { command, queued_at } = envelope;
+    deps.profile
+        .record_command(queued_at, command.profile_kind());
+
     match command {
-        AccessCommand::Prefetch(request) => match try_prefetch_inline(&state, request) {
-            Ok(()) => {}
-            Err(request) => {
-                tasks.spawn_local(handle_command(
-                    state,
-                    deps.clone(),
-                    AccessCommand::Prefetch(request),
-                ));
+        AccessCommand::Prefetch(request) => {
+            match try_prefetch_inline(&state, &deps.profile, request) {
+                Ok(()) => {}
+                Err(request) => {
+                    tasks.spawn_local(handle_command(
+                        state,
+                        deps.clone(),
+                        AccessCommand::Prefetch(request),
+                    ));
+                }
             }
-        },
+        }
         AccessCommand::ScheduledDecode(request) => {
-            if try_scheduled_decode_inline(&state, &request) {
+            if try_scheduled_decode_inline(&state, &deps.profile, &request) {
                 return;
             }
 
@@ -920,7 +1012,7 @@ fn spawn_command(
             }
         }
         AccessCommand::ScheduledEnsureReady(request) => {
-            match try_scheduled_ensure_ready_inline(&state, &request) {
+            match try_scheduled_ensure_ready_inline(&state, &deps.profile, &request) {
                 EnsureInline::Handled => {}
                 EnsureInline::NeedsAsync => {
                     tasks.spawn_local(handle_scheduled_ensure_ready(
@@ -941,18 +1033,20 @@ fn spawn_command(
                 }
             }
         }
-        AccessCommand::ScheduledTake(request) => match try_scheduled_take_inline(&state, request) {
-            Ok(()) => {}
-            Err(request) => {
-                tasks.spawn_local(handle_command(
-                    state,
-                    deps.clone(),
-                    AccessCommand::ScheduledTake(request),
-                ));
+        AccessCommand::ScheduledTake(request) => {
+            match try_scheduled_take_inline(&state, &deps.profile, request) {
+                Ok(()) => {}
+                Err(request) => {
+                    tasks.spawn_local(handle_command(
+                        state,
+                        deps.clone(),
+                        AccessCommand::ScheduledTake(request),
+                    ));
+                }
             }
-        },
+        }
         AccessCommand::ScheduledCancel(request) => {
-            cancel_scheduled(&state, request.id);
+            cancel_scheduled(&state, &deps.profile, request.id);
         }
         command => {
             tasks.spawn_local(handle_command(state, deps.clone(), command));
@@ -960,7 +1054,14 @@ fn spawn_command(
     }
 }
 
-fn try_scheduled_decode_inline(state: &StateHandle, request: &ScheduledDecodeRequest) -> bool {
+fn try_scheduled_decode_inline(
+    state: &StateHandle,
+    profile: &AccessProfile,
+    request: &ScheduledDecodeRequest,
+) -> bool {
+    let mut cache_hit = None;
+    let mut decode_cached = false;
+    let mut identity_decode = false;
     let mut state_ref = state.borrow_mut();
     if state_ref.scheduled.contains(&request.id) {
         return true;
@@ -971,65 +1072,112 @@ fn try_scheduled_decode_inline(state: &StateHandle, request: &ScheduledDecodeReq
         &request.item.codec,
         request.item.expected_size,
     );
-    state_ref
-        .cache
-        .pin_and_get(&request.item.key)
-        .is_some_and(|pinned| {
-            if is_matching_decoded(&pinned, decode_key) {
-                state_ref
-                    .scheduled
-                    .insert(request.id, ScheduledStage::Complete);
-                return true;
-            }
-            if pinned.kind == CachePayloadKind::Raw && request.item.codec.is_identity() {
-                let stage = match validate_identity_decoded_size(
-                    &request.item.codec,
-                    pinned.data.len(),
-                    request.item.expected_size,
-                ) {
-                    Ok(()) => ScheduledStage::Complete,
-                    Err(err) => ScheduledStage::Failed(err.to_string()),
-                };
-                state_ref.scheduled.insert(request.id, stage);
-                return true;
-            }
+    let handled = if state_ref.cache.pin_decoded(&decode_key).is_some() {
+        cache_hit = Some(AccessCacheHitKind::Decoded);
+        decode_cached = true;
+        state_ref
+            .scheduled
+            .insert(request.id, ScheduledStage::Complete);
+        true
+    } else if let Some(pinned) = state_ref.cache.pin_raw(&request.item.key) {
+        if request.item.codec.is_identity() {
+            cache_hit = Some(AccessCacheHitKind::Raw);
+            identity_decode = true;
+            let stage = match validate_identity_decoded_size(
+                &request.item.codec,
+                pinned.data.len(),
+                request.item.expected_size,
+            ) {
+                Ok(()) => ScheduledStage::Complete,
+                Err(err) => ScheduledStage::Failed(err.to_string()),
+            };
+            state_ref.scheduled.insert(request.id, stage);
+            true
+        } else {
             false
-        })
+        }
+    } else {
+        false
+    };
+    drop(state_ref);
+
+    if let Some(kind) = cache_hit {
+        profile.record_cache_hit(kind);
+    }
+    if decode_cached {
+        profile.record_decode_cached();
+    }
+    if identity_decode {
+        profile.record_identity_decode();
+    }
+    handled
 }
 
-fn register_decode_waiter_after_raw_load(state: &StateHandle, item: &AccessItem) -> DecodeRegister {
-    register_decode_waiter_inner(state, item, false)
+fn register_decode_waiter_after_raw_load(
+    state: &StateHandle,
+    profile: &AccessProfile,
+    item: &AccessItem,
+) -> DecodeRegister {
+    register_decode_waiter_inner(state, profile, item, false)
 }
 
 #[cfg(test)]
 fn register_decode_waiter(state: &StateHandle, item: &AccessItem) -> DecodeRegister {
-    register_decode_waiter_inner(state, item, true)
+    register_decode_waiter_inner(state, &AccessProfile::disabled(), item, true)
 }
 
 fn register_decode_waiter_inner(
     state: &StateHandle,
+    profile: &AccessProfile,
     item: &AccessItem,
     check_cache: bool,
 ) -> DecodeRegister {
-    let mut state_ref = state.borrow_mut();
+    enum RegisterAction {
+        Ready(PinnedChunk),
+        Wait(OwnedNotified),
+        First(DecodeKey),
+    }
+
     let key = DecodeKey::new(item.key, &item.codec, item.expected_size);
-    if check_cache {
-        if let Some(pinned) = state_ref.cache.pin_and_get(&item.key) {
-            if is_matching_decoded(&pinned, key) {
-                return DecodeRegister::Ready(pinned);
+
+    let action = {
+        let mut state_ref = state.borrow_mut();
+        if check_cache {
+            if let Some(pinned) = state_ref.cache.pin_decoded(&key) {
+                RegisterAction::Ready(pinned)
+            } else if let Some(notify) = state_ref.decode_inflight.get(&key) {
+                RegisterAction::Wait(Arc::clone(notify).notified_owned())
+            } else {
+                state_ref
+                    .decode_inflight
+                    .insert(key.clone(), Arc::new(Notify::new()));
+                RegisterAction::First(key)
             }
-            drop(pinned);
+        } else if let Some(notify) = state_ref.decode_inflight.get(&key) {
+            RegisterAction::Wait(Arc::clone(notify).notified_owned())
+        } else {
+            state_ref
+                .decode_inflight
+                .insert(key.clone(), Arc::new(Notify::new()));
+            RegisterAction::First(key)
+        }
+    };
+
+    match action {
+        RegisterAction::Ready(pinned) => {
+            profile.record_cache_hit(AccessCacheHitKind::Decoded);
+            profile.record_decode_cached();
+            DecodeRegister::Ready(pinned)
+        }
+        RegisterAction::Wait(notify) => DecodeRegister::Wait {
+            notify,
+            started: profile.timer(ACCESS_DECODE_SCOPE),
+        },
+        RegisterAction::First(key) => {
+            profile.record_decode_first();
+            DecodeRegister::First(key)
         }
     }
-
-    if let Some(notify) = state_ref.decode_inflight.get(&key) {
-        return DecodeRegister::Wait(Arc::clone(notify).notified_owned());
-    }
-
-    state_ref
-        .decode_inflight
-        .insert(key, Arc::new(Notify::new()));
-    DecodeRegister::First(key)
 }
 
 enum EnsureInline {
@@ -1058,16 +1206,38 @@ fn inline_staged_action(data: &StagedBytes, slice: &SliceSpec) -> InlineStagedAc
 
 fn try_prefetch_inline(
     state: &StateHandle,
+    profile: &AccessProfile,
     request: PrefetchRequest,
 ) -> Result<(), PrefetchRequest> {
-    let result = {
+    enum PrefetchInline {
+        Hit,
+        TooLarge,
+        NeedsAsync,
+    }
+
+    let action = {
         let state_ref = state.borrow();
         if state_ref.cache.contains_raw(&request.key) {
-            Some(Ok(()))
+            PrefetchInline::Hit
         } else if request.key.len > state_ref.cache.capacity() {
-            Some(Err(AccessError::OutOfMemory))
+            PrefetchInline::TooLarge
         } else {
-            None
+            PrefetchInline::NeedsAsync
+        }
+    };
+
+    let result = {
+        match action {
+            PrefetchInline::Hit => {
+                profile.record_cache_hit(AccessCacheHitKind::Raw);
+                Some(Ok(()))
+            }
+            PrefetchInline::TooLarge => {
+                profile.record_cache_miss();
+                profile.record_cache_too_large();
+                Some(Err(AccessError::OutOfMemory))
+            }
+            PrefetchInline::NeedsAsync => None,
         }
     };
 
@@ -1081,8 +1251,10 @@ fn try_prefetch_inline(
 
 fn try_scheduled_ensure_ready_inline(
     state: &StateHandle,
+    profile: &AccessProfile,
     request: &ScheduledEnsureReadyRequest,
 ) -> EnsureInline {
+    let mut materialize_record = None;
     let mut state_ref = state.borrow_mut();
     let action = match state_ref.scheduled.get(&request.id) {
         None => return EnsureInline::Missing,
@@ -1108,9 +1280,14 @@ fn try_scheduled_ensure_ready_inline(
                 bytes,
             }) = state_ref.scheduled.remove(&request.id)
             {
+                materialize_record = Some((bytes, false));
                 state_ref
                     .scheduled
                     .insert(request.id, ScheduledStage::Ready { data, bytes });
+            }
+            drop(state_ref);
+            if let Some((bytes, error)) = materialize_record {
+                profile.record_materialize(ProfileTimer::disabled(), bytes, error);
             }
             EnsureInline::Handled
         }
@@ -1123,6 +1300,8 @@ fn try_scheduled_ensure_ready_inline(
             state_ref
                 .scheduled
                 .insert(request.id, ScheduledStage::Failed(err.to_string()));
+            drop(state_ref);
+            profile.record_materialize(ProfileTimer::disabled(), 0, true);
             EnsureInline::Handled
         }
         InlineStagedAction::NeedsAsync => EnsureInline::NeedsAsync,
@@ -1140,8 +1319,10 @@ enum TakeInlineAction {
 
 fn try_scheduled_take_inline(
     state: &StateHandle,
+    profile: &AccessProfile,
     request: ScheduledTakeRequest,
 ) -> Result<(), ScheduledTakeRequest> {
+    let mut materialize_record = None;
     let result = {
         let mut state_ref = state.borrow_mut();
         let action = match state_ref.scheduled.get(&request.id) {
@@ -1180,6 +1361,7 @@ fn try_scheduled_take_inline(
                 }) = state_ref.scheduled.remove(&request.id)
                 {
                     state_ref.budget.release(bytes);
+                    materialize_record = Some((bytes, false));
                     Some(Ok(data))
                 } else {
                     None
@@ -1191,6 +1373,7 @@ fn try_scheduled_take_inline(
                 {
                     state_ref.budget.release(bytes);
                 }
+                materialize_record = Some((0, true));
                 Some(Err(err))
             }
             TakeInlineAction::FailedMessage(message) => {
@@ -1206,6 +1389,10 @@ fn try_scheduled_take_inline(
             TakeInlineAction::NeedsAsync => None,
         }
     };
+
+    if let Some((bytes, error)) = materialize_record {
+        profile.record_materialize(ProfileTimer::disabled(), bytes, error);
+    }
 
     if let Some(result) = result {
         send_reply(request.reply, result);
@@ -1230,6 +1417,7 @@ async fn handle_command(state: StateHandle, deps: SchedulerDeps, command: Access
                 deps.io.as_ref(),
                 deps.decode.as_ref(),
                 deps.cpu.as_ref(),
+                &deps.profile,
                 item,
                 deps.priority,
                 deps.keep_decoded,
@@ -1238,7 +1426,14 @@ async fn handle_command(state: StateHandle, deps: SchedulerDeps, command: Access
             send_reply(reply, result);
         }
         AccessCommand::Prefetch(request) => {
-            let result = prefetch_key(state, deps.io.as_ref(), request.key, deps.priority).await;
+            let result = prefetch_key(
+                state,
+                deps.io.as_ref(),
+                &deps.profile,
+                request.key,
+                deps.priority,
+            )
+            .await;
             send_prefetch_reply(request.reply, result);
         }
         AccessCommand::ScheduledTake(request) => {
@@ -1251,17 +1446,20 @@ async fn handle_command(state: StateHandle, deps: SchedulerDeps, command: Access
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn access_item(
     state: StateHandle,
     io: &dyn IoBackend,
     decode: &dyn DecodeBackend,
     cpu: &AccessCpuPool,
+    profile: &AccessProfile,
     item: AccessItem,
     priority: u8,
     keep_decoded: bool,
 ) -> Result<Vec<u8>, AccessError> {
-    let decoded = decoded_item_data(state, io, decode, &item, priority, keep_decoded).await?;
-    materialize_decoded(cpu, decoded, &item.slice).await
+    let decoded =
+        decoded_item_data(state, io, decode, profile, &item, priority, keep_decoded).await?;
+    materialize_decoded(profile, cpu, decoded, &item.slice).await
 }
 
 enum DecodedOutput {
@@ -1302,12 +1500,23 @@ enum MaterializeSource {
 }
 
 async fn materialize_decoded(
+    profile: &AccessProfile,
     cpu: &AccessCpuPool,
     decoded: DecodedOutput,
     slice: &SliceSpec,
 ) -> Result<Vec<u8>, AccessError> {
-    let plan = slice.plan(decoded.as_slice().len())?;
-    materialize_decoded_planned(cpu, decoded, plan).await
+    let started = profile.timer(ACCESS_MATERIALIZE_SCOPE);
+    let result = async {
+        let plan = slice.plan(decoded.as_slice().len())?;
+        materialize_decoded_planned(cpu, decoded, plan).await
+    }
+    .await;
+    profile.record_materialize(
+        started,
+        result.as_ref().map_or(0, Vec::len),
+        result.is_err(),
+    );
+    result
 }
 
 async fn materialize_decoded_planned(
@@ -1353,6 +1562,7 @@ async fn decoded_item_data(
     state: StateHandle,
     io: &dyn IoBackend,
     decode: &dyn DecodeBackend,
+    profile: &AccessProfile,
     item: &AccessItem,
     priority: u8,
     keep_decoded: bool,
@@ -1362,19 +1572,22 @@ async fn decoded_item_data(
         let chunk = load_chunk(
             Rc::clone(&state),
             io,
+            profile,
             item.key,
             priority,
             true,
-            CacheUse::RawOrDecoded(decode_key),
+            CacheUse::RawOrDecoded(decode_key.clone()),
         )
         .await?;
 
         match chunk.kind {
             CachePayloadKind::Decoded => {
+                profile.record_decode_cached();
                 return Ok(chunk.into_decoded_output());
             }
             CachePayloadKind::Raw => {
                 if item.codec.is_identity() {
+                    profile.record_identity_decode();
                     validate_identity_decoded_size(
                         &item.codec,
                         chunk.data.len(),
@@ -1384,33 +1597,49 @@ async fn decoded_item_data(
                 }
 
                 if !keep_decoded {
+                    let started = profile.timer(ACCESS_DECODE_SCOPE);
                     let decode_task: DecodeTask = decode.submit_decode(
                         Arc::clone(&item.codec),
                         Arc::clone(&chunk.data),
                         item.expected_size,
                     );
-                    let decoded = decode_task.await?;
+                    let decoded = decode_task.await;
+                    profile.record_decode(
+                        started,
+                        chunk.data.len(),
+                        decoded.as_ref().ok().map(Vec::len),
+                        decoded.is_err(),
+                    );
+                    let decoded = decoded?;
                     return Ok(DecodedOutput::Owned(decoded));
                 }
 
-                match register_decode_waiter_after_raw_load(&state, item) {
+                match register_decode_waiter_after_raw_load(&state, profile, item) {
                     DecodeRegister::Ready(pinned) => {
                         return Ok(DecodedOutput::Shared {
                             data: pinned.data,
                             _guard: Some(DecodedGuard::Pin { _pin: pinned.guard }),
                         });
                     }
-                    DecodeRegister::Wait(wait) => {
+                    DecodeRegister::Wait { notify, started } => {
                         drop(chunk);
-                        wait.await;
+                        notify.await;
+                        profile.record_decode_waiter(started);
                     }
                     DecodeRegister::First(key) => {
+                        let started = profile.timer(ACCESS_DECODE_SCOPE);
                         let decode_task: DecodeTask = decode.submit_decode(
                             Arc::clone(&item.codec),
                             Arc::clone(&chunk.data),
                             item.expected_size,
                         );
                         let decoded = decode_task.await;
+                        profile.record_decode(
+                            started,
+                            chunk.data.len(),
+                            decoded.as_ref().ok().map(Vec::len),
+                            decoded.is_err(),
+                        );
                         drop(chunk);
 
                         let decoded = match decoded {
@@ -1425,9 +1654,10 @@ async fn decoded_item_data(
                         let result = if let Some(pinned) = try_cache_decoded(
                             Rc::clone(&state),
                             item.key,
-                            key,
+                            key.clone(),
                             Arc::clone(&item.codec),
                             Arc::clone(&decoded),
+                            profile,
                         )
                         .await
                         {
@@ -1436,6 +1666,7 @@ async fn decoded_item_data(
                                 _guard: Some(DecodedGuard::Pin { _pin: pinned.guard }),
                             })
                         } else {
+                            profile.record_uncached_fallback();
                             Ok(DecodedOutput::Shared {
                                 data: decoded,
                                 _guard: None,
@@ -1452,7 +1683,10 @@ async fn decoded_item_data(
 
 enum DecodeRegister {
     Ready(PinnedChunk),
-    Wait(OwnedNotified),
+    Wait {
+        notify: OwnedNotified,
+        started: ProfileTimer,
+    },
     First(DecodeKey),
 }
 
@@ -1463,23 +1697,23 @@ fn finish_decode_waiter(state: &StateHandle, key: &DecodeKey) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum CacheUse {
     RawOnly,
     RawOrDecoded(DecodeKey),
 }
 
-fn is_usable_cached_chunk(pinned: &PinnedChunk, cache_use: CacheUse) -> bool {
+fn pin_cached_chunk(
+    cache: &ChunkCache,
+    key: &ChunkKey,
+    cache_use: &CacheUse,
+) -> Option<PinnedChunk> {
     match cache_use {
-        CacheUse::RawOnly => pinned.kind == CachePayloadKind::Raw,
+        CacheUse::RawOnly => cache.pin_raw(key),
         CacheUse::RawOrDecoded(decode_key) => {
-            pinned.kind == CachePayloadKind::Raw || is_matching_decoded(pinned, decode_key)
+            cache.pin_decoded(decode_key).or_else(|| cache.pin_raw(key))
         }
     }
-}
-
-fn is_matching_decoded(pinned: &PinnedChunk, decode_key: DecodeKey) -> bool {
-    pinned.kind == CachePayloadKind::Decoded && pinned.decode_key == Some(decode_key)
 }
 
 fn validate_identity_decoded_size(
@@ -1597,37 +1831,48 @@ impl MemoryReservation {
 async fn load_chunk(
     state: StateHandle,
     io: &dyn IoBackend,
+    profile: &AccessProfile,
     key: ChunkKey,
     priority: u8,
     allow_uncached: bool,
     cache_use: CacheUse,
 ) -> Result<LoadedChunk, AccessError> {
     loop {
+        let mut cache_hit = None;
+        let mut cache_miss = false;
+        let mut inflight_first = false;
         let action = {
             let mut state = state.borrow_mut();
-            if let Some(pinned) = state.cache.pin_and_get(&key) {
-                if is_usable_cached_chunk(&pinned, cache_use) {
-                    LoadAction::Hit(pinned)
-                } else {
-                    drop(pinned);
-                    match state.inflight.try_register(key) {
-                        RegisterResult::First => LoadAction::Read,
-                        RegisterResult::Waiter(notify) => LoadAction::Wait(notify),
-                    }
-                }
+            if let Some(pinned) = pin_cached_chunk(&state.cache, &key, &cache_use) {
+                cache_hit = Some(match pinned.kind {
+                    CachePayloadKind::Raw => AccessCacheHitKind::Raw,
+                    CachePayloadKind::Decoded => AccessCacheHitKind::Decoded,
+                });
+                LoadAction::Hit(pinned)
             } else {
+                cache_miss = true;
                 match state.inflight.try_register(key) {
-                    RegisterResult::First => LoadAction::Read,
+                    RegisterResult::First => {
+                        inflight_first = true;
+                        LoadAction::Read
+                    }
                     RegisterResult::Waiter(notify) => LoadAction::Wait(notify),
                 }
             }
         };
 
+        profile.record_load(cache_hit, cache_miss, inflight_first);
+
         match action {
             LoadAction::Hit(pinned) => return Ok(LoadedChunk::cached(pinned)),
-            LoadAction::Wait(notify) => notify.await,
+            LoadAction::Wait(notify) => {
+                let started = profile.timer(ACCESS_INFLIGHT_SCOPE);
+                notify.await;
+                profile.record_inflight_wait(started);
+            }
             LoadAction::Read => {
-                return read_first(state, io, key, priority, allow_uncached, cache_use).await;
+                return read_first(state, io, profile, key, priority, allow_uncached, cache_use)
+                    .await;
             }
         }
     }
@@ -1636,26 +1881,30 @@ async fn load_chunk(
 async fn read_first(
     state: StateHandle,
     io: &dyn IoBackend,
+    profile: &AccessProfile,
     key: ChunkKey,
     priority: u8,
     allow_uncached: bool,
     cache_use: CacheUse,
 ) -> Result<LoadedChunk, AccessError> {
-    if let Err(err) = reserve_bytes(Rc::clone(&state), key.len).await {
+    if let Err(err) = reserve_bytes(profile, Rc::clone(&state), key.len).await {
         state.borrow_mut().inflight.complete(&key);
         return Err(err);
     }
 
+    let started = profile.timer(ACCESS_IO_SCOPE);
     let io_task: IoTask = io.submit_read(key.file, key.offset, key.len, priority);
     let data = match io_task.await {
         Ok(data) => data,
         Err(err) => {
+            profile.record_io_read(started, key.len, None, true);
             finish_failed_read(&state, &key, key.len);
             return Err(AccessError::Io(err));
         }
     };
 
     if data.len() != key.len {
+        profile.record_io_read(started, key.len, Some(data.len()), true);
         finish_failed_read(&state, &key, key.len);
         return Err(AccessError::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1668,13 +1917,31 @@ async fn read_first(
         )));
     }
 
-    finish_successful_raw_read(&state, key, data, allow_uncached, cache_use)
+    profile.record_io_read(started, key.len, Some(data.len()), false);
+    finish_successful_raw_read(&state, profile, key, data, allow_uncached, cache_use)
 }
 
-async fn reserve_bytes(state: StateHandle, bytes: usize) -> Result<(), AccessError> {
+async fn reserve_bytes(
+    profile: &AccessProfile,
+    state: StateHandle,
+    bytes: usize,
+) -> Result<(), AccessError> {
     if bytes == 0 {
         return Ok(());
     }
+
+    let started = profile.timer(ACCESS_RESERVE_SCOPE);
+    let result = reserve_bytes_inner(profile, state, bytes).await;
+    profile.record_reserve(started, bytes, result.is_ok());
+    result
+}
+
+async fn reserve_bytes_inner(
+    profile: &AccessProfile,
+    state: StateHandle,
+    bytes: usize,
+) -> Result<(), AccessError> {
+    debug_assert!(bytes > 0);
 
     loop {
         let wait = {
@@ -1692,6 +1959,7 @@ async fn reserve_bytes(state: StateHandle, bytes: usize) -> Result<(), AccessErr
                     break;
                 };
                 state.budget.release(evicted.bytes);
+                profile.record_cache_eviction(1, evicted.bytes);
             }
 
             while state.budget.available() < bytes {
@@ -1699,6 +1967,7 @@ async fn reserve_bytes(state: StateHandle, bytes: usize) -> Result<(), AccessErr
                     break;
                 };
                 state.budget.release(evicted_bytes);
+                profile.record_staged_eviction(evicted_bytes);
             }
 
             if state.budget.try_reserve(bytes) {
@@ -1712,10 +1981,19 @@ async fn reserve_bytes(state: StateHandle, bytes: usize) -> Result<(), AccessErr
     }
 }
 
-fn try_reserve_bytes(state: &StateHandle, bytes: usize) -> bool {
+fn try_reserve_bytes(profile: &AccessProfile, state: &StateHandle, bytes: usize) -> bool {
     if bytes == 0 {
         return true;
     }
+
+    let started = profile.timer(ACCESS_RESERVE_SCOPE);
+    let success = try_reserve_bytes_inner(profile, state, bytes);
+    profile.record_reserve(started, bytes, success);
+    success
+}
+
+fn try_reserve_bytes_inner(profile: &AccessProfile, state: &StateHandle, bytes: usize) -> bool {
+    debug_assert!(bytes > 0);
 
     let mut state = state.borrow_mut();
     if bytes > state.budget.capacity() {
@@ -1731,6 +2009,7 @@ fn try_reserve_bytes(state: &StateHandle, bytes: usize) -> bool {
             break;
         };
         state.budget.release(evicted.bytes);
+        profile.record_cache_eviction(1, evicted.bytes);
     }
 
     while state.budget.available() < bytes {
@@ -1738,6 +2017,7 @@ fn try_reserve_bytes(state: &StateHandle, bytes: usize) -> bool {
             break;
         };
         state.budget.release(evicted_bytes);
+        profile.record_staged_eviction(evicted_bytes);
     }
 
     state.budget.try_reserve(bytes)
@@ -1751,11 +2031,15 @@ fn finish_failed_read(state: &StateHandle, key: &ChunkKey, reserved_bytes: usize
 
 fn finish_successful_raw_read(
     state: &StateHandle,
+    profile: &AccessProfile,
     key: ChunkKey,
     data: Arc<[u8]>,
     allow_uncached: bool,
-    cache_use: CacheUse,
+    _cache_use: CacheUse,
 ) -> Result<LoadedChunk, AccessError> {
+    let mut insert_record = None;
+    let mut failure_record = None;
+    let mut uncached_fallback = false;
     let pinned = {
         let mut state_ref = state.borrow_mut();
         let pinned = match state_ref
@@ -1763,11 +2047,16 @@ fn finish_successful_raw_read(
             .insert_if_absent(key, CachePayload::Raw(Arc::clone(&data)))
         {
             Ok(outcome) if outcome.inserted => {
+                insert_record = Some((
+                    outcome.evicted_count,
+                    outcome.evicted_bytes,
+                    outcome.replaced_bytes,
+                ));
                 state_ref.budget.release(outcome.evicted_bytes);
                 Some(
                     state_ref
                         .cache
-                        .pin_and_get(&key)
+                        .pin_raw(&key)
                         .expect("inserted cache entry must be pinnable"),
                 )
             }
@@ -1777,42 +2066,22 @@ fn finish_successful_raw_read(
                     .release(outcome.evicted_bytes.saturating_add(outcome.replaced_bytes));
                 let existing = state_ref
                     .cache
-                    .pin_and_get(&key)
+                    .pin_raw(&key)
                     .expect("existing cache entry must be pinnable");
-                if is_usable_cached_chunk(&existing, cache_use) {
-                    state_ref.budget.release(key.len);
-                    Some(existing)
-                } else {
-                    drop(existing);
-                    match state_ref
-                        .cache
-                        .insert_or_replace(key, CachePayload::Raw(Arc::clone(&data)))
-                    {
-                        Ok(outcome) => {
-                            state_ref.budget.release(
-                                outcome.evicted_bytes.saturating_add(outcome.replaced_bytes),
-                            );
-                            Some(
-                                state_ref
-                                    .cache
-                                    .pin_and_get(&key)
-                                    .expect("replaced cache entry must be pinnable"),
-                            )
-                        }
-                        Err(err) => {
-                            state_ref.budget.release(err.evicted_bytes);
-                            if !allow_uncached {
-                                state_ref.budget.release(key.len);
-                            }
-                            None
-                        }
-                    }
-                }
+                state_ref.budget.release(key.len);
+                Some(existing)
             }
             Err(err) => {
+                failure_record = Some((
+                    cache_insert_failure_kind(err.kind),
+                    err.evicted_count,
+                    err.evicted_bytes,
+                ));
                 state_ref.budget.release(err.evicted_bytes);
                 if !allow_uncached {
                     state_ref.budget.release(key.len);
+                } else {
+                    uncached_fallback = true;
                 }
                 None
             }
@@ -1821,6 +2090,16 @@ fn finish_successful_raw_read(
         state_ref.inflight.complete(&key);
         pinned
     };
+
+    if let Some((evicted_count, evicted_bytes, replaced_bytes)) = insert_record {
+        profile.record_cache_insert(evicted_count, evicted_bytes, replaced_bytes);
+    }
+    if let Some((kind, evicted_count, evicted_bytes)) = failure_record {
+        profile.record_cache_insert_failure(kind, evicted_count, evicted_bytes);
+    }
+    if uncached_fallback {
+        profile.record_uncached_fallback();
+    }
 
     match pinned {
         Some(pinned) => Ok(LoadedChunk::cached(pinned)),
@@ -1833,59 +2112,98 @@ fn finish_successful_raw_read(
     }
 }
 
+fn cache_insert_failure_kind(kind: CacheInsertErrorKind) -> AccessCacheInsertFailureKind {
+    match kind {
+        CacheInsertErrorKind::ItemTooLarge => AccessCacheInsertFailureKind::TooLarge,
+        CacheInsertErrorKind::AllPinned => AccessCacheInsertFailureKind::AllPinned,
+    }
+}
+
 async fn try_cache_decoded(
     state: StateHandle,
     key: ChunkKey,
     decode_key: DecodeKey,
     codec: SharedCodec,
     data: Arc<[u8]>,
+    profile: &AccessProfile,
 ) -> Option<PinnedChunk> {
     if data.len() > state.borrow().cache.capacity() {
+        profile.record_cache_insert_failure(AccessCacheInsertFailureKind::TooLarge, 0, 0);
         return None;
     }
 
-    if reserve_bytes(Rc::clone(&state), data.len()).await.is_err() {
+    if reserve_bytes(profile, Rc::clone(&state), data.len())
+        .await
+        .is_err()
+    {
         return None;
     }
 
-    let mut state_ref = state.borrow_mut();
-    match state_ref.cache.insert_or_replace(
-        key,
-        CachePayload::Decoded {
-            data: Arc::clone(&data),
-            decode_key,
-            _codec: codec,
-        },
-    ) {
-        Ok(outcome) => {
-            state_ref
-                .budget
-                .release(outcome.evicted_bytes.saturating_add(outcome.replaced_bytes));
-            state_ref.cache.pin_and_get(&key)
+    let mut insert_record = None;
+    let mut failure_record = None;
+    let pinned = {
+        let mut state_ref = state.borrow_mut();
+        match state_ref.cache.insert_or_replace(
+            key,
+            CachePayload::Decoded {
+                data: Arc::clone(&data),
+                decode_key: decode_key.clone(),
+                _codec: codec,
+            },
+        ) {
+            Ok(outcome) => {
+                insert_record = Some((
+                    outcome.evicted_count,
+                    outcome.evicted_bytes,
+                    outcome.replaced_bytes,
+                ));
+                state_ref
+                    .budget
+                    .release(outcome.evicted_bytes.saturating_add(outcome.replaced_bytes));
+                state_ref.cache.pin_decoded(&decode_key)
+            }
+            Err(err) => {
+                failure_record = Some((
+                    cache_insert_failure_kind(err.kind),
+                    err.evicted_count,
+                    err.evicted_bytes,
+                ));
+                state_ref
+                    .budget
+                    .release(err.evicted_bytes.saturating_add(data.len()));
+                None
+            }
         }
-        Err(err) => {
-            state_ref
-                .budget
-                .release(err.evicted_bytes.saturating_add(data.len()));
-            None
-        }
+    };
+
+    if let Some((evicted_count, evicted_bytes, replaced_bytes)) = insert_record {
+        profile.record_cache_insert(evicted_count, evicted_bytes, replaced_bytes);
     }
+    if let Some((kind, evicted_count, evicted_bytes)) = failure_record {
+        profile.record_cache_insert_failure(kind, evicted_count, evicted_bytes);
+    }
+
+    pinned
 }
 
 async fn prefetch_key(
     state: StateHandle,
     io: &dyn IoBackend,
+    profile: &AccessProfile,
     key: ChunkKey,
     priority: u8,
 ) -> Result<(), AccessError> {
     if state.borrow().cache.contains_raw(&key) {
+        profile.record_cache_hit(AccessCacheHitKind::Raw);
         return Ok(());
     }
     if key.len > state.borrow().cache.capacity() {
+        profile.record_cache_miss();
+        profile.record_cache_too_large();
         return Err(AccessError::OutOfMemory);
     }
 
-    let chunk = load_chunk(state, io, key, priority, false, CacheUse::RawOnly).await?;
+    let chunk = load_chunk(state, io, profile, key, priority, false, CacheUse::RawOnly).await?;
     if chunk.kind == CachePayloadKind::Raw {
         Ok(())
     } else {
@@ -1906,20 +2224,32 @@ fn begin_scheduled_pending(state: &StateHandle, id: u64) -> Option<Arc<Notify>> 
     Some(notify)
 }
 
-fn cancel_scheduled(state: &StateHandle, id: u64) {
+fn cancel_scheduled(state: &StateHandle, profile: &AccessProfile, id: u64) {
+    let mut wake = None;
+    let mut cancelled = false;
     let mut state_ref = state.borrow_mut();
     match state_ref.scheduled.remove(&id) {
-        Some(ScheduledStage::Pending(notify)) => {
+        Some(ScheduledStage::Pending(pending_notify)) => {
+            cancelled = true;
             state_ref.scheduled.insert(id, ScheduledStage::Cancelled);
-            notify.notify_waiters();
+            wake = Some(pending_notify);
         }
         Some(ScheduledStage::Decoded { bytes, .. }) | Some(ScheduledStage::Ready { bytes, .. }) => {
+            cancelled = true;
             state_ref.budget.release(bytes);
         }
         Some(ScheduledStage::Complete)
         | Some(ScheduledStage::Failed(_))
         | Some(ScheduledStage::Cancelled)
         | None => {}
+    }
+    drop(state_ref);
+
+    if cancelled {
+        profile.record_scheduled_cancelled();
+    }
+    if let Some(notify) = wake {
+        notify.notify_waiters();
     }
 }
 
@@ -1933,21 +2263,24 @@ async fn handle_scheduled_decode(
         Rc::clone(&state),
         deps.io.as_ref(),
         deps.decode.as_ref(),
+        &deps.profile,
         request.item,
         deps.priority,
         deps.keep_decoded,
     )
     .await;
 
-    finish_scheduled_decode(&state, request.id, result);
+    finish_scheduled_decode(&state, &deps.profile, request.id, result);
     notify.notify_waiters();
 }
 
 fn finish_scheduled_decode(
     state: &StateHandle,
+    profile: &AccessProfile,
     id: u64,
     result: Result<StageDecodeOutput, AccessError>,
 ) {
+    let mut staged_bytes = None;
     let mut state_ref = state.borrow_mut();
     if matches!(
         state_ref.scheduled.get(&id),
@@ -1965,11 +2298,17 @@ fn finish_scheduled_decode(
         match result {
             Ok(StageDecodeOutput::Cached) => ScheduledStage::Complete,
             Ok(StageDecodeOutput::Staged { data, bytes }) => {
+                staged_bytes = Some(bytes);
                 ScheduledStage::Decoded { data, bytes }
             }
             Err(err) => ScheduledStage::Failed(err.to_string()),
         },
     );
+    drop(state_ref);
+
+    if let Some(bytes) = staged_bytes {
+        profile.record_staged_bytes(bytes);
+    }
 }
 
 enum StageDecodeOutput {
@@ -1981,6 +2320,7 @@ async fn decode_for_schedule(
     state: StateHandle,
     io: &dyn IoBackend,
     decode: &dyn DecodeBackend,
+    profile: &AccessProfile,
     item: AccessItem,
     priority: u8,
     keep_decoded: bool,
@@ -1991,16 +2331,19 @@ async fn decode_for_schedule(
         let chunk = load_chunk(
             Rc::clone(&state),
             io,
+            profile,
             item.key,
             priority,
             true,
-            CacheUse::RawOrDecoded(decode_key),
+            CacheUse::RawOrDecoded(decode_key.clone()),
         )
         .await?;
         if chunk.kind == CachePayloadKind::Decoded {
+            profile.record_decode_cached();
             return Ok(StageDecodeOutput::Cached);
         }
         if item.codec.is_identity() {
+            profile.record_identity_decode();
             validate_identity_decoded_size(&item.codec, chunk.data.len(), item.expected_size)?;
             if chunk.is_cached() {
                 return Ok(StageDecodeOutput::Cached);
@@ -2010,36 +2353,52 @@ async fn decode_for_schedule(
         }
 
         if !keep_decoded {
+            let started = profile.timer(ACCESS_DECODE_SCOPE);
             let decode_task: DecodeTask = decode.submit_decode(
                 Arc::clone(&item.codec),
                 Arc::clone(&chunk.data),
                 item.expected_size,
             );
-            let decoded = decode_task.await?;
+            let decoded = decode_task.await;
+            profile.record_decode(
+                started,
+                chunk.data.len(),
+                decoded.as_ref().ok().map(Vec::len),
+                decoded.is_err(),
+            );
+            let decoded = decoded?;
             drop(chunk);
 
             let bytes = decoded.len();
-            reserve_bytes(Rc::clone(&state), bytes).await?;
+            reserve_bytes(profile, Rc::clone(&state), bytes).await?;
             return Ok(StageDecodeOutput::Staged {
                 data: StagedBytes::Owned(decoded),
                 bytes,
             });
         }
 
-        match register_decode_waiter_after_raw_load(&state, &item) {
+        match register_decode_waiter_after_raw_load(&state, profile, &item) {
             DecodeRegister::Ready(_) => return Ok(StageDecodeOutput::Cached),
-            DecodeRegister::Wait(wait) => {
+            DecodeRegister::Wait { notify, started } => {
                 drop(chunk);
-                wait.await;
+                notify.await;
+                profile.record_decode_waiter(started);
                 continue;
             }
             DecodeRegister::First(key) => {
+                let started = profile.timer(ACCESS_DECODE_SCOPE);
                 let decode_task: DecodeTask = decode.submit_decode(
                     Arc::clone(&item.codec),
                     Arc::clone(&chunk.data),
                     item.expected_size,
                 );
                 let decoded = decode_task.await;
+                profile.record_decode(
+                    started,
+                    chunk.data.len(),
+                    decoded.as_ref().ok().map(Vec::len),
+                    decoded.is_err(),
+                );
                 drop(chunk);
 
                 let decoded = match decoded {
@@ -2054,16 +2413,18 @@ async fn decode_for_schedule(
                 let output = if try_cache_decoded(
                     Rc::clone(&state),
                     item.key,
-                    key,
+                    key.clone(),
                     Arc::clone(&item.codec),
                     Arc::clone(&decoded),
+                    profile,
                 )
                 .await
                 .is_some()
                 {
                     Ok(StageDecodeOutput::Cached)
                 } else {
-                    reserve_bytes(Rc::clone(&state), decoded.len())
+                    profile.record_uncached_fallback();
+                    reserve_bytes(profile, Rc::clone(&state), decoded.len())
                         .await
                         .map(|()| StageDecodeOutput::Staged {
                             bytes: decoded.len(),
@@ -2107,6 +2468,7 @@ async fn handle_scheduled_ensure_ready(
             Rc::clone(&state),
             deps.io.as_ref(),
             deps.decode.as_ref(),
+            &deps.profile,
             request.item.clone(),
             deps.priority,
             deps.keep_decoded,
@@ -2125,7 +2487,7 @@ async fn handle_scheduled_ensure_ready(
             Err(err) => Err(err),
         };
 
-        finish_scheduled_ready(&state, request.id, result, 0);
+        finish_scheduled_ready(&state, &deps.profile, request.id, result, 0);
         notify.notify_waiters();
         return;
     }
@@ -2185,18 +2547,19 @@ async fn handle_scheduled_ensure_ready(
                 let result = make_ready_from_staged_data(
                     Rc::clone(&state),
                     deps.cpu.as_ref(),
+                    &deps.profile,
                     data,
                     &request.item.slice,
                     bytes,
                 )
                 .await;
-                finish_scheduled_ready(&state, request.id, result, 0);
+                finish_scheduled_ready(&state, &deps.profile, request.id, result, 0);
                 notify.notify_waiters();
                 return;
             }
             ReadyAction::PrepareDirect { notify } => {
                 let result = make_ready_direct(Rc::clone(&state), &deps, request.item).await;
-                finish_scheduled_ready(&state, request.id, result, 0);
+                finish_scheduled_ready(&state, &deps.profile, request.id, result, 0);
                 notify.notify_waiters();
                 return;
             }
@@ -2216,17 +2579,27 @@ async fn async_ready_from_decode_output(
     match output {
         StageDecodeOutput::Cached => make_ready_direct(state, deps, item).await,
         StageDecodeOutput::Staged { data, bytes } => {
-            make_ready_from_staged_data(state, deps.cpu.as_ref(), data, &item.slice, bytes).await
+            make_ready_from_staged_data(
+                state,
+                deps.cpu.as_ref(),
+                &deps.profile,
+                data,
+                &item.slice,
+                bytes,
+            )
+            .await
         }
     }
 }
 
 fn finish_scheduled_ready(
     state: &StateHandle,
+    profile: &AccessProfile,
     id: u64,
     result: Result<ReadyBuffer, AccessError>,
     release_staged_bytes: usize,
 ) {
+    let mut staged_bytes = None;
     let mut state_ref = state.borrow_mut();
     if release_staged_bytes > 0 {
         state_ref.budget.release(release_staged_bytes);
@@ -2246,13 +2619,21 @@ fn finish_scheduled_ready(
     state_ref.scheduled.insert(
         id,
         match result {
-            Ok(buffer) => ScheduledStage::Ready {
-                data: buffer.data,
-                bytes: buffer.bytes,
-            },
+            Ok(buffer) => {
+                staged_bytes = Some(buffer.bytes);
+                ScheduledStage::Ready {
+                    data: buffer.data,
+                    bytes: buffer.bytes,
+                }
+            }
             Err(err) => ScheduledStage::Failed(err.to_string()),
         },
     );
+    drop(state_ref);
+
+    if let Some(bytes) = staged_bytes {
+        profile.record_staged_bytes(bytes);
+    }
 }
 
 struct ReadyBuffer {
@@ -2269,19 +2650,34 @@ async fn make_ready_direct(
         Rc::clone(&state),
         deps.io.as_ref(),
         deps.decode.as_ref(),
+        &deps.profile,
         &item,
         deps.priority,
         deps.keep_decoded,
     )
     .await?;
-    let plan = item.slice.plan(decoded.as_slice().len())?;
+    let materialize_started = deps.profile.timer(ACCESS_MATERIALIZE_SCOPE);
+    let plan = match item.slice.plan(decoded.as_slice().len()) {
+        Ok(plan) => plan,
+        Err(err) => {
+            deps.profile
+                .record_materialize(materialize_started, 0, true);
+            return Err(err);
+        }
+    };
     let bytes = plan.output_len;
 
-    if decoded.has_budget_guard() && try_reserve_bytes(&state, bytes) {
+    if decoded.has_budget_guard() && try_reserve_bytes(&deps.profile, &state, bytes) {
         let data = match materialize_decoded_planned(deps.cpu.as_ref(), decoded, plan).await {
-            Ok(data) => data,
+            Ok(data) => {
+                deps.profile
+                    .record_materialize(materialize_started, data.len(), false);
+                data
+            }
             Err(err) => {
                 state.borrow_mut().budget.release(bytes);
+                deps.profile
+                    .record_materialize(materialize_started, 0, true);
                 return Err(err);
             }
         };
@@ -2301,19 +2697,25 @@ async fn make_ready_direct(
     }
     let source = into_materialize_source(decoded);
 
-    reserve_bytes(Rc::clone(&state), source_bytes).await?;
-    if let Err(err) = reserve_bytes(Rc::clone(&state), bytes).await {
+    reserve_bytes(&deps.profile, Rc::clone(&state), source_bytes).await?;
+    if let Err(err) = reserve_bytes(&deps.profile, Rc::clone(&state), bytes).await {
         state.borrow_mut().budget.release(source_bytes);
         return Err(err);
     }
 
     let data = match materialize_source(deps.cpu.as_ref(), source, plan).await {
-        Ok(data) => data,
+        Ok(data) => {
+            deps.profile
+                .record_materialize(materialize_started, data.len(), false);
+            data
+        }
         Err(err) => {
             state
                 .borrow_mut()
                 .budget
                 .release(source_bytes.saturating_add(bytes));
+            deps.profile
+                .record_materialize(materialize_started, 0, true);
             return Err(err);
         }
     };
@@ -2326,14 +2728,17 @@ async fn make_ready_direct(
 async fn make_ready_from_staged_data(
     state: StateHandle,
     cpu: &AccessCpuPool,
+    profile: &AccessProfile,
     data: StagedBytes,
     slice: &SliceSpec,
     staged_bytes: usize,
 ) -> Result<ReadyBuffer, AccessError> {
+    let materialize_started = profile.timer(ACCESS_MATERIALIZE_SCOPE);
     let plan = match slice.plan(data.as_slice().len()) {
         Ok(plan) => plan,
         Err(err) => {
             state.borrow_mut().budget.release(staged_bytes);
+            profile.record_materialize(materialize_started, 0, true);
             return Err(err);
         }
     };
@@ -2341,7 +2746,10 @@ async fn make_ready_from_staged_data(
 
     if plan.ranges.is_none() {
         match data {
-            StagedBytes::Owned(data) => return Ok(ReadyBuffer { data, bytes }),
+            StagedBytes::Owned(data) => {
+                profile.record_materialize(materialize_started, data.len(), false);
+                return Ok(ReadyBuffer { data, bytes });
+            }
             StagedBytes::Shared(data) => {
                 let peak_fits = match staged_bytes.checked_add(bytes) {
                     Some(peak) => peak <= state.borrow().budget.capacity(),
@@ -2349,21 +2757,27 @@ async fn make_ready_from_staged_data(
                 };
                 if !peak_fits {
                     state.borrow_mut().budget.release(staged_bytes);
+                    profile.record_materialize(materialize_started, 0, true);
                     return Err(AccessError::OutOfMemory);
                 }
 
-                if let Err(err) = reserve_bytes(Rc::clone(&state), bytes).await {
+                if let Err(err) = reserve_bytes(profile, Rc::clone(&state), bytes).await {
                     state.borrow_mut().budget.release(staged_bytes);
+                    profile.record_materialize(materialize_started, 0, true);
                     return Err(err);
                 }
 
                 let data = match cpu.materialize(data, plan).await {
-                    Ok(data) => data,
+                    Ok(data) => {
+                        profile.record_materialize(materialize_started, data.len(), false);
+                        data
+                    }
                     Err(err) => {
                         state
                             .borrow_mut()
                             .budget
                             .release(staged_bytes.saturating_add(bytes));
+                        profile.record_materialize(materialize_started, 0, true);
                         return Err(err);
                     }
                 };
@@ -2379,11 +2793,13 @@ async fn make_ready_from_staged_data(
     };
     if !peak_fits {
         state.borrow_mut().budget.release(staged_bytes);
+        profile.record_materialize(materialize_started, 0, true);
         return Err(AccessError::OutOfMemory);
     }
 
-    if let Err(err) = reserve_bytes(Rc::clone(&state), bytes).await {
+    if let Err(err) = reserve_bytes(profile, Rc::clone(&state), bytes).await {
         state.borrow_mut().budget.release(staged_bytes);
+        profile.record_materialize(materialize_started, 0, true);
         return Err(err);
     }
 
@@ -2392,12 +2808,16 @@ async fn make_ready_from_staged_data(
         StagedBytes::Shared(data) => cpu.materialize(data, plan).await,
     };
     let data = match result {
-        Ok(data) => data,
+        Ok(data) => {
+            profile.record_materialize(materialize_started, data.len(), false);
+            data
+        }
         Err(err) => {
             state
                 .borrow_mut()
                 .budget
                 .release(staged_bytes.saturating_add(bytes));
+            profile.record_materialize(materialize_started, 0, true);
             return Err(err);
         }
     };
@@ -2445,6 +2865,7 @@ async fn scheduled_take(
                     deps.io.as_ref(),
                     deps.decode.as_ref(),
                     deps.cpu.as_ref(),
+                    &deps.profile,
                     item,
                     deps.priority,
                     deps.keep_decoded,
@@ -2455,6 +2876,7 @@ async fn scheduled_take(
                 let buffer = make_ready_from_staged_data(
                     Rc::clone(&state),
                     deps.cpu.as_ref(),
+                    &deps.profile,
                     data,
                     &item.slice,
                     bytes,
@@ -2528,8 +2950,14 @@ fn access_error_to_io(err: AccessError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "profile")]
+    use super::super::profile::{
+        access_profile_registry, test_metrics, ACCESS_CACHE_SCOPE, ACCESS_IO_SCOPE,
+    };
     use super::*;
     use crate::codecs::{ChunkCodec, CodecError, CodecResult, SharedCodec, UncompressedCodec};
+    #[cfg(feature = "profile")]
+    use crate::profile::{ProfileConfig, ProfileRegistry, ProfileRuntime};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -2668,6 +3096,13 @@ mod tests {
             "prefix"
         }
 
+        fn cache_key(&self) -> crate::codecs::CodecCacheKey {
+            crate::codecs::CodecCacheKey::Pipeline(vec![
+                crate::codecs::CodecCacheKey::Static("test-prefix"),
+                crate::codecs::CodecCacheKey::Unsupported(format!("prefix-byte:{}", self.prefix)),
+            ])
+        }
+
         fn decode(&self, encoded: &[u8], _expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
             let mut decoded = Vec::with_capacity(encoded.len() + 1);
             decoded.push(self.prefix);
@@ -2712,6 +3147,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         }
     }
 
@@ -2793,6 +3229,11 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for reads");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[cfg(feature = "profile")]
+    fn metric(snapshot: &ProfileSnapshot, id: crate::profile::ProfileMetricId) -> u64 {
+        snapshot.metric_value(id).unwrap_or(0)
     }
 
     #[test]
@@ -2982,6 +3423,29 @@ mod tests {
     }
 
     #[test]
+    fn keep_decoded_reuses_equivalent_codec_instances() {
+        let (io, reads) = StaticIo::counted(b"x");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let mut config = test_config();
+        config.keep_decoded = true;
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 1);
+
+        let (first, first_rx) =
+            request_with_codec(key, Arc::new(PrefixCodec { prefix: b'a' }), None);
+        handle.send(first).expect("send first");
+        assert_eq!(recv_reply(first_rx).expect("first"), b"ax");
+
+        let (second, second_rx) =
+            request_with_codec(key, Arc::new(PrefixCodec { prefix: b'a' }), None);
+        handle.send(second).expect("send second");
+        assert_eq!(recv_reply(second_rx).expect("second"), b"ax");
+
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn decode_waiter_registered_before_finish_observes_wake() {
         let config = test_config();
         let state = Rc::new(RefCell::new(SchedulerState::new(&config)));
@@ -2994,7 +3458,7 @@ mod tests {
             DecodeRegister::First(_)
         ));
         let waiter = match register_decode_waiter(&state, &item) {
-            DecodeRegister::Wait(waiter) => waiter,
+            DecodeRegister::Wait { notify, .. } => notify,
             DecodeRegister::Ready(_) | DecodeRegister::First(_) => {
                 panic!("second decode registration should wait")
             }
@@ -3028,7 +3492,7 @@ mod tests {
         handle.send(second).expect("send second");
         assert_eq!(recv_reply(second_rx).expect("second"), b"bx");
 
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 2);
     }
 
@@ -3089,6 +3553,244 @@ mod tests {
         assert_eq!(decodes.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_access_read_cache_and_materialize_events() {
+        let (io, reads) = StaticIo::counted(b"abcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let profile = AccessProfile::enabled("access-test");
+        let mut config = test_config();
+        config.profile = profile.clone();
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let round = profile.start();
+
+        let (first, first_rx) = request_with_codec(key, Arc::clone(&codec), Some(6));
+        handle.send(first).expect("send first");
+        assert_eq!(recv_reply(first_rx).expect("first"), b"abcdef");
+
+        let first_snapshot = handle.profile_snapshot();
+        assert_eq!(first_snapshot.label, "access-test");
+        assert_eq!(metric(&first_snapshot, test_metrics::COMMANDS), 1);
+        assert_eq!(metric(&first_snapshot, test_metrics::READ_COMMANDS), 1);
+        assert_eq!(metric(&first_snapshot, test_metrics::CACHE_MISSES), 1);
+        assert_eq!(metric(&first_snapshot, test_metrics::CACHE_HITS), 0);
+        assert_eq!(metric(&first_snapshot, test_metrics::INFLIGHT_FIRST), 1);
+        assert_eq!(metric(&first_snapshot, test_metrics::IO_READS), 1);
+        assert_eq!(metric(&first_snapshot, test_metrics::IO_REQUESTED_BYTES), 6);
+        assert_eq!(metric(&first_snapshot, test_metrics::IO_READ_BYTES), 6);
+        assert_eq!(metric(&first_snapshot, test_metrics::IDENTITY_DECODE), 1);
+        assert_eq!(metric(&first_snapshot, test_metrics::MATERIALIZE_CALLS), 1);
+        assert_eq!(metric(&first_snapshot, test_metrics::MATERIALIZE_BYTES), 6);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
+
+        let (second, second_rx) = request_with_codec(key, Arc::clone(&codec), Some(6));
+        handle.send(second).expect("send second");
+        assert_eq!(recv_reply(second_rx).expect("second"), b"abcdef");
+
+        let total = profile.snapshot();
+        assert_eq!(metric(&total, test_metrics::COMMANDS), 2);
+        assert_eq!(metric(&total, test_metrics::READ_COMMANDS), 2);
+        assert_eq!(metric(&total, test_metrics::CACHE_HITS), 1);
+        assert_eq!(metric(&total, test_metrics::RAW_CACHE_HITS), 1);
+        assert_eq!(metric(&total, test_metrics::CACHE_MISSES), 1);
+        assert_eq!(metric(&total, test_metrics::IO_READS), 1);
+        assert_eq!(metric(&total, test_metrics::IDENTITY_DECODE), 2);
+        assert_eq!(metric(&total, test_metrics::MATERIALIZE_CALLS), 2);
+        assert_eq!(metric(&total, test_metrics::MATERIALIZE_BYTES), 12);
+
+        let reset = handle.profile_snapshot_and_reset();
+        assert_eq!(metric(&reset, test_metrics::COMMANDS), 2);
+        assert_eq!(
+            metric(&handle.profile_snapshot(), test_metrics::COMMANDS),
+            0
+        );
+
+        let (third, third_rx) = request_with_codec(key, codec, Some(6));
+        handle.send(third).expect("send third");
+        assert_eq!(recv_reply(third_rx).expect("third"), b"abcdef");
+        let after_reset = round.end();
+        assert_eq!(metric(&after_reset, test_metrics::COMMANDS), 1);
+        assert_eq!(metric(&after_reset, test_metrics::READ_COMMANDS), 1);
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_respects_access_scope_switches() {
+        let (io, _reads) = StaticIo::counted(b"abcdef");
+        let (decode, _decodes) = CodecBackedDecode::counted();
+        let profile = AccessProfile::from_runtime(ProfileRuntime::new_lazy(
+            ProfileConfig::enabled("access-scope").disable_scope("access.io"),
+            access_profile_registry,
+        ));
+        let mut config = test_config();
+        config.profile = profile.clone();
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let round = profile.start();
+
+        let (request, rx) = request_with_codec(key, codec, Some(6));
+        handle.send(request).expect("send request");
+        assert_eq!(recv_reply(rx).expect("read"), b"abcdef");
+
+        let snapshot = handle.profile_snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::COMMANDS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_MISSES), 1);
+        assert_eq!(metric(&snapshot, test_metrics::IO_READS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::IO_REQUESTED_BYTES), 0);
+        assert_eq!(metric(&snapshot, test_metrics::IO_READ_BYTES), 0);
+        assert_eq!(metric(&snapshot, test_metrics::IDENTITY_DECODE), 1);
+        assert_eq!(metric(&snapshot, test_metrics::MATERIALIZE_CALLS), 1);
+        assert!(
+            !snapshot
+                .scopes
+                .iter()
+                .find(|scope| scope.id == ACCESS_IO_SCOPE)
+                .expect("access.io scope")
+                .enabled
+        );
+
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_queue_full_rejections() {
+        let profile = AccessProfile::enabled("queue-full");
+        let (tx, _rx) = flume::bounded(0);
+        let handle = AccessHandle {
+            inner: Arc::new(AccessHandleInner {
+                shards: vec![tx],
+                profile: profile.clone(),
+            }),
+        };
+        let round = profile.start();
+        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let (request, _reply) = request(key);
+
+        assert!(matches!(
+            handle.try_send(request),
+            Err(AccessError::QueueFull { capacity: 0 })
+        ));
+
+        let snapshot = round.end();
+        assert_eq!(metric(&snapshot, test_metrics::COMMANDS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::COMMAND_REJECTIONS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::COMMAND_QUEUE_FULL), 1);
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_raw_and_decoded_cache_inserts() {
+        let (io, reads) = StaticIo::counted(b"bcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let profile = AccessProfile::enabled("cache-replace");
+        let mut config = test_config();
+        config.keep_decoded = true;
+        config.profile = profile.clone();
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 5);
+        let codec: SharedCodec = Arc::new(PrefixCodec { prefix: b'a' });
+        let round = profile.start();
+
+        let (request, rx) = request_with_codec(key, codec, Some(6));
+        handle.send(request).expect("send request");
+        assert_eq!(recv_reply(rx).expect("read"), b"abcdef");
+
+        let snapshot = round.end();
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_INSERTS), 2);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_REPLACEMENTS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_REPLACED_BYTES), 0);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_EVICTIONS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_UNCACHED_FALLBACKS), 0);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_cache_eviction_under_capacity_pressure() {
+        let (io, reads) = StaticIo::counted(b"abcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let profile = AccessProfile::enabled("cache-evict");
+        let mut config = test_config();
+        config.cache_capacity_bytes = 6;
+        config.memory_budget_bytes = 12;
+        config.profile = profile.clone();
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let first_key = ChunkKey::new(FileRef(1), 0, 6);
+        let second_key = ChunkKey::new(FileRef(1), 6, 6);
+        let round = profile.start();
+
+        let (first, first_rx) = request_with_codec(first_key, Arc::clone(&codec), Some(6));
+        handle.send(first).expect("send first");
+        assert_eq!(recv_reply(first_rx).expect("first"), b"abcdef");
+        let (second, second_rx) = request_with_codec(second_key, codec, Some(6));
+        handle.send(second).expect("send second");
+        assert_eq!(recv_reply(second_rx).expect("second"), b"abcdef");
+
+        let snapshot = round.end();
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_INSERTS), 2);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_EVICTIONS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_EVICTED_BYTES), 6);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_records_uncached_fallback_for_oversized_chunk() {
+        let (io, reads) = StaticIo::counted(b"abcdef");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let profile = AccessProfile::enabled("uncached");
+        let mut config = test_config();
+        config.cache_capacity_bytes = 1;
+        config.memory_budget_bytes = 12;
+        config.profile = profile.clone();
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 6);
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let round = profile.start();
+
+        let (request, rx) = request_with_codec(key, codec, Some(6));
+        handle.send(request).expect("send request");
+        assert_eq!(recv_reply(rx).expect("read"), b"abcdef");
+
+        let snapshot = round.end();
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_INSERTS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_INSERT_FAILURES), 1);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_TOO_LARGE), 1);
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_UNCACHED_FALLBACKS), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn profile_registers_access_scopes_for_active_runtime() {
+        let runtime = ProfileRuntime::new_lazy(
+            ProfileConfig::enabled("access-active"),
+            ProfileRegistry::new,
+        );
+        let round = runtime.start();
+        let profile = AccessProfile::from_runtime(runtime.clone());
+
+        profile.record_cache_miss();
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::CACHE_MISSES), 1);
+        assert!(snapshot
+            .scopes
+            .iter()
+            .any(|scope| scope.id == ACCESS_CACHE_SCOPE && scope.enabled));
+
+        round.end();
+    }
+
     #[test]
     fn identity_codec_size_mismatch_fails_without_decode_pool() {
         let (io, _reads) = StaticIo::counted(b"abcdef");
@@ -3117,6 +3819,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(IdentityDecode::new()))
             .expect("spawn");
@@ -3129,7 +3832,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_prefetch_loads_raw_when_only_decoded_is_cached() {
+    fn standalone_prefetch_reuses_raw_after_decoded_is_cached() {
         let (io, reads) = StaticIo::counted(b"x");
         let (decode, decodes) = CodecBackedDecode::counted();
         let mut config = test_config();
@@ -3146,13 +3849,13 @@ mod tests {
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
 
         recv_prefetch(handle.prefetch(key).expect("prefetch submit")).expect("prefetch");
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
 
         let (second, second_rx) = request_with_codec(key, second_codec, None);
         handle.send(second).expect("send second");
         assert_eq!(recv_reply(second_rx).expect("second"), b"bx");
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(decodes.load(Ordering::SeqCst), 2);
     }
 
@@ -3168,6 +3871,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: true,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let expanding_key = ChunkKey::new(FileRef(1), 0, 4);
@@ -3206,6 +3910,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: true,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 1);
@@ -3252,6 +3957,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 1);
@@ -3293,6 +3999,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: true,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 5);
@@ -3330,6 +4037,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 1);
@@ -3371,6 +4079,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 1);
@@ -3412,6 +4121,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: true,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 5);
@@ -3456,6 +4166,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 1);
@@ -3493,6 +4204,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let state = Rc::new(RefCell::new(SchedulerState::new(&config)));
         let cpu = Arc::new(AccessCpuPool::new(test_cpu_config()).expect("cpu pool"));
@@ -3500,6 +4212,7 @@ mod tests {
             io: Arc::new(StaticIo::new(b"x")),
             decode: Arc::new(CodecBackedDecode::counted().0),
             cpu,
+            profile: AccessProfile::disabled(),
             priority: 0,
             keep_decoded: false,
         };
@@ -3529,6 +4242,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: true,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let state = Rc::new(RefCell::new(SchedulerState::new(&config)));
         let cpu = Arc::new(AccessCpuPool::new(test_cpu_config()).expect("cpu pool"));
@@ -3536,6 +4250,7 @@ mod tests {
             io: Arc::new(StaticIo::new(b"x")),
             decode: Arc::new(CodecBackedDecode::counted().0),
             cpu,
+            profile: AccessProfile::disabled(),
             priority: 0,
             keep_decoded: true,
         };
@@ -3555,10 +4270,12 @@ mod tests {
         assert!(matches!(result, Err(AccessError::OutOfMemory)));
     }
 
+    #[cfg(feature = "profile")]
     #[test]
     fn scheduled_future_ready_buffers_are_evictable_under_memory_pressure() {
         let (io, gate, reads) = StaticIo::gated(b"x");
         let (decode, decodes) = CodecBackedDecode::counted();
+        let profile = AccessProfile::enabled("scheduled-evict");
         let config = AccessConfig {
             queue_capacity: 32,
             scheduler_shards: 1,
@@ -3567,6 +4284,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: profile.clone(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let codec: SharedCodec = Arc::new(ExpandCodec {
@@ -3577,6 +4295,7 @@ mod tests {
             AccessItem::new(ChunkKey::new(FileRef(1), 0, 1), Arc::clone(&codec), Some(4)),
             AccessItem::new(ChunkKey::new(FileRef(1), 1, 1), codec, Some(4)),
         ];
+        let round = profile.start();
 
         let scheduled = handle
             .scheduled(
@@ -3600,6 +4319,9 @@ mod tests {
                 .expect("ready result"),
             vec![b'z'; 4]
         );
+        let snapshot = round.end();
+        assert_eq!(metric(&snapshot, test_metrics::SCHEDULED_EVICTIONS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::SCHEDULED_EVICTED_BYTES), 4);
     }
 
     #[test]
@@ -3729,6 +4451,7 @@ mod tests {
             default_io_priority: 0,
             keep_decoded: false,
             cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
         };
         let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
         let key = ChunkKey::new(FileRef(1), 0, 6);

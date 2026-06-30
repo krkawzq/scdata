@@ -38,7 +38,15 @@ impl MemBudget {
         if bytes == 0 {
             return;
         }
-        self.used = self.used.saturating_sub(bytes);
+        debug_assert!(
+            bytes <= self.used,
+            "memory budget release ({bytes}) exceeds used bytes ({})",
+            self.used
+        );
+        self.used = self
+            .used
+            .checked_sub(bytes)
+            .expect("memory budget release exceeds used bytes");
         self.release_notify.notify_waiters();
     }
 

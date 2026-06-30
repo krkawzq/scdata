@@ -8,6 +8,9 @@ use std::thread;
 
 use tokio::sync::oneshot;
 
+use crate::profile::{ProfileRuntime, ProfileSnapshot};
+
+use super::profile::{CodecProfile, CodecQueueTimer, CodecSubmitKind};
 use super::runner::DecodeRunner;
 use super::{CodecError, CodecResult, CodecSpec, SharedCodec};
 
@@ -132,6 +135,7 @@ impl DecodeRequest {
 struct DecodeWork {
     request: DecodeRequest,
     reply: oneshot::Sender<CodecResult<Vec<u8>>>,
+    queued_at: CodecQueueTimer,
 }
 
 /// Future returned by decode submission.
@@ -156,9 +160,13 @@ impl DecodeFuture {
     }
 }
 
-fn decode_work(request: DecodeRequest) -> (DecodeWork, DecodeFuture) {
+fn decode_work(request: DecodeRequest, queued_at: CodecQueueTimer) -> (DecodeWork, DecodeFuture) {
     let (reply, rx) = oneshot::channel();
-    let work = DecodeWork { request, reply };
+    let work = DecodeWork {
+        request,
+        reply,
+        queued_at,
+    };
     (work, DecodeFuture::new(rx))
 }
 
@@ -182,10 +190,22 @@ impl Future for DecodeFuture {
 pub struct DecodePool {
     tx: Option<flume::Sender<DecodeWork>>,
     threads: Vec<thread::JoinHandle<()>>,
+    profile: CodecProfile,
 }
 
 impl DecodePool {
     pub fn new(config: DecodePoolConfig) -> CodecResult<Self> {
+        Self::with_codec_profile(config, CodecProfile::from_env())
+    }
+
+    pub fn with_profile(config: DecodePoolConfig, profile: ProfileRuntime) -> CodecResult<Self> {
+        Self::with_codec_profile(config, CodecProfile::from_runtime(profile))
+    }
+
+    pub fn with_codec_profile(
+        config: DecodePoolConfig,
+        profile: CodecProfile,
+    ) -> CodecResult<Self> {
         config.validate()?;
         let affinity_cpus = resolve_cpu_affinity(&config)?;
         let (tx, rx) = flume::bounded(config.queue_capacity());
@@ -198,6 +218,7 @@ impl DecodePool {
             } else {
                 Some(affinity_cpus[worker_idx % affinity_cpus.len()])
             };
+            let worker_profile = profile.clone();
 
             match thread::Builder::new()
                 .name(format!("decode-wrk-{worker_idx}"))
@@ -205,7 +226,7 @@ impl DecodePool {
                     if let Some(cpu) = cpu {
                         pin_current_thread(cpu);
                     }
-                    worker_loop(worker_rx);
+                    worker_loop(worker_rx, worker_profile);
                 }) {
                 Ok(handle) => threads.push(handle),
                 Err(err) => {
@@ -221,27 +242,62 @@ impl DecodePool {
         Ok(Self {
             tx: Some(tx),
             threads,
+            profile,
         })
+    }
+
+    pub fn profiler(&self) -> &CodecProfile {
+        &self.profile
+    }
+
+    pub fn profile(&self) -> &ProfileRuntime {
+        self.profile.runtime()
+    }
+
+    pub fn profile_snapshot(&self) -> ProfileSnapshot {
+        self.profile.snapshot()
+    }
+
+    pub fn profile_snapshot_and_reset(&self) -> ProfileSnapshot {
+        self.profile.snapshot_and_reset()
+    }
+
+    pub fn reset_profile(&self) {
+        self.profile.reset_metrics();
     }
 
     /// Submit a decode request, blocking only when the bounded queue is full.
     pub fn submit(&self, request: DecodeRequest) -> CodecResult<DecodeFuture> {
-        let (work, future) = decode_work(request);
-        let tx = self.tx.as_ref().ok_or(CodecError::Shutdown)?;
-        tx.send(work).map_err(|_| CodecError::Shutdown)?;
+        let queued_at = self.profile.record_submit(CodecSubmitKind::Blocking);
+        let (work, future) = decode_work(request, queued_at);
+        let Some(tx) = self.tx.as_ref() else {
+            self.profile.record_submit_error();
+            return Err(CodecError::Shutdown);
+        };
+        if tx.send(work).is_err() {
+            self.profile.record_submit_error();
+            return Err(CodecError::Shutdown);
+        }
         Ok(future)
     }
 
     /// Submit without waiting for queue capacity.
     pub fn try_submit(&self, request: DecodeRequest) -> CodecResult<DecodeFuture> {
-        let (work, future) = decode_work(request);
-        let tx = self.tx.as_ref().ok_or(CodecError::Shutdown)?;
-        tx.try_send(work).map_err(|err| match err {
-            flume::TrySendError::Full(_) => CodecError::QueueFull {
-                capacity: tx.capacity().unwrap_or(0),
-            },
-            flume::TrySendError::Disconnected(_) => CodecError::Shutdown,
-        })?;
+        let queued_at = self.profile.record_submit(CodecSubmitKind::Try);
+        let (work, future) = decode_work(request, queued_at);
+        let Some(tx) = self.tx.as_ref() else {
+            self.profile.record_submit_error();
+            return Err(CodecError::Shutdown);
+        };
+        if let Err(err) = tx.try_send(work) {
+            self.profile.record_submit_error();
+            return Err(match err {
+                flume::TrySendError::Full(_) => CodecError::QueueFull {
+                    capacity: tx.capacity().unwrap_or(0),
+                },
+                flume::TrySendError::Disconnected(_) => CodecError::Shutdown,
+            });
+        }
         Ok(future)
     }
 
@@ -249,11 +305,26 @@ impl DecodePool {
     /// bounded queue accepted the command. Await the returned future for decode
     /// completion.
     pub async fn submit_async(&self, request: DecodeRequest) -> CodecResult<DecodeFuture> {
-        let (work, future) = decode_work(request);
-        let tx = self.tx.as_ref().ok_or(CodecError::Shutdown)?;
-        tx.send_async(work)
-            .await
-            .map_err(|_| CodecError::Shutdown)?;
+        let queued_at = self.profile.record_submit(CodecSubmitKind::Async);
+        let (work, future) = decode_work(request, queued_at);
+        let Some(tx) = self.tx.as_ref() else {
+            self.profile.record_submit_error();
+            return Err(CodecError::Shutdown);
+        };
+
+        match tx.try_send(work) {
+            Ok(()) => return Ok(future),
+            Err(flume::TrySendError::Full(work)) => {
+                if tx.send_async(work).await.is_err() {
+                    self.profile.record_submit_error();
+                    return Err(CodecError::Shutdown);
+                }
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                self.profile.record_submit_error();
+                return Err(CodecError::Shutdown);
+            }
+        }
         Ok(future)
     }
 }
@@ -269,34 +340,54 @@ impl Drop for DecodePool {
     }
 }
 
-fn worker_loop(rx: flume::Receiver<DecodeWork>) {
+fn worker_loop(rx: flume::Receiver<DecodeWork>, profile: CodecProfile) {
     while let Ok(work) = rx.recv() {
         // One worker is one OS thread; each chunk is decoded serially.
-        complete_work(work);
+        complete_work(work, &profile);
     }
 }
 
-fn complete_work(work: DecodeWork) {
+fn complete_work(work: DecodeWork, profile: &CodecProfile) {
+    let queued_at = work.queued_at;
     let DecodeRequest {
         codec,
         encoded,
         expected_size,
         output,
     } = work.request;
-    let result = panic::catch_unwind(AssertUnwindSafe(|| match output {
-        DecodeOutput::Allocate => DecodeRunner::decode(codec.as_ref(), &encoded, expected_size),
+    let encoded_bytes = encoded.len();
+    let work_profile = profile.start_work();
+    let mut panicked = false;
+    let result = match panic::catch_unwind(AssertUnwindSafe(|| match output {
+        DecodeOutput::Allocate => DecodeRunner::decode_borrowed_to_vec(
+            codec.as_ref(),
+            &encoded,
+            Vec::new(),
+            expected_size,
+        ),
         DecodeOutput::ReuseInitialized(output) => {
             DecodeRunner::decode_to_initialized_vec(codec.as_ref(), &encoded, output, expected_size)
         }
         DecodeOutput::ReuseCapacity(output) => {
             DecodeRunner::decode_to_capacity_vec(codec.as_ref(), &encoded, output, expected_size)
         }
-    }))
-    .unwrap_or_else(|_| {
-        Err(CodecError::WorkerPanic {
-            codec: codec.name().to_string(),
-        })
-    });
+    })) {
+        Ok(result) => result,
+        Err(_) => {
+            panicked = true;
+            Err(CodecError::WorkerPanic {
+                codec: codec.name().to_string(),
+            })
+        }
+    };
+    let decoded_bytes = result.as_ref().ok().map(Vec::len);
+    work_profile.record(
+        queued_at,
+        encoded_bytes,
+        decoded_bytes,
+        result.is_err() && !panicked,
+        panicked,
+    );
 
     let _ = work.reply.send(result);
 }
@@ -340,7 +431,25 @@ fn pin_current_thread(cpu: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codecs::{UncompressedCodec, UnsupportedCodec};
+    #[cfg(feature = "profile")]
+    use crate::codecs::profile::test_metrics;
+    use crate::codecs::{sealed, ChunkCodec, UncompressedCodec, UnsupportedCodec};
+    #[cfg(feature = "profile")]
+    use crate::profile::{ProfileMetricId, ProfileRegistry, ProfileRuntime};
+
+    #[cfg(feature = "profile")]
+    static PROFILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "profile")]
+    const PROFILE_ENV_KEYS: &[&str] = &[
+        "SCDATA_PROFILE",
+        "SCDATA_PROFILE_LABEL",
+        "SCDATA_PROFILE_COMPONENTS",
+        "SCDATA_PROFILE_COMPONENT_ENABLE",
+        "SCDATA_PROFILE_COMPONENT_DISABLE",
+        "SCDATA_PROFILE_SCOPES",
+        "SCDATA_PROFILE_SCOPE_ENABLE",
+        "SCDATA_PROFILE_SCOPE_DISABLE",
+    ];
 
     fn make_pool() -> DecodePool {
         DecodePool::new(DecodePoolConfig {
@@ -349,6 +458,145 @@ mod tests {
             cpus: None,
         })
         .expect("create decode pool")
+    }
+
+    #[cfg(feature = "profile")]
+    fn make_profiled_pool(profile: CodecProfile) -> DecodePool {
+        DecodePool::with_codec_profile(
+            DecodePoolConfig {
+                num_workers: 2,
+                queue_capacity: 8,
+                cpus: None,
+            },
+            profile,
+        )
+        .expect("create decode pool")
+    }
+
+    #[cfg(feature = "profile")]
+    fn enabled_profile(label: &'static str) -> CodecProfile {
+        CodecProfile::enabled(label)
+    }
+
+    #[cfg(feature = "profile")]
+    fn metric(snapshot: &ProfileSnapshot, id: ProfileMetricId) -> u64 {
+        snapshot.metric_value(id).unwrap_or(0)
+    }
+
+    #[cfg(feature = "profile")]
+    fn with_profile_env_enabled<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = PROFILE_ENV_LOCK.lock().unwrap();
+        let saved = PROFILE_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+
+        std::env::set_var("SCDATA_PROFILE", "1");
+        for key in PROFILE_ENV_KEYS
+            .iter()
+            .copied()
+            .filter(|key| *key != "SCDATA_PROFILE")
+        {
+            std::env::remove_var(key);
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (key, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[derive(Debug)]
+    struct VecFastPathCodec {
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl sealed::Sealed for VecFastPathCodec {}
+
+    impl ChunkCodec for VecFastPathCodec {
+        fn name(&self) -> &str {
+            "vec-fast"
+        }
+
+        fn decode(&self, _encoded: &[u8], _expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
+            panic!("decode should not be called when Allocate uses vec fastpath");
+        }
+
+        fn decode_to_vec_grow(
+            &self,
+            encoded: &[u8],
+            mut output: Vec<u8>,
+            expected_size: Option<usize>,
+        ) -> CodecResult<Vec<u8>> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(expected_size) = expected_size {
+                if expected_size != encoded.len() {
+                    return Err(CodecError::SizeMismatch {
+                        codec: self.name().to_string(),
+                        expected: expected_size,
+                        actual: encoded.len(),
+                    });
+                }
+            }
+            output.clear();
+            output.extend_from_slice(encoded);
+            Ok(output)
+        }
+    }
+
+    #[cfg(feature = "profile")]
+    #[derive(Debug)]
+    struct PanicCodec;
+
+    #[cfg(feature = "profile")]
+    impl sealed::Sealed for PanicCodec {}
+
+    #[cfg(feature = "profile")]
+    impl ChunkCodec for PanicCodec {
+        fn name(&self) -> &str {
+            "panic"
+        }
+
+        fn decode(&self, _encoded: &[u8], _expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
+            panic!("intentional decode panic");
+        }
+    }
+
+    #[cfg(feature = "profile")]
+    #[derive(Debug)]
+    struct BlockingCodec {
+        started: std::sync::mpsc::Sender<()>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    #[cfg(feature = "profile")]
+    impl sealed::Sealed for BlockingCodec {}
+
+    #[cfg(feature = "profile")]
+    impl ChunkCodec for BlockingCodec {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {
+            let _ = self.started.send(());
+            let (released, condvar) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            let codec = UncompressedCodec;
+            codec.decode(encoded, expected_size)
+        }
     }
 
     #[test]
@@ -384,6 +632,144 @@ mod tests {
         assert_eq!(&decoded, b"abcdef");
     }
 
+    #[cfg(feature = "profile")]
+    #[test]
+    fn decode_pool_records_profile_for_successful_work() {
+        let profile = enabled_profile("codec-success");
+        let pool = make_profiled_pool(profile.clone());
+        let round = profile.start();
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let request = DecodeRequest::new(codec, b"abcdef".to_vec()).with_expected_size(6);
+
+        let decoded = pool
+            .submit(request)
+            .expect("submit")
+            .blocking_recv()
+            .expect("decode");
+
+        assert_eq!(&decoded, b"abcdef");
+        let snapshot = pool.profiler().snapshot();
+        assert_eq!(snapshot.label, "codec-success");
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_BLOCKING_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_ERRORS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::ENCODED_BYTES), 6);
+        assert_eq!(metric(&snapshot, test_metrics::DECODED_BYTES), 6);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_ERRORS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_PANICS), 0);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn decode_pool_records_profile_for_async_submit() {
+        let profile = enabled_profile("codec-async");
+        let pool = make_profiled_pool(profile.clone());
+        let round = profile.start();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("tokio runtime");
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let request = DecodeRequest::new(codec, b"abcdef".to_vec()).with_expected_size(6);
+
+        let future = runtime
+            .block_on(pool.submit_async(request))
+            .expect("async submit");
+        let decoded = future.blocking_recv().expect("decode");
+
+        assert_eq!(&decoded, b"abcdef");
+        let snapshot = pool.profiler().snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_ASYNC_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_CALLS), 1);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn decode_pool_from_env_auto_records_and_reset_keeps_recording() {
+        with_profile_env_enabled(|| {
+            let pool = make_pool();
+            assert!(pool.profile().is_recording());
+
+            let codec: SharedCodec = Arc::new(UncompressedCodec);
+            let request = DecodeRequest::new(codec, b"abcdef".to_vec()).with_expected_size(6);
+            let decoded = pool
+                .submit(request)
+                .expect("submit")
+                .blocking_recv()
+                .expect("decode");
+            assert_eq!(&decoded, b"abcdef");
+
+            let first_snapshot = pool.profile_snapshot_and_reset();
+            assert_eq!(metric(&first_snapshot, test_metrics::SUBMIT_CALLS), 1);
+            assert_eq!(metric(&first_snapshot, test_metrics::WORK_CALLS), 1);
+            assert!(pool.profile().is_recording());
+            assert_eq!(
+                metric(&pool.profile_snapshot(), test_metrics::SUBMIT_CALLS),
+                0
+            );
+
+            let codec: SharedCodec = Arc::new(UncompressedCodec);
+            let request = DecodeRequest::new(codec, b"ghijkl".to_vec()).with_expected_size(6);
+            let decoded = pool
+                .submit(request)
+                .expect("second submit")
+                .blocking_recv()
+                .expect("second decode");
+            assert_eq!(&decoded, b"ghijkl");
+            pool.reset_profile();
+            assert!(pool.profile().is_recording());
+            assert_eq!(
+                metric(&pool.profile_snapshot(), test_metrics::SUBMIT_CALLS),
+                0
+            );
+        });
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn codec_profile_snapshot_and_reset_keeps_manual_round_recording() {
+        let profile = enabled_profile("codec-manual-reset");
+        let pool = make_profiled_pool(profile.clone());
+        let round = profile.start();
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let request = DecodeRequest::new(codec, b"abcdef".to_vec()).with_expected_size(6);
+
+        let decoded = pool
+            .submit(request)
+            .expect("submit")
+            .blocking_recv()
+            .expect("decode");
+
+        assert_eq!(&decoded, b"abcdef");
+        let reset = pool.profile_snapshot_and_reset();
+        assert_eq!(metric(&reset, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(metric(&reset, test_metrics::WORK_CALLS), 1);
+        assert!(pool.profile().is_recording());
+        assert_eq!(
+            metric(&pool.profile_snapshot(), test_metrics::SUBMIT_CALLS),
+            0
+        );
+
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let request = DecodeRequest::new(codec, b"ghijkl".to_vec()).with_expected_size(6);
+        let decoded = pool
+            .submit(request)
+            .expect("second submit")
+            .blocking_recv()
+            .expect("second decode");
+        assert_eq!(&decoded, b"ghijkl");
+        pool.reset_profile();
+        assert!(pool.profile().is_recording());
+        assert_eq!(
+            metric(&pool.profile_snapshot(), test_metrics::SUBMIT_CALLS),
+            0
+        );
+        round.end();
+    }
+
     #[test]
     fn decode_pool_returns_codec_errors() {
         let pool = make_pool();
@@ -397,6 +783,156 @@ mod tests {
             .expect_err("unsupported codec");
 
         assert!(matches!(err, CodecError::Unsupported { codec } if codec == "blosc"));
+    }
+
+    #[test]
+    fn decode_pool_allocate_uses_codec_vec_fastpath() {
+        let pool = make_pool();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let codec: SharedCodec = Arc::new(VecFastPathCodec {
+            called: Arc::clone(&called),
+        });
+        let request = DecodeRequest::new(codec, b"abcdef".to_vec()).with_expected_size(6);
+
+        let decoded = pool
+            .submit(request)
+            .expect("submit")
+            .blocking_recv()
+            .expect("decode");
+
+        assert_eq!(&decoded, b"abcdef");
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn decode_pool_records_profile_for_codec_errors() {
+        let profile = enabled_profile("codec-error");
+        let pool = make_profiled_pool(profile.clone());
+        let round = profile.start();
+        let codec: SharedCodec = Arc::new(UnsupportedCodec::new("blosc"));
+        let request = DecodeRequest::new(codec, b"payload".to_vec());
+
+        let err = pool
+            .try_submit(request)
+            .expect("submit")
+            .blocking_recv()
+            .expect_err("unsupported codec");
+
+        assert!(matches!(err, CodecError::Unsupported { codec } if codec == "blosc"));
+        let snapshot = pool.profiler().snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_TRY_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_ERRORS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::ENCODED_BYTES), 7);
+        assert_eq!(metric(&snapshot, test_metrics::DECODED_BYTES), 0);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_ERRORS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_PANICS), 0);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn decode_pool_records_profile_for_worker_panics() {
+        let profile = enabled_profile("codec-panic");
+        let pool = make_profiled_pool(profile.clone());
+        let round = profile.start();
+        let codec: SharedCodec = Arc::new(PanicCodec);
+        let request = DecodeRequest::new(codec, b"payload".to_vec());
+
+        let err = pool
+            .submit(request)
+            .expect("submit")
+            .blocking_recv()
+            .expect_err("panic is reported");
+
+        assert!(matches!(err, CodecError::WorkerPanic { codec } if codec == "panic"));
+        let snapshot = pool.profiler().snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_BLOCKING_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::ENCODED_BYTES), 7);
+        assert_eq!(metric(&snapshot, test_metrics::DECODED_BYTES), 0);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_ERRORS), 0);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_PANICS), 1);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn codec_profile_registers_scopes_for_active_runtime() {
+        let runtime = ProfileRuntime::enabled_lazy("codec-active-registry", ProfileRegistry::new);
+        let round = runtime.start();
+        let pool = make_profiled_pool(CodecProfile::from_runtime(runtime.clone()));
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let request = DecodeRequest::new(codec, b"abcdef".to_vec()).with_expected_size(6);
+
+        let decoded = pool
+            .submit(request)
+            .expect("submit")
+            .blocking_recv()
+            .expect("decode");
+
+        assert_eq!(&decoded, b"abcdef");
+        let snapshot = runtime.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::WORK_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::DECODED_BYTES), 6);
+        round.end();
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    fn decode_pool_does_not_record_queue_wait_across_rounds() {
+        let profile = enabled_profile("codec-queue-round");
+        let pool = DecodePool::with_codec_profile(
+            DecodePoolConfig {
+                num_workers: 1,
+                queue_capacity: 8,
+                cpus: None,
+            },
+            profile.clone(),
+        )
+        .expect("create decode pool");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let round = profile.start();
+        let blocking_codec: SharedCodec = Arc::new(BlockingCodec {
+            started: started_tx,
+            release: Arc::clone(&release),
+        });
+        let first = pool
+            .submit(DecodeRequest::new(blocking_codec, b"first".to_vec()).with_expected_size(5))
+            .expect("submit blocking request");
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker should start blocking request");
+
+        let second = pool
+            .submit(
+                DecodeRequest::new(Arc::new(UncompressedCodec), b"second".to_vec())
+                    .with_expected_size(6),
+            )
+            .expect("submit queued request");
+        let round_one = round.end();
+        assert_eq!(metric(&round_one, test_metrics::SUBMIT_CALLS), 2);
+
+        let round = profile.start();
+        {
+            let (released, condvar) = &*release;
+            *released.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+
+        assert_eq!(first.blocking_recv().expect("first decode"), b"first");
+        assert_eq!(second.blocking_recv().expect("second decode"), b"second");
+
+        let snapshot = profile.snapshot();
+        assert_eq!(metric(&snapshot, test_metrics::WORK_CALLS), 1);
+        assert_eq!(metric(&snapshot, test_metrics::QUEUE_WAIT_NS), 0);
+        round.end();
     }
 
     #[test]

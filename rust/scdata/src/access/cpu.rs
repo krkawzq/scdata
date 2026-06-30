@@ -66,8 +66,22 @@ impl AccessCpuConfig {
     }
 }
 
+enum AccessCpuInput {
+    Shared(Arc<[u8]>),
+    Owned(Vec<u8>),
+}
+
+impl AccessCpuInput {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Shared(input) => input.as_ref(),
+            Self::Owned(input) => input.as_slice(),
+        }
+    }
+}
+
 struct AccessCpuWork {
-    input: Arc<[u8]>,
+    input: AccessCpuInput,
     ranges: Option<Arc<[RangeCopy]>>,
     output_len: usize,
     shape: SliceShape,
@@ -131,6 +145,15 @@ impl AccessCpuPool {
             return materialize_planned(&input, plan.ranges(), plan.output_len, plan.shape);
         }
 
+        self.materialize_on_worker(AccessCpuInput::Shared(input), plan)
+            .await
+    }
+
+    async fn materialize_on_worker(
+        &self,
+        input: AccessCpuInput,
+        plan: SlicePlan,
+    ) -> Result<Vec<u8>, AccessError> {
         let (reply, rx) = oneshot::channel();
         let work = AccessCpuWork {
             input,
@@ -165,7 +188,7 @@ impl AccessCpuPool {
             );
         }
 
-        self.materialize(Arc::from(input.into_boxed_slice()), plan)
+        self.materialize_on_worker(AccessCpuInput::Owned(input), plan)
             .await
     }
 }
@@ -188,17 +211,19 @@ fn worker_loop(rx: flume::Receiver<AccessCpuWork>) {
 }
 
 fn complete_work(work: AccessCpuWork) {
+    let AccessCpuWork {
+        input,
+        ranges,
+        output_len,
+        shape,
+        reply,
+    } = work;
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        materialize_planned(
-            &work.input,
-            work.ranges.as_deref(),
-            work.output_len,
-            work.shape,
-        )
+        materialize_planned(input.as_slice(), ranges.as_deref(), output_len, shape)
     }))
     .unwrap_or(Err(AccessError::CpuWorkerPanic));
 
-    let _ = work.reply.send(result);
+    let _ = reply.send(result);
 }
 
 fn materialize_planned(
@@ -420,6 +445,32 @@ mod tests {
             .expect("materialize");
 
         assert_eq!(out, b"abccde");
+    }
+
+    #[test]
+    fn materializes_owned_scatter_copy_on_worker() {
+        let pool = AccessCpuPool::new(AccessCpuConfig {
+            num_workers: 2,
+            queue_capacity: 4,
+            cpus: None,
+        })
+        .expect("pool");
+        let input = (0..64 * 1024)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        let ranges = [(0, 1024, 12_000), (10_976, 30_000, 42_000)];
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&input[1024..12_000]);
+        expected.extend_from_slice(&input[30_000..42_000]);
+
+        let out = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(pool.materialize_owned(input, plan(&ranges, 64 * 1024)))
+            .expect("materialize");
+
+        assert_eq!(out, expected);
     }
 
     #[test]

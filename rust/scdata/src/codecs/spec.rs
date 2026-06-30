@@ -20,8 +20,23 @@ pub(crate) mod sealed {
 }
 
 /// Decode one numcodecs-compatible zarr chunk into an owned output buffer.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CodecCacheKey {
+    Static(&'static str),
+    Lzma { format: i32, has_filters: bool },
+    Unsupported(String),
+    Pipeline(Vec<CodecCacheKey>),
+    Object(usize),
+}
+
 pub trait ChunkCodec: sealed::Sealed + Send + Sync + fmt::Debug + 'static {
     fn name(&self) -> &str;
+
+    #[doc(hidden)]
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Object(self as *const Self as *const () as usize)
+    }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>>;
 

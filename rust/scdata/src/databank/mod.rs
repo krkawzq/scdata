@@ -9,21 +9,27 @@ mod batch;
 mod compute;
 mod config;
 mod dataset;
+mod dense;
+mod direct;
 mod error;
+mod gene_axis;
 mod interner;
 mod plan;
+mod profile;
 mod registry;
+mod scheduled;
+mod sparse;
+mod util;
 
 use std::sync::Arc;
 
 pub use array::{
-    ArrayCodecMeta, ArrayGridSpec, ArrayMeta, ArrayOrder, ArraySpec, Bf16Bits, ChunkSourceSpec,
-    ChunkSpec, ChunkStoreMeta, DType, DataValue, DirectoryChunkLocationMeta, EdgeChunkLayout,
-    F16Bits, FileChunkLocation, RegisteredFile,
+    ArrayCodecSpec, ArrayGridSpec, ArrayOrder, ArraySpec, Bf16Bits, ChunkSourceSpec, ChunkSpec,
+    DType, DataValue, EdgeChunkLayout, F16Bits, RegisteredFile,
 };
-pub use batch::{MissingGenePolicy, PrefetchCells, PrefetchedBatch};
+pub use batch::{MissingGenePolicy, MultiBatchCells, PrefetchCells, PrefetchedBatch};
 pub use config::{DataBankConfig, FillConfig, ScheduledPrefetchConfig};
-pub use dataset::{Dense1DMeta, Dense2DMeta, SparseCsrDatasetMeta};
+pub use dataset::{Dense1DSpec, Dense2DSpec, SparseCsrSpec};
 pub use error::{DataBankError, DataBankResult};
 pub use interner::GeneNameView;
 pub use registry::DatasetId;
@@ -31,11 +37,13 @@ pub use registry::DatasetId;
 use crate::access::{AccessHandle, AccessScheduler, ScheduledAccessConfig};
 use crate::codecs::DecodePool;
 use crate::iopool::IoPool;
+use crate::profile::{ProfileRuntime, ProfileSnapshot};
 
 use adapter::{DecodePoolBackend, IoPoolBackend};
 use compute::DataBankComputePool;
 use dataset::{Dataset, Dense1DDataset, Dense2DDataset, SparseCsrDataset};
 use interner::GeneInterner;
+use profile::{DataBankAccessKind, DataBankProfile, DataBankRegisterKind, DataBankScheduledKind};
 use registry::DatasetRegistry;
 
 pub struct DataBank {
@@ -47,10 +55,23 @@ pub struct DataBank {
     retired: Vec<Arc<Dataset>>,
     interner: GeneInterner,
     config: DataBankConfig,
+    profiler: DataBankProfile,
 }
 
 impl DataBank {
     pub fn new(config: DataBankConfig) -> DataBankResult<Self> {
+        Self::new_with_profile(config, DataBankProfile::from_env())
+    }
+
+    #[cfg(all(test, feature = "profile"))]
+    pub(crate) fn new_with_profiler(
+        config: DataBankConfig,
+        profiler: DataBankProfile,
+    ) -> DataBankResult<Self> {
+        Self::new_with_profile(config, profiler)
+    }
+
+    fn new_with_profile(config: DataBankConfig, profiler: DataBankProfile) -> DataBankResult<Self> {
         config.validate().map_err(DataBankError::InvalidConfig)?;
         let io_pool = Arc::new(IoPool::new(config.io_config.clone())?);
         let decode_pool = Arc::new(DecodePool::new(config.decode_config.clone())?);
@@ -69,57 +90,114 @@ impl DataBank {
             retired: Vec::new(),
             interner: GeneInterner::new(),
             config,
+            profiler,
         })
     }
 
-    pub fn register_dense_1d(&mut self, meta: Dense1DMeta) -> DataBankResult<DatasetId> {
-        self.cleanup_retired()?;
-        self.registry.ensure_can_register()?;
-        let genes = self.interner.intern_dataset(&meta.gene_names);
-        match Dense1DDataset::from_meta(genes.clone(), meta, self.io_pool.as_ref()) {
-            Ok(dataset) => self.registry.register(Dataset::Dense1D(dataset)),
-            Err(err) => {
-                self.interner.release_dataset(&genes);
-                Err(err)
-            }
-        }
+    pub fn profile(&self) -> &ProfileRuntime {
+        self.profiler.runtime()
     }
 
-    pub fn register_dense_2d(&mut self, meta: Dense2DMeta) -> DataBankResult<DatasetId> {
-        self.cleanup_retired()?;
-        self.registry.ensure_can_register()?;
-        let genes = self.interner.intern_dataset(&meta.gene_names);
-        match Dense2DDataset::from_meta(genes.clone(), meta, self.io_pool.as_ref()) {
-            Ok(dataset) => self.registry.register(Dataset::Dense2D(dataset)),
-            Err(err) => {
-                self.interner.release_dataset(&genes);
-                Err(err)
-            }
-        }
+    pub fn profile_snapshot(&self) -> ProfileSnapshot {
+        self.profiler.snapshot()
     }
 
-    pub fn register_dense(&mut self, meta: Dense2DMeta) -> DataBankResult<DatasetId> {
-        self.register_dense_2d(meta)
+    pub fn profile_snapshot_and_reset(&self) -> ProfileSnapshot {
+        self.profiler.snapshot_and_reset()
     }
 
-    pub fn register_sparse_csr(&mut self, meta: SparseCsrDatasetMeta) -> DataBankResult<DatasetId> {
-        self.cleanup_retired()?;
-        self.registry.ensure_can_register()?;
-        let genes = self.interner.intern_dataset(&meta.gene_names);
-        match SparseCsrDataset::from_meta(genes.clone(), meta, self.io_pool.as_ref()) {
-            Ok(dataset) => self.registry.register(Dataset::SparseCsr(dataset)),
-            Err(err) => {
-                self.interner.release_dataset(&genes);
-                Err(err)
+    pub fn reset_profile(&self) {
+        self.profiler.reset_metrics();
+    }
+
+    pub fn register_dense_1d(&mut self, spec: Dense1DSpec) -> DataBankResult<DatasetId> {
+        let started = self.profiler.lifecycle_timer();
+        let gene_count = spec.gene_names.len();
+        let result = (|| {
+            self.cleanup_retired()?;
+            self.registry.ensure_can_register()?;
+            let genes = self.interner.intern_dataset(&spec.gene_names);
+            match Dense1DDataset::from_spec(genes.clone(), spec, self.io_pool.as_ref()) {
+                Ok(dataset) => self.registry.register(Dataset::Dense1D(dataset)),
+                Err(err) => {
+                    self.interner.release_dataset(&genes);
+                    Err(err)
+                }
             }
-        }
+        })();
+        self.profiler.record_register(
+            started,
+            DataBankRegisterKind::Dense1D,
+            gene_count,
+            result.is_err(),
+        );
+        result
+    }
+
+    pub fn register_dense_2d(&mut self, spec: Dense2DSpec) -> DataBankResult<DatasetId> {
+        let started = self.profiler.lifecycle_timer();
+        let gene_count = spec.gene_names.len();
+        let result = (|| {
+            self.cleanup_retired()?;
+            self.registry.ensure_can_register()?;
+            let genes = self.interner.intern_dataset(&spec.gene_names);
+            match Dense2DDataset::from_spec(genes.clone(), spec, self.io_pool.as_ref()) {
+                Ok(dataset) => self.registry.register(Dataset::Dense2D(dataset)),
+                Err(err) => {
+                    self.interner.release_dataset(&genes);
+                    Err(err)
+                }
+            }
+        })();
+        self.profiler.record_register(
+            started,
+            DataBankRegisterKind::Dense2D,
+            gene_count,
+            result.is_err(),
+        );
+        result
+    }
+
+    pub fn register_sparse_csr(&mut self, spec: SparseCsrSpec) -> DataBankResult<DatasetId> {
+        let started = self.profiler.lifecycle_timer();
+        let gene_count = spec.gene_names.len();
+        let result = (|| {
+            self.cleanup_retired()?;
+            self.registry.ensure_can_register()?;
+            let genes = self.interner.intern_dataset(&spec.gene_names);
+            match SparseCsrDataset::from_spec(genes.clone(), spec, self.io_pool.as_ref()) {
+                Ok(dataset) => self.registry.register(Dataset::SparseCsr(dataset)),
+                Err(err) => {
+                    self.interner.release_dataset(&genes);
+                    Err(err)
+                }
+            }
+        })();
+        self.profiler.record_register(
+            started,
+            DataBankRegisterKind::SparseCsr,
+            gene_count,
+            result.is_err(),
+        );
+        result
     }
 
     pub fn unregister(&mut self, id: DatasetId) -> DataBankResult<()> {
-        self.cleanup_retired()?;
-        let dataset = self.registry.remove(id)?;
-        self.interner.release_dataset(dataset.genes());
-        self.unregister_files_or_retire(dataset)
+        let started = self.profiler.lifecycle_timer();
+        let result = (|| {
+            self.cleanup_retired()?;
+            let dataset = self.registry.remove(id)?;
+            self.interner.release_dataset(dataset.genes());
+            let retired = Arc::strong_count(&dataset) != 1;
+            self.unregister_files_or_retire(dataset)?;
+            Ok(retired)
+        })();
+        self.profiler.record_unregister(
+            started,
+            result.as_ref().copied().unwrap_or(false),
+            result.is_err(),
+        );
+        result.map(|_| ())
     }
 
     pub fn access_cells<T: DataValue>(
@@ -149,8 +227,26 @@ impl DataBank {
         names: Option<&mut [GeneNameView]>,
         config: ScheduledAccessConfig,
     ) -> DataBankResult<()> {
-        let dataset = self.registry.get(id)?;
-        batch::access_cells(
+        let started = self.profiler.access_timer();
+        let output_elements = out.len();
+        let output_bytes = output_bytes::<T>(output_elements);
+        let dataset = match self.registry.get(id) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                self.profiler.record_access(
+                    started,
+                    DataBankAccessKind::Borrowed,
+                    cells.len(),
+                    0,
+                    output_elements,
+                    output_bytes,
+                    true,
+                );
+                return Err(err);
+            }
+        };
+        let output_genes = dataset.num_genes();
+        let result = batch::access_cells(
             &self.access,
             &self.compute,
             &config,
@@ -158,7 +254,17 @@ impl DataBank {
             cells,
             out,
             names,
-        )
+        );
+        self.profiler.record_access(
+            started,
+            DataBankAccessKind::Borrowed,
+            cells.len(),
+            output_genes,
+            output_elements,
+            output_bytes,
+            result.is_err(),
+        );
+        result
     }
 
     pub fn access_cells_by_gene_names<T, G>(
@@ -200,8 +306,26 @@ impl DataBank {
         T: DataValue,
         G: AsRef<str>,
     {
-        let dataset = self.registry.get(id)?;
-        batch::access_cells_by_gene_names(
+        let started = self.profiler.access_timer();
+        let output_elements = out.len();
+        let output_bytes = output_bytes::<T>(output_elements);
+        let output_genes = gene_names.len();
+        let dataset = match self.registry.get(id) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                self.profiler.record_access(
+                    started,
+                    DataBankAccessKind::ByGeneNames,
+                    cells.len(),
+                    output_genes,
+                    output_elements,
+                    output_bytes,
+                    true,
+                );
+                return Err(err);
+            }
+        };
+        let result = batch::access_cells_by_gene_names(
             &self.access,
             &self.compute,
             &config,
@@ -211,7 +335,17 @@ impl DataBank {
             out,
             names,
             missing,
-        )
+        );
+        self.profiler.record_access(
+            started,
+            DataBankAccessKind::ByGeneNames,
+            cells.len(),
+            output_genes,
+            output_elements,
+            output_bytes,
+            result.is_err(),
+        );
+        result
     }
 
     /// Access trusted CSR cells through the unchecked hot path.
@@ -267,8 +401,26 @@ impl DataBank {
         names: Option<&mut [GeneNameView]>,
         config: ScheduledAccessConfig,
     ) -> DataBankResult<()> {
-        let dataset = self.registry.get(id)?;
-        unsafe {
+        let started = self.profiler.access_timer();
+        let output_elements = out.len();
+        let output_bytes = output_bytes::<T>(output_elements);
+        let dataset = match self.registry.get(id) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                self.profiler.record_access(
+                    started,
+                    DataBankAccessKind::Unchecked,
+                    cells.len(),
+                    0,
+                    output_elements,
+                    output_bytes,
+                    true,
+                );
+                return Err(err);
+            }
+        };
+        let output_genes = dataset.num_genes();
+        let result = unsafe {
             batch::access_cells_unchecked(
                 &self.access,
                 &self.compute,
@@ -278,12 +430,32 @@ impl DataBank {
                 out,
                 names,
             )
-        }
+        };
+        self.profiler.record_access(
+            started,
+            DataBankAccessKind::Unchecked,
+            cells.len(),
+            output_genes,
+            output_elements,
+            output_bytes,
+            result.is_err(),
+        );
+        result
     }
 
     pub fn prefetch_cells(&self, id: DatasetId, cells: &[usize]) -> DataBankResult<()> {
-        let dataset = self.registry.get(id)?;
-        batch::prefetch_cells(&self.access, dataset, cells)
+        let started = self.profiler.prefetch_timer();
+        let dataset = match self.registry.get(id) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                self.profiler.record_prefetch(started, cells.len(), true);
+                return Err(err);
+            }
+        };
+        let result = batch::prefetch_cells(&self.access, dataset, cells);
+        self.profiler
+            .record_prefetch(started, cells.len(), result.is_err());
+        result
     }
 
     /// Access cells with a databank-allocated output buffer.
@@ -305,23 +477,54 @@ impl DataBank {
         cells: &[usize],
         config: ScheduledAccessConfig,
     ) -> DataBankResult<Vec<T>> {
-        let dataset = self.registry.get(id)?;
-        batch::validate_dtype_and_cells::<T>(dataset, cells)?;
-        let total = cells
-            .len()
-            .checked_mul(dataset.num_genes())
-            .ok_or_else(|| DataBankError::InvalidConfig("output length overflow".to_string()))?;
-        let mut out = vec![T::zero(); total];
-        batch::access_cells(
-            &self.access,
-            &self.compute,
-            &config,
-            dataset,
-            cells,
-            &mut out,
-            None,
-        )?;
-        Ok(out)
+        let started = self.profiler.access_timer();
+        let dataset = match self.registry.get(id) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                self.profiler.record_access(
+                    started,
+                    DataBankAccessKind::Owned,
+                    cells.len(),
+                    0,
+                    0,
+                    0,
+                    true,
+                );
+                return Err(err);
+            }
+        };
+        let output_genes = dataset.num_genes();
+        let attempted_elements = cells.len().checked_mul(output_genes).unwrap_or(0);
+        let result = (|| {
+            batch::validate_dtype_and_cells::<T>(dataset, cells)?;
+            let total = cells.len().checked_mul(output_genes).ok_or_else(|| {
+                DataBankError::InvalidConfig("output length overflow".to_string())
+            })?;
+            let mut out = vec![T::zero(); total];
+            batch::access_cells_validated(
+                &self.access,
+                &self.compute,
+                &config,
+                dataset,
+                cells,
+                &mut out,
+                true,
+            )?;
+            Ok(out)
+        })();
+        let output_elements = result
+            .as_ref()
+            .map_or(attempted_elements, std::vec::Vec::len);
+        self.profiler.record_access(
+            started,
+            DataBankAccessKind::Owned,
+            cells.len(),
+            output_genes,
+            output_elements,
+            output_bytes::<T>(output_elements),
+            result.is_err(),
+        );
+        result
     }
 
     pub fn access_cells_owned_by_gene_names<T, G>(
@@ -356,8 +559,25 @@ impl DataBank {
         T: DataValue,
         G: AsRef<str>,
     {
-        let dataset = self.registry.get(id)?;
-        batch::access_cells_by_gene_names_owned(
+        let started = self.profiler.access_timer();
+        let output_genes = gene_names.len();
+        let dataset = match self.registry.get(id) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                self.profiler.record_access(
+                    started,
+                    DataBankAccessKind::OwnedByGeneNames,
+                    cells.len(),
+                    output_genes,
+                    0,
+                    0,
+                    true,
+                );
+                return Err(err);
+            }
+        };
+        let attempted_elements = cells.len().checked_mul(output_genes).unwrap_or(0);
+        let result = batch::access_cells_by_gene_names_owned(
             &self.access,
             &self.compute,
             &config,
@@ -365,7 +585,20 @@ impl DataBank {
             cells,
             gene_names,
             missing,
-        )
+        );
+        let output_elements = result
+            .as_ref()
+            .map_or(attempted_elements, std::vec::Vec::len);
+        self.profiler.record_access(
+            started,
+            DataBankAccessKind::OwnedByGeneNames,
+            cells.len(),
+            output_genes,
+            output_elements,
+            output_bytes::<T>(output_elements),
+            result.is_err(),
+        );
+        result
     }
 
     /// Alias for [`Self::access_cells_owned`].
@@ -403,14 +636,25 @@ impl DataBank {
         I::IntoIter: Send + 'static,
         I::Item: AsRef<[usize]> + Send,
     {
-        let dataset = self.registry.get_arc(id)?;
-        batch::prefetch_cells_scheduled(
+        let started = self.profiler.scheduled_timer();
+        let dataset = match self.registry.get_arc(id) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                self.profiler
+                    .record_scheduled(started, DataBankScheduledKind::Single, 1, true);
+                return Err(err);
+            }
+        };
+        let result = batch::prefetch_cells_scheduled(
             &self.access,
             Arc::clone(&self.compute),
             dataset,
             batch_source.into_iter(),
             config,
-        )
+        );
+        self.profiler
+            .record_scheduled(started, DataBankScheduledKind::Single, 1, result.is_err());
+        result
     }
 
     pub fn prefetch_cells_scheduled_by_gene_names<T, I, G>(
@@ -428,8 +672,20 @@ impl DataBank {
         I::Item: AsRef<[usize]> + Send,
         G: AsRef<str>,
     {
-        let dataset = self.registry.get_arc(id)?;
-        batch::prefetch_cells_scheduled_by_gene_names(
+        let started = self.profiler.scheduled_timer();
+        let dataset = match self.registry.get_arc(id) {
+            Ok(dataset) => dataset,
+            Err(err) => {
+                self.profiler.record_scheduled(
+                    started,
+                    DataBankScheduledKind::SingleByGeneNames,
+                    1,
+                    true,
+                );
+                return Err(err);
+            }
+        };
+        let result = batch::prefetch_cells_scheduled_by_gene_names(
             &self.access,
             Arc::clone(&self.compute),
             dataset,
@@ -437,7 +693,114 @@ impl DataBank {
             gene_names,
             missing,
             config,
-        )
+        );
+        self.profiler.record_scheduled(
+            started,
+            DataBankScheduledKind::SingleByGeneNames,
+            1,
+            result.is_err(),
+        );
+        result
+    }
+
+    pub fn prefetch_cells_scheduled_multi<T, I>(
+        &self,
+        ids: &[DatasetId],
+        batch_source: I,
+        config: ScheduledPrefetchConfig,
+    ) -> DataBankResult<PrefetchCells<T>>
+    where
+        T: DataValue,
+        I: IntoIterator,
+        I::IntoIter: Send + 'static,
+        I::Item: Into<MultiBatchCells> + Send,
+    {
+        let started = self.profiler.scheduled_timer();
+        let datasets = match self.dataset_arcs(ids) {
+            Ok(datasets) => datasets,
+            Err(err) => {
+                self.profiler.record_scheduled(
+                    started,
+                    DataBankScheduledKind::Multi,
+                    ids.len(),
+                    true,
+                );
+                return Err(err);
+            }
+        };
+        let result = batch::prefetch_cells_scheduled_multi(
+            &self.access,
+            Arc::clone(&self.compute),
+            datasets,
+            batch_source.into_iter(),
+            config,
+        );
+        self.profiler.record_scheduled(
+            started,
+            DataBankScheduledKind::Multi,
+            ids.len(),
+            result.is_err(),
+        );
+        result
+    }
+
+    pub fn prefetch_cells_scheduled_multi_by_gene_names<T, I, G>(
+        &self,
+        ids: &[DatasetId],
+        batch_source: I,
+        gene_names: &[G],
+        missing: MissingGenePolicy,
+        config: ScheduledPrefetchConfig,
+    ) -> DataBankResult<PrefetchCells<T>>
+    where
+        T: DataValue,
+        I: IntoIterator,
+        I::IntoIter: Send + 'static,
+        I::Item: Into<MultiBatchCells> + Send,
+        G: AsRef<str>,
+    {
+        let started = self.profiler.scheduled_timer();
+        let datasets = match self.dataset_arcs(ids) {
+            Ok(datasets) => datasets,
+            Err(err) => {
+                self.profiler.record_scheduled(
+                    started,
+                    DataBankScheduledKind::MultiByGeneNames,
+                    ids.len(),
+                    true,
+                );
+                return Err(err);
+            }
+        };
+        let result = batch::prefetch_cells_scheduled_multi_by_gene_names(
+            &self.access,
+            Arc::clone(&self.compute),
+            datasets,
+            batch_source.into_iter(),
+            gene_names,
+            missing,
+            config,
+        );
+        self.profiler.record_scheduled(
+            started,
+            DataBankScheduledKind::MultiByGeneNames,
+            ids.len(),
+            result.is_err(),
+        );
+        result
+    }
+
+    fn dataset_arcs(&self, ids: &[DatasetId]) -> DataBankResult<Arc<[Arc<Dataset>]>> {
+        if ids.is_empty() {
+            return Err(DataBankError::InvalidConfig(
+                "prefetch requires at least one dataset".to_string(),
+            ));
+        }
+        let mut datasets = Vec::with_capacity(ids.len());
+        for &id in ids {
+            datasets.push(self.registry.get_arc(id)?);
+        }
+        Ok(Arc::from(datasets.into_boxed_slice()))
     }
 
     /// Borrow the gene-name views for a registered dataset.
@@ -481,6 +844,8 @@ impl DataBank {
     }
 
     fn cleanup_retired(&mut self) -> DataBankResult<()> {
+        let started = self.profiler.lifecycle_timer();
+        let inspected = self.retired.len();
         let mut first_error = None;
         let mut retained = Vec::with_capacity(self.retired.len());
 
@@ -495,18 +860,30 @@ impl DataBank {
         }
 
         self.retired = retained;
-        first_error.map_or(Ok(()), Err)
+        let retained = self.retired.len();
+        let result = first_error.map_or(Ok(()), Err);
+        self.profiler
+            .record_cleanup(started, inspected, retained, result.is_err());
+        result
     }
 }
 
 impl Drop for DataBank {
     fn drop(&mut self) {
+        let started = self.profiler.lifecycle_timer();
         let _ = self.cleanup_retired();
+        let mut drained = 0usize;
         for dataset in self.registry.drain() {
+            drained += 1;
             self.interner.release_dataset(dataset.genes());
             if Arc::strong_count(&dataset) == 1 {
                 let _ = dataset.unregister_files(self.io_pool.as_ref());
             }
         }
+        self.profiler.record_drop(started, drained);
     }
+}
+
+fn output_bytes<T>(elements: usize) -> usize {
+    elements.saturating_mul(std::mem::size_of::<T>())
 }

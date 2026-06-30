@@ -42,16 +42,31 @@ impl CachePayload {
         }
     }
 
-    pub(crate) fn decode_key(&self) -> Option<DecodeKey> {
-        match self {
-            Self::Raw(_) => None,
-            Self::Decoded { decode_key, .. } => Some(*decode_key),
-        }
-    }
-
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Raw(data) | Self::Decoded { data, .. } => data.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CacheEntryKey {
+    Raw(ChunkKey),
+    Decoded(DecodeKey),
+}
+
+impl CacheEntryKey {
+    fn for_payload(chunk: ChunkKey, payload: &CachePayload) -> Self {
+        match payload {
+            CachePayload::Raw(_) => Self::Raw(chunk),
+            CachePayload::Decoded { decode_key, .. } => Self::Decoded(decode_key.clone()),
+        }
+    }
+
+    fn chunk(&self) -> ChunkKey {
+        match self {
+            Self::Raw(chunk) => *chunk,
+            Self::Decoded(decode_key) => decode_key.chunk,
         }
     }
 }
@@ -67,8 +82,8 @@ struct CacheEntry {
 struct CacheInner {
     capacity: usize,
     used: usize,
-    entries: HashMap<ChunkKey, CacheEntry>,
-    lru: VecDeque<(ChunkKey, u64)>,
+    entries: HashMap<CacheEntryKey, CacheEntry>,
+    lru: VecDeque<(CacheEntryKey, u64)>,
     clock: u64,
 }
 
@@ -88,7 +103,7 @@ impl CacheInner {
         self.clock
     }
 
-    fn record_touch(&mut self, key: ChunkKey, stamp: u64) {
+    fn record_touch(&mut self, key: CacheEntryKey, stamp: u64) {
         self.lru.push_back((key, stamp));
         self.compact_lru_if_needed();
     }
@@ -116,31 +131,37 @@ impl CacheInner {
         self.evict_one_except(None)
     }
 
-    fn evict_one_except(&mut self, skip_key: Option<ChunkKey>) -> Option<EvictedEntry> {
-        let visits = self.lru.len();
-        for _ in 0..visits {
-            let Some((key, stamp)) = self.lru.pop_front() else {
+    fn evict_one_except(&mut self, skip_key: Option<&CacheEntryKey>) -> Option<EvictedEntry> {
+        let mut idx = 0;
+        while idx < self.lru.len() {
+            let Some((key, stamp)) = self.lru.get(idx).cloned() else {
                 break;
             };
 
             let Some(entry) = self.entries.get(&key) else {
+                self.lru.remove(idx);
                 continue;
             };
             if entry.stamp != stamp {
+                self.lru.remove(idx);
                 continue;
             }
-            if Some(key) == skip_key || entry.refcount > 0 {
-                self.lru.push_back((key, stamp));
+            if skip_key == Some(&key) || entry.refcount > 0 {
+                idx += 1;
                 continue;
             }
 
+            self.lru.remove(idx);
             let entry = self
                 .entries
                 .remove(&key)
                 .expect("entry checked before eviction");
             let bytes = entry.payload.len();
-            self.used = self.used.saturating_sub(bytes);
-            return Some(EvictedEntry { key, bytes });
+            self.used = self
+                .used
+                .checked_sub(bytes)
+                .expect("evicted bytes are part of cache usage");
+            return Some(EvictedEntry { bytes });
         }
         None
     }
@@ -148,19 +169,19 @@ impl CacheInner {
     fn evict_until_fits(
         &mut self,
         additional_bytes: usize,
-        skip_key: Option<ChunkKey>,
-    ) -> Result<usize, CacheInsertError> {
-        let mut evicted_bytes = 0;
+        skip_key: Option<&CacheEntryKey>,
+    ) -> Result<EvictionStats, CacheInsertError> {
+        let mut stats = EvictionStats::default();
         while match self.used.checked_add(additional_bytes) {
             Some(total) => total > self.capacity,
             None => true,
         } {
             let Some(evicted) = self.evict_one_except(skip_key) else {
-                return Err(CacheInsertError::all_pinned(evicted_bytes));
+                return Err(CacheInsertError::all_pinned(stats));
             };
-            evicted_bytes = evicted_bytes.saturating_add(evicted.bytes);
+            stats.add(evicted.bytes);
         }
-        Ok(evicted_bytes)
+        Ok(stats)
     }
 }
 
@@ -168,7 +189,6 @@ impl CacheInner {
 pub(crate) struct PinnedChunk {
     pub(crate) data: Arc<[u8]>,
     pub(crate) kind: CachePayloadKind,
-    pub(crate) decode_key: Option<DecodeKey>,
     pub(crate) guard: PinGuard,
 }
 
@@ -184,19 +204,19 @@ impl fmt::Debug for PinnedChunk {
 
 /// RAII guard that unpins a cache entry on drop.
 pub(crate) struct PinGuard {
-    key: ChunkKey,
+    key: CacheEntryKey,
     inner: Weak<RefCell<CacheInner>>,
     notify: Arc<Notify>,
 }
 
 impl PinGuard {
-    fn new(key: ChunkKey, inner: Weak<RefCell<CacheInner>>, notify: Arc<Notify>) -> Self {
+    fn new(key: CacheEntryKey, inner: Weak<RefCell<CacheInner>>, notify: Arc<Notify>) -> Self {
         Self { key, inner, notify }
     }
 
     #[allow(dead_code)]
     pub(crate) fn key(&self) -> ChunkKey {
-        self.key
+        self.key.chunk()
     }
 }
 
@@ -219,7 +239,10 @@ impl Drop for PinGuard {
             let Some(entry) = inner.entries.get_mut(&self.key) else {
                 return;
             };
-            entry.refcount = entry.refcount.saturating_sub(1);
+            entry.refcount = entry
+                .refcount
+                .checked_sub(1)
+                .expect("pin guard refcount underflow");
             entry.refcount == 0
         };
 
@@ -229,17 +252,30 @@ impl Drop for PinGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EvictedEntry {
-    pub(crate) key: ChunkKey,
     pub(crate) bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InsertOutcome {
     pub(crate) inserted: bool,
+    pub(crate) evicted_count: usize,
     pub(crate) evicted_bytes: usize,
     pub(crate) replaced_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EvictionStats {
+    pub(crate) count: usize,
+    pub(crate) bytes: usize,
+}
+
+impl EvictionStats {
+    fn add(&mut self, bytes: usize) {
+        self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +287,7 @@ pub(crate) enum CacheInsertErrorKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CacheInsertError {
     pub(crate) kind: CacheInsertErrorKind,
+    pub(crate) evicted_count: usize,
     pub(crate) evicted_bytes: usize,
 }
 
@@ -258,14 +295,16 @@ impl CacheInsertError {
     fn item_too_large() -> Self {
         Self {
             kind: CacheInsertErrorKind::ItemTooLarge,
+            evicted_count: 0,
             evicted_bytes: 0,
         }
     }
 
-    fn all_pinned(evicted_bytes: usize) -> Self {
+    fn all_pinned(evicted: EvictionStats) -> Self {
         Self {
             kind: CacheInsertErrorKind::AllPinned,
-            evicted_bytes,
+            evicted_count: evicted.count,
+            evicted_bytes: evicted.bytes,
         }
     }
 }
@@ -290,36 +329,37 @@ impl ChunkCache {
         self.inner
             .borrow()
             .entries
-            .get(key)
+            .get(&CacheEntryKey::Raw(*key))
             .is_some_and(|entry| entry.payload.kind() == CachePayloadKind::Raw)
     }
 
-    /// Pin and clone the cached bytes in one synchronous operation.
-    pub(crate) fn pin_and_get(&self, key: &ChunkKey) -> Option<PinnedChunk> {
+    pub(crate) fn pin_raw(&self, key: &ChunkKey) -> Option<PinnedChunk> {
+        self.pin_entry(CacheEntryKey::Raw(*key))
+    }
+
+    pub(crate) fn pin_decoded(&self, decode_key: &DecodeKey) -> Option<PinnedChunk> {
+        self.pin_entry(CacheEntryKey::Decoded(decode_key.clone()))
+    }
+
+    fn pin_entry(&self, entry_key: CacheEntryKey) -> Option<PinnedChunk> {
         let mut inner = self.inner.borrow_mut();
-        let (kind, data, decode_key, stamp) = {
+        let (kind, data, stamp) = {
             let inner = &mut *inner;
             let entries = &mut inner.entries;
             let clock = &mut inner.clock;
-            let entry = entries.get_mut(key)?;
+            let entry = entries.get_mut(&entry_key)?;
             *clock = clock.wrapping_add(1);
             let stamp = *clock;
             entry.refcount += 1;
             entry.stamp = stamp;
-            (
-                entry.payload.kind(),
-                entry.payload.data(),
-                entry.payload.decode_key(),
-                stamp,
-            )
+            (entry.payload.kind(), entry.payload.data(), stamp)
         };
-        inner.record_touch(*key, stamp);
+        inner.record_touch(entry_key.clone(), stamp);
         Some(PinnedChunk {
             data,
             kind,
-            decode_key,
             guard: PinGuard::new(
-                *key,
+                entry_key,
                 Rc::downgrade(&self.inner),
                 Arc::clone(&self.unpin_notify),
             ),
@@ -333,6 +373,7 @@ impl ChunkCache {
         payload: CachePayload,
     ) -> Result<InsertOutcome, CacheInsertError> {
         let size = payload.len();
+        let entry_key = CacheEntryKey::for_payload(key, &payload);
         let mut inner = self.inner.borrow_mut();
 
         if size > inner.capacity {
@@ -343,7 +384,7 @@ impl ChunkCache {
             let inner = &mut *inner;
             let entries = &mut inner.entries;
             let clock = &mut inner.clock;
-            if let Some(entry) = entries.get_mut(&key) {
+            if let Some(entry) = entries.get_mut(&entry_key) {
                 *clock = clock.wrapping_add(1);
                 let stamp = *clock;
                 entry.stamp = stamp;
@@ -352,32 +393,34 @@ impl ChunkCache {
                 None
             }
         } {
-            inner.record_touch(key, stamp);
+            inner.record_touch(entry_key, stamp);
             return Ok(InsertOutcome {
                 inserted: false,
+                evicted_count: 0,
                 evicted_bytes: 0,
                 replaced_bytes: 0,
             });
         }
 
-        let evicted_bytes = inner.evict_until_fits(size, None)?;
+        let evicted = inner.evict_until_fits(size, None)?;
         let stamp = inner.next_stamp();
         inner.used = inner
             .used
             .checked_add(size)
             .expect("cache usage checked before insert");
         inner.entries.insert(
-            key,
+            entry_key.clone(),
             CacheEntry {
                 payload,
                 refcount: 0,
                 stamp,
             },
         );
-        inner.record_touch(key, stamp);
+        inner.record_touch(entry_key, stamp);
         Ok(InsertOutcome {
             inserted: true,
-            evicted_bytes,
+            evicted_count: evicted.count,
+            evicted_bytes: evicted.bytes,
             replaced_bytes: 0,
         })
     }
@@ -389,15 +432,16 @@ impl ChunkCache {
         payload: CachePayload,
     ) -> Result<InsertOutcome, CacheInsertError> {
         let size = payload.len();
+        let entry_key = CacheEntryKey::for_payload(key, &payload);
         let mut inner = self.inner.borrow_mut();
 
         if size > inner.capacity {
             return Err(CacheInsertError::item_too_large());
         }
 
-        let replaced_bytes = if let Some(entry) = inner.entries.get(&key) {
+        let replaced_bytes = if let Some(entry) = inner.entries.get(&entry_key) {
             if entry.refcount > 0 {
-                return Err(CacheInsertError::all_pinned(0));
+                return Err(CacheInsertError::all_pinned(EvictionStats::default()));
             }
             entry.payload.len()
         } else {
@@ -411,7 +455,7 @@ impl ChunkCache {
                 .expect("replacement bytes are part of cache usage");
         }
 
-        let evicted = match inner.evict_until_fits(size, Some(key)) {
+        let evicted = match inner.evict_until_fits(size, Some(&entry_key)) {
             Ok(evicted) => evicted,
             Err(err) => {
                 if replaced_bytes > 0 {
@@ -428,23 +472,23 @@ impl ChunkCache {
             let stamp = inner.next_stamp();
             let entry = inner
                 .entries
-                .get_mut(&key)
+                .get_mut(&entry_key)
                 .expect("replacement target checked above");
             entry.payload = payload;
             entry.refcount = 0;
             entry.stamp = stamp;
-            inner.record_touch(key, stamp);
+            inner.record_touch(entry_key, stamp);
         } else {
             let stamp = inner.next_stamp();
             inner.entries.insert(
-                key,
+                entry_key.clone(),
                 CacheEntry {
                     payload,
                     refcount: 0,
                     stamp,
                 },
             );
-            inner.record_touch(key, stamp);
+            inner.record_touch(entry_key, stamp);
         }
         inner.used = inner
             .used
@@ -453,7 +497,8 @@ impl ChunkCache {
 
         Ok(InsertOutcome {
             inserted: true,
-            evicted_bytes: evicted,
+            evicted_count: evicted.count,
+            evicted_bytes: evicted.bytes,
             replaced_bytes,
         })
     }
@@ -488,7 +533,7 @@ impl ChunkCache {
 mod tests {
     use super::*;
     use crate::access::FileRef;
-    use crate::codecs::UncompressedCodec;
+    use crate::codecs::{SharedCodec, UncompressedCodec};
 
     fn key(offset: u64) -> ChunkKey {
         ChunkKey::new(FileRef(1), offset, 4)
@@ -503,14 +548,11 @@ mod tests {
     }
 
     fn decoded(bytes: &'static [u8], offset: u64) -> CachePayload {
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
         CachePayload::Decoded {
             data: Arc::from(bytes),
-            decode_key: DecodeKey {
-                chunk: key(offset),
-                codec: 1,
-                expected_size: Some(bytes.len()),
-            },
-            _codec: Arc::new(UncompressedCodec),
+            decode_key: DecodeKey::new(key(offset), &codec, Some(bytes.len())),
+            _codec: codec,
         }
     }
 
@@ -525,12 +567,12 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.used_bytes(), 8);
 
-        assert_eq!(&*cache.pin_and_get(&key(0)).expect("hit").data, b"aaaa");
+        assert_eq!(&*cache.pin_raw(&key(0)).expect("hit").data, b"aaaa");
         cache.insert_if_absent(key(8), raw(b"cccc")).unwrap();
 
-        assert!(cache.pin_and_get(&key(0)).is_some());
-        assert!(cache.pin_and_get(&key(4)).is_none());
-        assert!(cache.pin_and_get(&key(8)).is_some());
+        assert!(cache.pin_raw(&key(0)).is_some());
+        assert!(cache.pin_raw(&key(4)).is_none());
+        assert!(cache.pin_raw(&key(8)).is_some());
     }
 
     #[test]
@@ -538,13 +580,13 @@ mod tests {
         let cache = cache(8);
         cache.insert_if_absent(key(0), raw(b"aaaa")).unwrap();
         cache.insert_if_absent(key(4), raw(b"bbbb")).unwrap();
-        let pinned = cache.pin_and_get(&key(0)).expect("pin");
+        let pinned = cache.pin_raw(&key(0)).expect("pin");
 
         cache.insert_if_absent(key(8), raw(b"cccc")).unwrap();
 
-        assert!(cache.pin_and_get(&key(0)).is_some());
-        assert!(cache.pin_and_get(&key(4)).is_none());
-        assert!(cache.pin_and_get(&key(8)).is_some());
+        assert!(cache.pin_raw(&key(0)).is_some());
+        assert!(cache.pin_raw(&key(4)).is_none());
+        assert!(cache.pin_raw(&key(8)).is_some());
         assert_eq!(pinned.guard.key(), key(0));
     }
 
@@ -552,7 +594,7 @@ mod tests {
     fn all_pinned_cache_rejects_insert_until_unpinned() {
         let cache = cache(4);
         cache.insert_if_absent(key(0), raw(b"aaaa")).unwrap();
-        let pinned = cache.pin_and_get(&key(0)).expect("pin");
+        let pinned = cache.pin_raw(&key(0)).expect("pin");
 
         assert_eq!(
             cache
@@ -564,8 +606,8 @@ mod tests {
 
         drop(pinned);
         assert!(cache.insert_if_absent(key(4), raw(b"bbbb")).is_ok());
-        assert!(cache.pin_and_get(&key(0)).is_none());
-        assert!(cache.pin_and_get(&key(4)).is_some());
+        assert!(cache.pin_raw(&key(0)).is_none());
+        assert!(cache.pin_raw(&key(4)).is_some());
     }
 
     #[test]
@@ -573,7 +615,7 @@ mod tests {
         let cache = cache(8);
         cache.insert_if_absent(key(0), raw(b"aaaa")).unwrap();
         cache.insert_if_absent(key(4), raw(b"bbbb")).unwrap();
-        let _pinned = cache.pin_and_get(&key(4)).expect("pin");
+        let _pinned = cache.pin_raw(&key(4)).expect("pin");
 
         let err = cache
             .insert_if_absent(key(8), raw(b"cccccccc"))
@@ -582,23 +624,29 @@ mod tests {
         assert_eq!(err.kind, CacheInsertErrorKind::AllPinned);
         assert_eq!(err.evicted_bytes, 4);
         assert_eq!(cache.used_bytes(), 4);
-        assert!(cache.pin_and_get(&key(0)).is_none());
-        assert!(cache.pin_and_get(&key(4)).is_some());
+        assert!(cache.pin_raw(&key(0)).is_none());
+        assert!(cache.pin_raw(&key(4)).is_some());
     }
 
     #[test]
-    fn decoded_payload_replaces_unpinned_raw_payload() {
+    fn decoded_payload_coexists_with_raw_payload() {
         let cache = cache(16);
         cache.insert_if_absent(key(0), raw(b"raw")).unwrap();
+        let codec: SharedCodec = Arc::new(UncompressedCodec);
+        let decode_key = DecodeKey::new(key(0), &codec, Some(b"decoded".len()));
 
         let outcome = cache
             .insert_or_replace(key(0), decoded(b"decoded", 0))
             .unwrap();
-        assert_eq!(outcome.replaced_bytes, 3);
+        assert_eq!(outcome.replaced_bytes, 0);
+        assert_eq!(cache.used_bytes(), b"raw".len() + b"decoded".len());
 
-        let pinned = cache.pin_and_get(&key(0)).expect("decoded hit");
+        let pinned_raw = cache.pin_raw(&key(0)).expect("raw hit");
+        assert_eq!(pinned_raw.kind, CachePayloadKind::Raw);
+        assert_eq!(&*pinned_raw.data, b"raw");
+
+        let pinned = cache.pin_decoded(&decode_key).expect("decoded hit");
         assert_eq!(pinned.kind, CachePayloadKind::Decoded);
-        assert_eq!(pinned.decode_key.expect("decode key").chunk, key(0));
         assert_eq!(&*pinned.data, b"decoded");
     }
 }

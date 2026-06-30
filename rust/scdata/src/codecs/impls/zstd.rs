@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
-use super::super::spec::{sealed, ChunkCodec};
+use super::super::spec::{sealed, ChunkCodec, CodecCacheKey};
 use super::super::util::{
     decode_error, output_too_small, reserve_decode_buffer, vec_with_decode_capacity, verify_size,
 };
@@ -44,6 +44,10 @@ fn zstd_output_size(
 impl ChunkCodec for ZstdCodec {
     fn name(&self) -> &str {
         "zstd"
+    }
+
+    fn cache_key(&self) -> CodecCacheKey {
+        CodecCacheKey::Static("zstd")
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>> {

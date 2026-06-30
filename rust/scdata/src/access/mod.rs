@@ -13,6 +13,7 @@ mod error;
 mod inflight;
 mod key;
 mod membudget;
+mod profile;
 mod scheduled;
 mod scheduler;
 mod slice;
@@ -21,6 +22,7 @@ pub use backend::{DecodeBackend, DecodeTask, FileRef, IoBackend, IoTask};
 pub use cpu::AccessCpuConfig;
 pub use error::{AccessError, AccessResult};
 pub use key::ChunkKey;
+pub use profile::{access_profile_registry, AccessProfile};
 pub use scheduler::{
     AccessConfig, AccessHandle, AccessItem, AccessRequest, AccessScheduler, PrefetchCancel,
     PrefetchRequest, ScheduledAccess, ScheduledAccessConfig,
