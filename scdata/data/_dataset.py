@@ -29,7 +29,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Iterable, Literal, Sequence, cast
 
 import numpy as np
 
@@ -365,12 +365,12 @@ class ArrayMeta:
     # does not yield a bool, so they are excluded from the dataclass-generated
     # ``__eq__`` / ``__hash__``.  Equality is still well-defined via the other
     # fields, and these objects are never used as dict keys in practice.
-    chunk_offsets: np.ndarray = field(
+    chunk_offsets: np.ndarray | Sequence[int] = field(
         default_factory=lambda: np.empty(0, dtype=np.uint64),
         compare=False,
         repr=False,
     )
-    chunk_lengths: np.ndarray = field(
+    chunk_lengths: np.ndarray | Sequence[int] = field(
         default_factory=lambda: np.empty(0, dtype=np.uint64),
         compare=False,
         repr=False,
@@ -591,10 +591,12 @@ class ArrayMeta:
         they are physical archive offsets.  For ``store_kind="dir"`` offsets
         are 0 for directory stores and physical archive offsets for zip stores.
         """
-        if self.chunk_lengths.shape[0] == 0:
+        chunk_lengths = cast(np.ndarray, self.chunk_lengths)
+        chunk_offsets = cast(np.ndarray, self.chunk_offsets)
+        if chunk_lengths.shape[0] == 0:
             return ()
-        offsets = self.chunk_offsets.tolist()
-        lengths = self.chunk_lengths.tolist()
+        offsets = chunk_offsets.tolist()
+        lengths = chunk_lengths.tolist()
         return tuple(ChunkLocation(offset=o, length=length) for o, length in zip(offsets, lengths))
 
     def __repr__(self) -> str:
@@ -964,7 +966,7 @@ Dataset = DenseDataset | SparseDataset
 
 
 @dataclass(frozen=True)
-class DatasetCollection(Mapping[str, Dataset]):
+class DatasetCollection:
     """All matrix datasets parsed from one AnnData-style store.
 
     ``x`` is the primary ``X`` matrix.  ``layers`` maps AnnData layer names

@@ -16,6 +16,7 @@ from __future__ import annotations
 import operator
 from bisect import bisect_right
 from collections.abc import Sequence
+from typing import overload
 
 __all__ = ["CellIndexDataset"]
 
@@ -49,7 +50,13 @@ class CellIndexDataset(Sequence[tuple[int, int]]):
     def __len__(self) -> int:
         return self._offsets[-1]
 
-    def __getitem__(self, index: int) -> tuple[int, int]:
+    @overload
+    def __getitem__(self, index: int) -> tuple[int, int]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[tuple[int, int]]: ...
+
+    def __getitem__(self, index: int | slice) -> tuple[int, int] | Sequence[tuple[int, int]]:
         if isinstance(index, slice):
             raise TypeError("CellIndexDataset does not support slice indexing")
         idx = operator.index(index)

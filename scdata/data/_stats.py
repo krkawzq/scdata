@@ -15,15 +15,16 @@ The split that matters for tuning is
 * when it is low, the consumer is starved and prefetch / cache tuning is the
   right lever.
 
-:func:`percentile` is shared here so :mod:`scdata.tools._tune` can compute the
-same wait-time summary from its tuning search.
+:func:`percentile` is shared here for callers that need the same wait-time
+summary as :class:`LoaderStats`.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from scdata.databank import DataBankConfig, ScheduledPrefetchConfig
@@ -93,7 +94,7 @@ class LoaderStats:
     throughput_values_per_s: float
     throughput_gib_per_s: float
     consumer_fraction: float
-    prefetch_config: "ScheduledPrefetchConfig | None"
+    prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None"
     bank_config_summary: "BankConfigSummary | None"
 
 
@@ -148,7 +149,7 @@ class _StatsCollector:
         *,
         max_samples: int = 4096,
         stall_threshold_ms: float = 5.0,
-        prefetch_config: "ScheduledPrefetchConfig | None" = None,
+        prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
         bank_config_summary: "BankConfigSummary | None" = None,
     ) -> None:
         if max_samples < 1:
@@ -231,7 +232,10 @@ class _StatsCollector:
         self._wall = 0.0
         self._stalls = 0
 
-    def set_prefetch_config(self, config: "ScheduledPrefetchConfig | None") -> None:
+    def set_prefetch_config(
+        self,
+        config: "ScheduledPrefetchConfig | Mapping[str, Any] | None",
+    ) -> None:
         """Update the config stamp carried on subsequent snapshots."""
         self._prefetch_config = config
 

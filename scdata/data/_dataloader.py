@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
 from os import PathLike
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, Protocol, Sequence
 from typing import TypedDict, cast
 
 import numpy as np
@@ -243,7 +243,7 @@ def _batch_plan(
             }
         )
 
-    stream_parts = [
+    stream_parts: list[_BatchPartPlan] = [
         {
             "file_id": file_id,
             "positions": np.empty(0, dtype=np.intp),
@@ -532,7 +532,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         *,
         layer: str | None = None,
         matrix: str | None = None,
-        gene_alignment: str = "strict",
+        gene_alignment: Literal["strict", "union", "intersection", "none"] = "strict",
         missing: "MissingGenePolicy | str | None" = None,
         batch_size: int = 1024,
         shuffle: bool = True,

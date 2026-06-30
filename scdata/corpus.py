@@ -22,7 +22,7 @@ import os
 import warnings
 from collections.abc import Mapping as MappingABC
 from os import PathLike
-from typing import TYPE_CHECKING, Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal
 
 from scdata.data._collate import stitch_dense_collate
 from scdata.data._dataloader import ScDataBatch, ScDataLoader
@@ -43,7 +43,6 @@ if TYPE_CHECKING:
 
     from scdata.data._dataset import DType
     from scdata.data._stats import BankConfigSummary
-    from scdata.tools._tune import TuneResult
 
 __all__ = ["Corpus"]
 
@@ -261,45 +260,6 @@ class Corpus:
             collect_stats=collect_stats,
             bank_config_summary=self.bank_config_summary,
             **torch_kwargs,
-        )
-
-    def tune(
-        self,
-        *,
-        batch_size: int = 1024,
-        warmup_batches: int = 20,
-        measure_batches: int = 100,
-        time_budget_seconds: float = 60.0,
-        candidate_configs: "Sequence[ScheduledPrefetchConfig | Mapping[str, Any]] | None" = None,
-        wait_threshold_ms: float = 5.0,
-        shuffle: bool = True,
-        seed: int = 0,
-    ) -> "TuneResult":
-        """Search prefetch configs for throughput, reusing this Corpus's bank.
-
-        See :func:`scdata.tune` for the parameter meanings.  Unlike the
-        top-level :func:`~scdata.tune`, this reuses the already-registered
-        datasets and only swaps each candidate's ``prefetch_config`` (no bank
-        rebuild) — so it is the cheaper entry point when you already hold a
-        Corpus.
-        """
-        try:
-            from scdata.tools import tune_corpus
-        except ModuleNotFoundError as exc:
-            if exc.name != "scdata.tools":
-                raise
-            raise RuntimeError("Corpus.tune requires the scdata.tools module to be installed.") from exc
-
-        return tune_corpus(
-            self,
-            batch_size=batch_size,
-            warmup_batches=warmup_batches,
-            measure_batches=measure_batches,
-            time_budget_seconds=time_budget_seconds,
-            candidate_configs=candidate_configs,
-            wait_threshold_ms=wait_threshold_ms,
-            shuffle=shuffle,
-            seed=seed,
         )
 
     @classmethod

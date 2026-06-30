@@ -533,7 +533,7 @@ def _v3_blosc_shuffle(value: object, context: str) -> int:
         if text in names:
             return names[text]
         raise StoreError(f"{context}: unsupported blosc shuffle value {value!r}")
-    parsed = int(value)
+    parsed = int(cast(Any, value))
     if parsed not in (0, 1, 2):
         raise StoreError(f"{context}: unsupported blosc shuffle value {value!r}")
     return parsed

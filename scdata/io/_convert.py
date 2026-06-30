@@ -7,7 +7,7 @@ import gzip
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
 
 from scdata.io._anndata import (
     _DEFAULT_CHUNK_ELEMENTS,
@@ -295,7 +295,7 @@ def _read_zarr_with_anndata(source: Path, kwargs: dict[str, Any]) -> "AnnData":
 
         store = ZipStore(str(source), mode="r")
         try:
-            return ad.io.read_zarr(store, **kwargs)
+            return ad.io.read_zarr(cast(Any, store), **kwargs)
         finally:
             store.close()
     return ad.io.read_zarr(source, **kwargs)

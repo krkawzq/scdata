@@ -75,13 +75,6 @@ def _missing(name: str):
     return _raise
 
 
-def _missing_tools(name: str):
-    def _raise(*args: object, **kwargs: object) -> None:
-        raise RuntimeError(f"{name} requires the scdata.tools module to be installed.")
-
-    return _raise
-
-
 try:
     from scdata.databank import (
         AccessConfig,
@@ -126,15 +119,6 @@ except ModuleNotFoundError as exc:
         raise
     Corpus = _missing("Corpus")  # type: ignore[assignment, misc]
 
-try:
-    from scdata.tools import TuneConfigResult, TuneResult, tune
-except ModuleNotFoundError as exc:
-    if exc.name != "scdata.tools":
-        raise
-    tune = _missing_tools("tune")  # type: ignore[assignment, misc]
-    TuneResult = _missing_tools("TuneResult")  # type: ignore[assignment, misc]
-    TuneConfigResult = _missing_tools("TuneConfigResult")  # type: ignore[assignment, misc]
-
 __all__ = [
     "__version__",
     "kernel_name",
@@ -156,10 +140,6 @@ __all__ = [
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
     "Corpus",
-    # tools (Rust-backed workflows: tuning, ...)
-    "tune",
-    "TuneResult",
-    "TuneConfigResult",
     # data (pure Python — usable with or without the Rust extension)
     "CellAccess",
     "CellBatch",

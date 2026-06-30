@@ -129,6 +129,7 @@ def write_zarr(
         store=store,
         compressor=compressor,
     )
+    tmp_root: Path | None = None
     if store == "zip":
         _prepare_zip_target(root)
         zstore = MemoryStore()
@@ -185,6 +186,7 @@ def write_zarr(
         if store == "zip":
             _zip_store(zstore, root)
         else:
+            assert tmp_root is not None
             _replace_directory(tmp_root, root)
             tmp_root = None
     finally:
@@ -277,8 +279,9 @@ def _write_raw(
     sub = g.require_group("raw")
     sub.attrs.update({"encoding-type": "raw", "encoding-version": "0.1.0"})
     write_elem(sub, "var", raw.var)
-    if raw.varm:
-        write_elem(sub, "varm", dict(raw.varm))
+    raw_varm = getattr(raw, "varm", None)
+    if raw_varm:
+        write_elem(sub, "varm", dict(raw_varm))
     if raw.X is None:
         write_elem(sub, "X", None)
         return
@@ -803,7 +806,7 @@ def _zarr_compressors(np_dtype: np.dtype, compressor: _Compressor) -> tuple[Any,
         return (
             BloscCodec(
                 typesize=int(cfg["typesize"]),
-                cname=str(cfg["cname"]),
+                cname=_blosc_cname(cfg["cname"]),
                 clevel=int(cfg["clevel"]),
                 shuffle=_blosc_shuffle_name(cfg["shuffle"]),
                 blocksize=int(cfg["blocksize"]),
@@ -952,8 +955,32 @@ def _blosc_shuffle_int(value: int | str | None) -> int:
     return parsed
 
 
-def _blosc_shuffle_name(value: int | str | None) -> str:
-    return {0: "noshuffle", 1: "shuffle", 2: "bitshuffle"}[_blosc_shuffle_int(value)]
+def _blosc_cname(
+    value: object,
+) -> Literal["lz4", "lz4hc", "blosclz", "snappy", "zlib", "zstd"]:
+    text = str(value).strip().lower()
+    if text == "lz4":
+        return "lz4"
+    if text == "lz4hc":
+        return "lz4hc"
+    if text == "blosclz":
+        return "blosclz"
+    if text == "snappy":
+        return "snappy"
+    if text == "zlib":
+        return "zlib"
+    if text == "zstd":
+        return "zstd"
+    raise StoreError(f"unsupported blosc cname: {value!r}")
+
+
+def _blosc_shuffle_name(value: int | str | None) -> Literal["noshuffle", "shuffle", "bitshuffle"]:
+    parsed = _blosc_shuffle_int(value)
+    if parsed == 0:
+        return "noshuffle"
+    if parsed == 1:
+        return "shuffle"
+    return "bitshuffle"
 
 
 def _v3_array_json(
@@ -1234,7 +1261,7 @@ def read_zarr(
         if not metadata_only and "raw.X" in f:
             raw_kwargs = _read_legacy_raw(f, None, read_dataframe, read_elem)
             raw = ad.AnnData(**raw_kwargs)
-            raw.obs_names = adata.obs_names
+            raw.obs_names = [str(name) for name in adata.obs_names]
             adata.raw = raw
 
         # Pre-0.7 compat: ``obs`` stored as a zarr.Array leaks categoricals into

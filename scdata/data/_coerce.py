@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import operator
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -49,7 +49,7 @@ def _as_cell_index(value: Any, name: str) -> NDArray[np.intp]:
         arr = arr.astype(np.intp, copy=False)
     if not arr.flags["C_CONTIGUOUS"]:
         arr = np.ascontiguousarray(arr)
-    return arr
+    return cast(NDArray[np.intp], arr)
 
 
 def _as_u64_array(value: Any, name: str) -> NDArray[np.uint64]:
@@ -59,7 +59,7 @@ def _as_u64_array(value: Any, name: str) -> NDArray[np.uint64]:
         arr = arr.astype(np.uint64, copy=False)
     if not arr.flags["C_CONTIGUOUS"]:
         arr = np.ascontiguousarray(arr)
-    return arr
+    return cast(NDArray[np.uint64], arr)
 
 
 def _as_gene_names(value: Any, name: str = "gene_names") -> tuple[str, ...]:

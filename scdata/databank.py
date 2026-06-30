@@ -56,7 +56,7 @@ from collections.abc import Iterable as IterableABC, Mapping as MappingABC, Sequ
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from os import PathLike, fspath
-from typing import Any, Iterable, Iterator, Literal, Mapping, TypeVar, get_type_hints, overload
+from typing import Any, Iterable, Iterator, Literal, Mapping, TypeVar, cast, get_type_hints, overload
 
 from .data._cell import CellAccess, CellBatch, CellData, _as_cell_index
 from .data._coerce import _as_gene_names
@@ -1166,16 +1166,17 @@ class ScDataBank:
             if genes is None:
                 genes = cells.gene_names
             cells = cells.cells
+        cell_iter = cast(Iterable[int], cells)
         dtype_value = (
             None
             if isinstance(dtype, str) and dtype.strip().lower() == "auto"
             else _coerce_dtype(dtype)  # type: ignore[arg-type]
         )
         if genes is None:
-            return self._load_all_genes(id, cells, dtype=dtype_value, access_config=access_config)
+            return self._load_all_genes(id, cell_iter, dtype=dtype_value, access_config=access_config)
         return self._load_genes(
             id,
-            cells,
+            cell_iter,
             genes,
             missing=_coerce_missing_policy(missing),
             dtype=dtype_value,
