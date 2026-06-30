@@ -723,9 +723,7 @@ class DenseDataset:
         if self.num_genes <= 0:
             raise ValueError(f"dense dataset requires positive num_genes, got {self.num_genes}")
         if len(gene_names) != self.num_genes:
-            raise ValueError(
-                f"gene_names count {len(gene_names)} != num_genes {self.num_genes}"
-            )
+            raise ValueError(f"gene_names count {len(gene_names)} != num_genes {self.num_genes}")
         _validate_unique_gene_names(gene_names)
         elements = 1
         for s in self.data.shape:
@@ -844,9 +842,7 @@ class SparseDataset:
         if self.num_genes <= 0:
             raise ValueError(f"sparse dataset requires positive num_genes, got {self.num_genes}")
         if len(gene_names) != self.num_genes:
-            raise ValueError(
-                f"gene_names count {len(gene_names)} != num_genes {self.num_genes}"
-            )
+            raise ValueError(f"gene_names count {len(gene_names)} != num_genes {self.num_genes}")
         _validate_unique_gene_names(gene_names)
 
         indptr = _as_u64_array(self.indptr, "indptr")
@@ -1010,13 +1006,9 @@ class DatasetCollection:
         object.__setattr__(self, "layers", MappingProxyType(normalized))
         if self.raw is not None:
             if not isinstance(self.raw, (DenseDataset, SparseDataset)):
-                raise TypeError(
-                    f"raw has unsupported dataset type {type(self.raw).__name__}"
-                )
+                raise TypeError(f"raw has unsupported dataset type {type(self.raw).__name__}")
             if self.raw.num_cells != self.x.num_cells:
-                raise ValueError(
-                    f"raw has {self.raw.num_cells} cells, expected {self.x.num_cells}"
-                )
+                raise ValueError(f"raw has {self.raw.num_cells} cells, expected {self.x.num_cells}")
 
     def __getitem__(self, key: str) -> Dataset:
         if key == "X":
@@ -1055,12 +1047,22 @@ class DatasetCollection:
             out.append("raw/X")
         return tuple(out)
 
+    def get(self, key: str, default: Dataset | None = None) -> Dataset | None:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
     def items(self) -> Iterator[tuple[str, Dataset]]:
         yield "X", self.x
         for name, dataset in self.layers.items():
             yield f"layers/{name}", dataset
         if self.raw is not None:
             yield "raw/X", self.raw
+
+    def values(self) -> Iterator[Dataset]:
+        for _key, dataset in self.items():
+            yield dataset
 
     def __repr__(self) -> str:
         return (

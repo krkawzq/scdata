@@ -6,7 +6,17 @@ import time
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
 from os import PathLike
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Literal,
+    Mapping,
+    Protocol,
+    Sequence,
+)
 from typing import TypedDict, cast
 
 import numpy as np
@@ -44,16 +54,19 @@ __all__ = ["ScDataLoader"]
 class _SupportsPrefetch(Protocol):
     def prefetch(
         self,
-        id: DatasetId
-        | str
-        | int
-        | PathLike[str]
-        | Sequence[DatasetId | str | int | PathLike[str]],
-        batches: Iterable[
-            Iterable[int]
-            | NDArray[np.intp]
-            | Iterable[tuple[int, Iterable[int] | NDArray[np.intp]]]
-        ],
+        id: DatasetId | str | int | PathLike[str],
+        batches: Iterable[Iterable[int] | NDArray[np.intp]],
+        genes: Iterable[str] | None = None,
+        *,
+        missing: MissingGenePolicy | str | None = None,
+        dtype: DType | str | None = None,
+        config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
+    ) -> Iterator[CellBatch]: ...
+
+    def prefetch_multi(
+        self,
+        ids: Sequence[DatasetId | str | int | PathLike[str]],
+        batches: Iterable[Iterable[tuple[int, Iterable[int] | NDArray[np.intp]]]],
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy | str | None = None,
@@ -114,10 +127,14 @@ def _rows_for_positions(
         return matrix[:0]
     start = int(positions[0])
     stop = start + positions.shape[0]
-    if 0 <= start and stop <= matrix.shape[0] and _sequential_positions(
-        positions,
-        start,
-        positions.shape[0],
+    if (
+        0 <= start
+        and stop <= matrix.shape[0]
+        and _sequential_positions(
+            positions,
+            start,
+            positions.shape[0],
+        )
     ):
         return matrix[start:stop]
     return np.ascontiguousarray(matrix[positions])
@@ -306,52 +323,43 @@ def _normalize_dataset_ids(
     return resolve_sequence
 
 
-def _extract_positional_collate(
-    args: tuple[Any, ...],
-    collate_fn: Callable[[ScDataBatch], Any] | None,
-) -> tuple[tuple[Any, ...], Callable[[ScDataBatch], Any] | None]:
-    """Replace DataLoader's positional collate_fn with the raw identity fn."""
-    if len(args) < 6:
-        return args, collate_fn
-    if collate_fn is not None:
-        raise TypeError("collate_fn was passed both positionally and by keyword")
-    mutable = list(args)
-    collate_fn = mutable[5]
-    mutable[5] = _identity_raw_collate
-    return tuple(mutable), collate_fn
+# Sentinel for ``shuffle`` so the default (True) can be distinguished from an
+# explicit ``shuffle=None``/``False`` when resolving sampler mutual exclusion.
+_SHUFFLE_UNSET: Any = object()
 
 
-def _reject_unsupported_torch_options(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> None:
+def _reject_unsupported_torch_options(kwargs: Mapping[str, Any]) -> None:
     """Reject DataLoader options this adapter would otherwise ignore."""
-    if len(args) >= 5 and _to_int(args[4], "num_workers") != 0:
+    if _to_int(kwargs.get("num_workers", 0), "num_workers") != 0:
         raise ValueError("ScDataLoader does not support torch worker processes; use num_workers=0")
-    if "num_workers" in kwargs and _to_int(kwargs["num_workers"], "num_workers") != 0:
-        raise ValueError("ScDataLoader does not support torch worker processes; use num_workers=0")
-
-    if len(args) >= 7 and bool(args[6]):
-        raise ValueError("ScDataLoader does not support pin_memory=True")
     if bool(kwargs.get("pin_memory", False)):
         raise ValueError("ScDataLoader does not support pin_memory=True")
-
-    if len(args) >= 9 and args[8] not in (0, 0.0):
-        raise ValueError("ScDataLoader does not support DataLoader timeout")
     if kwargs.get("timeout", 0) not in (0, 0.0):
         raise ValueError("ScDataLoader does not support DataLoader timeout")
-
-    if len(args) >= 10 and args[9] is not None:
-        raise ValueError("ScDataLoader does not support worker_init_fn")
     if kwargs.get("worker_init_fn") is not None:
         raise ValueError("ScDataLoader does not support worker_init_fn")
-
-    if len(args) >= 11 and args[10] is not None:
-        raise ValueError("ScDataLoader does not support multiprocessing_context")
     if kwargs.get("multiprocessing_context") is not None:
         raise ValueError("ScDataLoader does not support multiprocessing_context")
-
     if kwargs.get("prefetch_factor") is not None:
         raise ValueError("ScDataLoader does not support torch prefetch_factor")
     if bool(kwargs.get("persistent_workers", False)):
         raise ValueError("ScDataLoader does not support persistent_workers=True")
+
+
+def _dataset_ids_as_tuple(
+    dataset_ids: Mapping[int, DatasetId | str | int | PathLike[str]]
+    | Sequence[DatasetId | str | int | PathLike[str]]
+    | None,
+) -> tuple[DatasetId | str | int | PathLike[str], ...]:
+    """Flatten the ``dataset_ids`` argument into a stable tuple for introspection.
+
+    A mapping is ordered by numeric file id; a sequence keeps its order.
+    """
+    if dataset_ids is None:
+        return ()
+    if isinstance(dataset_ids, Mapping):
+        return tuple(dataset_ids[k] for k in sorted(dataset_ids))
+    return tuple(dataset_ids)
 
 
 class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
@@ -360,13 +368,16 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
     Torch still owns sampling, shuffling, ``batch_size``, ``sampler``,
     ``batch_sampler`` and ``drop_last``.  On ``iter(loader)``, this adapter
     materializes all torch batch indices, plans each batch as cross-dataset
-    parts, starts one :meth:`ScDataBank.prefetch` stream, and yields decoded
-    dictionaries to ``collate_fn``.
+    parts, starts one :meth:`ScDataBank.prefetch_multi` stream, and yields
+    decoded dictionaries to ``collate_fn``.
 
     The dictionary always has ``file_ids`` and ``cell_ids`` in original batch
     order plus ``batch``, a single decoded :class:`CellBatch` with the same row
     order.  ``batches`` / ``cells`` / ``positions`` are retained as
     compatibility views grouped by file id.
+
+    ``bank`` is **not** owned by the loader; the caller is responsible for its
+    lifecycle (close it after iteration).  Access it via :attr:`bank` if needed.
     """
 
     def __init__(
@@ -375,7 +386,12 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         dataset: Sequence[
             tuple[int, int] | list[int] | NDArray[np.intp] | Mapping[str, int | np.integer[Any]]
         ],
-        *args: Any,
+        *,
+        batch_size: int = 1024,
+        shuffle: Any = _SHUFFLE_UNSET,
+        drop_last: bool = False,
+        sampler: Any = None,
+        batch_sampler: Any = None,
         dataset_ids: Mapping[int, DatasetId | str | int | PathLike[str]]
         | Sequence[DatasetId | str | int | PathLike[str]]
         | None = None,
@@ -384,33 +400,62 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         out_dtype: "DType | str | None" = None,
         prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
         collate_fn: Callable[[ScDataBatch], Any] | None = None,
-        collect_stats: bool = False,
+        collect_stats: bool = True,
         bank_config_summary: BankConfigSummary | None = None,
-        **kwargs: Any,
+        **torch_kwargs: Any,
     ) -> None:
         if torch is None:
             raise ModuleNotFoundError("ScDataLoader requires torch. Install torch first.")
 
-        kwargs_collate = kwargs.pop("collate_fn", None)
-        if kwargs_collate is not None:
-            if collate_fn is not None:
-                raise TypeError("collate_fn was passed twice")
-            collate_fn = cast(Callable[[ScDataBatch], Any], kwargs_collate)
+        # Resolve shuffle against torch's mutual-exclusion rules: a provided
+        # sampler or batch_sampler already defines the draw order, so an
+        # unspecified shuffle auto-disables (-> None) instead of forcing the
+        # caller to pass shuffle=False explicitly.  Otherwise shuffle defaults
+        # to False (torch semantics); training entry points such as
+        # :meth:`Corpus.loader` pass ``shuffle=True`` explicitly.
+        if batch_sampler is not None:
+            if shuffle is _SHUFFLE_UNSET:
+                shuffle = None
+            elif shuffle:
+                raise ValueError("batch_sampler is mutually exclusive with shuffle")
+        elif sampler is not None:
+            if shuffle is _SHUFFLE_UNSET:
+                shuffle = None
+            elif shuffle:
+                raise ValueError(
+                    "sampler is mutually exclusive with shuffle; pass shuffle=False"
+                )
+        else:
+            shuffle = False if shuffle is _SHUFFLE_UNSET else shuffle
 
-        _reject_unsupported_torch_options(args, kwargs)
-        args, collate_fn = _extract_positional_collate(args, collate_fn)
-        if len(args) < 6:
-            kwargs["collate_fn"] = _identity_raw_collate
-
-        super().__init__(dataset, *args, **kwargs)
+        _reject_unsupported_torch_options(torch_kwargs)
+        # torch's own collate path is bypassed by __iter__; pass a raw identity
+        # so torch never tries to stack (file_id, cell_id) samples itself.
+        super().__init__(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            batch_sampler=batch_sampler,
+            drop_last=drop_last,
+            collate_fn=_identity_raw_collate,
+            **torch_kwargs,
+        )
         self.sc_bank: _SupportsPrefetch = cast(_SupportsPrefetch, bank)
         self.sc_dataset_id: Callable[[int], DatasetId | str | int | PathLike[str]] = (
             _normalize_dataset_ids(dataset_ids)
         )
-        self.sc_genes: tuple[str, ...] | None = _as_gene_names(genes, "genes") if genes is not None else None
+        self._sc_dataset_ids: tuple[DatasetId | str | int | PathLike[str], ...] = (
+            _dataset_ids_as_tuple(dataset_ids)
+        )
+        self.sc_genes: tuple[str, ...] | None = (
+            _as_gene_names(genes, "genes") if genes is not None else None
+        )
         self.sc_missing: MissingGenePolicy | str | None = missing
         self.sc_out_dtype: DType | str | None = out_dtype
-        self.sc_prefetch_config: ScheduledPrefetchConfig | Mapping[str, Any] | None = prefetch_config
+        self.sc_prefetch_config: ScheduledPrefetchConfig | Mapping[str, Any] | None = (
+            prefetch_config
+        )
         self.sc_collate_fn: Callable[[ScDataBatch], Any] = (
             collate_fn if collate_fn is not None else _identity_sc_collate
         )
@@ -421,6 +466,23 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
                 prefetch_config=prefetch_config,
                 bank_config_summary=bank_config_summary,
             )
+
+    # -- read-only introspection -------------------------------------------
+
+    @property
+    def bank(self) -> "ScDataBank":
+        """The underlying :class:`~scdata.databank.ScDataBank` (not owned)."""
+        return cast("ScDataBank", self.sc_bank)
+
+    @property
+    def gene_names(self) -> tuple[str, ...] | None:
+        """Gene names batches are projected onto (``None`` = all genes)."""
+        return self.sc_genes
+
+    @property
+    def dataset_ids(self) -> tuple[DatasetId | str | int | PathLike[str], ...]:
+        """Dataset ids this loader draws from, in file_id order."""
+        return self._sc_dataset_ids
 
     def __iter__(self) -> Iterator[Any]:
         plans = self._sc_build_plans()
@@ -451,7 +513,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         if self.sc_out_dtype is not None:
             prefetch_kwargs["dtype"] = self.sc_out_dtype
         prefetcher = iter(
-            self.sc_bank.prefetch(
+            self.sc_bank.prefetch_multi(
                 dataset_ids,
                 prefetch_batches(),
                 **prefetch_kwargs,
@@ -519,9 +581,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         ``stall_count`` are full-run counters.
         """
         if self._sc_stats is None:
-            raise RuntimeError(
-                "stats() requires collect_stats=True at construction"
-            )
+            raise RuntimeError("stats() requires collect_stats=True at construction")
         return self._sc_stats.snapshot(reset=reset)
 
     @classmethod
@@ -540,7 +600,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         out_dtype: "DType | str | None" = None,
         prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
         collate_fn: Callable[[ScDataBatch], Any] | None = None,
-        collect_stats: bool = False,
+        collect_stats: bool = True,
         **torch_kwargs: Any,
     ) -> "ScDataLoader":
         """Build a loader from ``paths`` and an existing ``bank``.
@@ -549,7 +609,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         :class:`~scdata.corpus.Corpus` built on ``bank`` (which the caller
         owns and must close), then returns the loader.  Use
         :class:`~scdata.corpus.Corpus` directly when you need bank/dataset
-        access, lifecycle control, or :meth:`~scdata.corpus.Corpus.tune`.
+        access or lifecycle control.
         """
         from scdata.corpus import Corpus
 

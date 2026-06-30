@@ -61,6 +61,7 @@ from scdata.io import (  # noqa: E402
     write_zarr,
 )
 
+
 # Pythonic DataBank wrapper + config dataclasses (re-exported verbatim from the
 # Rust extension).  When the extension is missing, the Rust-backed names raise
 # on use; the pure-Python ``CellAccess`` / ``CellBatch`` / ``CellData`` above

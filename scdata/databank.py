@@ -56,7 +56,17 @@ from collections.abc import Iterable as IterableABC, Mapping as MappingABC, Sequ
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from os import PathLike, fspath
-from typing import Any, Iterable, Iterator, Literal, Mapping, TypeVar, cast, get_type_hints, overload
+from typing import (
+    Any,
+    Iterable,
+    Iterator,
+    Literal,
+    Mapping,
+    TypeVar,
+    cast,
+    get_type_hints,
+    overload,
+)
 
 from .data._cell import CellAccess, CellBatch, CellData, _as_cell_index
 from .data._coerce import _as_gene_names
@@ -242,7 +252,9 @@ def _auto_output_dtype(dtypes: Iterable[DType]) -> DType:
     return signed[0] if signed else same_width[0]
 
 
-def _coerce_prefetch_dtype(dtype: DType | Literal["auto"] | str | None, ids: Iterable[DatasetId], bank: "ScDataBank") -> DType:
+def _coerce_prefetch_dtype(
+    dtype: DType | Literal["auto"] | str | None, ids: Iterable[DatasetId], bank: "ScDataBank"
+) -> DType:
     if dtype is None or (isinstance(dtype, str) and dtype.strip().lower() == "auto"):
         return _auto_output_dtype(bank.dataset_dtype(id) for id in ids)
     value = _coerce_dtype(dtype)
@@ -462,8 +474,11 @@ class AccessConfig(_Config):
 
     queue_capacity: int = 1024
     scheduler_shards: int = 8
-    cache_capacity_bytes: int = 256 * 1024**3
-    memory_budget_bytes: int = 512 * 1024**3
+    # Conservative defaults so a freshly-constructed bank does not risk OOM on
+    # a typical dev box (16-32 GiB). These are upper bounds, not preallocated;
+    # scale them up explicitly on a big-memory training host.
+    cache_capacity_bytes: int = 4 * 1024**3
+    memory_budget_bytes: int = 8 * 1024**3
     default_io_priority: int = 1
     keep_decoded: bool = False
     cpu: AccessCpuConfig = field(default_factory=AccessCpuConfig)
@@ -1128,10 +1143,8 @@ class ScDataBank:
 
     def load(
         self,
-        id: DatasetId | SequenceABC[DatasetId],
-        cells: CellAccess
-        | Iterable[int]
-        | Iterable[tuple[int, CellAccess | Iterable[int]]],
+        id: DatasetId,
+        cells: CellAccess | Iterable[int],
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy
@@ -1141,26 +1154,20 @@ class ScDataBank:
         dtype: DType | Literal["auto"] | str | None = None,
         access_config: ScheduledAccessConfig | Mapping[str, Any] | None = None,
     ) -> CellData:
-        """Load cells, optionally projected onto a gene subset.
+        """Load cells from one dataset, optionally projected onto a gene subset.
 
         ``genes=None`` returns all genes in dataset order.  Passing ``genes``
         dispatches to the Rust projection path and returns columns in the
         requested order.  ``cells`` may also be a :class:`CellAccess`; when
         ``genes`` is omitted, its ``gene_names`` are used.
 
-        Passing a sequence of dataset ids enables cross-dataset access.  In
-        that mode ``cells`` is one multi-part batch of ``(dataset_idx, cells)``
-        pairs, and ``dtype=None``/``"auto"`` selects one output dtype across all
-        datasets.
+        For a batch mixing cells from several datasets, use
+        :meth:`load_multi` instead.
         """
         if not isinstance(id, DatasetId):
-            return self._load_multi(
-                id,
-                cells,  # type: ignore[arg-type]
-                genes,
-                missing=_coerce_missing_policy(missing),
-                dtype=dtype,
-                access_config=access_config,
+            raise TypeError(
+                "load() takes a single DatasetId; for a sequence of dataset "
+                "ids use load_multi(ids, batch, ...)"
             )
         if isinstance(cells, CellAccess):
             if genes is None:
@@ -1173,7 +1180,9 @@ class ScDataBank:
             else _coerce_dtype(dtype)  # type: ignore[arg-type]
         )
         if genes is None:
-            return self._load_all_genes(id, cell_iter, dtype=dtype_value, access_config=access_config)
+            return self._load_all_genes(
+                id, cell_iter, dtype=dtype_value, access_config=access_config
+            )
         return self._load_genes(
             id,
             cell_iter,
@@ -1183,23 +1192,34 @@ class ScDataBank:
             access_config=access_config,
         )
 
-    def _load_multi(
+    def load_multi(
         self,
         ids: SequenceABC[DatasetId],
         batch: Iterable[tuple[int, CellAccess | Iterable[int]]],
         genes: Iterable[str] | None = None,
         *,
-        missing: MissingGenePolicy | None = None,
+        missing: MissingGenePolicy
+        | Literal["zero", "error", "raise", "strict"]
+        | str
+        | None = None,
         dtype: DType | Literal["auto"] | str | None = None,
         access_config: ScheduledAccessConfig | Mapping[str, Any] | None = None,
     ) -> CellData:
+        """Load one multi-dataset batch of cells, optionally projected onto ``genes``.
+
+        ``ids`` is a sequence of :class:`DatasetId`.  ``batch`` is one multi-part
+        batch of ``(dataset_idx, cells)`` pairs, where ``dataset_idx`` indexes
+        into ``ids``; the result rows follow the input part order.  This is the
+        one-shot equivalent of :meth:`prefetch_multi` for a single batch.
+        ``dtype=None``/``"auto"`` selects one output dtype across all datasets.
+        """
         prefetch_config = None
         if access_config is not None:
             prefetch_config = ScheduledPrefetchConfig(
                 prefetch_step=1,
                 access=_coerce_access_config(access_config),
             )
-        iterator = self.prefetch(
+        iterator = self.prefetch_multi(
             ids,
             [batch],
             genes=genes,
@@ -1277,9 +1297,8 @@ class ScDataBank:
 
     def prefetch(
         self,
-        id: DatasetId | SequenceABC[DatasetId],
-        batches: Iterable[CellAccess | Iterable[int]]
-        | Iterable[Iterable[tuple[int, CellAccess | Iterable[int]]]],
+        id: DatasetId,
+        batches: Iterable[CellAccess | Iterable[int]],
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy
@@ -1289,13 +1308,19 @@ class ScDataBank:
         dtype: DType | Literal["auto"] | str | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
-        """Stream decoded cell batches, optionally projected onto ``genes``."""
-        multi_request = not isinstance(id, DatasetId)
-        ids = self._coerce_prefetch_ids(id)
-        stored_dtype = self.dataset_dtype(ids[0]) if not multi_request else None
-        if stored_dtype is not None and (
-            dtype is None or (isinstance(dtype, str) and dtype.strip().lower() == "auto")
-        ):
+        """Stream decoded cell batches from one dataset, optionally onto ``genes``.
+
+        For cross-dataset batches where one batch may mix cells from several
+        datasets, use :meth:`prefetch_multi` instead.
+        """
+        if not isinstance(id, DatasetId):
+            raise TypeError(
+                "prefetch() takes a single DatasetId; for a sequence of dataset "
+                "ids use prefetch_multi(ids, batches, ...)"
+            )
+        ids = (id,)
+        stored_dtype = self.dataset_dtype(id)
+        if dtype is None or (isinstance(dtype, str) and dtype.strip().lower() == "auto"):
             dtype_value = stored_dtype
         else:
             dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
@@ -1303,29 +1328,59 @@ class ScDataBank:
         rust_missing = _coerce_missing_policy(missing)
         config = _coerce_prefetch_config(config)
 
-        if stored_dtype is not None and dtype_value == stored_dtype:
+        if dtype_value == stored_dtype:
             if names is None:
-                return self._prefetch_all_genes(
-                    ids[0],
-                    batches,  # type: ignore[arg-type]
-                    config=config,
-                )
+                return self._prefetch_all_genes(id, batches, config=config)
             return self._prefetch_genes(
-                ids[0],
-                batches,  # type: ignore[arg-type]
+                id,
+                batches,
                 names,
                 missing=rust_missing,
                 config=config,
             )
 
-        if not multi_request:
-            batch_parts = self._single_prefetch_parts(
-                batches,  # type: ignore[arg-type]
-            )
-        else:
-            batch_parts = self._iter_multi_prefetch_parts(
-                batches,  # type: ignore[arg-type]
-            )
+        # dtype differs from the stored one: plan as a single-dataset multi-style
+        # request so the Rust projection path can cast on output.
+        batch_parts = self._single_prefetch_parts(batches)
+        rust_missing_value = rust_missing._rust if rust_missing is not None else None
+        rust_config = _config_to_rust(config)
+        inner = self._core().prefetch_cells(
+            [id._rust],
+            batch_parts,
+            dtype_value,
+            list(names) if names is not None else None,
+            rust_missing_value,
+            rust_config,
+        )
+        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
+
+    def prefetch_multi(
+        self,
+        ids: SequenceABC[DatasetId],
+        batches: Iterable[Iterable[tuple[int, CellAccess | Iterable[int]]]],
+        genes: Iterable[str] | None = None,
+        *,
+        missing: MissingGenePolicy
+        | Literal["zero", "error", "raise", "strict"]
+        | str
+        | None = None,
+        dtype: DType | Literal["auto"] | str | None = None,
+        config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
+    ) -> Iterator[CellBatch]:
+        """Stream decoded cell batches mixing cells from several datasets.
+
+        ``ids`` is a sequence of :class:`DatasetId`.  ``batches`` yields one
+        batch per torch batch; each batch is an iterable of
+        ``(dataset_idx, cells)`` parts where ``dataset_idx`` indexes into
+        ``ids``.  ``dtype=None``/``"auto"`` picks one output dtype across all
+        datasets; an explicit ``dtype`` casts every batch to it.
+        """
+        ids = self._coerce_prefetch_ids(ids)
+        dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
+        names = _as_gene_names(genes, "genes") if genes is not None else None
+        rust_missing = _coerce_missing_policy(missing)
+        config = _coerce_prefetch_config(config)
+        batch_parts = self._iter_multi_prefetch_parts(batches)
         rust_missing_value = rust_missing._rust if rust_missing is not None else None
         rust_config = _config_to_rust(config)
         inner = self._core().prefetch_cells(

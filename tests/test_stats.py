@@ -70,9 +70,15 @@ def test_collector_records_aggregates_and_percentiles() -> None:
 
 def test_collector_stall_count() -> None:
     collector = _StatsCollector(stall_threshold_ms=5.0)
-    collector.record_batch(wait_seconds=0.001, wall_seconds=0.001, num_cells=1, num_genes=1, bytes_=4)
-    collector.record_batch(wait_seconds=0.020, wall_seconds=0.020, num_cells=1, num_genes=1, bytes_=4)  # 20ms > 5ms
-    collector.record_batch(wait_seconds=0.004, wall_seconds=0.004, num_cells=1, num_genes=1, bytes_=4)
+    collector.record_batch(
+        wait_seconds=0.001, wall_seconds=0.001, num_cells=1, num_genes=1, bytes_=4
+    )
+    collector.record_batch(
+        wait_seconds=0.020, wall_seconds=0.020, num_cells=1, num_genes=1, bytes_=4
+    )  # 20ms > 5ms
+    collector.record_batch(
+        wait_seconds=0.004, wall_seconds=0.004, num_cells=1, num_genes=1, bytes_=4
+    )
     stats = collector.snapshot(reset=False)
     assert stats.stall_count == 1
     assert stats.stall_threshold_ms == pytest.approx(5.0)
@@ -107,9 +113,13 @@ def test_collector_reset_clears_everything() -> None:
 
 def test_collector_snapshot_no_reset_accumulates() -> None:
     collector = _StatsCollector()
-    collector.record_batch(wait_seconds=0.001, wall_seconds=0.001, num_cells=1, num_genes=1, bytes_=4)
+    collector.record_batch(
+        wait_seconds=0.001, wall_seconds=0.001, num_cells=1, num_genes=1, bytes_=4
+    )
     collector.snapshot(reset=False)
-    collector.record_batch(wait_seconds=0.002, wall_seconds=0.002, num_cells=1, num_genes=1, bytes_=4)
+    collector.record_batch(
+        wait_seconds=0.002, wall_seconds=0.002, num_cells=1, num_genes=1, bytes_=4
+    )
     stats = collector.snapshot(reset=True)
     assert stats.batches_seen == 2
 
@@ -118,14 +128,18 @@ def test_collector_set_prefetch_config_stamps_snapshot() -> None:
     collector = _StatsCollector()
     sentinel = object()  # the real config type comes from the Rust-backed layer
     collector.set_prefetch_config(sentinel)  # type: ignore[arg-type]
-    collector.record_batch(wait_seconds=0.001, wall_seconds=0.001, num_cells=1, num_genes=1, bytes_=4)
+    collector.record_batch(
+        wait_seconds=0.001, wall_seconds=0.001, num_cells=1, num_genes=1, bytes_=4
+    )
     stats = collector.snapshot(reset=False)
     assert stats.prefetch_config is sentinel
 
 
 def test_loader_stats_is_frozen() -> None:
     collector = _StatsCollector(bank_config_summary=None)
-    collector.record_batch(wait_seconds=0.001, wall_seconds=0.002, num_cells=1, num_genes=1, bytes_=4)
+    collector.record_batch(
+        wait_seconds=0.001, wall_seconds=0.002, num_cells=1, num_genes=1, bytes_=4
+    )
     stats = collector.snapshot(reset=False)
     assert isinstance(stats, LoaderStats)
     with pytest.raises((AttributeError, Exception)):

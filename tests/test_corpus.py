@@ -43,7 +43,11 @@ def _write_store(
 
 def _two_identical_gene_stores(tmp_path: Path) -> tuple[Path, Path, list[str]]:
     genes = ["g0", "g1", "g2", "g3"]
-    return _write_store(tmp_path, "a", (5, 4), genes), _write_store(tmp_path, "b", (3, 4), genes), genes
+    return (
+        _write_store(tmp_path, "a", (5, 4), genes),
+        _write_store(tmp_path, "b", (3, 4), genes),
+        genes,
+    )
 
 
 def test_corpus_strict_alignment_success(tmp_path: Path) -> None:

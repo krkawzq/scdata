@@ -409,7 +409,7 @@ def test_prefetch_multi_dataset_casts_to_single_output_dtype(tmp_path: Path) -> 
             [(0, np.array([0, 2], dtype=np.intp)), (1, [1])],
             [(1, [3]), (0, [1])],
         ]
-        out = list(bank.prefetch(ids, batches, dtype="f32"))
+        out = list(bank.prefetch_multi(ids, batches, dtype="f32"))
 
         assert [batch.cells.tolist() for batch in out] == [[0, 2, 1], [3, 1]]
         assert [batch.data.dtype for batch in out] == [np.dtype("float32"), np.dtype("float32")]
@@ -422,7 +422,7 @@ def test_prefetch_multi_dataset_casts_to_single_output_dtype(tmp_path: Path) -> 
             np.vstack([expected32[[3]], expected16[[1]].astype(np.float32)]),
         )
 
-        auto = next(iter(bank.prefetch(ids, [[(0, [0]), (1, [0])]], dtype="auto")))
+        auto = next(iter(bank.prefetch_multi(ids, [[(0, [0]), (1, [0])]], dtype="auto")))
         assert auto.data.dtype == np.dtype("float32")
         assert np.array_equal(
             auto.to_numpy(),
@@ -430,7 +430,7 @@ def test_prefetch_multi_dataset_casts_to_single_output_dtype(tmp_path: Path) -> 
         )
 
         with pytest.raises(DataBankError):
-            list(bank.prefetch(ids, [[(0, [0]), (1, [0])]], dtype="i32"))
+            list(bank.prefetch_multi(ids, [[(0, [0]), (1, [0])]], dtype="i32"))
     finally:
         for did in ids:
             bank.unregister(did)
@@ -454,7 +454,7 @@ def test_load_multi_dataset_uses_single_output_dtype(tmp_path: Path) -> None:
     bank = ScDataBank()
     ids = [bank.register_dense(ds16, str(root16)), bank.register_dense(ds32, str(root32))]
     try:
-        out = bank.load(ids, [(0, [2, 0]), (1, np.array([1], dtype=np.intp))])
+        out = bank.load_multi(ids, [(0, [2, 0]), (1, np.array([1], dtype=np.intp))])
 
         assert out.cells.tolist() == [2, 0, 1]
         assert out.data.dtype == np.dtype("float32")
@@ -464,7 +464,7 @@ def test_load_multi_dataset_uses_single_output_dtype(tmp_path: Path) -> None:
             np.vstack([expected16[[2, 0]].astype(np.float32), expected32[[1]]]),
         )
 
-        projected = bank.load(ids, [(1, [2]), (0, [1])], genes=["g1"], dtype="f16")
+        projected = bank.load_multi(ids, [(1, [2]), (0, [1])], genes=["g1"], dtype="f16")
         assert projected.data.dtype == np.dtype("float16")
         assert projected.var_names == ("g1",)
         assert np.array_equal(
@@ -473,7 +473,7 @@ def test_load_multi_dataset_uses_single_output_dtype(tmp_path: Path) -> None:
         )
 
         with pytest.raises(DataBankError):
-            bank.load(ids, [(0, [0]), (1, [0])], dtype="i32")
+            bank.load_multi(ids, [(0, [0]), (1, [0])], dtype="i32")
     finally:
         for did in ids:
             bank.unregister(did)
@@ -527,9 +527,7 @@ def _raw_sparse_store(tmp_path: Path) -> tuple[Path, np.ndarray, np.ndarray]:
     x_matrix = sp.csr_matrix(
         np.array([[1, 0, 2, 0, 0], [0, 3, 0, 0, 4], [5, 0, 0, 6, 0]], dtype=np.float32)
     )
-    raw_matrix = sp.csr_matrix(
-        np.array([[7, 0, 8], [0, 9, 0], [1, 0, 2]], dtype=np.float32)
-    )
+    raw_matrix = sp.csr_matrix(np.array([[7, 0, 8], [0, 9, 0], [1, 0, 2]], dtype=np.float32))
     adata = ad.AnnData(
         X=x_matrix,
         obs=pd.DataFrame(index=["c0", "c1", "c2"]),

@@ -274,9 +274,7 @@ def test_launch_lz4_v3_codec_registers_with_databank(tmp_path: Path, dense_adata
     assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
 
 
-def test_launch_multiple_v3_codecs_preserves_decode_order(
-    tmp_path: Path, dense_adata
-) -> None:
+def test_launch_multiple_v3_codecs_preserves_decode_order(tmp_path: Path, dense_adata) -> None:
     from numcodecs import GZip, Zlib, Zstd
 
     root = write_zarr(
@@ -614,13 +612,9 @@ def rich_adata():
     adata.var_names = [f"g{i}" for i in range(n_var)]
     adata.obsm["X_pca"] = rng.normal(size=(n_obs, 2)).astype(np.float32)
     adata.varm["loadings"] = rng.normal(size=(n_var, 2)).astype(np.float32)
-    adata.obsp["connectivities"] = sp.csr_matrix(
-        rng.random((n_obs, n_obs)).astype(np.float32)
-    )
+    adata.obsp["connectivities"] = sp.csr_matrix(rng.random((n_obs, n_obs)).astype(np.float32))
     adata.uns["meta"] = {"k": 7, "arr": np.arange(3, dtype=np.float32)}
-    adata.layers["counts"] = sp.csr_matrix(
-        rng.poisson(2, (n_obs, n_var)).astype(np.float32)
-    )
+    adata.layers["counts"] = sp.csr_matrix(rng.poisson(2, (n_obs, n_var)).astype(np.float32))
     adata.raw = ad.AnnData(
         X=sp.csr_matrix(rng.poisson(1, (n_obs, 3)).astype(np.float32)),
         var=pd.DataFrame(index=[f"r{i}" for i in range(3)]),
@@ -716,9 +710,7 @@ def test_read_zarr_legacy_flat_raw_rebuild(tmp_path: Path, rich_adata) -> None:
     assert list(meta_only.obs["cell_type"]) == list(rich_adata.obs["cell_type"])
 
 
-def test_read_zarr_metadata_only_matches_full_read_annotations(
-    tmp_path: Path, rich_adata
-) -> None:
+def test_read_zarr_metadata_only_matches_full_read_annotations(tmp_path: Path, rich_adata) -> None:
     """Annotations read under ``metadata_only`` equal those from a full read."""
     root = write_zarr(
         rich_adata,

@@ -69,6 +69,17 @@ class _FakeBank:
 
         return iterator()
 
+    def prefetch_multi(
+        self,
+        id: list[str],
+        batches: Iterable[Iterable[tuple[int, NDArray[np.intp]]]],
+        genes: Iterable[str] | None = None,
+        missing: object | None = None,
+        dtype: object | None = None,
+        config: object | None = None,
+    ) -> Iterator[CellBatch]:
+        return self.prefetch(id, batches, genes=genes, missing=missing, dtype=dtype, config=config)
+
 
 def _patch_fake_torch_base(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_init(

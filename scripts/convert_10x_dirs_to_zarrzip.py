@@ -170,9 +170,7 @@ def main() -> int:
 
     counts = {"converted": 0, "skipped": 0, "failed": 0}
     if args.jobs == 1:
-        result_iter: Iterable[ConvertResult] = (
-            convert_one_task(task, **common) for task in tasks
-        )
+        result_iter: Iterable[ConvertResult] = (convert_one_task(task, **common) for task in tasks)
     else:
         result_iter = iter_parallel_results(tasks, jobs=args.jobs, common=common)
     for result in result_iter:
@@ -198,15 +196,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--manifest", type=Path, help="Text file with one 10x matrix dir per line.")
     parser.add_argument("--write-manifest", type=Path, help="Write selected source dirs for audit.")
-    parser.add_argument("--log-dir", type=Path, help="Directory for converted/skipped/failed TSV logs.")
-    parser.add_argument("--include-regex", help="Only convert source dirs whose path matches this regex.")
+    parser.add_argument(
+        "--log-dir", type=Path, help="Directory for converted/skipped/failed TSV logs."
+    )
+    parser.add_argument(
+        "--include-regex", help="Only convert source dirs whose path matches this regex."
+    )
     parser.add_argument("--exclude-regex", help="Skip source dirs whose path matches this regex.")
-    parser.add_argument("--start", type=int, default=0, help="Skip the first N selected source dirs.")
+    parser.add_argument(
+        "--start", type=int, default=0, help="Skip the first N selected source dirs."
+    )
     parser.add_argument("--limit", type=int, help="Convert at most N selected source dirs.")
-    parser.add_argument("--num-shards", type=int, default=1, help="Total shard count for manual/rjob sharding.")
+    parser.add_argument(
+        "--num-shards", type=int, default=1, help="Total shard count for manual/rjob sharding."
+    )
     parser.add_argument("--shard-index", type=int, default=0, help="0-based shard index to run.")
-    parser.add_argument("--jobs", type=int, default=1, help="Concurrent processes. Keep low for large matrices.")
-    parser.add_argument("--chunk-size", type=int, default=1_000_000, help="scdata sparse chunk target.")
+    parser.add_argument(
+        "--jobs", type=int, default=1, help="Concurrent processes. Keep low for large matrices."
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=1_000_000, help="scdata sparse chunk target."
+    )
     parser.add_argument(
         "--compressor",
         default=DEFAULT_COMPRESSOR,
@@ -235,11 +245,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--var-names", choices=("symbol", "id"), default="symbol")
     parser.add_argument("--no-make-var-names-unique", action="store_true")
     parser.add_argument("--sample-metadata", choices=("none", "uns"), default="uns")
-    parser.add_argument("--obs-sample-id", action="store_true", help="Add repeated sample_id/source_group columns to obs.")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing target .zarr.zip files.")
-    parser.add_argument("--no-verify", action="store_true", help="Skip scdata.io.launch verification after writing.")
-    parser.add_argument("--keep-zarr", action="store_true", help="Keep intermediate .work.zarr directories after success.")
-    parser.add_argument("--keep-failed-zarr", action="store_true", help="Keep intermediate zarr dirs when conversion fails.")
+    parser.add_argument(
+        "--obs-sample-id",
+        action="store_true",
+        help="Add repeated sample_id/source_group columns to obs.",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing target .zarr.zip files."
+    )
+    parser.add_argument(
+        "--no-verify", action="store_true", help="Skip scdata.io.launch verification after writing."
+    )
+    parser.add_argument(
+        "--keep-zarr",
+        action="store_true",
+        help="Keep intermediate .work.zarr directories after success.",
+    )
+    parser.add_argument(
+        "--keep-failed-zarr",
+        action="store_true",
+        help="Keep intermediate zarr dirs when conversion fails.",
+    )
     parser.add_argument(
         "--keep-matrix-dir-in-output-name",
         action="store_true",
@@ -321,7 +347,9 @@ def build_tasks(
     first_pass = [
         ConvertTask(
             source_dir=str(source_dir),
-            target_zip=str(default_target_zip(source_dir, input_root, output_root, drop_matrix_dir)),
+            target_zip=str(
+                default_target_zip(source_dir, input_root, output_root, drop_matrix_dir)
+            ),
         )
         for source_dir in source_dirs
     ]
@@ -699,7 +727,9 @@ def zip_directory_stored(source_dir: Path, target_zip: Path) -> None:
     target_zip.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(target_zip, "w", compression=zipfile.ZIP_STORED) as zf:
         for path in sorted(p for p in source_dir.rglob("*") if p.is_file()):
-            zf.write(path, path.relative_to(source_dir).as_posix(), compress_type=zipfile.ZIP_STORED)
+            zf.write(
+                path, path.relative_to(source_dir).as_posix(), compress_type=zipfile.ZIP_STORED
+            )
 
 
 def iter_parallel_results(

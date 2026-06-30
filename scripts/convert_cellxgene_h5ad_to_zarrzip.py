@@ -162,9 +162,7 @@ def main() -> int:
 
     counts = {"converted": 0, "skipped": 0, "failed": 0}
     if args.jobs == 1:
-        result_iter: Iterable[ConvertResult] = (
-            convert_one_task(task, **common) for task in tasks
-        )
+        result_iter: Iterable[ConvertResult] = (convert_one_task(task, **common) for task in tasks)
     else:
         result_iter = iter_parallel_results(tasks, jobs=args.jobs, common=common)
 
@@ -190,16 +188,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--source-name", default=DEFAULT_SOURCE_NAME)
     parser.add_argument("--target-name", default=DEFAULT_TARGET_NAME)
-    parser.add_argument("--manifest", type=Path, help="Text file with one dataset dir or H5AD path per line.")
+    parser.add_argument(
+        "--manifest", type=Path, help="Text file with one dataset dir or H5AD path per line."
+    )
     parser.add_argument("--write-manifest", type=Path, help="Write selected H5AD paths for audit.")
-    parser.add_argument("--log-dir", type=Path, help="Directory for converted/skipped/failed TSV logs.")
+    parser.add_argument(
+        "--log-dir", type=Path, help="Directory for converted/skipped/failed TSV logs."
+    )
     parser.add_argument("--include-regex", help="Only convert paths matching this regex.")
     parser.add_argument("--exclude-regex", help="Skip paths matching this regex.")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
-    parser.add_argument("--jobs", type=int, default=1, help="Concurrent processes. Keep low for large H5ADs.")
+    parser.add_argument(
+        "--jobs", type=int, default=1, help="Concurrent processes. Keep low for large H5ADs."
+    )
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--compressor", default=DEFAULT_COMPRESSOR)
     parser.add_argument(
@@ -219,11 +223,25 @@ def parse_args() -> argparse.Namespace:
         help="Passed directly to scdata.io.write_zarr.",
     )
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--remove-source", action="store_true", help="Delete full.h5ad after successful conversion.")
-    parser.add_argument("--no-verify", action="store_true", help="Skip scdata.io.launch verification.")
-    parser.add_argument("--keep-zarr", action="store_true", help="Keep intermediate .work.zarr directories after success.")
-    parser.add_argument("--keep-failed-zarr", action="store_true", help="Keep intermediate zarr dirs on failure.")
-    parser.add_argument("--no-sanitize-keys", action="store_true", help="Do not rename zarr-hostile keys containing '/'.")
+    parser.add_argument(
+        "--remove-source", action="store_true", help="Delete full.h5ad after successful conversion."
+    )
+    parser.add_argument(
+        "--no-verify", action="store_true", help="Skip scdata.io.launch verification."
+    )
+    parser.add_argument(
+        "--keep-zarr",
+        action="store_true",
+        help="Keep intermediate .work.zarr directories after success.",
+    )
+    parser.add_argument(
+        "--keep-failed-zarr", action="store_true", help="Keep intermediate zarr dirs on failure."
+    )
+    parser.add_argument(
+        "--no-sanitize-keys",
+        action="store_true",
+        help="Do not rename zarr-hostile keys containing '/'.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--print-limit", type=int, default=20)
     parser.add_argument("--fail-on-error", action="store_true")
@@ -511,7 +529,11 @@ def coerce_matrix_dtype(matrix: Any, *, data_dtype: DataDtype, sample_size: int)
         return out
 
     arr = np.asarray(matrix)
-    target = np.dtype("float32") if data_dtype == "float32" else infer_target_dtype(arr, sample_size=sample_size, np=np)
+    target = (
+        np.dtype("float32")
+        if data_dtype == "float32"
+        else infer_target_dtype(arr, sample_size=sample_size, np=np)
+    )
     if target == arr.dtype:
         return arr
     return coerce_values(arr, target=target, np=np)
@@ -719,7 +741,9 @@ def zip_directory_stored(source_dir: Path, target_zip: Path) -> None:
     target_zip.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(target_zip, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
         for path in sorted(p for p in source_dir.rglob("*") if p.is_file()):
-            zf.write(path, path.relative_to(source_dir).as_posix(), compress_type=zipfile.ZIP_STORED)
+            zf.write(
+                path, path.relative_to(source_dir).as_posix(), compress_type=zipfile.ZIP_STORED
+            )
 
 
 def iter_parallel_results(

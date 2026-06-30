@@ -139,9 +139,7 @@ class Corpus:
             self._cells_per_file: tuple[int, ...] = tuple(
                 bank.dataset_num_cells(did) for did in self._dataset_ids
             )
-            self._gene_names, self._missing = self._resolve_gene_alignment(
-                gene_alignment, missing
-            )
+            self._gene_names, self._missing = self._resolve_gene_alignment(gene_alignment, missing)
         except Exception:
             if registered and not bank.is_closed:
                 bank.unregister_all(registered)
@@ -202,7 +200,7 @@ class Corpus:
 
     @property
     def bank_config_summary(self) -> "BankConfigSummary | None":
-        """Structural summary of the bank config, for stats/tune tooling.
+        """Structural summary of the bank config for loader stats.
 
         The summary is built from the running bank config.  Self-owned corpora
         use the config passed to ``Corpus``; externally-owned corpora read a
@@ -367,6 +365,5 @@ def _normalize_bank_config(
     if isinstance(bank_config, MappingABC):
         return DataBankConfig.from_dict(bank_config)
     raise TypeError(
-        "bank_config must be DataBankConfig, a mapping, or None; "
-        f"got {type(bank_config).__name__}"
+        f"bank_config must be DataBankConfig, a mapping, or None; got {type(bank_config).__name__}"
     )

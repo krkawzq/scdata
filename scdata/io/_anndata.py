@@ -875,8 +875,7 @@ def _compressor_config_from_string(text: str, np_dtype: np.dtype) -> dict[str, A
                 raise StoreError(f"unsupported blosc compressor option: {part!r}")
         return _blosc_config(np_dtype=np_dtype, cname=cname, clevel=clevel, shuffle=shuffle)
     raise StoreError(
-        f"unsupported compressor {text!r}; supported values include "
-        "'blosc.lz4.level5' and None"
+        f"unsupported compressor {text!r}; supported values include 'blosc.lz4.level5' and None"
     )
 
 
@@ -1192,6 +1191,7 @@ def read_zarr(
     f = _open_store_for_read(path)
 
     try:
+
         def callback(read_func: Any, elem_name: str, elem: Any, *, iospec: Any) -> Any:
             name = elem_name.lstrip("/")
             attrs = _node_attrs(elem)
@@ -1245,9 +1245,7 @@ def read_zarr(
                 # way :func:`anndata.read_zarr` does.
                 modern_raw = read_func(elem)
                 if any(k.startswith("raw.") for k in f):
-                    raise StoreError(
-                        "store has both a modern 'raw' group and legacy 'raw.*' keys"
-                    )
+                    raise StoreError("store has both a modern 'raw' group and legacy 'raw.*' keys")
                 return modern_raw
             return read_func(elem)
 
