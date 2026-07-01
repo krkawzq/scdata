@@ -7,6 +7,7 @@ use crate::access::{
 
 use super::super::array::{DType, DataValue};
 use super::super::compute::DataBankComputePool;
+use super::super::config::ProjectedSparseDataGroupStrategy;
 use super::super::dataset::{Dataset, SparseCsrDataset};
 use super::super::error::{DataBankError, DataBankResult};
 use super::super::plan::DenseSegment;
@@ -24,6 +25,7 @@ pub(crate) fn assemble_planned_batch<T, J>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     gene_axes: &MultiGeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -40,6 +42,7 @@ where
             access,
             compute,
             access_config,
+            projected_sparse_data_strategy,
             cancel,
             profiler,
             plan,
@@ -55,6 +58,7 @@ where
                 access,
                 compute,
                 access_config,
+                projected_sparse_data_strategy,
                 gene_axis,
                 cancel,
                 profiler,
@@ -81,6 +85,7 @@ pub(crate) fn assemble_single_planned_batch<T, J>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -113,6 +118,7 @@ where
                     access,
                     compute,
                     access_config,
+                    projected_sparse_data_strategy,
                     gene_axis,
                     cancel,
                     profiler,
@@ -135,6 +141,7 @@ pub(crate) fn assemble_multi_prefetch_batch<T, J>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
     plan: MultiDatasetPlan,
@@ -165,6 +172,7 @@ where
             access,
             compute,
             access_config,
+            projected_sparse_data_strategy,
             cancel,
             profiler,
             part,
@@ -187,6 +195,7 @@ pub(crate) fn scatter_multi_part_into<T, J>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
     part: MultiBatchPlanPart,
@@ -263,6 +272,7 @@ where
                 access,
                 compute,
                 access_config,
+                projected_sparse_data_strategy,
                 &part.gene_axis,
                 cancel,
                 profiler,
@@ -439,6 +449,7 @@ pub(crate) fn assemble_sparse_prefetch_batch<T, J>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -463,6 +474,7 @@ where
         access,
         compute,
         access_config,
+        projected_sparse_data_strategy,
         gene_axis,
         cancel,
         profiler,
@@ -486,6 +498,7 @@ pub(crate) fn scatter_sparse_prefetch_into<T, J>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -519,18 +532,34 @@ where
 
     if gene_axis.projection().is_some() {
         let scatter_started = profiler.start_scatter();
-        load_sparse_data_groups_and_scatter_projected_checked(
-            access,
-            compute,
-            access_config,
-            dataset,
-            plan,
-            index_bytes,
-            gene_axis,
-            Some(cancel),
-            Some(active_rows),
-            buffer,
-        )?;
+        if projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::ReadAll {
+            scatter_sparse_prefetch_projected_read_all_data(
+                access,
+                cancel,
+                profiler,
+                dataset,
+                plan,
+                index_bytes,
+                gene_axis,
+                scheduled,
+                buffer,
+            )?;
+        } else {
+            load_sparse_data_groups_and_scatter_projected_checked(
+                access,
+                compute,
+                access_config,
+                projected_sparse_data_strategy,
+                dataset,
+                plan,
+                index_bytes,
+                gene_axis,
+                Some(cancel),
+                Some(active_rows),
+                Some(profiler),
+                buffer,
+            )?;
+        }
         profiler.record_scatter(scatter_started);
     } else {
         scatter_sparse_prefetch_data(
@@ -548,6 +577,89 @@ where
     }
 
     Ok(output_genes)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scatter_sparse_prefetch_projected_read_all_data<T, J>(
+    access: &AccessHandle,
+    cancel: &Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    dataset: &SparseCsrDataset,
+    plan: &SparseBatchPlan,
+    index_bytes: Vec<u8>,
+    gene_axis: &GeneAxisPlan,
+    scheduled: &mut ScheduledAccess<J>,
+    buffer: &mut [T],
+) -> DataBankResult<()>
+where
+    T: DataValue,
+    J: Iterator<Item = AccessItem>,
+{
+    let selected_bytes = plan
+        .data_groups
+        .iter()
+        .fold(0usize, |total, group| total.saturating_add(group.bytes));
+    profiler.record_sparse_projected_groups(
+        ProjectedSparseDataGroupStrategy::ReadAll,
+        plan.data_groups.len(),
+        plan.data_groups.len(),
+        selected_bytes,
+    );
+
+    for group in &plan.data_groups {
+        if cancel.is_cancelled() {
+            return Err(DataBankError::PrefetchCancelled);
+        }
+        match &group.source {
+            SparseGroupSource::AccessItem(_) => {
+                let load_started = profiler.start_sparse_projected_data_load();
+                let bytes = next_scheduled_bytes(scheduled, profiler);
+                profiler.record_sparse_projected_data_load(
+                    load_started,
+                    bytes.as_ref().map_or(0, Vec::len),
+                );
+                let bytes = bytes?;
+                scatter_sparse_data_group_projected_checked(
+                    dataset,
+                    &plan.data_pieces,
+                    group,
+                    &index_bytes,
+                    &bytes,
+                    gene_axis,
+                    buffer,
+                )?;
+            }
+            SparseGroupSource::Memory { .. } => {
+                if try_scatter_sparse_memory_identity_data_group_projected_checked(
+                    dataset,
+                    &plan.data_pieces,
+                    group,
+                    &index_bytes,
+                    gene_axis,
+                    buffer,
+                )? {
+                    continue;
+                }
+                let load_started = profiler.start_sparse_projected_data_load();
+                let bytes = load_sparse_group(access, group);
+                profiler.record_sparse_projected_data_load(
+                    load_started,
+                    bytes.as_ref().map_or(0, Vec::len),
+                );
+                let bytes = bytes?;
+                scatter_sparse_data_group_projected_checked(
+                    dataset,
+                    &plan.data_pieces,
+                    group,
+                    &index_bytes,
+                    &bytes,
+                    gene_axis,
+                    buffer,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load_sparse_prefetch_indices<J>(

@@ -10,7 +10,7 @@ import pytest
 
 from scdata import DataBankConfig, IoConfig, MissingGenePolicy, ScDataBank
 from scdata._scdata import DataBankError
-from scdata.data import DatasetCollection, DenseDataset, DType, SparseDataset
+from scdata.data import CellIndexPlan, DatasetCollection, DenseDataset, DType, SparseDataset
 from scdata.io import launch, launch_all, write_zarr
 
 ad = pytest.importorskip("anndata")
@@ -95,11 +95,13 @@ def test_config_dynamic_routing_and_validation() -> None:
         entries=512,
         cache_capacity_bytes=512 * 1024**2,
         io__uring__base__max_in_flight=2048,
+        io__uring__base__queue_capacity=8192,
     )
 
     assert cfg.io_config.backend == "uring"
     assert cfg.io_config.uring_config.entries == 512
     assert cfg.io_config.uring_config.base.max_in_flight == 2048
+    assert cfg.io_config.uring_config.base.queue_capacity == 8192
     assert cfg.access_config.cache_capacity_bytes == 512 * 1024**2
 
     cfg.update(fill__num_workers=8)
@@ -120,7 +122,10 @@ def test_config_accepts_dict_and_nested_dicts() -> None:
         {
             "io": {
                 "backend": "uring",
-                "uring": {"entries": 1024, "base": {"max_in_flight": 2048}},
+                "uring": {
+                    "entries": 1024,
+                    "base": {"max_in_flight": 2048, "queue_capacity": 8192},
+                },
             },
             "access_config": {
                 "cache_capacity_bytes": 16 * 1024**2,
@@ -135,6 +140,7 @@ def test_config_accepts_dict_and_nested_dicts() -> None:
     assert cfg.io_config.backend == "uring"
     assert cfg.io_config.uring_config.entries == 1024
     assert cfg.io_config.uring_config.base.max_in_flight == 2048
+    assert cfg.io_config.uring_config.base.queue_capacity == 8192
     assert cfg.access_config.cpu.num_workers == 2
     assert cfg.decode_config.num_workers == 3
     assert cfg.fill_config.num_workers == 4
@@ -144,11 +150,15 @@ def test_config_accepts_dict_and_nested_dicts() -> None:
     assert cfg.fill_config.queue_capacity == 16
 
     direct = DataBankConfig(
-        io_config={"backend": "threaded", "threaded": {"num_workers": 9}},
+        io_config={
+            "backend": "threaded",
+            "threaded": {"num_workers": 9, "base": {"queue_capacity": 33}},
+        },
         access_config={"cpu": {"queue_capacity": 7}},
     )
     assert isinstance(direct.io_config, IoConfig)
     assert direct.io_config.threaded_config.num_workers == 9
+    assert direct.io_config.threaded_config.base.queue_capacity == 33
     assert direct.access_config.cpu.queue_capacity == 7
 
     io = IoConfig.uring({"entries": 256, "base": {"priority_levels": 5}})
@@ -354,6 +364,34 @@ def test_load_by_genes_missing_error(tmp_path: Path) -> None:
     bank.unregister(did)
 
 
+def test_prefetch_missing_gene_zero_keeps_requested_var_names(tmp_path: Path) -> None:
+    root, ds, expected, _ = _dense_store(
+        tmp_path, "pfgn_zero", (4, 3), np.float32, ["g0", "g1", "g2"]
+    )
+    bank = ScDataBank()
+    did = bank.register_dense(ds, str(root))
+    try:
+        batch = next(
+            iter(
+                bank.prefetch(
+                    did,
+                    [[0, 2]],
+                    genes=["g1", "missing"],
+                    missing=MissingGenePolicy.ZERO,
+                )
+            )
+        )
+
+        assert batch.num_genes == 2
+        assert batch.var_names == ("g1", "missing")
+        assert np.array_equal(
+            batch.to_numpy(),
+            np.column_stack([expected[[0, 2]][:, 1], np.zeros(2, dtype=np.float32)]),
+        )
+    finally:
+        bank.unregister(did)
+
+
 def test_access_unregistered_raises(tmp_path: Path) -> None:
     root, ds, _, _ = _dense_store(tmp_path, "unreg", (3, 4), np.float32, ["g0", "g1", "g2", "g3"])
     bank = ScDataBank()
@@ -384,6 +422,41 @@ def test_prefetch(tmp_path: Path) -> None:
         rows = expected[cells.tolist()]
         assert np.array_equal(data.reshape(len(cells), 6), rows)
     assert seen == 5
+    bank.unregister(did)
+
+
+def test_prefetch_accepts_cells_attribute_without_python_numpy_materialization(
+    tmp_path: Path,
+) -> None:
+    class CellRequest:
+        def __init__(self, cells: object) -> None:
+            self.cells = cells
+
+    root, ds, expected, _ = _dense_store(
+        tmp_path, "pf_cells_attr", (6, 4), np.float32, [f"g{i}" for i in range(4)]
+    )
+    bank = ScDataBank()
+    did = bank.register_dense(ds, str(root))
+    non_contiguous = np.array([0, 99, 2, 99, 4], dtype=np.int64)[::2]
+    batches = [
+        CellRequest([0, 2]),
+        CellRequest(np.array([4], dtype=np.int32)),
+        np.array([1, 3], dtype=np.uint32),
+        non_contiguous,
+    ]
+    out = list(bank.prefetch(did, batches))
+
+    assert [batch.cells.tolist() for batch in out] == [[0, 2], [4], [1, 3], [0, 2, 4]]
+    assert all(batch.cells.dtype == np.dtype(np.intp) for batch in out)
+    assert np.array_equal(out[0].to_numpy(), expected[[0, 2]])
+    assert np.array_equal(out[1].to_numpy(), expected[[4]])
+    assert np.array_equal(out[2].to_numpy(), expected[[1, 3]])
+    assert np.array_equal(out[3].to_numpy(), expected[[0, 2, 4]])
+
+    with pytest.raises(TypeError):
+        list(bank.prefetch(did, [[True]]))
+    with pytest.raises(ValueError):
+        list(bank.prefetch(did, [np.array([-1], dtype=np.int32)]))
     bank.unregister(did)
 
 
@@ -431,6 +504,91 @@ def test_prefetch_multi_dataset_casts_to_single_output_dtype(tmp_path: Path) -> 
 
         with pytest.raises(DataBankError):
             list(bank.prefetch_multi(ids, [[(0, [0]), (1, [0])]], dtype="i32"))
+    finally:
+        for did in ids:
+            bank.unregister(did)
+
+
+def test_prefetch_multi_flat_plan_edges(tmp_path: Path) -> None:
+    root0, ds0, expected0, _ = _dense_store(
+        tmp_path,
+        "pf_multi_flat0",
+        (5, 3),
+        np.float32,
+        ["g0", "g1", "g2"],
+    )
+    root1, ds1, expected1, _ = _dense_store(
+        tmp_path,
+        "pf_multi_flat1",
+        (5, 3),
+        np.float32,
+        ["g0", "g1", "g2"],
+    )
+    bank = ScDataBank()
+    ids = [bank.register_dense(ds0, str(root0)), bank.register_dense(ds1, str(root1))]
+    try:
+        batches = [
+            [[0, []], [0, [2]], (0, [0, 1])],
+            [(1, []), [1, [3]], (1, np.array([1, 2], dtype=np.int32))],
+            [(0, []), [1, []]],
+        ]
+        out = list(bank.prefetch_multi(ids, batches, dtype="f32"))
+
+        assert [batch.cells.tolist() for batch in out] == [[2, 0, 1], [3, 1, 2], []]
+        assert np.array_equal(out[0].to_numpy(), expected0[[2, 0, 1]])
+        assert np.array_equal(out[1].to_numpy(), expected1[[3, 1, 2]])
+        assert out[2].shape == (0, 3)
+        assert out[2].data.shape == (0,)
+
+        with pytest.raises(TypeError, match="dataset_idx"):
+            list(bank.prefetch_multi(ids, [[(True, [0])]]))
+        with pytest.raises(ValueError, match="dataset_idx"):
+            list(bank.prefetch_multi(ids, [[(-1, [0])]]))
+        with pytest.raises(ValueError, match="2-item"):
+            list(bank.prefetch_multi(ids, [[[0, [0], "extra"]]]))
+        with pytest.raises(DataBankError, match="dataset index"):
+            list(bank.prefetch_multi(ids, [[(2, [0])]]))
+    finally:
+        for did in ids:
+            bank.unregister(did)
+
+
+def test_prefetch_indexed_numeric_plan(tmp_path: Path) -> None:
+    root0, ds0, expected0, _ = _dense_store(
+        tmp_path,
+        "pf_indexed0",
+        (5, 3),
+        np.float32,
+        ["g0", "g1", "g2"],
+    )
+    root1, ds1, expected1, _ = _dense_store(
+        tmp_path,
+        "pf_indexed1",
+        (5, 3),
+        np.float32,
+        ["g0", "g1", "g2"],
+    )
+    bank = ScDataBank()
+    ids = [bank.register_dense(ds0, str(root0)), bank.register_dense(ds1, str(root1))]
+    try:
+        plan = CellIndexPlan(
+            dataset_index=np.array([0, 0, 1, 1, 0], dtype=np.uint16),
+            cell_index=np.array([2, 0, 1, 3, 1], dtype=np.uint32),
+            batch_size=3,
+        )
+        out = list(bank.prefetch_indexed(ids, plan, dtype="f32"))
+
+        assert [batch.cells.tolist() for batch in out] == [[2, 0, 1], [3, 1]]
+        assert np.array_equal(out[0].to_numpy(), np.vstack([expected0[[2, 0]], expected1[[1]]]))
+        assert np.array_equal(out[1].to_numpy(), np.vstack([expected1[[3]], expected0[[1]]]))
+
+        with pytest.raises(DataBankError, match="dataset index"):
+            bad = CellIndexPlan(
+                dataset_index=np.array([2], dtype=np.uint16),
+                cell_index=np.array([0], dtype=np.uint32),
+                batch_size=1,
+            )
+            list(bank.prefetch_indexed(ids, bad))
     finally:
         for did in ids:
             bank.unregister(did)

@@ -23,7 +23,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from scdata.data._coerce import _as_gene_names, _coerce_index_int
-from scdata.data._cell import CellBatch, _as_cell_index
+from scdata.data._cell import CellAccess, CellBatch, _as_cell_index
+from scdata.data._index import CellIndexDataset, CellIndexPlan
 from scdata.data._stats import BankConfigSummary, LoaderStats, _StatsCollector
 
 try:
@@ -39,14 +40,16 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in torch-free envs.
     _TorchDataLoader = _MissingTorchDataLoader
 
 if TYPE_CHECKING:
-    from scdata.data._dataset import DType
+    from scdata.data._dataset import DType, DenseDataset, SparseDataset
     from scdata.databank import DatasetId, MissingGenePolicy, ScDataBank, ScheduledPrefetchConfig
 else:
     DType = object
+    DenseDataset = object
     DatasetId = object
     MissingGenePolicy = object
     ScDataBank = object
     ScheduledPrefetchConfig = object
+    SparseDataset = object
 
 __all__ = ["ScDataLoader"]
 
@@ -55,7 +58,7 @@ class _SupportsPrefetch(Protocol):
     def prefetch(
         self,
         id: DatasetId | str | int | PathLike[str],
-        batches: Iterable[Iterable[int] | NDArray[np.intp]],
+        batches: Iterable[CellAccess | Iterable[int] | NDArray[np.intp]],
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy | str | None = None,
@@ -74,6 +77,17 @@ class _SupportsPrefetch(Protocol):
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]: ...
 
+    def prefetch_indexed(
+        self,
+        ids: Sequence[DatasetId | str | int | PathLike[str]],
+        plan: CellIndexPlan,
+        genes: Iterable[str] | None = None,
+        *,
+        missing: MissingGenePolicy | str | None = None,
+        dtype: DType | str | None = None,
+        config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
+    ) -> Iterator[CellBatch]: ...
+
 
 class _BatchPartPlan(TypedDict):
     file_id: int
@@ -81,11 +95,17 @@ class _BatchPartPlan(TypedDict):
     cells: NDArray[np.intp]
 
 
+class _StreamBatchPartPlan(TypedDict):
+    file_id: int
+    positions: NDArray[np.intp]
+    cells: list[int]
+
+
 class _BatchPlan(TypedDict):
     file_ids: NDArray[np.intp]
     cell_ids: NDArray[np.intp]
     parts: list[_BatchPartPlan]
-    stream_parts: list[_BatchPartPlan]
+    stream_parts: list[_StreamBatchPartPlan]
 
 
 class _ScDataBatchBase(TypedDict):
@@ -260,11 +280,11 @@ def _batch_plan(
             }
         )
 
-    stream_parts: list[_BatchPartPlan] = [
+    stream_parts: list[_StreamBatchPartPlan] = [
         {
             "file_id": file_id,
             "positions": np.empty(0, dtype=np.intp),
-            "cells": _as_cell_index(cells, "cell_id"),
+            "cells": cells,
         }
         for file_id, cells in stream_rows
     ]
@@ -272,6 +292,54 @@ def _batch_plan(
     return {
         "file_ids": file_ids,
         "cell_ids": cell_ids,
+        "parts": parts,
+        "stream_parts": stream_parts,
+    }
+
+
+def _batch_plan_from_arrays(file_ids: NDArray[Any], cell_ids: NDArray[Any]) -> _BatchPlan:
+    file_arr = np.asarray(file_ids, dtype=np.intp)
+    cell_arr = np.asarray(cell_ids, dtype=np.intp)
+    if file_arr.ndim != 1 or cell_arr.ndim != 1:
+        raise ValueError("file_ids and cell_ids must be 1D arrays")
+    if file_arr.shape[0] != cell_arr.shape[0]:
+        raise ValueError("file_ids and cell_ids must have the same length")
+
+    grouped: OrderedDict[int, tuple[list[int], list[int]]] = OrderedDict()
+    stream_rows: list[tuple[int, list[int]]] = []
+    for pos in range(file_arr.shape[0]):
+        file_id = int(file_arr[pos])
+        cell_id = int(cell_arr[pos])
+        grouped_entry = grouped.get(file_id)
+        if grouped_entry is None:
+            grouped_entry = ([], [])
+            grouped[file_id] = grouped_entry
+        grouped_entry[0].append(pos)
+        grouped_entry[1].append(cell_id)
+        if stream_rows and stream_rows[-1][0] == file_id:
+            stream_rows[-1][1].append(cell_id)
+        else:
+            stream_rows.append((file_id, [cell_id]))
+
+    parts: list[_BatchPartPlan] = [
+        {
+            "file_id": file_id,
+            "positions": np.asarray(positions, dtype=np.intp),
+            "cells": _as_cell_index(cells, "cell_id"),
+        }
+        for file_id, (positions, cells) in grouped.items()
+    ]
+    stream_parts: list[_StreamBatchPartPlan] = [
+        {
+            "file_id": file_id,
+            "positions": np.empty(0, dtype=np.intp),
+            "cells": cells,
+        }
+        for file_id, cells in stream_rows
+    ]
+    return {
+        "file_ids": file_arr,
+        "cell_ids": cell_arr,
         "parts": parts,
         "stream_parts": stream_parts,
     }
@@ -429,6 +497,17 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
             shuffle = False if shuffle is _SHUFFLE_UNSET else shuffle
 
         _reject_unsupported_torch_options(torch_kwargs)
+        self._sc_use_index_plan = (
+            sampler is None
+            and batch_sampler is None
+            and isinstance(dataset, CellIndexDataset)
+        )
+        self._sc_batch_size = _to_int(batch_size, "batch_size")
+        if self._sc_batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self._sc_drop_last = bool(drop_last)
+        self._sc_shuffle = bool(shuffle) if shuffle is not None else False
+        self._sc_generator = torch_kwargs.get("generator")
         # torch's own collate path is bypassed by __iter__; pass a raw identity
         # so torch never tries to stack (file_id, cell_id) samples itself.
         super().__init__(
@@ -485,6 +564,10 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         return self._sc_dataset_ids
 
     def __iter__(self) -> Iterator[Any]:
+        indexed = self._sc_index_plan()
+        if indexed is not None:
+            return self._sc_iter_indexed(*indexed)
+
         plans = self._sc_build_plans()
         if not plans:
             return iter(())
@@ -498,7 +581,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
                     file_to_dataset_idx[file_id] = len(dataset_ids)
                     dataset_ids.append(self.sc_dataset_id(file_id))
 
-        def prefetch_batches() -> Iterator[list[tuple[int, NDArray[np.intp]]]]:
+        def prefetch_batches() -> Iterator[list[tuple[int, list[int]]]]:
             for plan in plans:
                 yield [
                     (file_to_dataset_idx[part["file_id"]], part["cells"])
@@ -569,6 +652,112 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
 
         return iter(iterator())
 
+    def _sc_index_plan(
+        self,
+    ) -> tuple[list[DatasetId | str | int | PathLike[str]], CellIndexPlan] | None:
+        if not self._sc_use_index_plan or not hasattr(self.sc_bank, "prefetch_indexed"):
+            return None
+        dataset = self.dataset
+        if not isinstance(dataset, CellIndexDataset):
+            return None
+        dataset_ids = [self.sc_dataset_id(file_id) for file_id in range(dataset.num_files)]
+        if self._sc_shuffle:
+            order = self._sc_global_order(len(dataset))
+            plan = CellIndexPlan.from_global_indices(
+                dataset.cells_per_file,
+                order,
+                batch_size=self._sc_batch_size,
+                drop_last=self._sc_drop_last,
+            )
+        else:
+            plan = CellIndexPlan.from_counts(
+                dataset.cells_per_file,
+                batch_size=self._sc_batch_size,
+                drop_last=self._sc_drop_last,
+            )
+        if plan.num_batches == 0:
+            return None
+        return dataset_ids, plan
+
+    def _sc_global_order(self, size: int) -> NDArray[Any]:
+        if size == 0:
+            return np.empty(0, dtype=np.uint64)
+        if torch is not None and hasattr(torch, "randperm"):
+            order = torch.randperm(size, generator=self._sc_generator)
+            if hasattr(order, "cpu"):
+                order = order.cpu()
+            if hasattr(order, "numpy"):
+                return order.numpy()
+        return np.random.default_rng().permutation(size)
+
+    def _sc_iter_indexed(
+        self,
+        dataset_ids: Sequence[DatasetId | str | int | PathLike[str]],
+        index_plan: CellIndexPlan,
+    ) -> Iterator[Any]:
+        prefetch_kwargs: dict[str, Any] = {
+            "genes": self.sc_genes,
+            "missing": self.sc_missing,
+            "config": self.sc_prefetch_config,
+        }
+        if self.sc_out_dtype is not None:
+            prefetch_kwargs["dtype"] = self.sc_out_dtype
+        prefetcher = iter(
+            self.sc_bank.prefetch_indexed(
+                dataset_ids,
+                index_plan,
+                **prefetch_kwargs,
+            )
+        )
+
+        def iterator() -> Iterator[Any]:
+            perf_counter = time.perf_counter
+            collect = self.sc_collect_stats
+            collector = self._sc_stats
+            for file_ids, cell_ids in index_plan.iter_batches():
+                batch_plan = _batch_plan_from_arrays(file_ids, cell_ids)
+                t0 = perf_counter() if collect else 0.0
+                decoded = next(prefetcher)
+                batches = _LazyCellBatches(decoded, batch_plan["parts"])
+                cells: dict[int, NDArray[np.intp]] = {
+                    part["file_id"]: part["cells"] for part in batch_plan["parts"]
+                }
+                positions: dict[int, NDArray[np.intp]] = {
+                    part["file_id"]: part["positions"] for part in batch_plan["parts"]
+                }
+                t1 = perf_counter() if collect else 0.0
+
+                batch: ScDataBatch = {
+                    "file_ids": batch_plan["file_ids"],
+                    "cell_ids": batch_plan["cell_ids"],
+                    "batch": decoded,
+                    "batches": batches,
+                    "cells": cells,
+                    "positions": positions,
+                }
+                if len(batches) == 1:
+                    file_id = next(iter(batches))
+                    batch.update(
+                        {
+                            "file_id": file_id,
+                            "cells_in_file": cells[file_id],
+                            "positions_in_batch": positions[file_id],
+                        }
+                    )
+                result = self.sc_collate_fn(batch)
+                if collect and collector is not None:
+                    t2 = perf_counter()
+                    collector.record_batch(
+                        wait_seconds=t1 - t0,
+                        wall_seconds=t2 - t0,
+                        num_cells=len(batch_plan["cell_ids"]),
+                        num_genes=decoded.num_genes,
+                        bytes_=decoded.data.nbytes,
+                    )
+                yield result
+
+        return iter(iterator())
+
     def stats(self, *, reset: bool = True) -> LoaderStats:
         """Return consumer-side health metrics collected during iteration.
 
@@ -588,7 +777,14 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
     def from_paths(
         cls,
         bank: "ScDataBank",
-        paths: Iterable[str | PathLike[str]],
+        paths: Iterable[
+            str
+            | PathLike[str]
+            | tuple[str | PathLike[str], str]
+            | Mapping[str, Any]
+            | "DenseDataset"
+            | "SparseDataset"
+        ],
         *,
         layer: str | None = None,
         matrix: str | None = None,

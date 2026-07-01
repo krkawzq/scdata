@@ -183,6 +183,9 @@ fn parse_args() -> Result<Args, String> {
                 args.direct = false;
                 args.pool = true;
             }
+            "--bench" => {
+                // Cargo passes this to custom bench binaries.
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);

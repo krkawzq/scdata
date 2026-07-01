@@ -225,6 +225,7 @@ where
         datasets,
         batch_source,
         access_config: config.access,
+        projected_sparse_data_strategy: config.projected_sparse_data_strategy,
         gene_axes: Arc::new(gene_axes),
         tx,
         cancel: Arc::clone(&cancel),

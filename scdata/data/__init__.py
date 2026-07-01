@@ -31,8 +31,8 @@ from scdata.data._dataset import (
     CodecConfigError,
     SparseDataset,
 )
-from scdata.data._index import CellIndexDataset
-from scdata.data._prefetch import PrefetchBatches, PrefetchIterator
+from scdata.data._index import CellIndexDataset, CellIndexPlan
+from scdata.data._prefetch import PrefetchIterator
 from scdata.data._stats import BankConfigSummary, LoaderStats
 
 __all__ = [
@@ -52,9 +52,9 @@ __all__ = [
     "CellBatch",
     "CellData",
     "ScDataLoader",
-    "PrefetchBatches",
     "PrefetchIterator",
     "CellIndexDataset",
+    "CellIndexPlan",
     "stitch_dense_collate",
     "LoaderStats",
     "BankConfigSummary",

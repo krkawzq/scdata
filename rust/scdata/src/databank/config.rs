@@ -4,6 +4,40 @@ use crate::access::{AccessConfig, ScheduledAccessConfig};
 use crate::codecs::DecodePoolConfig;
 use crate::iopool::IoConfig;
 
+/// Data loading strategy for projected sparse CSR data groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectedSparseDataGroupStrategy {
+    /// Scan CSR indices first and load only data groups containing requested genes.
+    SelectedOnly,
+    /// Load every data group covered by the planned CSR rows.
+    ReadAll,
+}
+
+impl Default for ProjectedSparseDataGroupStrategy {
+    fn default() -> Self {
+        Self::SelectedOnly
+    }
+}
+
+impl ProjectedSparseDataGroupStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelectedOnly => "selected_only",
+            Self::ReadAll => "read_all",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "selected_only" | "selected-only" | "selected" => Ok(Self::SelectedOnly),
+            "read_all" | "read-all" | "all" => Ok(Self::ReadAll),
+            other => Err(format!(
+                "projected_sparse_data_strategy must be 'selected_only' or 'read_all', got {other:?}"
+            )),
+        }
+    }
+}
+
 /// Configuration for the single-cell DataBank facade.
 #[derive(Debug, Clone)]
 pub struct DataBankConfig {
@@ -46,6 +80,8 @@ pub struct ScheduledPrefetchConfig {
     pub prefetch_step: usize,
     /// Access-layer scheduled look-ahead for file-backed chunk reads.
     pub access: ScheduledAccessConfig,
+    /// Strategy for projected sparse CSR data groups.
+    pub projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
 }
 
 impl Default for ScheduledPrefetchConfig {
@@ -53,6 +89,7 @@ impl Default for ScheduledPrefetchConfig {
         Self {
             prefetch_step: 2,
             access: ScheduledAccessConfig::default(),
+            projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy::default(),
         }
     }
 }

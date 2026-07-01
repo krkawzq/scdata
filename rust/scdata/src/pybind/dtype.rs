@@ -1,6 +1,7 @@
-use numpy::PyReadonlyArray1;
-use pyo3::exceptions::PyValueError;
+use numpy::{Element, PyReadonlyArray1};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyString};
 
 use crate::databank::{DType, GeneNameView};
 
@@ -54,26 +55,193 @@ pub(crate) fn intp_array_to_usize_vec(
     cells: &PyReadonlyArray1<'_, isize>,
     context: &str,
 ) -> PyResult<Vec<usize>> {
-    let slice = cells.as_slice().map_err(|_| {
-        PyValueError::new_err(format!("{context} must be a contiguous 1D np.intp array"))
-    })?;
-    let mut out = Vec::with_capacity(slice.len());
-    for (i, &cell) in slice.iter().enumerate() {
-        if cell < 0 {
-            return Err(PyValueError::new_err(format!(
-                "{context}[{i}] must be non-negative, got {cell}"
-            )));
-        }
-        out.push(cell as usize);
-    }
+    let mut out = Vec::new();
+    extend_signed_array_to_usize_vec_by(cells, context, |value| value as i128, &mut out)?;
     Ok(out)
 }
 
-pub(crate) fn extract_cells_any(obj: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
-    if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, isize>>() {
-        return intp_array_to_usize_vec(&array, "cells");
+pub(crate) fn index_any_to_usize_vec(
+    obj: &Bound<'_, PyAny>,
+    context: &str,
+) -> PyResult<Vec<usize>> {
+    let mut out = Vec::new();
+    extend_index_any(obj, context, &mut out)?;
+    Ok(out)
+}
+
+pub(crate) fn extend_index_any(
+    obj: &Bound<'_, PyAny>,
+    context: &str,
+    out: &mut Vec<usize>,
+) -> PyResult<usize> {
+    if let Some(len) = extend_integer_array_any(obj, context, out)? {
+        return Ok(len);
     }
-    obj.extract::<Vec<usize>>()
+    extend_iterable_to_usize_vec(obj, context, out)
+}
+
+pub(crate) fn extend_cells_any(obj: &Bound<'_, PyAny>, out: &mut Vec<usize>) -> PyResult<usize> {
+    if let Some(len) = extend_integer_array_any(obj, "cells", out)? {
+        return Ok(len);
+    }
+    if let Ok(cells) = obj.getattr("cells") {
+        return extend_cells_any(&cells, out);
+    }
+    extend_iterable_to_usize_vec(obj, "cells", out)
+}
+
+fn extend_integer_array_any(
+    obj: &Bound<'_, PyAny>,
+    context: &str,
+    out: &mut Vec<usize>,
+) -> PyResult<Option<usize>> {
+    macro_rules! try_signed_array {
+        ($ty:ty) => {
+            if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, $ty>>() {
+                return Ok(Some(extend_signed_array_to_usize_vec_by(
+                    &array,
+                    context,
+                    |value| value as i128,
+                    out,
+                )?));
+            }
+        };
+    }
+    macro_rules! try_unsigned_array {
+        ($ty:ty) => {
+            if let Ok(array) = obj.extract::<PyReadonlyArray1<'_, $ty>>() {
+                return Ok(Some(extend_unsigned_array_to_usize_vec_by(
+                    &array,
+                    context,
+                    |value| value as u128,
+                    out,
+                )?));
+            }
+        };
+    }
+
+    try_signed_array!(isize);
+    try_signed_array!(i64);
+    try_signed_array!(i32);
+    try_signed_array!(i16);
+    try_signed_array!(i8);
+    try_unsigned_array!(usize);
+    try_unsigned_array!(u64);
+    try_unsigned_array!(u32);
+    try_unsigned_array!(u16);
+    try_unsigned_array!(u8);
+
+    Ok(None)
+}
+
+fn extend_signed_array_to_usize_vec_by<T, F>(
+    cells: &PyReadonlyArray1<'_, T>,
+    context: &str,
+    cast: F,
+    out: &mut Vec<usize>,
+) -> PyResult<usize>
+where
+    T: Element + Copy,
+    F: Fn(T) -> i128,
+{
+    let view = cells.as_array();
+    let start = out.len();
+    out.reserve(view.len());
+    for (i, &cell) in view.iter().enumerate() {
+        let value = cast(cell);
+        if value < 0 {
+            return Err(PyValueError::new_err(format!(
+                "{context}[{i}] must be non-negative, got {value}"
+            )));
+        }
+        if value > isize::MAX as i128 {
+            return Err(PyValueError::new_err(format!(
+                "{context}[{i}] must fit in numpy intp, got {value}"
+            )));
+        }
+        out.push(value as usize);
+    }
+    Ok(out.len() - start)
+}
+
+fn extend_unsigned_array_to_usize_vec_by<T, F>(
+    cells: &PyReadonlyArray1<'_, T>,
+    context: &str,
+    cast: F,
+    out: &mut Vec<usize>,
+) -> PyResult<usize>
+where
+    T: Element + Copy,
+    F: Fn(T) -> u128,
+{
+    let view = cells.as_array();
+    let start = out.len();
+    out.reserve(view.len());
+    for (i, &cell) in view.iter().enumerate() {
+        let value = cast(cell);
+        if value > isize::MAX as u128 {
+            return Err(PyValueError::new_err(format!(
+                "{context}[{i}] must fit in numpy intp, got {value}"
+            )));
+        }
+        out.push(value as usize);
+    }
+    Ok(out.len() - start)
+}
+
+fn extend_iterable_to_usize_vec(
+    obj: &Bound<'_, PyAny>,
+    context: &str,
+    out: &mut Vec<usize>,
+) -> PyResult<usize> {
+    if obj.is_instance_of::<PyString>()
+        || obj.is_instance_of::<PyBytes>()
+        || obj.is_instance_of::<PyByteArray>()
+    {
+        return Err(PyTypeError::new_err(format!(
+            "{context} must be a 1D iterable of integers"
+        )));
+    }
+    let py = obj.py();
+    let mut operator = None;
+    let start = out.len();
+    for (i, item) in obj.try_iter()?.enumerate() {
+        let item = item?;
+        if item.is_instance_of::<PyBool>() {
+            return Err(PyTypeError::new_err(format!(
+                "{context}[{i}] must be an integer, got bool"
+            )));
+        }
+        if let Ok(value) = item.extract::<usize>() {
+            if value > isize::MAX as usize {
+                return Err(PyValueError::new_err(format!(
+                    "{context}[{i}] must fit in numpy intp, got {value}"
+                )));
+            }
+            out.push(value);
+            continue;
+        }
+        let op = match operator.as_ref() {
+            Some(op) => op,
+            None => {
+                operator = Some(py.import("operator")?);
+                operator.as_ref().expect("operator module just imported")
+            }
+        };
+        let value: i128 = op.call_method1("index", (&item,))?.extract()?;
+        if value < 0 {
+            return Err(PyValueError::new_err(format!(
+                "{context}[{i}] must be non-negative, got {value}"
+            )));
+        }
+        if value > isize::MAX as i128 {
+            return Err(PyValueError::new_err(format!(
+                "{context}[{i}] must fit in numpy intp, got {value}"
+            )));
+        }
+        out.push(value as usize);
+    }
+    Ok(out.len() - start)
 }
 
 pub(crate) fn gene_view_to_string(view: GeneNameView) -> String {

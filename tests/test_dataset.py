@@ -5,7 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from scdata.data import CellAccess, CellBatch, CellData
+import scdata.data as data_api
+from scdata.data import CellAccess, CellBatch, CellData, CellIndexPlan
 from scdata.data._dataset import (
     ArrayMeta,
     ArrayOrder,
@@ -121,6 +122,58 @@ def test_dtype_from_numpy(np_dt, expected):
 def test_dtype_from_numpy_rejects_complex():
     with pytest.raises(DtypeParseError):
         DType.from_numpy(np.complex64)
+
+
+def test_cell_index_plan_from_counts_and_global_indices():
+    plan = CellIndexPlan.from_counts(
+        [3, 4],
+        local_cells=[2, np.array([3, 1], dtype=np.uint32)],
+        batch_size=2,
+    )
+    assert plan.dataset_index.dtype == np.dtype(np.uint16)
+    assert plan.cell_index.dtype == np.dtype(np.uint32)
+    assert plan.dataset_index.tolist() == [0, 0, 1, 1]
+    assert plan.cell_index.tolist() == [0, 1, 3, 1]
+    assert plan.num_batches == 2
+
+    shuffled = CellIndexPlan.from_global_indices(
+        [3, 4],
+        np.array([6, 0, 3, 2], dtype=np.int64),
+        batch_size=3,
+    )
+    assert shuffled.dataset_index.tolist() == [1, 0, 1, 0]
+    assert shuffled.cell_index.tolist() == [3, 0, 0, 2]
+    assert [cells.tolist() for _, cells in shuffled.iter_batches()] == [[3, 0, 0], [2]]
+
+    dropped = shuffled.take([0, 1, 2, 3], batch_size=3, drop_last=True)
+    assert dropped.dataset_index.tolist() == [1, 0, 1]
+    assert dropped.cell_index.tolist() == [3, 0, 0]
+
+    generated = CellIndexPlan.from_counts(
+        [3],
+        local_cells=[(i for i in [2, 0])],
+        batch_size=2,
+    )
+    assert generated.dataset_index.tolist() == [0, 0]
+    assert generated.cell_index.tolist() == [2, 0]
+
+    with pytest.raises(ValueError, match="local_cells"):
+        CellIndexPlan.from_counts([2], local_cells=[None, None])
+    with pytest.raises(ValueError, match="indices"):
+        CellIndexPlan.from_global_indices([2], [2], batch_size=1)
+
+
+def test_cell_index_plan_rejects_non_integer_generators():
+    with pytest.raises(TypeError, match="integer array"):
+        CellIndexPlan.from_global_indices([10], (x for x in [1.9]), batch_size=1)
+    with pytest.raises(TypeError, match="integer array"):
+        CellIndexPlan.from_global_indices([10], (x for x in [True]), batch_size=1)
+    with pytest.raises(TypeError, match="integer array"):
+        CellIndexPlan.from_counts([10], local_cells=[(x for x in [1.9])], batch_size=1)
+    with pytest.raises(TypeError, match="integer array"):
+        CellIndexPlan.from_counts([10], local_cells=[(x for x in [True])], batch_size=1)
+    with pytest.raises(TypeError, match="integer array"):
+        CellIndexPlan.from_counts([10], batch_size=1).take(x for x in [1.9])
 
 
 # --------------------------------------------------------------------------
@@ -629,6 +682,11 @@ def test_cell_carriers_strict_indices_and_single_gene_string():
         gene_names="TP53",
     )
     assert batch.gene_names == ("TP53",)
+
+
+def test_prefetch_batches_is_not_public_data_api():
+    assert not hasattr(data_api, "PrefetchBatches")
+    assert "PrefetchBatches" not in data_api.__all__
 
 
 # --------------------------------------------------------------------------

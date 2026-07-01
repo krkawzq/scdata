@@ -2,7 +2,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::access::{DecodeBackend, DecodeTask, FileRef, IoBackend, IoTask};
-use crate::codecs::{DecodePool, DecodeRequest, SharedCodec};
+use crate::codecs::{DecodePool, DecodeRequest, DecodeSlice, SharedCodec};
 use crate::iopool::{IoCommand, IoPool};
 
 #[derive(Clone)]
@@ -27,7 +27,8 @@ impl IoBackend for IoPoolBackend {
                 )
             })?;
             let output = pool
-                .submit(IoCommand::read(file_id, offset, len, priority as usize))?
+                .submit_async(IoCommand::read(file_id, offset, len, priority as usize))
+                .await?
                 .await?;
             output.into_read_bytes()
         })
@@ -51,12 +52,16 @@ impl DecodeBackend for DecodePoolBackend {
         codec: SharedCodec,
         encoded: Arc<[u8]>,
         expected_size: Option<usize>,
+        slice: Option<DecodeSlice>,
     ) -> DecodeTask {
         let pool = Arc::clone(&self.pool);
         Box::pin(async move {
             let mut request = DecodeRequest::new(codec, encoded);
             if let Some(expected_size) = expected_size {
                 request = request.with_expected_size(expected_size);
+            }
+            if let Some(slice) = slice {
+                request = request.with_slice(slice);
             }
             pool.submit_async(request).await?.await
         })

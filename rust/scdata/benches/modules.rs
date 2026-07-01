@@ -209,7 +209,10 @@ fn bench_access_profile(config: BenchConfig) {
     .expect("access scheduler");
 
     let cold = bench_profiled(
-        config,
+        BenchConfig {
+            warmups: 0,
+            ..config
+        },
         "access/profiled_cold_read_lz4_64k",
         256,
         Some(raw.len()),
@@ -459,6 +462,7 @@ fn threaded_io_config(workers: usize, max_in_flight: usize, shards: usize) -> Io
     IoConfig::Threaded(ThreadedConfig {
         base: BaseIoConfig {
             max_in_flight,
+            queue_capacity: max_in_flight.saturating_mul(4).max(max_in_flight),
             priority_levels: 2,
             queue_shards: shards,
             assume_non_overlapping_reads: true,

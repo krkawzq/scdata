@@ -14,19 +14,19 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::pin::Pin;
-#[cfg(feature = "uring")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
 use std::thread;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::profile::{ProfileRuntime, ProfileSnapshot, ProfileTimer};
 
 use self::profile::{
     record_iopool_cancelled_before_dispatch, record_iopool_dedup_hit, record_iopool_dispatched,
-    record_iopool_immediate, record_iopool_max_active_rejection, record_iopool_operation,
-    record_iopool_queue_full, record_iopool_submit, IoCommandKind, IoPoolProfile,
+    record_iopool_immediate, record_iopool_operation, record_iopool_queue_full,
+    record_iopool_submit, IoCommandKind, IoPoolProfile,
 };
 
 const TARGETED_READY_NOTIFIES: usize = 8;
@@ -65,9 +65,12 @@ pub struct RequestKey {
 /// Settings shared by every backend.
 #[derive(Debug, Clone)]
 pub struct BaseIoConfig {
-    /// Maximum number of unique active IO operations. Duplicate reads do not
-    /// consume another slot. Default: 1024.
+    /// Maximum number of IO operations dispatched to the backend at once.
+    /// Duplicate reads do not consume another slot. Default: 1024.
     pub max_in_flight: usize,
+    /// Maximum number of unique IO operations admitted into the internal queue.
+    /// Duplicate reads do not consume another slot. Default: 4096.
+    pub queue_capacity: usize,
     /// Number of priority levels. `0` is the highest priority. Default: 3.
     pub priority_levels: usize,
     /// Number of independent internal queues. Default: 1.
@@ -88,6 +91,7 @@ impl Default for BaseIoConfig {
     fn default() -> Self {
         Self {
             max_in_flight: 1024,
+            queue_capacity: 4096,
             priority_levels: 3,
             queue_shards: 1,
             assume_non_overlapping_reads: false,
@@ -104,6 +108,10 @@ impl BaseIoConfig {
         self.priority_levels.max(1)
     }
 
+    pub(super) fn queue_capacity(&self) -> usize {
+        self.queue_capacity.max(1)
+    }
+
     pub(super) fn queue_shards(&self) -> usize {
         self.queue_shards.max(1)
     }
@@ -111,6 +119,9 @@ impl BaseIoConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_in_flight == 0 {
             return Err("max_in_flight must be greater than 0".to_string());
+        }
+        if self.queue_capacity == 0 {
+            return Err("queue_capacity must be greater than 0".to_string());
         }
         if self.priority_levels == 0 {
             return Err("priority_levels must be greater than 0".to_string());
@@ -262,6 +273,10 @@ impl IoConfig {
         self.base().priority_levels()
     }
 
+    pub(super) fn queue_capacity(&self) -> usize {
+        self.base().queue_capacity()
+    }
+
     pub(super) fn queue_shards(&self) -> usize {
         let requested = self.base().queue_shards();
         let max_active = self.base().in_flight_limit();
@@ -399,6 +414,19 @@ impl IoCommand {
             | Self::SyncData { file, .. }
             | Self::Truncate { file, .. }
             | Self::Metadata { file, .. } => *file,
+        }
+    }
+
+    fn immediate_output(&self) -> Option<IoOutput> {
+        match self {
+            Self::Read { len: 0, .. } => Some(IoOutput::Read(Arc::from(Vec::new()))),
+            Self::Write { buf, .. } if buf.is_empty() => Some(IoOutput::Write { bytes: 0 }),
+            Self::Read { .. }
+            | Self::Write { .. }
+            | Self::Fsync { .. }
+            | Self::SyncData { .. }
+            | Self::Truncate { .. }
+            | Self::Metadata { .. } => None,
         }
     }
 
@@ -675,15 +703,15 @@ enum Access {
 }
 
 impl Access {
-    fn for_operation(op: &IoOperation) -> Self {
-        match op {
-            IoOperation::Read { file, .. } => Self::Read { file: *file },
-            IoOperation::Write { file, .. } => Self::Write { file: *file },
-            IoOperation::Fsync { file, .. } | IoOperation::SyncData { file, .. } => {
+    fn for_command(cmd: &IoCommand) -> Self {
+        match cmd {
+            IoCommand::Read { file, .. } => Self::Read { file: *file },
+            IoCommand::Write { file, .. } => Self::Write { file: *file },
+            IoCommand::Fsync { file, .. } | IoCommand::SyncData { file, .. } => {
                 Self::Sync { file: *file }
             }
-            IoOperation::Truncate { file, .. } => Self::Truncate { file: *file },
-            IoOperation::Metadata { file, .. } => Self::Metadata { file: *file },
+            IoCommand::Truncate { file, .. } => Self::Truncate { file: *file },
+            IoCommand::Metadata { file, .. } => Self::Metadata { file: *file },
         }
     }
 
@@ -704,12 +732,58 @@ struct Inflight {
     op: Option<IoOperation>,
     access: Access,
     waiters: Waiters,
+    _queue_permit: QueuePermit,
     refcount: usize,
     state: InflightState,
     priority: usize,
     seq: u64,
     fast_read: bool,
     queued_at: ProfileTimer,
+}
+
+struct QueuePermit {
+    permit: Option<OwnedSemaphorePermit>,
+    signal: Arc<QueueSignal>,
+}
+
+impl std::fmt::Debug for QueuePermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueuePermit")
+    }
+}
+
+impl QueuePermit {
+    fn new(permit: OwnedSemaphorePermit, signal: Arc<QueueSignal>) -> Self {
+        Self {
+            permit: Some(permit),
+            signal,
+        }
+    }
+}
+
+impl Drop for QueuePermit {
+    fn drop(&mut self) {
+        if self.signal.waiters.load(Ordering::Acquire) == 0 {
+            self.permit.take();
+            return;
+        }
+
+        let guard = self
+            .signal
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.permit.take();
+        drop(guard);
+        self.signal.available.notify_one();
+    }
+}
+
+#[derive(Debug, Default)]
+struct QueueSignal {
+    waiters: AtomicUsize,
+    mutex: Mutex<()>,
+    available: Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -741,7 +815,6 @@ struct Inner {
     active_by_file: Vec<Option<FileActive>>,
     next_id: u64,
     next_seq: u64,
-    max_active: usize,
     shutdown: bool,
     failure: Option<SharedIoError>,
 }
@@ -750,6 +823,8 @@ struct Inner {
 struct ActiveLimiter {
     max: usize,
     active: AtomicUsize,
+    wake_epoch: AtomicUsize,
+    signal: QueueSignal,
 }
 
 impl ActiveLimiter {
@@ -757,17 +832,16 @@ impl ActiveLimiter {
         Self {
             max: max.max(1),
             active: AtomicUsize::new(0),
+            wake_epoch: AtomicUsize::new(0),
+            signal: QueueSignal::default(),
         }
     }
 
-    fn try_acquire(&self) -> io::Result<()> {
+    fn try_acquire(&self) -> bool {
         let mut current = self.active.load(Ordering::Relaxed);
         loop {
             if current >= self.max {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("IO queue reached max_in_flight={}", self.max),
-                ));
+                return false;
             }
             match self.active.compare_exchange_weak(
                 current,
@@ -775,7 +849,7 @@ impl ActiveLimiter {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => return true,
                 Err(next) => current = next,
             }
         }
@@ -784,6 +858,7 @@ impl ActiveLimiter {
     fn release(&self) {
         let previous = self.active.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+        self.notify_one_waiter();
     }
 
     #[cfg(any(feature = "uring", test))]
@@ -793,6 +868,77 @@ impl ActiveLimiter {
         }
         let previous = self.active.fetch_sub(count, Ordering::AcqRel);
         debug_assert!(previous >= count);
+        self.notify_all_waiters();
+    }
+
+    fn wait_for_capacity_until<F>(&self, mut should_stop: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        if self.active.load(Ordering::Acquire) < self.max {
+            return false;
+        }
+        if should_stop() {
+            return true;
+        }
+
+        let observed_epoch = self.wake_epoch.load(Ordering::Acquire);
+        self.signal.waiters.fetch_add(1, Ordering::AcqRel);
+        let mut guard = self
+            .signal
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stopped = false;
+        while self.active.load(Ordering::Acquire) >= self.max
+            && self.wake_epoch.load(Ordering::Acquire) == observed_epoch
+        {
+            if should_stop() {
+                stopped = true;
+                break;
+            }
+            guard = self
+                .signal
+                .available
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(guard);
+        self.signal.waiters.fetch_sub(1, Ordering::AcqRel);
+        stopped
+    }
+
+    fn notify_one_waiter(&self) {
+        if self.signal.waiters.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let guard = self
+            .signal
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.wake_epoch.fetch_add(1, Ordering::AcqRel);
+        drop(guard);
+        self.signal.available.notify_one();
+    }
+
+    fn notify_all_waiters(&self) {
+        if self.signal.waiters.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let guard = self
+            .signal
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.wake_epoch.fetch_add(1, Ordering::AcqRel);
+        drop(guard);
+        self.signal.available.notify_all();
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.signal.waiters.load(Ordering::Acquire)
     }
 }
 
@@ -800,6 +946,10 @@ impl ActiveLimiter {
 pub(super) struct QueueCore {
     inner: Mutex<Inner>,
     active_limiter: Arc<ActiveLimiter>,
+    queue_limiter: Arc<Semaphore>,
+    queue_signal: Arc<QueueSignal>,
+    queue_capacity: usize,
+    shutdown_flag: AtomicBool,
     profiler: IoPoolProfile,
     available: Condvar,
     inactive_waiters: AtomicUsize,
@@ -809,50 +959,91 @@ pub(super) struct QueueCore {
     wake_pending: AtomicBool,
 }
 
+#[derive(Debug)]
+enum QueueSubmitError {
+    Full(IoCommand),
+    Io(io::Error),
+}
+
+impl From<io::Error> for QueueSubmitError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+enum PopAttempt {
+    Work(IoWork),
+    NoReady,
+    ActiveFull,
+}
+
 impl QueueCore {
     #[cfg(test)]
     pub(super) fn new(priority_levels: usize, max_active: usize) -> Self {
-        Self::new_with_fast_read_path(priority_levels, max_active, false)
+        Self::new_with_capacity(priority_levels, max_active, max_active)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_capacity(
+        priority_levels: usize,
+        queue_capacity: usize,
+        max_active: usize,
+    ) -> Self {
+        Self::new_with_fast_read_path(priority_levels, queue_capacity, max_active, false)
     }
 
     #[cfg(test)]
     pub(super) fn new_with_fast_read_path(
         priority_levels: usize,
+        queue_capacity: usize,
         max_active: usize,
         fast_read_path: bool,
     ) -> Self {
         Self::new_with_limiter(
             priority_levels,
+            queue_capacity,
             max_active,
             fast_read_path,
             Arc::new(ActiveLimiter::new(max_active)),
+            Arc::new(Semaphore::new(queue_capacity.max(1))),
+            Arc::new(QueueSignal::default()),
         )
     }
 
     #[cfg(test)]
     fn new_with_limiter(
         priority_levels: usize,
+        queue_capacity: usize,
         max_active: usize,
         fast_read_path: bool,
         active_limiter: Arc<ActiveLimiter>,
+        queue_limiter: Arc<Semaphore>,
+        queue_signal: Arc<QueueSignal>,
     ) -> Self {
         Self::new_with_limiter_and_profile(
             priority_levels,
+            queue_capacity,
             max_active,
             fast_read_path,
             active_limiter,
+            queue_limiter,
+            queue_signal,
             IoPoolProfile::disabled(),
         )
     }
 
     fn new_with_limiter_and_profile(
         priority_levels: usize,
-        max_active: usize,
+        queue_capacity: usize,
+        _max_active: usize,
         fast_read_path: bool,
         active_limiter: Arc<ActiveLimiter>,
+        queue_limiter: Arc<Semaphore>,
+        queue_signal: Arc<QueueSignal>,
         profiler: IoPoolProfile,
     ) -> Self {
         let priority_levels = priority_levels.max(1);
+        let queue_capacity = queue_capacity.max(1);
         Self {
             inner: Mutex::new(Inner {
                 priority_levels,
@@ -868,16 +1059,19 @@ impl QueueCore {
                 fixed_file_update_base: 0,
                 #[cfg(feature = "uring")]
                 fixed_file_update_cursors: HashMap::new(),
-                table: HashMap::with_capacity(max_active),
-                dedup: HashMap::with_capacity(max_active),
+                table: HashMap::new(),
+                dedup: HashMap::new(),
                 active_by_file: Vec::new(),
                 next_id: 0,
                 next_seq: 0,
-                max_active: max_active.max(1),
                 shutdown: false,
                 failure: None,
             }),
             active_limiter,
+            queue_limiter,
+            queue_signal,
+            queue_capacity,
+            shutdown_flag: AtomicBool::new(false),
             profiler,
             available: Condvar::new(),
             inactive_waiters: AtomicUsize::new(0),
@@ -890,21 +1084,207 @@ impl QueueCore {
 
     #[cfg(test)]
     fn submit(self: &Arc<Self>, cmd: IoCommand) -> io::Result<IoFuture> {
-        self.submit_with_handle(cmd, None)
+        match self.try_submit_with_handle(cmd, None, true) {
+            Ok(future) => Ok(future),
+            Err(QueueSubmitError::Full(cmd)) => {
+                let permit = self.blocking_acquire_queue_permit()?;
+                self.submit_with_handle_permit(cmd, None, permit, false)
+            }
+            Err(QueueSubmitError::Io(err)) => Err(err),
+        }
     }
 
-    fn submit_with_handle(
+    async fn acquire_queue_permit(self: &Arc<Self>) -> io::Result<QueuePermit> {
+        Arc::clone(&self.queue_limiter)
+            .acquire_owned()
+            .await
+            .map(|permit| QueuePermit::new(permit, Arc::clone(&self.queue_signal)))
+            .map_err(|_| self.queue_closed_error())
+    }
+
+    fn blocking_acquire_queue_permit(self: &Arc<Self>) -> io::Result<QueuePermit> {
+        match Arc::clone(&self.queue_limiter).try_acquire_owned() {
+            Ok(permit) => {
+                return Ok(QueuePermit::new(permit, Arc::clone(&self.queue_signal)));
+            }
+            Err(TryAcquireError::NoPermits) => {}
+            Err(TryAcquireError::Closed) => {
+                return Err(self.queue_closed_error());
+            }
+        }
+
+        self.queue_signal.waiters.fetch_add(1, Ordering::AcqRel);
+        let mut guard = self
+            .queue_signal
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let result = loop {
+            match Arc::clone(&self.queue_limiter).try_acquire_owned() {
+                Ok(permit) => {
+                    break Ok(QueuePermit::new(permit, Arc::clone(&self.queue_signal)));
+                }
+                Err(TryAcquireError::NoPermits) => {
+                    guard = self
+                        .queue_signal
+                        .available
+                        .wait(guard)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                Err(TryAcquireError::Closed) => {
+                    break Err(());
+                }
+            }
+        };
+        drop(guard);
+        self.queue_signal.waiters.fetch_sub(1, Ordering::AcqRel);
+        match result {
+            Ok(permit) => Ok(permit),
+            Err(()) => Err(self.queue_closed_error()),
+        }
+    }
+
+    fn queue_full_error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("IO queue reached queue_capacity={}", self.queue_capacity),
+        )
+    }
+
+    fn queue_closed_error(&self) -> io::Error {
+        let inner = self.inner.lock().unwrap();
+        if let Some(failure) = &inner.failure {
+            return failure.to_io_error();
+        }
+        if inner.shutdown {
+            return io::Error::new(io::ErrorKind::BrokenPipe, "IO queue is shut down");
+        }
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "IO queue capacity limiter is closed",
+        )
+    }
+
+    fn try_submit_with_handle(
         self: &Arc<Self>,
         cmd: IoCommand,
         handle: Option<Arc<File>>,
-    ) -> io::Result<IoFuture> {
-        record_iopool_submit(&self.profiler, cmd.profile_kind());
+        record_submit: bool,
+    ) -> Result<IoFuture, QueueSubmitError> {
+        if record_submit {
+            record_iopool_submit(&self.profiler, cmd.profile_kind());
+        }
         let priority = cmd.priority();
         let key = cmd.dedup_key();
-        let operation = cmd.into_operation(handle);
-        let access = Access::for_operation(&operation);
+        let access = Access::for_command(&cmd);
+        let immediate = cmd.immediate_output();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(failure) = &inner.failure {
+            return Err(QueueSubmitError::Io(failure.to_io_error()));
+        }
+        if inner.shutdown {
+            return Err(QueueSubmitError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "IO queue is shut down",
+            )));
+        }
+        if priority >= inner.priority_levels {
+            return Err(QueueSubmitError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "priority {priority} is out of range for {} priority levels",
+                    inner.priority_levels
+                ),
+            )));
+        }
+
+        if let Some(output) = immediate {
+            if Self::can_complete_immediately_locked(&inner, access) {
+                drop(inner);
+                record_iopool_immediate(&self.profiler);
+                let _ = tx.send(Ok(output));
+                return Ok(IoFuture::detached(rx));
+            }
+        }
+
+        if let Some(key) = key {
+            if let Some(id) = inner.dedup.get(&key).copied() {
+                if inner
+                    .table
+                    .get(&id)
+                    .is_some_and(|inflight| Self::can_dedup_locked(&inner, id, inflight, access))
+                {
+                    if inner
+                        .table
+                        .get(&id)
+                        .is_some_and(|inflight| inflight.refcount == usize::MAX)
+                    {
+                        return Err(QueueSubmitError::Io(refcount_overflow()));
+                    }
+                    Self::promote_priority_locked(&mut inner, id, priority);
+                    let inflight = inner
+                        .table
+                        .get_mut(&id)
+                        .expect("deduplicated entry checked above");
+                    inflight.refcount += 1;
+                    inflight.waiters.push(tx);
+                    drop(inner);
+                    record_iopool_dedup_hit(&self.profiler);
+                    return Ok(IoFuture::new(rx, Arc::downgrade(self), id));
+                }
+                if !inner.table.contains_key(&id) {
+                    inner.dedup.remove(&key);
+                }
+            }
+        }
+
+        let queue_permit = match Arc::clone(&self.queue_limiter).try_acquire_owned() {
+            Ok(permit) => QueuePermit::new(permit, Arc::clone(&self.queue_signal)),
+            Err(TryAcquireError::NoPermits) => {
+                drop(inner);
+                record_iopool_queue_full(&self.profiler);
+                return Err(QueueSubmitError::Full(cmd));
+            }
+            Err(TryAcquireError::Closed) => {
+                drop(inner);
+                return Err(QueueSubmitError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "IO queue capacity limiter is closed",
+                )));
+            }
+        };
+
+        Self::insert_locked(
+            self,
+            inner,
+            cmd,
+            handle,
+            queue_permit,
+            priority,
+            key,
+            access,
+            tx,
+            rx,
+        )
+    }
+
+    fn submit_with_handle_permit(
+        self: &Arc<Self>,
+        cmd: IoCommand,
+        handle: Option<Arc<File>>,
+        queue_permit: QueuePermit,
+        record_submit: bool,
+    ) -> io::Result<IoFuture> {
+        if record_submit {
+            record_iopool_submit(&self.profiler, cmd.profile_kind());
+        }
+        let priority = cmd.priority();
+        let key = cmd.dedup_key();
+        let access = Access::for_command(&cmd);
+        let immediate = cmd.immediate_output();
+        let (tx, rx) = tokio::sync::oneshot::channel();
         let mut inner = self.inner.lock().unwrap();
         if let Some(failure) = &inner.failure {
             return Err(failure.to_io_error());
@@ -924,16 +1304,15 @@ impl QueueCore {
                 ),
             ));
         }
-
-        if let Some(output) = immediate_operation_output(&operation) {
+        if let Some(output) = immediate {
             if Self::can_complete_immediately_locked(&inner, access) {
                 drop(inner);
                 record_iopool_immediate(&self.profiler);
+                drop(queue_permit);
                 let _ = tx.send(Ok(output));
                 return Ok(IoFuture::detached(rx));
             }
         }
-
         if let Some(key) = key {
             if let Some(id) = inner.dedup.get(&key).copied() {
                 if inner
@@ -956,6 +1335,7 @@ impl QueueCore {
                     inflight.refcount += 1;
                     inflight.waiters.push(tx);
                     drop(inner);
+                    drop(queue_permit);
                     record_iopool_dedup_hit(&self.profiler);
                     return Ok(IoFuture::new(rx, Arc::downgrade(self), id));
                 }
@@ -964,17 +1344,37 @@ impl QueueCore {
                 }
             }
         }
+        Self::insert_locked(
+            self,
+            inner,
+            cmd,
+            handle,
+            queue_permit,
+            priority,
+            key,
+            access,
+            tx,
+            rx,
+        )
+        .map_err(|err| match err {
+            QueueSubmitError::Io(err) => err,
+            QueueSubmitError::Full(_) => unreachable!("queue permit was already acquired"),
+        })
+    }
 
-        if inner.table.len() >= inner.max_active {
-            let max_active = inner.max_active;
-            drop(inner);
-            record_iopool_queue_full(&self.profiler);
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("IO queue reached max_in_flight={max_active}"),
-            ));
-        }
-
+    #[allow(clippy::too_many_arguments)]
+    fn insert_locked(
+        this: &Arc<Self>,
+        mut inner: std::sync::MutexGuard<'_, Inner>,
+        cmd: IoCommand,
+        handle: Option<Arc<File>>,
+        queue_permit: QueuePermit,
+        priority: usize,
+        key: Option<RequestKey>,
+        access: Access,
+        tx: IoResultSender,
+        rx: tokio::sync::oneshot::Receiver<SharedIoResult>,
+    ) -> Result<IoFuture, QueueSubmitError> {
         let id = WorkId(inner.next_id);
         inner.next_id = inner.next_id.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::OutOfMemory, "IO work id counter overflowed")
@@ -984,13 +1384,9 @@ impl QueueCore {
             io::Error::new(io::ErrorKind::OutOfMemory, "IO sequence counter overflowed")
         })?;
 
-        if let Err(err) = self.active_limiter.try_acquire() {
-            drop(inner);
-            record_iopool_max_active_rejection(&self.profiler);
-            return Err(err);
-        }
         let fast_read = Self::can_use_fast_read_locked(&inner, access);
-        let queued_at = self.profiler.queue_timer();
+        let queued_at = this.profiler.queue_timer();
+        let operation = cmd.into_operation(handle);
 
         inner.table.insert(
             id,
@@ -999,6 +1395,7 @@ impl QueueCore {
                 op: Some(operation),
                 access,
                 waiters: Waiters::new(tx),
+                _queue_permit: queue_permit,
                 refcount: 1,
                 state: InflightState::Queued,
                 priority,
@@ -1020,17 +1417,34 @@ impl QueueCore {
         drop(inner);
 
         if became_ready {
-            self.notify_one();
+            this.notify_one();
         }
-        Ok(IoFuture::new(rx, Arc::downgrade(self), id))
+        Ok(IoFuture::new(rx, Arc::downgrade(this), id))
     }
 
     pub(super) fn pop(&self) -> Option<IoWork> {
         let mut inner = self.inner.lock().unwrap();
         loop {
-            if let Some(work) = Self::pop_ready_locked(&mut inner) {
-                drop(inner);
-                return Some(self.profile_dispatched(work));
+            match self.pop_ready_with_active_locked(&mut inner) {
+                PopAttempt::Work(work) => {
+                    drop(inner);
+                    return Some(self.profile_dispatched(work));
+                }
+                PopAttempt::NoReady => {}
+                PopAttempt::ActiveFull => {
+                    if inner.shutdown {
+                        return None;
+                    }
+                    drop(inner);
+                    if self
+                        .active_limiter
+                        .wait_for_capacity_until(|| self.is_shutdown())
+                    {
+                        return None;
+                    }
+                    inner = self.inner.lock().unwrap();
+                    continue;
+                }
             }
 
             if inner.shutdown {
@@ -1041,13 +1455,42 @@ impl QueueCore {
         }
     }
 
+    #[cfg(test)]
+    fn try_pop_for_test(&self) -> Option<IoWork> {
+        let mut inner = self.inner.lock().unwrap();
+        match self.pop_ready_with_active_locked(&mut inner) {
+            PopAttempt::Work(work) => {
+                drop(inner);
+                Some(self.profile_dispatched(work))
+            }
+            PopAttempt::NoReady | PopAttempt::ActiveFull => None,
+        }
+    }
+
     #[cfg(feature = "uring")]
     pub(super) fn pop_or_notification(&self, fixed_file_update_cursor: usize) -> QueueWake {
         let mut inner = self.inner.lock().unwrap();
         loop {
-            if let Some(work) = Self::pop_ready_locked(&mut inner) {
-                drop(inner);
-                return QueueWake::Work(self.profile_dispatched(work));
+            match self.pop_ready_with_active_locked(&mut inner) {
+                PopAttempt::Work(work) => {
+                    drop(inner);
+                    return QueueWake::Work(self.profile_dispatched(work));
+                }
+                PopAttempt::NoReady => {}
+                PopAttempt::ActiveFull => {
+                    if inner.shutdown {
+                        return QueueWake::Shutdown;
+                    }
+                    drop(inner);
+                    if self
+                        .active_limiter
+                        .wait_for_capacity_until(|| self.is_shutdown())
+                    {
+                        return QueueWake::Shutdown;
+                    }
+                    inner = self.inner.lock().unwrap();
+                    continue;
+                }
             }
 
             if inner.shutdown {
@@ -1075,15 +1518,39 @@ impl QueueCore {
         let start = out.len();
         let mut inner = self.inner.lock().unwrap();
         for _ in 0..limit {
-            let Some(work) = Self::pop_ready_locked(&mut inner) else {
-                break;
-            };
-            out.push(work);
+            match self.pop_ready_with_active_locked(&mut inner) {
+                PopAttempt::Work(work) => out.push(work),
+                PopAttempt::NoReady | PopAttempt::ActiveFull => break,
+            }
         }
         drop(inner);
         for work in &mut out[start..] {
             self.profile_dispatched_in_place(work);
         }
+    }
+
+    fn pop_ready_with_active_locked(&self, inner: &mut Inner) -> PopAttempt {
+        if !Self::has_ready_candidate_locked(inner) {
+            return PopAttempt::NoReady;
+        }
+        if !self.active_limiter.try_acquire() {
+            return PopAttempt::ActiveFull;
+        }
+        match Self::pop_ready_locked(inner) {
+            Some(work) => PopAttempt::Work(work),
+            None => {
+                self.active_limiter.release();
+                PopAttempt::NoReady
+            }
+        }
+    }
+
+    fn has_ready_candidate_locked(inner: &Inner) -> bool {
+        !inner.ready.is_empty() || inner.fast_ready.iter().any(|ready| !ready.is_empty())
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Acquire)
     }
 
     fn profile_dispatched(&self, mut work: IoWork) -> IoWork {
@@ -1149,35 +1616,55 @@ impl QueueCore {
             let file_inactive = !Self::file_active_locked(&inner, file);
             drop(inner);
             record_iopool_cancelled_before_dispatch(&self.profiler);
-            self.active_limiter.release();
             self.notify_ready_count(ready_count);
             self.notify_file_inactive(file_inactive);
         }
     }
 
     pub(super) fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
         inner.shutdown = true;
         drop(inner);
+        self.close_queue_capacity_limiter();
+        self.active_limiter.notify_all_waiters();
         self.notify_all();
     }
 
     #[cfg(any(feature = "uring", test))]
     pub(super) fn fail(&self, err: io::Error) {
+        self.shutdown_flag.store(true, Ordering::Release);
         let failure = SharedIoError::from(err);
-        let (waiters, released) = {
+        let (waiters, released_active) = {
             let mut inner = self.inner.lock().unwrap();
             inner.shutdown = true;
             inner.failure = Some(failure.clone());
-            let released = inner.table.len();
-            (Self::drain_locked(&mut inner), released)
+            let released_active = inner
+                .table
+                .values()
+                .filter(|inflight| inflight.state == InflightState::Dispatched)
+                .count();
+            (Self::drain_locked(&mut inner), released_active)
         };
 
-        self.active_limiter.release_many(released);
+        self.active_limiter.release_many(released_active);
+        self.active_limiter.notify_all_waiters();
         for waiters in waiters {
             waiters.send(Err(failure.clone()));
         }
+        self.close_queue_capacity_limiter();
         self.notify_all();
+    }
+
+    fn close_queue_capacity_limiter(&self) {
+        let guard = self
+            .queue_signal
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.queue_limiter.close();
+        drop(guard);
+        self.queue_signal.available.notify_all();
     }
 
     fn notify_one(&self) {
@@ -1520,7 +2007,8 @@ impl QueueCore {
                     (inflight.queued_at, inflight.op.take())
                 };
                 inner.queued = inner.queued.saturating_sub(1);
-                return op.map(|op| IoWork {
+                let op = op.expect("queued fast entry has an operation");
+                return Some(IoWork {
                     id,
                     op,
                     queued_at,
@@ -1549,7 +2037,8 @@ impl QueueCore {
                 (inflight.queued_at, inflight.op.take())
             };
             inner.queued = inner.queued.saturating_sub(1);
-            return op.map(|op| IoWork {
+            let op = op.expect("queued dispatchable entry has an operation");
+            return Some(IoWork {
                 id,
                 op,
                 queued_at,
@@ -1743,6 +2232,11 @@ impl QueueCore {
     }
 
     #[cfg(test)]
+    fn debug_active_waiter_count(&self) -> usize {
+        self.active_limiter.waiter_count()
+    }
+
+    #[cfg(test)]
     fn debug_fast_active_read_count(&self, file: FileId) -> usize {
         let inner = self.inner.lock().unwrap();
         Self::fast_active_read_count(&inner, file)
@@ -1922,15 +2416,21 @@ impl IoPool {
 
         let queue_count = config.queue_shards();
         let in_flight_limit = config.in_flight_limit();
+        let queue_capacity = config.queue_capacity();
         let active_limiter = Arc::new(ActiveLimiter::new(in_flight_limit));
+        let queue_limiter = Arc::new(Semaphore::new(queue_capacity));
+        let queue_signal = Arc::new(QueueSignal::default());
         let fast_read_path = config.base().assume_non_overlapping_reads;
         let queues = (0..queue_count)
             .map(|_| {
                 Arc::new(QueueCore::new_with_limiter_and_profile(
                     config.priority_levels(),
+                    queue_capacity,
                     in_flight_limit,
                     fast_read_path,
                     Arc::clone(&active_limiter),
+                    Arc::clone(&queue_limiter),
+                    Arc::clone(&queue_signal),
                     profiler.clone(),
                 ))
             })
@@ -2167,14 +2667,63 @@ impl IoPool {
         Ok(true)
     }
 
+    pub fn try_submit(&self, cmd: IoCommand) -> io::Result<IoFuture> {
+        let file = cmd.file();
+        let queue = Arc::clone(self.select_queue(&cmd));
+        let future = {
+            let table = self.file_table.read().unwrap();
+            let handle = registered_file_locked(&table, file)?;
+            queue.try_submit_with_handle(cmd, Some(handle), true)
+        };
+        match future {
+            Ok(future) => Ok(future),
+            Err(QueueSubmitError::Full(_)) => Err(queue.queue_full_error()),
+            Err(QueueSubmitError::Io(err)) => Err(err),
+        }
+    }
+
     pub fn submit(&self, cmd: IoCommand) -> io::Result<IoFuture> {
         let file = cmd.file();
-        let queue = self.select_queue(&cmd);
-        let table = self.file_table.read().unwrap();
-        let handle = registered_file_locked(&table, file)?;
-        let future = queue.submit_with_handle(cmd, Some(handle));
-        drop(table);
-        future
+        let queue = Arc::clone(self.select_queue(&cmd));
+        let future = {
+            let table = self.file_table.read().unwrap();
+            let handle = registered_file_locked(&table, file)?;
+            queue.try_submit_with_handle(cmd, Some(handle), true)
+        };
+        match future {
+            Ok(future) => Ok(future),
+            Err(QueueSubmitError::Full(cmd)) => {
+                let permit = queue.blocking_acquire_queue_permit()?;
+                {
+                    let table = self.file_table.read().unwrap();
+                    let handle = registered_file_locked(&table, file)?;
+                    queue.submit_with_handle_permit(cmd, Some(handle), permit, false)
+                }
+            }
+            Err(QueueSubmitError::Io(err)) => Err(err),
+        }
+    }
+
+    pub async fn submit_async(&self, cmd: IoCommand) -> io::Result<IoFuture> {
+        let file = cmd.file();
+        let queue = Arc::clone(self.select_queue(&cmd));
+        let future = {
+            let table = self.file_table.read().unwrap();
+            let handle = registered_file_locked(&table, file)?;
+            queue.try_submit_with_handle(cmd, Some(handle), true)
+        };
+        match future {
+            Ok(future) => Ok(future),
+            Err(QueueSubmitError::Full(cmd)) => {
+                let permit = queue.acquire_queue_permit().await?;
+                {
+                    let table = self.file_table.read().unwrap();
+                    let handle = registered_file_locked(&table, file)?;
+                    queue.submit_with_handle_permit(cmd, Some(handle), permit, false)
+                }
+            }
+            Err(QueueSubmitError::Io(err)) => Err(err),
+        }
     }
 
     fn select_queue(&self, cmd: &IoCommand) -> &Arc<QueueCore> {
@@ -2274,19 +2823,6 @@ pub(super) fn execute_work(file_table: &Arc<FileTable>, op: IoOperation) -> io::
             let file = operation_file(file_table, file, handle)?;
             Ok(IoOutput::Metadata(file.metadata()?.into()))
         }
-    }
-}
-
-fn immediate_operation_output(op: &IoOperation) -> Option<IoOutput> {
-    match op {
-        IoOperation::Read { len: 0, .. } => Some(IoOutput::Read(Arc::from(Vec::new()))),
-        IoOperation::Write { buf, .. } if buf.is_empty() => Some(IoOutput::Write { bytes: 0 }),
-        IoOperation::Read { .. }
-        | IoOperation::Write { .. }
-        | IoOperation::Fsync { .. }
-        | IoOperation::SyncData { .. }
-        | IoOperation::Truncate { .. }
-        | IoOperation::Metadata { .. } => None,
     }
 }
 
@@ -2411,6 +2947,9 @@ mod tests {
     use std::io::{self, ErrorKind, Write};
     #[cfg(feature = "profile")]
     use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     #[cfg(feature = "profile")]
     static PROFILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2439,6 +2978,7 @@ mod tests {
         IoPool::new(IoConfig::Threaded(ThreadedConfig {
             base: BaseIoConfig {
                 max_in_flight: 16,
+                queue_capacity: 64,
                 priority_levels: 3,
                 queue_shards: 1,
                 assume_non_overlapping_reads: false,
@@ -2450,18 +2990,32 @@ mod tests {
     }
 
     fn make_unstarted_pool(queue_count: usize, max_active: usize) -> IoPool {
+        make_unstarted_pool_with_capacity(queue_count, max_active, max_active)
+    }
+
+    fn make_unstarted_pool_with_capacity(
+        queue_count: usize,
+        queue_capacity: usize,
+        max_active: usize,
+    ) -> IoPool {
         let active_limiter = Arc::new(ActiveLimiter::new(max_active));
+        let queue_limiter = Arc::new(Semaphore::new(queue_capacity.max(1)));
+        let queue_signal = Arc::new(QueueSignal::default());
+        let queues = (0..queue_count)
+            .map(|_| {
+                Arc::new(QueueCore::new_with_limiter(
+                    3,
+                    queue_capacity,
+                    max_active,
+                    false,
+                    Arc::clone(&active_limiter),
+                    Arc::clone(&queue_limiter),
+                    Arc::clone(&queue_signal),
+                ))
+            })
+            .collect::<Vec<_>>();
         IoPool {
-            queues: (0..queue_count)
-                .map(|_| {
-                    Arc::new(QueueCore::new_with_limiter(
-                        3,
-                        max_active,
-                        false,
-                        Arc::clone(&active_limiter),
-                    ))
-                })
-                .collect(),
+            queues,
             file_table: Arc::new(RwLock::new(Vec::new())),
             free_file_ids: Mutex::new(Vec::new()),
             threads: Vec::new(),
@@ -2469,6 +3023,46 @@ mod tests {
             #[cfg(feature = "uring")]
             uses_uring: false,
         }
+    }
+
+    #[test]
+    fn blocking_submit_waiting_for_queue_capacity_wakes_on_shutdown() {
+        let path = temp_file("blocking_submit_shutdown", b"abcdef");
+        let pool = Arc::new(make_unstarted_pool_with_capacity(1, 1, 1));
+        let file = pool.register_file(&path).expect("register");
+        let held = pool
+            .submit(IoCommand::read(file, 0, 1, 0))
+            .expect("held submit");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_pool = Arc::clone(&pool);
+        let handle = thread::spawn(move || {
+            started_tx.send(()).expect("signal started");
+            let result = worker_pool.submit(IoCommand::read(file, 1, 1, 0));
+            result_tx
+                .send(result.map(|_| ()))
+                .expect("send submit result");
+        });
+
+        started_rx.recv().expect("submit thread started");
+        pool.queues[0].shutdown();
+        let result = match result_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(result) => result,
+            Err(err) => {
+                drop(held);
+                let _ = handle.join();
+                panic!("blocking submit did not wake after queue shutdown: {err}");
+            }
+        };
+        assert_eq!(
+            result
+                .expect_err("shutdown should reject blocked submit")
+                .kind(),
+            ErrorKind::BrokenPipe
+        );
+        drop(held);
+        handle.join().expect("submit thread joined");
     }
 
     #[cfg(feature = "profile")]
@@ -2523,17 +3117,23 @@ mod tests {
     #[cfg(feature = "uring")]
     fn make_unstarted_uring_pool(queue_count: usize, max_active: usize) -> IoPool {
         let active_limiter = Arc::new(ActiveLimiter::new(max_active));
+        let queue_limiter = Arc::new(Semaphore::new(max_active.max(1)));
+        let queue_signal = Arc::new(QueueSignal::default());
+        let queues = (0..queue_count)
+            .map(|_| {
+                Arc::new(QueueCore::new_with_limiter(
+                    3,
+                    max_active,
+                    max_active,
+                    false,
+                    Arc::clone(&active_limiter),
+                    Arc::clone(&queue_limiter),
+                    Arc::clone(&queue_signal),
+                ))
+            })
+            .collect::<Vec<_>>();
         IoPool {
-            queues: (0..queue_count)
-                .map(|_| {
-                    Arc::new(QueueCore::new_with_limiter(
-                        3,
-                        max_active,
-                        false,
-                        Arc::clone(&active_limiter),
-                    ))
-                })
-                .collect(),
+            queues,
             file_table: Arc::new(RwLock::new(Vec::new())),
             free_file_ids: Mutex::new(Vec::new()),
             threads: Vec::new(),
@@ -2560,7 +3160,7 @@ mod tests {
     fn global_in_flight_limit_spans_shards() {
         let path_a = temp_file("global_limit_a", b"abcdefgh");
         let path_b = temp_file("global_limit_b", b"ABCDEFGH");
-        let pool = make_unstarted_pool(2, 2);
+        let pool = make_unstarted_pool_with_capacity(2, 4, 2);
         let file_a = pool.register_readonly_file(&path_a).expect("register a");
         let file_b = pool.register_readonly_file(&path_b).expect("register b");
 
@@ -2570,23 +3170,214 @@ mod tests {
         let second = pool
             .submit(IoCommand::read(file_b, 0, 1, 0))
             .expect("second read");
-        let err = pool
-            .submit(IoCommand::read(file_a, 1, 1, 0))
-            .expect_err("global limit should reject third unique read");
-        assert_eq!(err.kind(), ErrorKind::WouldBlock);
-
-        drop(first);
         let third = pool
             .submit(IoCommand::read(file_a, 1, 1, 0))
-            .expect("released permit should allow another read");
+            .expect("third read should queue behind active limit");
+
+        let queue_a = pool.queue_for_file(file_a);
+        let queue_b = pool.queue_for_file(file_b);
+        let first_work = queue_a.try_pop_for_test().expect("dispatch first read");
+        let second_work = queue_b.try_pop_for_test().expect("dispatch second read");
+        assert!(
+            queue_a.try_pop_for_test().is_none(),
+            "global active limit should stall third dispatch"
+        );
+
+        queue_a.complete(
+            first_work.id,
+            first_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"a".to_vec()))),
+        );
+        let third_work = queue_a
+            .try_pop_for_test()
+            .expect("released active permit should dispatch third read");
+        queue_b.complete(
+            second_work.id,
+            second_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"A".to_vec()))),
+        );
+        queue_a.complete(
+            third_work.id,
+            third_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"b".to_vec()))),
+        );
+        assert_eq!(&*first.blocking_recv_read().expect("first"), b"a");
+        assert_eq!(&*second.blocking_recv_read().expect("second"), b"A");
+        assert_eq!(&*third.blocking_recv_read().expect("third"), b"b");
+    }
+
+    #[test]
+    fn active_release_wakes_other_shard_waiting_on_global_limit() {
+        let path_a = temp_file("active_wake_a", b"abcdefgh");
+        let path_b = temp_file("active_wake_b", b"ABCDEFGH");
+        let pool = Arc::new(make_unstarted_pool_with_capacity(2, 4, 1));
+        let file_a = pool.register_readonly_file(&path_a).expect("register a");
+        let file_b = pool.register_readonly_file(&path_b).expect("register b");
+        let queue_a = Arc::clone(pool.queue_for_file(file_a));
+        let queue_b = Arc::clone(pool.queue_for_file(file_b));
+        assert!(
+            !Arc::ptr_eq(&queue_a, &queue_b),
+            "test requires distinct queue shards"
+        );
+
+        let first = pool
+            .submit(IoCommand::read(file_a, 0, 1, 0))
+            .expect("first read");
+        let first_work = queue_a
+            .try_pop_for_test()
+            .expect("first shard should occupy active slot");
+        let second = pool
+            .submit(IoCommand::read(file_b, 0, 1, 0))
+            .expect("second read");
+
+        let (work_tx, work_rx) = mpsc::channel();
+        let waiting_queue = Arc::clone(&queue_b);
+        let handle = thread::spawn(move || {
+            work_tx.send(waiting_queue.pop()).expect("send popped work");
+        });
+
+        for _ in 0..500 {
+            if queue_b.debug_active_waiter_count() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            queue_b.debug_active_waiter_count(),
+            1,
+            "second shard should be waiting for global active capacity"
+        );
+
+        queue_a.complete(
+            first_work.id,
+            first_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"a".to_vec()))),
+        );
+        let second_work = match work_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Some(work)) => work,
+            Ok(None) => panic!("second shard stopped before dispatching work"),
+            Err(err) => {
+                queue_b.shutdown();
+                let _ = handle.join();
+                panic!("active release did not wake second shard: {err}");
+            }
+        };
+        queue_b.complete(
+            second_work.id,
+            second_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"A".to_vec()))),
+        );
+
+        assert_eq!(&*first.blocking_recv_read().expect("first"), b"a");
+        assert_eq!(&*second.blocking_recv_read().expect("second"), b"A");
+        handle.join().expect("worker joined");
+    }
+
+    #[test]
+    fn queue_shutdown_wakes_shard_waiting_on_active_limit() {
+        let path_a = temp_file("active_shutdown_a", b"abcdefgh");
+        let path_b = temp_file("active_shutdown_b", b"ABCDEFGH");
+        let pool = Arc::new(make_unstarted_pool_with_capacity(2, 4, 1));
+        let file_a = pool.register_readonly_file(&path_a).expect("register a");
+        let file_b = pool.register_readonly_file(&path_b).expect("register b");
+        let queue_a = Arc::clone(pool.queue_for_file(file_a));
+        let queue_b = Arc::clone(pool.queue_for_file(file_b));
+        assert!(
+            !Arc::ptr_eq(&queue_a, &queue_b),
+            "test requires distinct queue shards"
+        );
+
+        let first = pool
+            .submit(IoCommand::read(file_a, 0, 1, 0))
+            .expect("first read");
+        let first_work = queue_a
+            .try_pop_for_test()
+            .expect("first shard should occupy active slot");
+        let second = pool
+            .submit(IoCommand::read(file_b, 0, 1, 0))
+            .expect("second read");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiting_queue = Arc::clone(&queue_b);
+        let handle = thread::spawn(move || {
+            done_tx
+                .send(waiting_queue.pop().is_none())
+                .expect("send shutdown result");
+        });
+
+        for _ in 0..500 {
+            if queue_b.debug_active_waiter_count() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            queue_b.debug_active_waiter_count(),
+            1,
+            "second shard should be waiting for global active capacity"
+        );
+
+        queue_b.shutdown();
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("active waiter should wake on shutdown"),
+            "queue pop should stop after shutdown"
+        );
         drop(second);
-        drop(third);
+        queue_a.complete(
+            first_work.id,
+            first_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"a".to_vec()))),
+        );
+        assert_eq!(&*first.blocking_recv_read().expect("first"), b"a");
+        handle.join().expect("worker joined");
+    }
+
+    #[test]
+    fn active_wait_observes_queue_shutdown_before_waiter_registration() {
+        let path_a = temp_file("active_preregister_shutdown_a", b"abcdefgh");
+        let path_b = temp_file("active_preregister_shutdown_b", b"ABCDEFGH");
+        let pool = make_unstarted_pool_with_capacity(2, 4, 1);
+        let file_a = pool.register_readonly_file(&path_a).expect("register a");
+        let file_b = pool.register_readonly_file(&path_b).expect("register b");
+        let queue_a = pool.queue_for_file(file_a);
+        let queue_b = pool.queue_for_file(file_b);
+        assert!(
+            !Arc::ptr_eq(queue_a, queue_b),
+            "test requires distinct queue shards"
+        );
+
+        let first = pool
+            .submit(IoCommand::read(file_a, 0, 1, 0))
+            .expect("first read");
+        let first_work = queue_a
+            .try_pop_for_test()
+            .expect("first shard should occupy active slot");
+        let second = pool
+            .submit(IoCommand::read(file_b, 0, 1, 0))
+            .expect("second read");
+
+        queue_b.shutdown();
+        assert!(
+            queue_b
+                .active_limiter
+                .wait_for_capacity_until(|| queue_b.is_shutdown()),
+            "active wait should return immediately when queue is already shut down"
+        );
+        drop(second);
+        queue_a.complete(
+            first_work.id,
+            first_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"a".to_vec()))),
+        );
+        assert_eq!(&*first.blocking_recv_read().expect("first"), b"a");
     }
 
     #[test]
     fn same_file_can_use_full_global_in_flight_limit() {
         let path = temp_file("same_file_full_limit", b"abcdefghijklmnopqrstuvwxyz");
-        let pool = make_unstarted_pool(2, 4);
+        let pool = make_unstarted_pool_with_capacity(2, 8, 4);
         let file = pool.register_readonly_file(&path).expect("register");
 
         let reads = (0..4)
@@ -2595,24 +3386,59 @@ mod tests {
                     .expect("same-file read within global limit")
             })
             .collect::<Vec<_>>();
-        let err = pool
+        let fifth = pool
             .submit(IoCommand::read(file, 4, 1, 0))
-            .expect_err("fifth read should exceed global limit");
-        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+            .expect("fifth read should queue behind active limit");
 
-        for read in reads {
-            drop(read);
+        let queue = pool.queue_for_file(file);
+        let mut works = (0..4)
+            .map(|_| {
+                queue
+                    .try_pop_for_test()
+                    .expect("dispatch within active limit")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            queue.try_pop_for_test().is_none(),
+            "fifth same-file read should wait for active capacity"
+        );
+        let first_work = works.pop().expect("held work");
+        queue.complete(
+            first_work.id,
+            first_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"a".to_vec()))),
+        );
+        let fifth_work = queue
+            .try_pop_for_test()
+            .expect("released active permit should dispatch fifth read");
+        for work in works {
+            queue.complete(
+                work.id,
+                work.operation_started,
+                Ok(IoOutput::Read(Arc::from(b"x".to_vec()))),
+            );
         }
+        queue.complete(
+            fifth_work.id,
+            fifth_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"e".to_vec()))),
+        );
+        drop(reads);
+        assert_eq!(&*fifth.blocking_recv_read().expect("fifth"), b"e");
     }
 
     #[test]
     fn zero_length_read_and_write_bypass_in_flight_limit() {
         let path = temp_file("zero_len_bypass", b"abcdef");
-        let pool = make_unstarted_pool(1, 1);
+        let pool = make_unstarted_pool_with_capacity(1, 2, 1);
         let file = pool.register_readonly_file(&path).expect("register");
         let held = pool
             .submit(IoCommand::read(file, 0, 1, 0))
             .expect("occupy in-flight permit");
+        let held_work = pool
+            .queue_for_file(file)
+            .try_pop_for_test()
+            .expect("dispatch held read");
 
         let empty = pool
             .submit(IoCommand::read(file, 3, 0, 0))
@@ -2628,16 +3454,30 @@ mod tests {
             .expect("zero write");
         assert_eq!(written.bytes_written(), Some(0));
 
-        let err = pool
-            .submit(IoCommand::read(file, 1, 1, 0))
-            .expect_err("detached zero-length futures must not release active permits");
-        assert_eq!(err.kind(), ErrorKind::WouldBlock);
-
-        drop(held);
         let next = pool
             .submit(IoCommand::read(file, 1, 1, 0))
-            .expect("dropping held read releases permit");
-        drop(next);
+            .expect("normal read should queue while active permit is held");
+        assert!(
+            pool.queue_for_file(file).try_pop_for_test().is_none(),
+            "detached zero-length futures must not release active permits"
+        );
+
+        pool.queue_for_file(file).complete(
+            held_work.id,
+            held_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"a".to_vec()))),
+        );
+        let next_work = pool
+            .queue_for_file(file)
+            .try_pop_for_test()
+            .expect("next read should dispatch after active release");
+        pool.queue_for_file(file).complete(
+            next_work.id,
+            next_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"b".to_vec()))),
+        );
+        assert_eq!(&*held.blocking_recv_read().expect("held"), b"a");
+        assert_eq!(&*next.blocking_recv_read().expect("next"), b"b");
     }
 
     #[test]
@@ -2699,6 +3539,7 @@ mod tests {
         let config = IoConfig::Threaded(ThreadedConfig {
             base: BaseIoConfig {
                 max_in_flight: 1,
+                queue_capacity: 4,
                 priority_levels: 2,
                 queue_shards: 4,
                 assume_non_overlapping_reads: false,
@@ -2729,6 +3570,7 @@ mod tests {
         let pool = IoPool::new(IoConfig::Threaded(ThreadedConfig {
             base: BaseIoConfig {
                 max_in_flight: 1,
+                queue_capacity: 4,
                 priority_levels: 2,
                 queue_shards: 4,
                 assume_non_overlapping_reads: false,
@@ -2995,6 +3837,7 @@ mod tests {
         let pool = IoPool::new(IoConfig::Threaded(ThreadedConfig {
             base: BaseIoConfig {
                 max_in_flight: 8,
+                queue_capacity: 16,
                 priority_levels: 2,
                 queue_shards: 2,
                 assume_non_overlapping_reads: false,
@@ -3037,6 +3880,7 @@ mod tests {
             IoConfig::Threaded(ThreadedConfig {
                 base: BaseIoConfig {
                     max_in_flight: 8,
+                    queue_capacity: 16,
                     priority_levels: 2,
                     queue_shards: 1,
                     assume_non_overlapping_reads: false,
@@ -3090,8 +3934,11 @@ mod tests {
         let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             3,
             8,
+            8,
             false,
             Arc::new(ActiveLimiter::new(8)),
+            Arc::new(Semaphore::new(8)),
+            Arc::new(QueueSignal::default()),
             profiler.clone(),
         ));
         let round = runtime.start();
@@ -3141,8 +3988,11 @@ mod tests {
         let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             2,
             1,
+            8,
             false,
-            Arc::new(ActiveLimiter::new(1)),
+            Arc::new(ActiveLimiter::new(8)),
+            Arc::new(Semaphore::new(1)),
+            Arc::new(QueueSignal::default()),
             profiler.clone(),
         ));
         let round = runtime.start();
@@ -3151,52 +4001,76 @@ mod tests {
             .expect("held submit");
 
         let err = queue
-            .submit(IoCommand::read(0, 1, 1, 0))
+            .try_submit_with_handle(IoCommand::read(0, 1, 1, 0), None, true)
             .expect_err("queue capacity should reject second unique read");
-        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+        assert!(matches!(err, QueueSubmitError::Full(_)));
 
         let snapshot = runtime.snapshot();
         assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 2);
         assert_eq!(metric(&snapshot, test_metrics::QUEUE_FULL), 1);
-        assert_eq!(metric(&snapshot, test_metrics::MAX_ACTIVE_REJECTIONS), 0);
         drop(held);
         round.end();
     }
 
     #[cfg(feature = "profile")]
     #[test]
-    fn profile_records_global_active_limit_rejections() {
+    fn profile_records_global_active_limit_dispatch_backpressure() {
         let (runtime, profiler) = enabled_queue_profile("iopool-active-limit-test");
         let limiter = Arc::new(ActiveLimiter::new(1));
+        let queue_signal = Arc::new(QueueSignal::default());
         let first_queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             2,
             8,
+            1,
             false,
             Arc::clone(&limiter),
+            Arc::new(Semaphore::new(8)),
+            Arc::clone(&queue_signal),
             profiler.clone(),
         ));
         let second_queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             2,
             8,
+            1,
             false,
             limiter,
+            Arc::new(Semaphore::new(8)),
+            queue_signal,
             profiler.clone(),
         ));
         let round = runtime.start();
         let held = first_queue
             .submit(IoCommand::read(0, 0, 1, 0))
             .expect("held submit");
-
-        let err = second_queue
+        let waiting = second_queue
             .submit(IoCommand::read(1, 0, 1, 0))
-            .expect_err("global active limit should reject submit");
-        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+            .expect("second submit should queue");
+
+        let first_work = first_queue.try_pop_for_test().expect("dispatch first read");
+        assert!(
+            second_queue.try_pop_for_test().is_none(),
+            "global active limit should stall second dispatch"
+        );
+        first_queue.complete(
+            first_work.id,
+            first_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"a".to_vec()))),
+        );
+        let second_work = second_queue
+            .try_pop_for_test()
+            .expect("second read should dispatch after active release");
+        second_queue.complete(
+            second_work.id,
+            second_work.operation_started,
+            Ok(IoOutput::Read(Arc::from(b"b".to_vec()))),
+        );
 
         let snapshot = runtime.snapshot();
         assert_eq!(metric(&snapshot, test_metrics::SUBMIT_CALLS), 2);
         assert_eq!(metric(&snapshot, test_metrics::QUEUE_FULL), 0);
-        assert_eq!(metric(&snapshot, test_metrics::MAX_ACTIVE_REJECTIONS), 1);
-        drop(held);
+        assert_eq!(metric(&snapshot, test_metrics::DISPATCHED), 2);
+        assert_eq!(&*held.blocking_recv_read().expect("held"), b"a");
+        assert_eq!(&*waiting.blocking_recv_read().expect("waiting"), b"b");
         round.end();
     }
 
@@ -3206,8 +4080,11 @@ mod tests {
         let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             2,
             4,
+            4,
             false,
             Arc::new(ActiveLimiter::new(4)),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(QueueSignal::default()),
             profiler.clone(),
         ));
 
@@ -3229,8 +4106,11 @@ mod tests {
         let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             2,
             8,
+            8,
             false,
             Arc::new(ActiveLimiter::new(8)),
+            Arc::new(Semaphore::new(8)),
+            Arc::new(QueueSignal::default()),
             profiler,
         ));
         let round = runtime.start();
@@ -3274,8 +4154,11 @@ mod tests {
         let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             2,
             4,
+            4,
             false,
             Arc::new(ActiveLimiter::new(4)),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(QueueSignal::default()),
             profiler,
         ));
         let round = runtime.start();
@@ -3310,6 +4193,7 @@ mod tests {
             let pool = IoPool::new(IoConfig::Threaded(ThreadedConfig {
                 base: BaseIoConfig {
                     max_in_flight: 4,
+                    queue_capacity: 16,
                     priority_levels: 2,
                     queue_shards: 1,
                     assume_non_overlapping_reads: false,
@@ -3364,8 +4248,11 @@ mod tests {
         let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             2,
             4,
+            4,
             false,
             Arc::new(ActiveLimiter::new(4)),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(QueueSignal::default()),
             IoPoolProfile::new(runtime.clone()),
         ));
 
@@ -3394,8 +4281,11 @@ mod tests {
         let queue = Arc::new(QueueCore::new_with_limiter_and_profile(
             2,
             4,
+            4,
             false,
             Arc::new(ActiveLimiter::new(4)),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(QueueSignal::default()),
             profiler,
         ));
 
@@ -3426,7 +4316,7 @@ mod tests {
 
     #[test]
     fn fast_read_path_tracks_active_reads_without_active_index() {
-        let queue = Arc::new(QueueCore::new_with_fast_read_path(2, 8, true));
+        let queue = Arc::new(QueueCore::new_with_fast_read_path(2, 8, 8, true));
         let future = queue
             .submit(IoCommand::read(0, 0, 4, 1))
             .expect("submit fast read");
@@ -3603,7 +4493,7 @@ mod tests {
 
     #[test]
     fn dispatched_fast_read_duplicate_does_not_leave_stale_ready_entry() {
-        let queue = Arc::new(QueueCore::new_with_fast_read_path(3, 8, true));
+        let queue = Arc::new(QueueCore::new_with_fast_read_path(3, 8, 8, true));
         let first = queue
             .submit(IoCommand::read(0, 10, 4, 2))
             .expect("first read");
@@ -3845,6 +4735,7 @@ mod tests {
         let pool = match IoPool::new(IoConfig::Uring(UringConfig {
             base: BaseIoConfig {
                 max_in_flight: 16,
+                queue_capacity: 64,
                 priority_levels: 3,
                 queue_shards: 1,
                 assume_non_overlapping_reads: false,

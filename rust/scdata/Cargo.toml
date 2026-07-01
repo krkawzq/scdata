@@ -46,6 +46,11 @@ path = "benches/modules.rs"
 harness = false
 
 [[bench]]
+name = "databank"
+path = "benches/databank.rs"
+harness = false
+
+[[bench]]
 name = "profile"
 path = "benches/profile.rs"
 harness = false

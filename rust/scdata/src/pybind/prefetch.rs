@@ -1,7 +1,8 @@
 use numpy::IntoPyArray;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyBool, PyTuple};
+use pyo3::PyRefMut;
 
 use crate::databank::{
     Bf16Bits, DType, DataBank as RustDataBank, DataBankResult, DatasetId, F16Bits,
@@ -9,42 +10,165 @@ use crate::databank::{
 };
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyPrefetchPlan>()?;
     m.add_class::<PyPrefetchCells>()?;
     Ok(())
 }
 
 pub(crate) struct PyMultiBatchSource {
-    batches: std::vec::IntoIter<MultiBatchCells>,
+    cells: std::vec::IntoIter<usize>,
+    parts: Vec<FlatPlanPart>,
+    batch_part_offsets: Vec<usize>,
+    next_batch: usize,
+    next_part: usize,
 }
 
 impl PyMultiBatchSource {
-    pub(crate) fn single(batches: Bound<'_, PyAny>) -> PyResult<Self> {
-        let mut out = Vec::new();
-        for item in batches.try_iter()? {
-            let item = item?;
-            out.push(MultiBatchCells::new(vec![(
-                0,
-                super::dtype::extract_cells_any(&item)?,
-            )]));
-        }
-        Ok(Self {
-            batches: out.into_iter(),
-        })
+    pub(crate) fn from_plan(mut plan: PyRefMut<'_, PyPrefetchPlan>) -> PyResult<Self> {
+        plan.take_source()
+    }
+}
+
+#[pyclass(name = "_PrefetchPlan", module = "scdata._scdata")]
+pub(crate) struct PyPrefetchPlan {
+    plan: Option<FlatPrefetchPlan>,
+}
+
+struct FlatPrefetchPlan {
+    cells: Vec<usize>,
+    parts: Vec<FlatPlanPart>,
+    batch_part_offsets: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct FlatPlanPart {
+    dataset_idx: usize,
+    len: usize,
+}
+
+impl PyPrefetchPlan {
+    fn new(plan: FlatPrefetchPlan) -> Self {
+        Self { plan: Some(plan) }
     }
 
-    pub(crate) fn multi(batches: Bound<'_, PyAny>) -> PyResult<Self> {
-        let mut out = Vec::new();
+    fn take_source(&mut self) -> PyResult<PyMultiBatchSource> {
+        let Some(plan) = self.plan.take() else {
+            return Err(PyValueError::new_err(
+                "prefetch plan has already been consumed",
+            ));
+        };
+        Ok(PyMultiBatchSource {
+            cells: plan.cells.into_iter(),
+            parts: plan.parts,
+            batch_part_offsets: plan.batch_part_offsets,
+            next_batch: 0,
+            next_part: 0,
+        })
+    }
+}
+
+#[pymethods]
+impl PyPrefetchPlan {
+    #[staticmethod]
+    fn single(batches: Bound<'_, PyAny>) -> PyResult<Self> {
+        let mut cells = Vec::new();
+        let mut parts = Vec::new();
+        let mut batch_part_offsets = vec![0];
+        for item in batches.try_iter()? {
+            let item = item?;
+            let len = super::dtype::extend_cells_any(&item, &mut cells)?;
+            parts.push(FlatPlanPart {
+                dataset_idx: 0,
+                len,
+            });
+            batch_part_offsets.push(parts.len());
+        }
+        Ok(Self::new(FlatPrefetchPlan {
+            cells,
+            parts,
+            batch_part_offsets,
+        }))
+    }
+
+    #[staticmethod]
+    fn multi(batches: Bound<'_, PyAny>) -> PyResult<Self> {
+        let mut cells = Vec::new();
+        let mut parts = Vec::new();
+        let mut batch_part_offsets = vec![0];
         for batch in batches.try_iter()? {
             let batch = batch?;
-            let mut parts = Vec::new();
             for part in batch.try_iter()? {
-                parts.push(extract_multi_batch_part(&part?)?);
+                let part = part?;
+                let (dataset_idx, len) = append_multi_batch_part(&part, &mut cells)?;
+                parts.push(FlatPlanPart { dataset_idx, len });
             }
-            out.push(MultiBatchCells::new(parts));
+            batch_part_offsets.push(parts.len());
         }
-        Ok(Self {
-            batches: out.into_iter(),
-        })
+        Ok(Self::new(FlatPrefetchPlan {
+            cells,
+            parts,
+            batch_part_offsets,
+        }))
+    }
+
+    #[staticmethod]
+    fn indexed(
+        dataset_index: Bound<'_, PyAny>,
+        cell_index: Bound<'_, PyAny>,
+        batch_size: usize,
+    ) -> PyResult<Self> {
+        if batch_size == 0 {
+            return Err(PyValueError::new_err("batch_size must be positive"));
+        }
+        let dataset_index = super::dtype::index_any_to_usize_vec(&dataset_index, "dataset_index")?;
+        let cells = super::dtype::index_any_to_usize_vec(&cell_index, "cell_index")?;
+        if dataset_index.len() != cells.len() {
+            return Err(PyValueError::new_err(format!(
+                "dataset_index and cell_index must have the same length, got {} and {}",
+                dataset_index.len(),
+                cells.len()
+            )));
+        }
+        Ok(Self::new(flat_plan_from_indexed(
+            dataset_index,
+            cells,
+            batch_size,
+        )))
+    }
+}
+
+fn flat_plan_from_indexed(
+    dataset_index: Vec<usize>,
+    cells: Vec<usize>,
+    batch_size: usize,
+) -> FlatPrefetchPlan {
+    let num_batches = cells.len().div_ceil(batch_size);
+    let mut parts = Vec::new();
+    let mut batch_part_offsets = Vec::with_capacity(num_batches + 1);
+    batch_part_offsets.push(0);
+
+    for batch_start in (0..cells.len()).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(cells.len());
+        let mut run_start = batch_start;
+        while run_start < batch_end {
+            let dataset_idx = dataset_index[run_start];
+            let mut run_end = run_start + 1;
+            while run_end < batch_end && dataset_index[run_end] == dataset_idx {
+                run_end += 1;
+            }
+            parts.push(FlatPlanPart {
+                dataset_idx,
+                len: run_end - run_start,
+            });
+            run_start = run_end;
+        }
+        batch_part_offsets.push(parts.len());
+    }
+
+    FlatPrefetchPlan {
+        cells,
+        parts,
+        batch_part_offsets,
     }
 }
 
@@ -52,21 +176,85 @@ impl Iterator for PyMultiBatchSource {
     type Item = MultiBatchCells;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.batches.next()
+        let end = *self.batch_part_offsets.get(self.next_batch + 1)?;
+        let part_slice = &self.parts[self.next_part..end];
+        let total_cells = part_slice.iter().map(|part| part.len).sum();
+        let mut cells = Vec::with_capacity(total_cells);
+        let mut parts = Vec::with_capacity(part_slice.len());
+        for idx in self.next_part..end {
+            let part = self.parts[idx];
+            let start = cells.len();
+            cells.extend(self.cells.by_ref().take(part.len));
+            debug_assert_eq!(cells.len() - start, part.len);
+            parts.push((part.dataset_idx, part.len));
+        }
+        self.next_batch += 1;
+        self.next_part = end;
+        Some(MultiBatchCells::from_flat_parts(cells, parts))
     }
 }
 
-fn extract_multi_batch_part(part: &Bound<'_, PyAny>) -> PyResult<(usize, Vec<usize>)> {
-    let tuple = part.downcast::<PyTuple>()?;
-    if tuple.len() != 2 {
+fn append_multi_batch_part(
+    part: &Bound<'_, PyAny>,
+    cells: &mut Vec<usize>,
+) -> PyResult<(usize, usize)> {
+    let (dataset_idx_obj, cells_obj) = extract_multi_batch_pair(part)?;
+    let dataset_idx = extract_dataset_idx(&dataset_idx_obj)?;
+    let len = super::dtype::extend_cells_any(&cells_obj, cells)?;
+    Ok((dataset_idx, len))
+}
+
+fn extract_multi_batch_pair<'py>(
+    part: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    if let Ok(tuple) = part.downcast::<PyTuple>() {
+        if tuple.len() != 2 {
+            return Err(PyValueError::new_err(format!(
+                "multi prefetch batch parts must be (dataset_idx, cells), got tuple length {}",
+                tuple.len()
+            )));
+        }
+        return Ok((tuple.get_item(0)?, tuple.get_item(1)?));
+    }
+
+    let mut iter = part.try_iter()?;
+    let Some(dataset_idx) = iter.next() else {
+        return Err(PyValueError::new_err(
+            "multi prefetch batch parts must be 2-item iterables: (dataset_idx, cells)",
+        ));
+    };
+    let Some(cells) = iter.next() else {
+        return Err(PyValueError::new_err(
+            "multi prefetch batch parts must be 2-item iterables: (dataset_idx, cells)",
+        ));
+    };
+    if iter.next().is_some() {
+        return Err(PyValueError::new_err(
+            "multi prefetch batch parts must be 2-item iterables: (dataset_idx, cells)",
+        ));
+    }
+    Ok((dataset_idx?, cells?))
+}
+
+fn extract_dataset_idx(obj: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if obj.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(
+            "dataset_idx must be an integer, got bool",
+        ));
+    }
+    let operator = obj.py().import("operator")?;
+    let value: i128 = operator.call_method1("index", (obj,))?.extract()?;
+    if value < 0 {
         return Err(PyValueError::new_err(format!(
-            "multi prefetch batch parts must be (dataset_idx, cells), got tuple length {}",
-            tuple.len()
+            "dataset_idx must be non-negative, got {value}"
         )));
     }
-    let dataset_idx = tuple.get_item(0)?.extract::<usize>()?;
-    let cells_obj = tuple.get_item(1)?;
-    Ok((dataset_idx, super::dtype::extract_cells_any(&cells_obj)?))
+    if value > usize::MAX as i128 {
+        return Err(PyValueError::new_err(format!(
+            "dataset_idx must fit in usize, got {value}"
+        )));
+    }
+    Ok(value as usize)
 }
 
 enum PrefetchDispatch {
@@ -148,8 +336,10 @@ pub(crate) struct PyPrefetchCells {
 }
 
 impl PyPrefetchCells {
-    fn new(inner: PrefetchDispatch) -> Self {
-        let gene_names = inner.gene_names();
+    fn new(inner: PrefetchDispatch, requested_gene_names: Option<&[String]>) -> Self {
+        let gene_names = requested_gene_names
+            .map(<[String]>::to_vec)
+            .unwrap_or_else(|| inner.gene_names());
         let prefetch_step = inner.prefetch_step();
         Self {
             inner: Some(inner),
@@ -185,7 +375,7 @@ impl PyPrefetchCells {
                 Ok(None)
             }
             Some(Ok(batch)) => {
-                let cells = batch.cells.into_pyarray(py).into_any().unbind();
+                let cells = usize_vec_to_intp_numpy(py, batch.cells)?;
                 let buffer = super::dispatch::buffer_to_numpy(py, batch.buffer)?;
                 let tuple = (cells, buffer, batch.num_genes).into_pyobject(py)?;
                 Ok(Some(tuple.into_any().unbind()))
@@ -193,6 +383,31 @@ impl PyPrefetchCells {
             Some(Err(err)) => Err(err.into()),
         }
     }
+}
+
+fn usize_vec_to_intp_numpy(py: Python<'_>, cells: Vec<usize>) -> PyResult<PyObject> {
+    if let Some((i, cell)) = cells
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, cell)| *cell > isize::MAX as usize)
+    {
+        return Err(PyValueError::new_err(format!(
+            "cells[{i}] must fit in numpy intp, got {cell}"
+        )));
+    }
+    debug_assert_eq!(std::mem::size_of::<usize>(), std::mem::size_of::<isize>());
+    debug_assert_eq!(std::mem::align_of::<usize>(), std::mem::align_of::<isize>());
+    let mut cells = cells;
+    let ptr = cells.as_mut_ptr() as *mut isize;
+    let len = cells.len();
+    let cap = cells.capacity();
+    std::mem::forget(cells);
+    // SAFETY: `usize` and `isize` have identical layout on the target. Values
+    // are checked above to fit in `isize`, so the reinterpreted vector contains
+    // valid non-negative numpy intp indices.
+    let cells = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+    Ok(cells.into_pyarray(py).into_any().unbind())
 }
 
 impl PrefetchDispatch {
@@ -282,5 +497,5 @@ pub(crate) fn prefetch_cells_multi_dispatch(
         DType::F16 => arm!(F16, F16Bits),
         DType::BF16 => arm!(BF16, Bf16Bits),
     };
-    Ok(PyPrefetchCells::new(dispatch))
+    Ok(PyPrefetchCells::new(dispatch, gene_names))
 }

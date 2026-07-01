@@ -35,6 +35,7 @@ from scdata.data import (  # noqa: E402
     CellBatch,
     CellData,
     CellIndexDataset,
+    CellIndexPlan,
     ChunkLocation,
     CodecPipeline,
     DataError,
@@ -88,6 +89,7 @@ try:
         FillConfig,
         IoConfig,
         MissingGenePolicy,
+        ProjectedSparseDataGroupStrategy,
         ScheduledAccessConfig,
         ScheduledPrefetchConfig,
         ScDataBank,
@@ -112,6 +114,7 @@ except ModuleNotFoundError as exc:
     FillConfig = _missing("FillConfig")  # type: ignore[assignment, misc]
     ScheduledAccessConfig = _missing("ScheduledAccessConfig")  # type: ignore[assignment, misc]
     ScheduledPrefetchConfig = _missing("ScheduledPrefetchConfig")  # type: ignore[assignment, misc]
+    ProjectedSparseDataGroupStrategy = _missing("ProjectedSparseDataGroupStrategy")  # type: ignore[assignment, misc]
 
 try:
     from scdata.corpus import Corpus
@@ -140,6 +143,7 @@ __all__ = [
     "FillConfig",
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
+    "ProjectedSparseDataGroupStrategy",
     "Corpus",
     # data (pure Python — usable with or without the Rust extension)
     "CellAccess",
@@ -159,6 +163,7 @@ __all__ = [
     "DatasetCollection",
     "SparseDataset",
     "CellIndexDataset",
+    "CellIndexPlan",
     "stitch_dense_collate",
     "LoaderStats",
     "BankConfigSummary",

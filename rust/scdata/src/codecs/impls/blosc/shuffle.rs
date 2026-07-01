@@ -10,9 +10,19 @@ pub(super) fn unshuffle_bytes(typesize: usize, shuffled: &[u8], output: &mut [u8
 
 fn unshuffle_2(shuffled: &[u8], output: &mut [u8]) {
     let elements = output.len() / 2;
-    for idx in 0..elements {
-        output[idx * 2] = shuffled[idx];
-        output[idx * 2 + 1] = shuffled[elements + idx];
+    #[cfg(target_endian = "little")]
+    unsafe {
+        let s0 = shuffled.as_ptr();
+        let s1 = s0.add(elements);
+        let dst = output.as_mut_ptr();
+        for idx in 0..elements {
+            let value = (*s0.add(idx) as u16) | ((*s1.add(idx) as u16) << 8);
+            std::ptr::write_unaligned(dst.add(idx * 2).cast::<u16>(), value);
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        unshuffle_generic(2, shuffled, output);
     }
     let rem = output.len() % 2;
     if rem != 0 {
@@ -53,11 +63,32 @@ fn unshuffle_4(shuffled: &[u8], output: &mut [u8]) {
 
 fn unshuffle_8(shuffled: &[u8], output: &mut [u8]) {
     let elements = output.len() / 8;
-    for idx in 0..elements {
-        let offset = idx * 8;
-        for byte in 0..8 {
-            output[offset + byte] = shuffled[byte * elements + idx];
+    #[cfg(target_endian = "little")]
+    unsafe {
+        let s0 = shuffled.as_ptr();
+        let s1 = s0.add(elements);
+        let s2 = s1.add(elements);
+        let s3 = s2.add(elements);
+        let s4 = s3.add(elements);
+        let s5 = s4.add(elements);
+        let s6 = s5.add(elements);
+        let s7 = s6.add(elements);
+        let dst = output.as_mut_ptr();
+        for idx in 0..elements {
+            let value = (*s0.add(idx) as u64)
+                | ((*s1.add(idx) as u64) << 8)
+                | ((*s2.add(idx) as u64) << 16)
+                | ((*s3.add(idx) as u64) << 24)
+                | ((*s4.add(idx) as u64) << 32)
+                | ((*s5.add(idx) as u64) << 40)
+                | ((*s6.add(idx) as u64) << 48)
+                | ((*s7.add(idx) as u64) << 56);
+            std::ptr::write_unaligned(dst.add(idx * 8).cast::<u64>(), value);
         }
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        unshuffle_generic(8, shuffled, output);
     }
     let rem = output.len() % 8;
     if rem != 0 {

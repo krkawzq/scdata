@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use super::super::super::buffer::set_vec_len_for_decode;
+use super::super::super::spec::DecodeSlice;
 use super::super::super::util::{
     decode_error, output_too_small, reserve_decode_buffer, verify_size,
 };
@@ -11,6 +12,7 @@ use super::shuffle::unshuffle_bytes;
 
 thread_local! {
     static BLOSC_LZ4_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static BLOSC_LZ4_BLOCK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(super) fn try_blosc_lz4_decode_into(
@@ -43,6 +45,127 @@ pub(super) fn try_blosc_lz4_decode_into(
         output,
         expected_size,
     ))
+}
+
+pub(super) fn try_blosc_lz4_decode_slice(
+    codec: &str,
+    encoded: &[u8],
+    header: BloscHeader,
+    slice: &DecodeSlice,
+) -> CodecResult<Option<Vec<u8>>> {
+    if header.compformat() != blosc_src::BLOSC_LZ4_FORMAT as u8 {
+        return Ok(None);
+    }
+    if header.compversion != blosc_src::BLOSC_LZ4_VERSION_FORMAT as u8 {
+        return Err(decode_error(codec, "unsupported Blosc LZ4 format version"));
+    }
+    if header.flags & 0x08 != 0 || header.is_bit_shuffled() {
+        return Ok(None);
+    }
+    validate_decode_slice(codec, header.decoded_size, slice)?;
+    if slice.output_len == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if header.decoded_size == 0 {
+        return Ok(Some(vec![0u8; slice.output_len]));
+    }
+
+    if header.is_memcpyed() {
+        if header.decoded_size + blosc_src::BLOSC_MAX_OVERHEAD as usize != header.compressed_size {
+            return Err(decode_error(codec, "invalid Blosc memcpy buffer"));
+        }
+        let source = &encoded[blosc_src::BLOSC_MAX_OVERHEAD as usize
+            ..blosc_src::BLOSC_MAX_OVERHEAD as usize + header.decoded_size];
+        return Ok(Some(materialize_decode_slice(codec, source, slice)?));
+    }
+
+    validate_lz4_header(codec, header)?;
+    let nblocks = header.decoded_size.div_ceil(header.blocksize);
+    let bstarts_bytes = block_table_bytes(codec, nblocks)?;
+    if bstarts_bytes > header.compressed_size {
+        return Err(decode_error(codec, "invalid Blosc block table"));
+    }
+
+    let touched = touched_blocks(codec, header, slice, nblocks)?;
+    let touched_count = touched.iter().filter(|&&touched| touched).count();
+    if touched_count == 0 {
+        return Ok(Some(vec![0u8; slice.output_len]));
+    }
+    if touched_count == nblocks {
+        return Ok(None);
+    }
+
+    BLOSC_LZ4_SCRATCH.with(|scratch| {
+        BLOSC_LZ4_BLOCK.with(|block_scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let mut block_scratch = block_scratch.borrow_mut();
+            if scratch.capacity() < header.blocksize {
+                let additional = header.blocksize - scratch.capacity();
+                reserve_decode_buffer(codec, &mut scratch, additional)?;
+            }
+            if !header.is_byte_shuffled() && block_scratch.capacity() < header.blocksize {
+                let additional = header.blocksize - block_scratch.capacity();
+                reserve_decode_buffer(codec, &mut block_scratch, additional)?;
+            }
+            if scratch.len() < header.blocksize {
+                set_vec_len_for_decode(&mut scratch, header.blocksize);
+            }
+            if !header.is_byte_shuffled() && block_scratch.len() < header.blocksize {
+                set_vec_len_for_decode(&mut block_scratch, header.blocksize);
+            }
+
+            let mut out = vec![0u8; slice.output_len];
+            let leftover = header.decoded_size % header.blocksize;
+            let mut decoded_offset = 0usize;
+            for (block_idx, &is_touched) in touched.iter().enumerate() {
+                let is_last = block_idx + 1 == nblocks;
+                let bsize = if is_last && leftover > 0 {
+                    leftover
+                } else {
+                    header.blocksize
+                };
+                if !is_touched {
+                    decoded_offset += bsize;
+                    continue;
+                }
+                let src_offset = block_start(codec, encoded, block_idx)?;
+                if src_offset < bstarts_bytes {
+                    return Err(decode_error(codec, "invalid Blosc block offset"));
+                }
+                let src_limit = if is_last {
+                    header.compressed_size
+                } else {
+                    block_start(codec, encoded, block_idx + 1)?
+                };
+                if src_offset >= src_limit || src_limit > header.compressed_size {
+                    return Err(decode_error(codec, "invalid Blosc block offset"));
+                }
+                let block = BloscLz4Block {
+                    size: bsize,
+                    leftover: is_last && leftover > 0,
+                    src_offset,
+                    src_limit,
+                };
+                if header.is_byte_shuffled() {
+                    let shuffled_block = &mut scratch[..bsize];
+                    decode_blosc_lz4_block(codec, encoded, header, block, shuffled_block)?;
+                    copy_shuffled_block_ranges(
+                        header.typesize,
+                        shuffled_block,
+                        decoded_offset,
+                        slice,
+                        &mut out,
+                    );
+                } else {
+                    let decoded_block = &mut block_scratch[..bsize];
+                    decode_blosc_lz4_block(codec, encoded, header, block, decoded_block)?;
+                    copy_block_ranges(decoded_block, decoded_offset, slice, &mut out);
+                }
+                decoded_offset += bsize;
+            }
+            Ok(Some(out))
+        })
+    })
 }
 
 fn blosc_lz4_decode_into(
@@ -79,10 +202,7 @@ fn blosc_lz4_decode_into(
     }
 
     let nblocks = header.decoded_size.div_ceil(header.blocksize);
-    let bstarts_bytes = nblocks
-        .checked_mul(4)
-        .and_then(|bytes| bytes.checked_add(blosc_src::BLOSC_MIN_HEADER_LENGTH as usize))
-        .ok_or_else(|| decode_error(codec, "Blosc block table overflow"))?;
+    let bstarts_bytes = block_table_bytes(codec, nblocks)?;
     if bstarts_bytes > header.compressed_size {
         return Err(decode_error(codec, "invalid Blosc block table"));
     }
@@ -140,6 +260,127 @@ fn blosc_lz4_decode_into(
 
         Ok(header.decoded_size)
     })
+}
+
+fn validate_lz4_header(codec: &str, header: BloscHeader) -> CodecResult<()> {
+    if header.blocksize == 0
+        || header.blocksize > header.decoded_size
+        || header.blocksize > blosc_src::BLOSC_MAX_BLOCKSIZE as usize
+        || header.typesize == 0
+        || header.typesize > blosc_src::BLOSC_MAX_TYPESIZE as usize
+    {
+        return Err(decode_error(codec, "invalid Blosc LZ4 header"));
+    }
+    Ok(())
+}
+
+fn block_table_bytes(codec: &str, nblocks: usize) -> CodecResult<usize> {
+    nblocks
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(blosc_src::BLOSC_MIN_HEADER_LENGTH as usize))
+        .ok_or_else(|| decode_error(codec, "Blosc block table overflow"))
+}
+
+fn validate_decode_slice(codec: &str, decoded_size: usize, slice: &DecodeSlice) -> CodecResult<()> {
+    for range in slice.ranges.iter().copied() {
+        let Some(dst_end) = range.dst_offset.checked_add(range.len()) else {
+            return Err(decode_error(codec, "invalid decode slice range"));
+        };
+        if range.src_start > range.src_end
+            || range.src_end > decoded_size
+            || dst_end > slice.output_len
+        {
+            return Err(decode_error(codec, "invalid decode slice range"));
+        }
+    }
+    Ok(())
+}
+
+fn touched_blocks(
+    codec: &str,
+    header: BloscHeader,
+    slice: &DecodeSlice,
+    nblocks: usize,
+) -> CodecResult<Vec<bool>> {
+    let mut touched = vec![false; nblocks];
+    for range in slice.ranges.iter().copied() {
+        if range.src_start == range.src_end {
+            continue;
+        }
+        let first = range.src_start / header.blocksize;
+        let last = (range.src_end - 1) / header.blocksize;
+        if first >= nblocks || last >= nblocks {
+            return Err(decode_error(codec, "invalid decode slice block range"));
+        }
+        for slot in &mut touched[first..=last] {
+            *slot = true;
+        }
+    }
+    Ok(touched)
+}
+
+fn materialize_decode_slice(
+    codec: &str,
+    decoded: &[u8],
+    slice: &DecodeSlice,
+) -> CodecResult<Vec<u8>> {
+    validate_decode_slice(codec, decoded.len(), slice)?;
+    let mut out = vec![0u8; slice.output_len];
+    for range in slice.ranges.iter().copied() {
+        let dst_end = range.dst_offset + range.len();
+        out[range.dst_offset..dst_end].copy_from_slice(&decoded[range.src_start..range.src_end]);
+    }
+    Ok(out)
+}
+
+fn copy_block_ranges(block: &[u8], block_offset: usize, slice: &DecodeSlice, out: &mut [u8]) {
+    let block_end = block_offset + block.len();
+    for range in slice.ranges.iter().copied() {
+        let start = range.src_start.max(block_offset);
+        let end = range.src_end.min(block_end);
+        if start >= end {
+            continue;
+        }
+        let dst_start = range.dst_offset + (start - range.src_start);
+        let dst_end = dst_start + (end - start);
+        out[dst_start..dst_end].copy_from_slice(&block[start - block_offset..end - block_offset]);
+    }
+}
+
+fn copy_shuffled_block_ranges(
+    typesize: usize,
+    shuffled: &[u8],
+    block_offset: usize,
+    slice: &DecodeSlice,
+    out: &mut [u8],
+) {
+    if typesize <= 1 {
+        copy_block_ranges(shuffled, block_offset, slice, out);
+        return;
+    }
+    let elements = shuffled.len() / typesize;
+    let main_len = elements * typesize;
+    let block_end = block_offset + shuffled.len();
+    for range in slice.ranges.iter().copied() {
+        let start = range.src_start.max(block_offset);
+        let end = range.src_end.min(block_end);
+        if start >= end {
+            continue;
+        }
+        let mut dst = range.dst_offset + (start - range.src_start);
+        for pos in start..end {
+            let rel = pos - block_offset;
+            let src = if rel < main_len {
+                let element = rel / typesize;
+                let byte = rel % typesize;
+                byte * elements + element
+            } else {
+                rel
+            };
+            out[dst] = shuffled[src];
+            dst += 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

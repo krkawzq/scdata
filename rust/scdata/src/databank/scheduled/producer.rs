@@ -8,6 +8,7 @@ use crate::profile::ProfileTimer;
 
 use super::super::array::DataValue;
 use super::super::compute::{ComputeJob, DataBankComputePool};
+use super::super::config::ProjectedSparseDataGroupStrategy;
 use super::super::dataset::Dataset;
 use super::super::error::{DataBankError, DataBankResult};
 
@@ -29,6 +30,7 @@ where
     pub(crate) datasets: Arc<[Arc<Dataset>]>,
     pub(crate) batch_source: I,
     pub(crate) access_config: ScheduledAccessConfig,
+    pub(crate) projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     pub(crate) gene_axes: Arc<MultiGeneAxisPlan>,
     pub(crate) tx: flume::Sender<DataBankResult<PrefetchedBatch<T>>>,
     pub(crate) cancel: Arc<PrefetchCancelRegistry>,
@@ -244,6 +246,7 @@ where
                 batch,
                 Arc::clone(&self.gene_axes),
                 self.access_config,
+                self.projected_sparse_data_strategy,
                 Arc::clone(&self.cancel),
                 planned_tx.clone(),
                 self.profiler.clone(),
@@ -363,6 +366,7 @@ where
                 self.access.clone(),
                 Arc::clone(&self.compute),
                 self.access_config,
+                self.projected_sparse_data_strategy,
                 Arc::clone(&self.gene_axes),
                 Arc::clone(&self.cancel),
                 done_tx.clone(),
@@ -432,6 +436,7 @@ pub(crate) fn make_prefetch_request_job(
     batch: MultiBatchCells,
     gene_axes: Arc<MultiGeneAxisPlan>,
     access_config: ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     registry: Arc<PrefetchCancelRegistry>,
     planned_tx: flume::Sender<PlannedMessage>,
     profiler: ScheduledPrefetchProfiler,
@@ -447,7 +452,12 @@ pub(crate) fn make_prefetch_request_job(
                     return Err(DataBankError::PrefetchCancelled);
                 }
                 let plan_started = profiler.start_request_plan();
-                let planned = plan_batch_multi(datasets.as_ref(), batch, gene_axes.as_ref());
+                let planned = plan_batch_multi(
+                    datasets.as_ref(),
+                    batch,
+                    gene_axes.as_ref(),
+                    projected_sparse_data_strategy,
+                );
                 profiler.record_request_plan(plan_started);
                 let (plan, items) = planned?;
                 if registry.is_cancelled() {
@@ -489,6 +499,7 @@ pub(crate) fn make_prefetch_response_job<T>(
     access: AccessHandle,
     compute: Arc<DataBankComputePool>,
     access_config: ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     gene_axes: Arc<MultiGeneAxisPlan>,
     registry: Arc<PrefetchCancelRegistry>,
     done_tx: flume::Sender<DoneMessage<T>>,
@@ -521,6 +532,7 @@ where
                     &access,
                     compute.as_ref(),
                     &access_config,
+                    projected_sparse_data_strategy,
                     gene_axes.as_ref(),
                     &cancel,
                     &profiler,

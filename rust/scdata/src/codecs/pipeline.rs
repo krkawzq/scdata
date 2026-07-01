@@ -150,7 +150,13 @@ impl ChunkCodec for CodecPipeline {
                 }
                 None => {
                     let output = std::mem::take(&mut spare);
-                    DecodeRunner::decode_borrowed_to_vec(codec.as_ref(), encoded, output, expected)?
+                    DecodeRunner::decode_borrowed_to_vec(
+                        codec.as_ref(),
+                        encoded,
+                        output,
+                        expected,
+                        None,
+                    )?
                 }
             });
         }
@@ -228,7 +234,13 @@ impl ChunkCodec for CodecPipeline {
                 }
                 None => {
                     let output = std::mem::take(&mut spare);
-                    DecodeRunner::decode_borrowed_to_vec(codec.as_ref(), encoded, output, expected)?
+                    DecodeRunner::decode_borrowed_to_vec(
+                        codec.as_ref(),
+                        encoded,
+                        output,
+                        expected,
+                        None,
+                    )?
                 }
             });
         }

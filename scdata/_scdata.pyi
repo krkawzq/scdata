@@ -53,12 +53,28 @@ class _MissingGenePolicy:
     def __init__(self, policy: Literal["zero", "error"] | str) -> None: ...
     def __repr__(self) -> str: ...
 
+class _PrefetchPlan:
+    @staticmethod
+    def single(batches: Iterable[Any]) -> _PrefetchPlan: ...
+    @staticmethod
+    def multi(batches: Iterable[Iterable[tuple[int, Any]]]) -> _PrefetchPlan: ...
+    @staticmethod
+    def indexed(
+        dataset_index: NDArray[np.integer[Any]],
+        cell_index: NDArray[np.integer[Any]],
+        batch_size: int,
+    ) -> _PrefetchPlan: ...
+
 class _BaseIoConfig:
     def __init__(self) -> None: ...
     @property
     def max_in_flight(self) -> int: ...
     @max_in_flight.setter
     def max_in_flight(self, value: int) -> None: ...
+    @property
+    def queue_capacity(self) -> int: ...
+    @queue_capacity.setter
+    def queue_capacity(self, value: int) -> None: ...
     @property
     def priority_levels(self) -> int: ...
     @priority_levels.setter
@@ -269,6 +285,10 @@ class _ScheduledPrefetchConfig:
     def access(self) -> _ScheduledAccessConfig: ...
     @access.setter
     def access(self, value: _ScheduledAccessConfig) -> None: ...
+    @property
+    def projected_sparse_data_strategy(self) -> str: ...
+    @projected_sparse_data_strategy.setter
+    def projected_sparse_data_strategy(self, value: str) -> None: ...
     def validate(self) -> None: ...
 
 class _DataBank:
@@ -321,7 +341,7 @@ class _DataBank:
     def prefetch_cells(
         self,
         dataset_ids: list[_DatasetId],
-        batches: Iterable[Iterable[tuple[int, Iterable[int] | NDArray[np.intp]]]],
+        plan: _PrefetchPlan,
         output_dtype: DType | str,
         gene_names: list[str] | None = None,
         missing: _MissingGenePolicy | None = None,
@@ -330,13 +350,13 @@ class _DataBank:
     def prefetch_cells_raw(
         self,
         id: _DatasetId,
-        batches: Iterable[Iterable[int] | NDArray[np.intp]],
+        plan: _PrefetchPlan,
         config: _ScheduledPrefetchConfig | None = None,
     ) -> _PrefetchCells: ...
     def prefetch_cells_by_gene_names_raw(
         self,
         id: _DatasetId,
-        batches: Iterable[Iterable[int] | NDArray[np.intp]],
+        plan: _PrefetchPlan,
         gene_names: list[str],
         missing: _MissingGenePolicy | None = None,
         config: _ScheduledPrefetchConfig | None = None,

@@ -91,6 +91,7 @@ fn stress_iopool(config: BenchConfig, threads: &[usize]) {
             IoConfig::Threaded(ThreadedConfig {
                 base: BaseIoConfig {
                     max_in_flight: 512,
+                    queue_capacity: 2048,
                     priority_levels: 2,
                     queue_shards: 4,
                     assume_non_overlapping_reads: true,

@@ -39,9 +39,6 @@ const DEDUP_HITS: ProfileMetricId = ProfileMetricId::count(IOPOOL_QUEUE_SCOPE, "
 #[cfg(any(feature = "profile", test))]
 const QUEUE_FULL: ProfileMetricId = ProfileMetricId::count(IOPOOL_QUEUE_SCOPE, "queue-full");
 #[cfg(any(feature = "profile", test))]
-const MAX_ACTIVE_REJECTIONS: ProfileMetricId =
-    ProfileMetricId::count(IOPOOL_QUEUE_SCOPE, "max-active-rejections");
-#[cfg(any(feature = "profile", test))]
 const CANCELLED_BEFORE_DISPATCH: ProfileMetricId =
     ProfileMetricId::count(IOPOOL_QUEUE_SCOPE, "cancelled-before-dispatch");
 #[cfg(any(feature = "profile", test))]
@@ -221,16 +218,6 @@ pub(crate) fn record_iopool_queue_full(profile: &IoPoolProfile) {
 }
 
 #[inline]
-pub(crate) fn record_iopool_max_active_rejection(profile: &IoPoolProfile) {
-    if !profile.is_recording() {
-        return;
-    }
-    crate::scdata_profile_record!(profile.runtime(), |ctx| {
-        ctx.inc(MAX_ACTIVE_REJECTIONS);
-    });
-}
-
-#[inline]
 pub(crate) fn record_iopool_cancelled_before_dispatch(profile: &IoPoolProfile) {
     if !profile.is_recording() {
         return;
@@ -306,7 +293,6 @@ pub(crate) mod test_metrics {
     pub(crate) const IMMEDIATE_COMPLETIONS: ProfileMetricId = super::IMMEDIATE_COMPLETIONS;
     pub(crate) const DEDUP_HITS: ProfileMetricId = super::DEDUP_HITS;
     pub(crate) const QUEUE_FULL: ProfileMetricId = super::QUEUE_FULL;
-    pub(crate) const MAX_ACTIVE_REJECTIONS: ProfileMetricId = super::MAX_ACTIVE_REJECTIONS;
     pub(crate) const CANCELLED_BEFORE_DISPATCH: ProfileMetricId = super::CANCELLED_BEFORE_DISPATCH;
     pub(crate) const DISPATCHED: ProfileMetricId = super::DISPATCHED;
     pub(crate) const OPERATION_CALLS: ProfileMetricId = super::OPERATION_CALLS;

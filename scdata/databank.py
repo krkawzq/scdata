@@ -71,7 +71,8 @@ from typing import (
 from .data._cell import CellAccess, CellBatch, CellData, _as_cell_index
 from .data._coerce import _as_gene_names
 from .data._dataset import DataError, Dataset, DatasetCollection, DenseDataset, DType, SparseDataset
-from .data._prefetch import PrefetchBatches, PrefetchIterator
+from .data._index import CellIndexPlan
+from .data._prefetch import PrefetchIterator
 from ._scdata import (
     _AccessConfig,
     _AccessCpuConfig,
@@ -83,6 +84,7 @@ from ._scdata import (
     _FillConfig,
     _IoConfig,
     _MissingGenePolicy,
+    _PrefetchPlan,
     _ScheduledAccessConfig,
     _ScheduledPrefetchConfig,
     _ThreadedConfig,
@@ -109,11 +111,13 @@ __all__ = [
     "FillConfig",
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
+    "ProjectedSparseDataGroupStrategy",
     "ProfileSnapshot",
 ]
 
 
 ProfileSnapshot = dict[str, Any]
+ProjectedSparseDataGroupStrategy = Literal["selected_only", "read_all"]
 
 
 # ===========================================================================
@@ -333,9 +337,10 @@ class _Config:
 
 @dataclass(slots=True)
 class BaseIoConfig(_Config):
-    """Shared IO backend settings (max in-flight, priority levels, ...)."""
+    """Shared IO backend settings (queue capacity, max in-flight, ...)."""
 
     max_in_flight: int = 768
+    queue_capacity: int = 4096
     priority_levels: int = 3
     queue_shards: int = 8
     assume_non_overlapping_reads: bool = False
@@ -553,9 +558,16 @@ class ScheduledPrefetchConfig(_Config):
 
     prefetch_step: int = 8
     access: ScheduledAccessConfig = field(default_factory=ScheduledAccessConfig)
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy = "selected_only"
 
     def __post_init__(self) -> None:
         self.access = _coerce_config_value(self.access, ScheduledAccessConfig, "access")
+        allowed = {"selected_only", "read_all", "selected", "selected-only", "read-all", "all"}
+        if self.projected_sparse_data_strategy not in allowed:
+            raise ValueError(
+                "projected_sparse_data_strategy must be 'selected_only' or 'read_all', "
+                f"got {self.projected_sparse_data_strategy!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +635,17 @@ def _config_to_rust(config: Any) -> Any:
         value = getattr(config, f.name)
         if type(value) in _CONFIG_CLASSES:
             value = _config_to_rust(value)
+        if not hasattr(r, f.name):
+            if (
+                cls is ScheduledPrefetchConfig
+                and f.name == "projected_sparse_data_strategy"
+                and value in {"selected_only", "selected", "selected-only"}
+            ):
+                continue
+            raise AttributeError(
+                f"Rust extension {type(r).__name__} has no config field {f.name!r}; "
+                "rebuild scdata._scdata"
+            )
         setattr(r, f.name, value)
     return r
 
@@ -653,6 +676,7 @@ def _config_from_rust(config: Any) -> Any:
     if isinstance(config, _BaseIoConfig):
         return BaseIoConfig(
             max_in_flight=config.max_in_flight,
+            queue_capacity=config.queue_capacity,
             priority_levels=config.priority_levels,
             queue_shards=config.queue_shards,
             assume_non_overlapping_reads=config.assume_non_overlapping_reads,
@@ -713,6 +737,10 @@ def _config_from_rust(config: Any) -> Any:
         return ScheduledPrefetchConfig(
             prefetch_step=config.prefetch_step,
             access=_config_from_rust(config.access),
+            projected_sparse_data_strategy=cast(
+                ProjectedSparseDataGroupStrategy,
+                getattr(config, "projected_sparse_data_strategy", "selected_only"),
+            ),
         )
     raise TypeError(f"not a Rust config object: {type(config).__name__}")
 
@@ -1341,12 +1369,12 @@ class ScDataBank:
 
         # dtype differs from the stored one: plan as a single-dataset multi-style
         # request so the Rust projection path can cast on output.
-        batch_parts = self._single_prefetch_parts(batches)
+        plan = _PrefetchPlan.single(batches)
         rust_missing_value = rust_missing._rust if rust_missing is not None else None
         rust_config = _config_to_rust(config)
         inner = self._core().prefetch_cells(
             [id._rust],
-            batch_parts,
+            plan,
             dtype_value,
             list(names) if names is not None else None,
             rust_missing_value,
@@ -1380,12 +1408,52 @@ class ScDataBank:
         names = _as_gene_names(genes, "genes") if genes is not None else None
         rust_missing = _coerce_missing_policy(missing)
         config = _coerce_prefetch_config(config)
-        batch_parts = self._iter_multi_prefetch_parts(batches)
+        plan = _PrefetchPlan.multi(batches)
         rust_missing_value = rust_missing._rust if rust_missing is not None else None
         rust_config = _config_to_rust(config)
         inner = self._core().prefetch_cells(
             [dataset_id._rust for dataset_id in ids],
-            batch_parts,
+            plan,
+            dtype_value,
+            list(names) if names is not None else None,
+            rust_missing_value,
+            rust_config,
+        )
+        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
+
+    def prefetch_indexed(
+        self,
+        ids: SequenceABC[DatasetId],
+        plan: CellIndexPlan,
+        genes: Iterable[str] | None = None,
+        *,
+        missing: MissingGenePolicy
+        | Literal["zero", "error", "raise", "strict"]
+        | str
+        | None = None,
+        dtype: DType | Literal["auto"] | str | None = None,
+        config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
+    ) -> Iterator[CellBatch]:
+        """Stream batches from a numeric :class:`~scdata.data.CellIndexPlan`.
+
+        ``plan.dataset_index`` selects entries from ``ids`` and
+        ``plan.cell_index`` holds local cell ids.  This avoids Python
+        per-batch ``(dataset_idx, cells)`` object materialization on the
+        scheduled path.
+        """
+        if not isinstance(plan, CellIndexPlan):
+            raise TypeError(f"plan must be a CellIndexPlan, got {type(plan).__name__}")
+        ids = self._coerce_prefetch_ids(ids)
+        dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
+        names = _as_gene_names(genes, "genes") if genes is not None else None
+        rust_missing = _coerce_missing_policy(missing)
+        config = _coerce_prefetch_config(config)
+        rust_plan = _PrefetchPlan.indexed(plan.dataset_index, plan.cell_index, plan.batch_size)
+        rust_missing_value = rust_missing._rust if rust_missing is not None else None
+        rust_config = _config_to_rust(config)
+        inner = self._core().prefetch_cells(
+            [dataset_id._rust for dataset_id in ids],
+            rust_plan,
             dtype_value,
             list(names) if names is not None else None,
             rust_missing_value,
@@ -1407,35 +1475,6 @@ class ScDataBank:
                 raise TypeError(f"id[{idx}] must be a DatasetId, got {type(dataset_id).__name__}")
         return ids
 
-    @staticmethod
-    def _single_prefetch_parts(
-        batches: Iterable[CellAccess | Iterable[int]],
-    ) -> list[list[tuple[int, Any]]]:
-        request = PrefetchBatches.from_iterable(batches)
-        return [[(0, cells)] for cells in request.batch_cell_arrays()]
-
-    @staticmethod
-    def _iter_multi_prefetch_parts(
-        batches: Iterable[Iterable[tuple[int, CellAccess | Iterable[int]]]],
-    ) -> Iterator[list[tuple[int, Any]]]:
-        for batch_index, batch in enumerate(batches):
-            parts: list[tuple[int, Any]] = []
-            for part_index, (dataset_idx, cells) in enumerate(batch):
-                dataset_index = int(dataset_idx)
-                if dataset_index < 0:
-                    raise ValueError(
-                        f"batches[{batch_index}][{part_index}] dataset_idx must be non-negative"
-                    )
-                if isinstance(cells, CellAccess):
-                    cell_array = cells.cells
-                else:
-                    cell_array = _as_cell_index(
-                        cells,
-                        f"batches[{batch_index}][{part_index}].cells",
-                    )
-                parts.append((dataset_index, cell_array))
-            yield parts
-
     def _prefetch_all_genes(
         self,
         id: DatasetId,
@@ -1443,10 +1482,10 @@ class ScDataBank:
         *,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
-        request = PrefetchBatches.from_iterable(batches)
         config = _coerce_prefetch_config(config)
         rust_config = _config_to_rust(config)
-        inner = self._core().prefetch_cells_raw(id._rust, request.batch_cell_arrays(), rust_config)
+        plan = _PrefetchPlan.single(batches)
+        inner = self._core().prefetch_cells_raw(id._rust, plan, rust_config)
         return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
 
     def _prefetch_genes(
@@ -1458,14 +1497,14 @@ class ScDataBank:
         missing: MissingGenePolicy | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
-        request = PrefetchBatches.from_iterable(batches, gene_names=genes)
-        names = tuple(request.gene_names) if request.gene_names is not None else ()
+        names = tuple(_as_gene_names(genes, "genes"))
         rust_missing = missing._rust if missing is not None else None
         config = _coerce_prefetch_config(config)
         rust_config = _config_to_rust(config)
+        plan = _PrefetchPlan.single(batches)
         inner = self._core().prefetch_cells_by_gene_names_raw(
             id._rust,
-            request.batch_cell_arrays(),
+            plan,
             list(names),
             rust_missing,
             rust_config,

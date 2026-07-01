@@ -5,13 +5,14 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use super::super::array::{Array, ArrayGrid, Chunk, ChunkSource, EdgeChunkLayout, RegisteredFile};
 use super::super::dataset::{Dataset, Dense2DDataset, SparseCsrDataset};
-use crate::access::SliceSpec;
+use crate::access::{ScheduledAccessConfig, SliceSpec};
 use crate::codecs::{ChunkCodec, CodecError, CodecResult, SharedCodec, UncompressedCodec};
 use crate::databank::{
     ArrayCodecSpec, ArrayGridSpec, ArrayOrder, ArraySpec, ChunkSourceSpec, ChunkSpec, DType,
     DataBank, DataBankConfig, Dense1DSpec, Dense2DSpec, MissingGenePolicy, PrefetchedBatch,
-    ScheduledPrefetchConfig, SparseCsrSpec,
+    ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig, SparseCsrSpec,
 };
+use crate::iopool::{BaseIoConfig, IoConfig, ThreadedConfig};
 #[cfg(feature = "profile")]
 use crate::profile::{ProfileMetricId, ProfileSnapshot};
 
@@ -884,6 +885,51 @@ fn scheduled_prefetch_dense_2d_matches_direct_access() {
 }
 
 #[test]
+fn scheduled_prefetch_waits_when_iopool_queue_is_full() {
+    let mut config = DataBankConfig::default();
+    config.io_config = IoConfig::Threaded(ThreadedConfig {
+        base: BaseIoConfig {
+            max_in_flight: 1,
+            queue_capacity: 1,
+            priority_levels: 3,
+            queue_shards: 1,
+            assume_non_overlapping_reads: false,
+        },
+        num_workers: 1,
+        cpus: None,
+    });
+    config.access_config.queue_capacity = 8;
+    config.fill_config.parallel = true;
+    config.fill_config.num_workers = 2;
+    config.fill_config.min_parallel_rows = 1;
+    config.fill_config.min_parallel_bytes = 1;
+
+    let mut bank = DataBank::new(config).expect("databank");
+    let id = register_dense_2d_file(&mut bank, 12, 4, 1);
+    let batches: Vec<Vec<usize>> = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]];
+    let expected: Vec<Vec<u32>> = batches
+        .iter()
+        .map(|cells| expected_dense_rows(cells, 4))
+        .collect();
+    let prefetch_config = ScheduledPrefetchConfig {
+        prefetch_step: 4,
+        access: ScheduledAccessConfig {
+            prefetch_step: 8,
+            decode_ahead_steps: 8,
+            ready_ahead_steps: 4,
+        },
+        ..ScheduledPrefetchConfig::default()
+    };
+
+    let collected: Vec<Vec<u32>> = bank
+        .prefetch_cells_scheduled::<u32, _>(id, batches, prefetch_config)
+        .expect("scheduled prefetch")
+        .map(|batch| batch.expect("prefetch batch").buffer)
+        .collect();
+    assert_eq!(collected, expected);
+}
+
+#[test]
 fn scheduled_multi_prefetch_casts_bf16_and_f32_to_f32() {
     let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
     let genes = vec!["g0".to_string(), "g1".to_string()];
@@ -977,7 +1023,13 @@ fn plan_batch_multi_uses_single_fast_path_for_dataset_zero_sequential_rows() {
     let gene_axes = super::MultiGeneAxisPlan::dataset_order(&datasets).expect("gene axes");
     let batch = super::MultiBatchCells::new(vec![(0, vec![2]), (0, vec![0, 1]), (0, vec![3])]);
 
-    let (plan, _items) = super::plan_batch_multi(&datasets, batch, &gene_axes).expect("plan batch");
+    let (plan, _items) = super::plan_batch_multi(
+        &datasets,
+        batch,
+        &gene_axes,
+        ProjectedSparseDataGroupStrategy::SelectedOnly,
+    )
+    .expect("plan batch");
 
     match plan {
         super::BatchPlan::Single {
@@ -1007,7 +1059,13 @@ fn plan_batch_multi_uses_single_fast_path_for_nonzero_single_dataset() {
     let gene_axes = super::MultiGeneAxisPlan::dataset_order(&datasets).expect("gene axes");
     let batch = super::MultiBatchCells::new(vec![(1, vec![2, 0])]);
 
-    let (plan, _items) = super::plan_batch_multi(&datasets, batch, &gene_axes).expect("plan batch");
+    let (plan, _items) = super::plan_batch_multi(
+        &datasets,
+        batch,
+        &gene_axes,
+        ProjectedSparseDataGroupStrategy::SelectedOnly,
+    )
+    .expect("plan batch");
 
     match plan {
         super::BatchPlan::Single {
@@ -1425,6 +1483,60 @@ fn parallel_projected_csr_scatter_reads_only_selected_groups() {
         .map(|batch| batch.expect("prefetch batch").buffer)
         .collect();
     assert_eq!(collected, expected_batches);
+}
+
+#[test]
+fn scheduled_projected_csr_read_all_data_groups_matches_selected_only() {
+    let mut bank = DataBank::new(parallel_config()).expect("databank");
+    let id = register_csr_file(&mut bank);
+    let genes = vec!["g1", "g3"];
+    let batches: Vec<Vec<usize>> = vec![vec![1, 0], vec![2, 1, 0]];
+    let expected_batches: Vec<Vec<u32>> = batches
+        .iter()
+        .map(|batch| {
+            bank.access_cells_owned_by_gene_names::<u32, _>(
+                id,
+                batch,
+                &genes,
+                MissingGenePolicy::Zero,
+            )
+            .expect("direct projected CSR")
+        })
+        .collect();
+
+    let selected_config = ScheduledPrefetchConfig {
+        projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy::SelectedOnly,
+        ..ScheduledPrefetchConfig::default()
+    };
+    let selected: Vec<Vec<u32>> = bank
+        .prefetch_cells_scheduled_by_gene_names::<u32, _, _>(
+            id,
+            batches.clone(),
+            &genes,
+            MissingGenePolicy::Zero,
+            selected_config,
+        )
+        .expect("scheduled selected-only projected CSR")
+        .map(|batch| batch.expect("prefetch batch").buffer)
+        .collect();
+    assert_eq!(selected, expected_batches);
+
+    let read_all_config = ScheduledPrefetchConfig {
+        projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy::ReadAll,
+        ..ScheduledPrefetchConfig::default()
+    };
+    let read_all: Vec<Vec<u32>> = bank
+        .prefetch_cells_scheduled_by_gene_names::<u32, _, _>(
+            id,
+            batches,
+            &genes,
+            MissingGenePolicy::Zero,
+            read_all_config,
+        )
+        .expect("scheduled read-all projected CSR")
+        .map(|batch| batch.expect("prefetch batch").buffer)
+        .collect();
+    assert_eq!(read_all, expected_batches);
 }
 
 #[test]

@@ -3,7 +3,9 @@ use pyo3::prelude::*;
 
 use crate::access::{AccessConfig, AccessCpuConfig, ScheduledAccessConfig};
 use crate::codecs::DecodePoolConfig;
-use crate::databank::{DataBankConfig, FillConfig, ScheduledPrefetchConfig};
+use crate::databank::{
+    DataBankConfig, FillConfig, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
+};
 use crate::iopool::{BaseIoConfig, IoConfig, ThreadedConfig, UringConfig};
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -48,6 +50,16 @@ impl PyBaseIoConfig {
     #[setter]
     fn set_max_in_flight(&mut self, value: usize) {
         self.inner.max_in_flight = value;
+    }
+
+    #[getter]
+    fn queue_capacity(&self) -> usize {
+        self.inner.queue_capacity
+    }
+
+    #[setter]
+    fn set_queue_capacity(&mut self, value: usize) {
+        self.inner.queue_capacity = value;
     }
 
     #[getter]
@@ -713,6 +725,18 @@ impl PyScheduledPrefetchConfig {
     #[setter]
     fn set_access(&mut self, value: PyScheduledAccessConfig) {
         self.inner.access = value.inner;
+    }
+
+    #[getter]
+    fn projected_sparse_data_strategy(&self) -> &'static str {
+        self.inner.projected_sparse_data_strategy.as_str()
+    }
+
+    #[setter]
+    fn set_projected_sparse_data_strategy(&mut self, value: &str) -> PyResult<()> {
+        self.inner.projected_sparse_data_strategy =
+            ProjectedSparseDataGroupStrategy::parse(value).map_err(PyValueError::new_err)?;
+        Ok(())
     }
 
     fn validate(&self) -> PyResult<()> {

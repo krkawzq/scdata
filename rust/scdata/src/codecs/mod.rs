@@ -29,8 +29,8 @@ pub use profile::{
 pub(crate) use spec::sealed;
 pub use spec::{
     codec_specs_from_json_str, codec_specs_from_json_value, BloscCodecConfig, BloscShuffle,
-    ChunkCodec, CodecCacheKey, CodecSpec, LevelCodecConfig, Lz4CodecConfig, LzmaCodecConfig,
-    ZstdCodecConfig,
+    ChunkCodec, CodecCacheKey, CodecSpec, DecodeRange, DecodeSlice, LevelCodecConfig,
+    Lz4CodecConfig, LzmaCodecConfig, ZstdCodecConfig,
 };
 
 /// Shared codec implementation used by decode requests.

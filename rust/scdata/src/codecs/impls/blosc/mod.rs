@@ -5,7 +5,7 @@ mod shuffle;
 use std::os::raw::c_void;
 
 use super::super::buffer::{set_vec_len_for_decode, DecodeBuffer};
-use super::super::spec::{sealed, ChunkCodec, CodecCacheKey};
+use super::super::spec::{sealed, ChunkCodec, CodecCacheKey, DecodeSlice};
 use super::super::util::{
     decode_error, output_too_small, reserve_decode_buffer, vec_with_decode_capacity, verify_size,
 };
@@ -37,6 +37,17 @@ impl ChunkCodec for BloscCodec {
         let written = blosc_decode_header_into_output(self.name(), encoded, header, &mut decoded)?;
         decoded.truncate(written);
         Ok(decoded)
+    }
+
+    fn decode_slice(
+        &self,
+        encoded: &[u8],
+        slice: &DecodeSlice,
+        expected_size: Option<usize>,
+    ) -> CodecResult<Option<Vec<u8>>> {
+        let header = blosc_header(self.name(), encoded)?;
+        verify_size(self.name(), header.decoded_size, expected_size)?;
+        lz4_fast::try_blosc_lz4_decode_slice(self.name(), encoded, header, slice)
     }
 
     fn decoded_size_hint(
@@ -156,8 +167,10 @@ fn blosc_decode_header_into_output(
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::codecs::{DecodeRange, DecodeSlice};
 
     #[test]
     fn lz4_fast_path_decodes_valid_blosc_lz4_buffers() {
@@ -227,6 +240,38 @@ mod tests {
             .expect("manual Blosc LZ4 raw blocks should decode");
 
         assert_eq!(&decoded, b"abcdefgh");
+    }
+
+    #[test]
+    fn lz4_fast_path_decodes_byte_shuffled_slices() {
+        let codec = BloscCodec;
+        for typesize in [2usize, 4, 8] {
+            let raw = (0..256 * 1024usize)
+                .map(|idx| (idx.wrapping_mul(37).wrapping_add(11) & 0xff) as u8)
+                .collect::<Vec<_>>();
+            let encoded = blosc_lz4_encode(&raw, blosc_src::BLOSC_SHUFFLE as i32, typesize, 1024);
+            let slice = DecodeSlice::new(
+                Arc::from(
+                    vec![
+                        DecodeRange::new(0, 3, 31),
+                        DecodeRange::new(28, 1000, 1100),
+                        DecodeRange::new(128, raw.len() - 17, raw.len()),
+                    ]
+                    .into_boxed_slice(),
+                ),
+                145,
+            );
+            let partial = codec
+                .decode_slice(&encoded, &slice, Some(raw.len()))
+                .expect("slice decode")
+                .expect("Blosc LZ4 should handle byte-shuffled slices");
+            let mut expected = vec![0u8; slice.output_len];
+            for range in slice.ranges.iter().copied() {
+                expected[range.dst_offset..range.dst_offset + range.len()]
+                    .copy_from_slice(&raw[range.src_start..range.src_end]);
+            }
+            assert_eq!(partial, expected, "typesize={typesize}");
+        }
     }
 
     fn blosc_lz4_encode(raw: &[u8], shuffle: i32, typesize: usize, blocksize: usize) -> Vec<u8> {

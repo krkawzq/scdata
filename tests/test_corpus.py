@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ pd = pytest.importorskip("pandas")
 pytest.importorskip("zarr")
 
 from scdata import Corpus, MissingGenePolicy, ScDataBank  # noqa: E402
-from scdata.io import write_zarr  # noqa: E402
+from scdata.io import launch, launch_all, write_zarr  # noqa: E402
 
 
 def _write_store(
@@ -48,6 +49,33 @@ def _two_identical_gene_stores(tmp_path: Path) -> tuple[Path, Path, list[str]]:
         _write_store(tmp_path, "b", (3, 4), genes),
         genes,
     )
+
+
+def _write_store_with_layer_and_raw(
+    tmp_path: Path,
+    name: str,
+) -> tuple[Path, tuple[str, ...], tuple[str, ...]]:
+    x = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.float32)
+    counts = x + 10
+    raw = np.array([[7, 8, 9], [10, 11, 12], [13, 14, 15]], dtype=np.float32)
+    x_genes = ("g0", "g1")
+    raw_genes = ("r0", "r1", "r2")
+    adata = ad.AnnData(
+        X=x,
+        obs=pd.DataFrame(index=["c0", "c1", "c2"]),
+        var=pd.DataFrame(index=x_genes),
+    )
+    adata.layers["counts"] = counts
+    adata.raw = ad.AnnData(X=raw, var=pd.DataFrame(index=raw_genes))
+    root = write_zarr(
+        adata,
+        tmp_path / f"{name}.zarr.zip",
+        format="dense2d",
+        layer_format="dense2d",
+        chunk_size=(2, 2),
+        store="zip",
+    )
+    return root, x_genes, raw_genes
 
 
 def test_corpus_strict_alignment_success(tmp_path: Path) -> None:
@@ -111,6 +139,69 @@ def test_corpus_none_alignment(tmp_path: Path) -> None:
     with Corpus([p0, p1], gene_alignment="none") as corpus:
         assert corpus.gene_names is None
         assert corpus.missing is None
+
+
+def test_corpus_global_raw_matrix_uses_raw_gene_space(tmp_path: Path) -> None:
+    root, _x_genes, raw_genes = _write_store_with_layer_and_raw(tmp_path, "raw_global")
+    with Corpus([root], matrix="raw") as corpus:
+        assert corpus.matrix_keys == ("raw/X",)
+        assert corpus.gene_names == raw_genes
+        assert corpus.num_genes == 3
+        batch = next(iter(corpus.loader(batch_size=2, shuffle=False)))
+        assert batch["x"].shape == (2, 3)
+        assert batch["gene_names"] == raw_genes
+
+
+def test_corpus_mixed_path_tuple_and_dict_matrix_keys(tmp_path: Path) -> None:
+    p0, _x0, raw0 = _write_store_with_layer_and_raw(tmp_path, "mixed_a")
+    p1, x1, _raw1 = _write_store_with_layer_and_raw(tmp_path, "mixed_b")
+
+    with Corpus(
+        [
+            (p0, "raw"),
+            {"path": p1, "X": "counts"},
+        ],
+        gene_alignment="union",
+    ) as corpus:
+        assert corpus.matrix_keys == ("raw/X", "layers/counts")
+        assert corpus.gene_names == (*raw0, *x1)
+        assert corpus.missing is MissingGenePolicy.ZERO
+        assert corpus.cells_per_file == (3, 3)
+        batch = next(iter(corpus.loader(batch_size=4, shuffle=False)))
+        assert batch["x"].shape == (4, 5)
+
+
+def test_corpus_accepts_dataset_and_collection_entries(tmp_path: Path) -> None:
+    p0, _x0, raw0 = _write_store_with_layer_and_raw(tmp_path, "entry_dataset")
+    p1, x1, _raw1 = _write_store_with_layer_and_raw(tmp_path, "entry_collection")
+
+    raw_dataset = launch(p0, matrix="raw")
+    collection = launch_all(p1)
+    with Corpus(
+        [
+            raw_dataset,
+            {"collection": collection, "X": "counts"},
+        ],
+        gene_alignment="union",
+    ) as corpus:
+        assert corpus.matrix_keys == ("X", "layers/counts")
+        assert corpus.gene_names == (*raw0, *x1)
+        assert corpus.num_cells == 6
+
+
+def test_corpus_dataset_mapping_can_supply_store_root(tmp_path: Path) -> None:
+    root, x_genes, _raw_genes = _write_store_with_layer_and_raw(tmp_path, "detached")
+    detached = replace(launch(root), store_root="")
+
+    with Corpus([{"dataset": detached, "store_root": root}]) as corpus:
+        assert corpus.gene_names == x_genes
+        assert corpus.cells_per_file == (3,)
+
+
+def test_corpus_rejects_ambiguous_mapping_entry(tmp_path: Path) -> None:
+    root, _x_genes, _raw_genes = _write_store_with_layer_and_raw(tmp_path, "ambiguous")
+    with pytest.raises(ValueError, match="either layer or a matrix key"):
+        Corpus([{"path": root, "layer": "counts", "X": "raw"}])
 
 
 def test_corpus_rejects_empty_paths() -> None:

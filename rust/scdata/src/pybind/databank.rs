@@ -1,5 +1,6 @@
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
+use pyo3::PyRefMut;
 
 use crate::databank::{
     DataBank as RustDataBank, DatasetId, Dense1DSpec, Dense2DSpec, MissingGenePolicy, SparseCsrSpec,
@@ -7,7 +8,9 @@ use crate::databank::{
 
 use super::config::{PyDataBankConfig, PyScheduledAccessConfig, PyScheduledPrefetchConfig};
 use super::ids::{PyDatasetId, PyMissingGenePolicy};
-use super::prefetch::{prefetch_cells_multi_dispatch, PyMultiBatchSource, PyPrefetchCells};
+use super::prefetch::{
+    prefetch_cells_multi_dispatch, PyMultiBatchSource, PyPrefetchCells, PyPrefetchPlan,
+};
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDataBank>()?;
@@ -212,11 +215,11 @@ impl PyDataBank {
         self.prefetch_cells_cache(id, cells)
     }
 
-    #[pyo3(signature = (dataset_ids, batches, output_dtype, gene_names=None, missing=None, config=None))]
+    #[pyo3(signature = (dataset_ids, plan, output_dtype, gene_names=None, missing=None, config=None))]
     fn prefetch_cells(
         &self,
         dataset_ids: Vec<PyDatasetId>,
-        batches: Bound<'_, PyAny>,
+        plan: PyRefMut<'_, PyPrefetchPlan>,
         output_dtype: Bound<'_, PyAny>,
         gene_names: Option<Vec<String>>,
         missing: Option<PyMissingGenePolicy>,
@@ -230,7 +233,7 @@ impl PyDataBank {
         prefetch_cells_multi_dispatch(
             &self.inner,
             &ids,
-            PyMultiBatchSource::multi(batches)?,
+            PyMultiBatchSource::from_plan(plan)?,
             gene_names.as_deref(),
             missing,
             config.map(|config| config.inner).unwrap_or_default(),
@@ -238,11 +241,11 @@ impl PyDataBank {
         )
     }
 
-    #[pyo3(signature = (id, batches, config=None))]
+    #[pyo3(signature = (id, plan, config=None))]
     fn prefetch_cells_raw(
         &self,
         id: PyDatasetId,
-        batches: Bound<'_, PyAny>,
+        plan: PyRefMut<'_, PyPrefetchPlan>,
         config: Option<PyScheduledPrefetchConfig>,
     ) -> PyResult<PyPrefetchCells> {
         let id: DatasetId = id.into();
@@ -250,7 +253,7 @@ impl PyDataBank {
         prefetch_cells_multi_dispatch(
             &self.inner,
             &[id],
-            PyMultiBatchSource::single(batches)?,
+            PyMultiBatchSource::from_plan(plan)?,
             None,
             MissingGenePolicy::Zero,
             config.map(|config| config.inner).unwrap_or_default(),
@@ -258,11 +261,11 @@ impl PyDataBank {
         )
     }
 
-    #[pyo3(signature = (id, batches, gene_names, missing=None, config=None))]
+    #[pyo3(signature = (id, plan, gene_names, missing=None, config=None))]
     fn prefetch_cells_by_gene_names_raw(
         &self,
         id: PyDatasetId,
-        batches: Bound<'_, PyAny>,
+        plan: PyRefMut<'_, PyPrefetchPlan>,
         gene_names: Vec<String>,
         missing: Option<PyMissingGenePolicy>,
         config: Option<PyScheduledPrefetchConfig>,
@@ -275,7 +278,7 @@ impl PyDataBank {
         prefetch_cells_multi_dispatch(
             &self.inner,
             &[id],
-            PyMultiBatchSource::single(batches)?,
+            PyMultiBatchSource::from_plan(plan)?,
             Some(&gene_names),
             missing,
             config.map(|config| config.inner).unwrap_or_default(),

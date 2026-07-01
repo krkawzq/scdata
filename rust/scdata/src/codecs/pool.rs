@@ -12,7 +12,7 @@ use crate::profile::{ProfileRuntime, ProfileSnapshot};
 
 use super::profile::{CodecProfile, CodecQueueTimer, CodecSubmitKind};
 use super::runner::DecodeRunner;
-use super::{CodecError, CodecResult, CodecSpec, SharedCodec};
+use super::{CodecError, CodecResult, CodecSpec, DecodeSlice, SharedCodec};
 
 /// Worker-pool settings for chunk decoding.
 #[derive(Debug, Clone)]
@@ -80,6 +80,7 @@ pub struct DecodeRequest {
     pub encoded: Arc<[u8]>,
     pub expected_size: Option<usize>,
     pub output: DecodeOutput,
+    pub slice: Option<DecodeSlice>,
 }
 
 /// Output ownership strategy for a decode request.
@@ -100,6 +101,7 @@ impl DecodeRequest {
             encoded: encoded.into(),
             expected_size: None,
             output: DecodeOutput::Allocate,
+            slice: None,
         }
     }
 
@@ -109,6 +111,11 @@ impl DecodeRequest {
 
     pub fn with_expected_size(mut self, expected_size: usize) -> Self {
         self.expected_size = Some(expected_size);
+        self
+    }
+
+    pub fn with_slice(mut self, slice: DecodeSlice) -> Self {
+        self.slice = Some(slice);
         self
     }
 
@@ -354,6 +361,7 @@ fn complete_work(work: DecodeWork, profile: &CodecProfile) {
         encoded,
         expected_size,
         output,
+        slice,
     } = work.request;
     let encoded_bytes = encoded.len();
     let work_profile = profile.start_work();
@@ -364,6 +372,7 @@ fn complete_work(work: DecodeWork, profile: &CodecProfile) {
             &encoded,
             Vec::new(),
             expected_size,
+            slice.as_ref(),
         ),
         DecodeOutput::ReuseInitialized(output) => {
             DecodeRunner::decode_to_initialized_vec(codec.as_ref(), &encoded, output, expected_size)

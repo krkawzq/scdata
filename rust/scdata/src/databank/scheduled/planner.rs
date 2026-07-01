@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::access::AccessItem;
 
+use super::super::config::ProjectedSparseDataGroupStrategy;
 use super::super::dataset::{Dataset, Dense1DDataset, Dense2DDataset, SparseCsrDataset};
 use super::super::error::{DataBankError, DataBankResult};
 use super::super::plan::{self};
@@ -23,6 +24,7 @@ pub(crate) fn plan_single_dataset_owned(
     cells: Vec<usize>,
     output_rows: Option<Vec<usize>>,
     gene_axis: &GeneAxisPlan,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
 ) -> DataBankResult<(Vec<usize>, SingleDatasetPlan, Vec<AccessItem>)> {
     if let Some(output_rows) = output_rows.as_ref() {
         if cells.len() != output_rows.len() {
@@ -102,7 +104,9 @@ pub(crate) fn plan_single_dataset_owned(
             let rows = make_sparse_rows(d)?;
             let value_size = d.data.dtype.item_size();
             let plan = plan_sparse_batch_with_value_size(d, &rows, value_size)?;
-            let items = if gene_axis.projection().is_some() {
+            let items = if gene_axis.projection().is_some()
+                && projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::SelectedOnly
+            {
                 sparse_plan_index_file_access_items(&plan)?
             } else {
                 sparse_plan_file_access_items(&plan)?
@@ -124,6 +128,7 @@ pub(crate) fn plan_batch_multi(
     datasets: &[Arc<Dataset>],
     batch: MultiBatchCells,
     gene_axes: &MultiGeneAxisPlan,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
 ) -> DataBankResult<(BatchPlan, Vec<AccessItem>)> {
     if datasets.is_empty() {
         return Err(DataBankError::InvalidConfig(
@@ -132,41 +137,38 @@ pub(crate) fn plan_batch_multi(
     }
 
     let total_cells = batch.total_cells()?;
-    let parts = batch.into_parts();
 
     let mut single_dataset_idx = None;
     let mut single_dataset_only = true;
-    for part in &parts {
-        if part.dataset_idx >= datasets.len() {
+    for (dataset_idx, cells) in batch.part_slices() {
+        if dataset_idx >= datasets.len() {
             return Err(DataBankError::InvalidConfig(format!(
                 "multi batch references dataset index {}, but only {} datasets were supplied",
-                part.dataset_idx,
+                dataset_idx,
                 datasets.len()
             )));
         }
-        if part.cells.is_empty() {
+        if cells.is_empty() {
             continue;
         }
         match single_dataset_idx {
-            Some(dataset_idx) if dataset_idx != part.dataset_idx => {
+            Some(seen_dataset_idx) if seen_dataset_idx != dataset_idx => {
                 single_dataset_only = false;
                 break;
             }
             Some(_) => {}
-            None => single_dataset_idx = Some(part.dataset_idx),
+            None => single_dataset_idx = Some(dataset_idx),
         }
     }
     if single_dataset_only {
         if let Some(dataset_idx) = single_dataset_idx {
-            let mut cells = Vec::with_capacity(total_cells);
-            for part in parts {
-                cells.extend(part.cells);
-            }
+            let cells = batch.into_cells();
             let (cells, plan, items) = plan_single_dataset_owned(
                 Arc::clone(&datasets[dataset_idx]),
                 cells,
                 None,
                 gene_axes.axis_for(dataset_idx)?,
+                projected_sparse_data_strategy,
             )?;
             return Ok((
                 BatchPlan::Single {
@@ -179,14 +181,15 @@ pub(crate) fn plan_batch_multi(
         }
     }
 
-    let layout = collect_multi_dataset_batch_rows(datasets, parts, total_cells)?;
-    plan_multi_layout(datasets, layout, gene_axes)
+    let layout = collect_multi_dataset_batch_rows(datasets, &batch, total_cells)?;
+    plan_multi_layout(datasets, layout, gene_axes, projected_sparse_data_strategy)
 }
 
 pub(crate) fn plan_multi_layout(
     datasets: &[Arc<Dataset>],
     mut layout: MultiBatchLayout,
     gene_axes: &MultiGeneAxisPlan,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
 ) -> DataBankResult<(BatchPlan, Vec<AccessItem>)> {
     let can_use_single_plan = layout.per_dataset.len() == 1
         && output_rows_are_sequential(&layout.per_dataset[0].output_rows);
@@ -198,6 +201,7 @@ pub(crate) fn plan_multi_layout(
             dataset_batch.cells,
             None,
             gene_axes.axis_for(dataset_idx)?,
+            projected_sparse_data_strategy,
         )?;
         return Ok((
             BatchPlan::Single {
@@ -221,6 +225,7 @@ pub(crate) fn plan_multi_layout(
             dataset_batch.cells,
             Some(dataset_batch.output_rows),
             &gene_axis,
+            projected_sparse_data_strategy,
         )?;
         debug_assert_eq!(planned_cells.len(), active_rows);
         items.append(&mut part_items);
@@ -247,15 +252,15 @@ pub(crate) fn plan_multi_layout(
 
 pub(crate) fn collect_multi_dataset_batch_rows(
     datasets: &[Arc<Dataset>],
-    parts: Vec<BatchPart>,
+    batch: &MultiBatchCells,
     total_cells: usize,
 ) -> DataBankResult<MultiBatchLayout> {
     let mut all_cells = Vec::with_capacity(total_cells);
     let mut groups = Vec::<BatchRows>::new();
-    let mut group_positions = fast_hash_map_with_capacity(parts.len().min(datasets.len()));
+    let mut group_positions = fast_hash_map_with_capacity(batch.part_count().min(datasets.len()));
     let mut output_row = 0usize;
 
-    for BatchPart { dataset_idx, cells } in parts {
+    for (dataset_idx, cells) in batch.part_slices() {
         if dataset_idx >= datasets.len() {
             return Err(DataBankError::InvalidConfig(format!(
                 "multi batch references dataset index {dataset_idx}, but only {} datasets were supplied",
@@ -283,10 +288,10 @@ pub(crate) fn collect_multi_dataset_batch_rows(
         let next_output_row = output_row.checked_add(part_len).ok_or_else(|| {
             DataBankError::InvalidConfig("multi batch output row overflow".to_string())
         })?;
-        all_cells.extend(cells.iter().copied());
+        all_cells.extend_from_slice(cells);
         group.cells.reserve(part_len);
         group.output_rows.reserve(part_len);
-        group.cells.extend(cells);
+        group.cells.extend_from_slice(cells);
         group.output_rows.extend(output_row..next_output_row);
         output_row = next_output_row;
     }

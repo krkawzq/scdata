@@ -8,7 +8,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::codecs::{CodecResult, SharedCodec};
+use crate::codecs::{CodecResult, DecodeSlice, SharedCodec};
 
 /// Opaque file handle understood by an [`IoBackend`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,5 +40,6 @@ pub trait DecodeBackend: Send + Sync + 'static {
         codec: SharedCodec,
         encoded: Arc<[u8]>,
         expected_size: Option<usize>,
+        slice: Option<DecodeSlice>,
     ) -> DecodeTask;
 }

@@ -19,6 +19,39 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeRange {
+    pub dst_offset: usize,
+    pub src_start: usize,
+    pub src_end: usize,
+}
+
+impl DecodeRange {
+    pub fn new(dst_offset: usize, src_start: usize, src_end: usize) -> Self {
+        Self {
+            dst_offset,
+            src_start,
+            src_end,
+        }
+    }
+
+    pub fn len(self) -> usize {
+        self.src_end - self.src_start
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeSlice {
+    pub ranges: Arc<[DecodeRange]>,
+    pub output_len: usize,
+}
+
+impl DecodeSlice {
+    pub fn new(ranges: Arc<[DecodeRange]>, output_len: usize) -> Self {
+        Self { ranges, output_len }
+    }
+}
+
 /// Decode one numcodecs-compatible zarr chunk into an owned output buffer.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -39,6 +72,16 @@ pub trait ChunkCodec: sealed::Sealed + Send + Sync + fmt::Debug + 'static {
     }
 
     fn decode(&self, encoded: &[u8], expected_size: Option<usize>) -> CodecResult<Vec<u8>>;
+
+    #[doc(hidden)]
+    fn decode_slice(
+        &self,
+        _encoded: &[u8],
+        _slice: &DecodeSlice,
+        _expected_size: Option<usize>,
+    ) -> CodecResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 
     /// Decode into caller-owned output memory and return the number of bytes written.
     fn decode_into(

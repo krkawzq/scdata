@@ -28,7 +28,9 @@ pub use array::{
     DType, DataValue, EdgeChunkLayout, F16Bits, RegisteredFile,
 };
 pub use batch::{MissingGenePolicy, MultiBatchCells, PrefetchCells, PrefetchedBatch};
-pub use config::{DataBankConfig, FillConfig, ScheduledPrefetchConfig};
+pub use config::{
+    DataBankConfig, FillConfig, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
+};
 pub use dataset::{Dense1DSpec, Dense2DSpec, SparseCsrSpec};
 pub use error::{DataBankError, DataBankResult};
 pub use interner::GeneNameView;
@@ -108,6 +110,25 @@ impl DataBank {
 
     pub fn reset_profile(&self) {
         self.profiler.reset_metrics();
+    }
+
+    pub fn access_profile_snapshot_and_reset(&self) -> ProfileSnapshot {
+        self.access.profile_snapshot_and_reset()
+    }
+
+    pub fn io_profile_snapshot_and_reset(&self) -> ProfileSnapshot {
+        self.io_pool.profile_snapshot_and_reset()
+    }
+
+    pub fn decode_profile_snapshot_and_reset(&self) -> ProfileSnapshot {
+        self._decode_pool.profile_snapshot_and_reset()
+    }
+
+    pub fn reset_runtime_profiles(&self) {
+        self.reset_profile();
+        self.access.reset_profile();
+        self.io_pool.reset_profile();
+        self._decode_pool.reset_profile();
     }
 
     pub fn register_dense_1d(&mut self, spec: Dense1DSpec) -> DataBankResult<DatasetId> {

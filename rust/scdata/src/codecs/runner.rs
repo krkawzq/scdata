@@ -1,6 +1,6 @@
 use super::buffer::DecodeBuffer;
-use super::spec::ChunkCodec;
-use super::CodecResult;
+use super::spec::{ChunkCodec, DecodeSlice};
+use super::{CodecError, CodecResult};
 
 pub(crate) struct DecodeRunner;
 
@@ -24,7 +24,7 @@ impl DecodeRunner {
             return Ok((decoded, output));
         }
 
-        let decoded = Self::decode_borrowed_to_vec(codec, &input, output, expected_size)?;
+        let decoded = Self::decode_borrowed_to_vec(codec, &input, output, expected_size, None)?;
         Ok((decoded, input))
     }
 
@@ -33,7 +33,15 @@ impl DecodeRunner {
         encoded: &[u8],
         output: Vec<u8>,
         expected_size: Option<usize>,
+        slice: Option<&DecodeSlice>,
     ) -> CodecResult<Vec<u8>> {
+        if let Some(slice) = slice {
+            if let Some(decoded) = codec.decode_slice(encoded, slice, expected_size)? {
+                return Ok(decoded);
+            }
+            let decoded = codec.decode_to_vec_grow(encoded, output, expected_size)?;
+            return materialize_slice(codec.name(), &decoded, slice);
+        }
         codec.decode_to_vec_grow(encoded, output, expected_size)
     }
 
@@ -69,6 +77,26 @@ impl DecodeRunner {
     ) -> CodecResult<Vec<u8>> {
         codec.decode_to_capacity_vec(encoded, output, expected_size)
     }
+}
+
+fn materialize_slice(codec: &str, decoded: &[u8], slice: &DecodeSlice) -> CodecResult<Vec<u8>> {
+    let mut out = vec![0u8; slice.output_len];
+    for range in slice.ranges.iter().copied() {
+        let Some(dst_end) = range.dst_offset.checked_add(range.len()) else {
+            return Err(CodecError::Decode {
+                codec: codec.to_string(),
+                message: "invalid decode slice range".to_string(),
+            });
+        };
+        if range.src_start > range.src_end || range.src_end > decoded.len() || dst_end > out.len() {
+            return Err(CodecError::Decode {
+                codec: codec.to_string(),
+                message: "invalid decode slice range".to_string(),
+            });
+        }
+        out[range.dst_offset..dst_end].copy_from_slice(&decoded[range.src_start..range.src_end]);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -125,8 +153,9 @@ mod tests {
             decode_to_vec_called: Arc::clone(&called),
         };
 
-        let decoded = DecodeRunner::decode_borrowed_to_vec(&codec, b"abcdef", Vec::new(), Some(6))
-            .expect("decode");
+        let decoded =
+            DecodeRunner::decode_borrowed_to_vec(&codec, b"abcdef", Vec::new(), Some(6), None)
+                .expect("decode");
 
         assert_eq!(&decoded, b"abcdef");
         assert!(called.load(Ordering::SeqCst));

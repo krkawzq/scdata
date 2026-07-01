@@ -1,7 +1,7 @@
 //! Sharded chunk access scheduler.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::io;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,7 +11,7 @@ use std::thread;
 use flume::TrySendError;
 use tokio::runtime::Builder;
 use tokio::sync::{futures::OwnedNotified, oneshot, Notify};
-use tokio::task::{JoinError, JoinSet, LocalSet};
+use tokio::task::{AbortHandle, JoinError, JoinSet, LocalSet};
 
 #[cfg(test)]
 use super::backend::FileRef;
@@ -33,7 +33,7 @@ use super::scheduled::{ScheduledStage, ScheduledStore, StagedBytes};
 #[cfg(test)]
 use super::slice::RangeCopy;
 use super::slice::{SlicePlan, SliceSpec};
-use crate::codecs::{CodecError, SharedCodec};
+use crate::codecs::{CodecError, DecodeRange, DecodeSlice, SharedCodec};
 use crate::profile::{ProfileSnapshot, ProfileTimer};
 
 type StateHandle = Rc<RefCell<SchedulerState>>;
@@ -909,6 +909,37 @@ struct SchedulerState {
     decode_inflight: HashMap<DecodeKey, Arc<Notify>>,
     budget: MemBudget,
     scheduled: ScheduledStore,
+    scheduled_tasks: HashMap<u64, ScheduledTaskHandles>,
+}
+
+#[derive(Debug)]
+enum ScheduledTaskHandles {
+    One(AbortHandle),
+    Many(Vec<AbortHandle>),
+}
+
+impl ScheduledTaskHandles {
+    fn push(&mut self, handle: AbortHandle) {
+        let current = std::mem::replace(self, Self::Many(Vec::new()));
+        *self = match current {
+            Self::One(first) => Self::Many(vec![first, handle]),
+            Self::Many(mut handles) => {
+                handles.push(handle);
+                Self::Many(handles)
+            }
+        };
+    }
+
+    fn abort_all(self) {
+        match self {
+            Self::One(handle) => handle.abort(),
+            Self::Many(handles) => {
+                for handle in handles {
+                    handle.abort();
+                }
+            }
+        }
+    }
 }
 
 impl SchedulerState {
@@ -921,6 +952,7 @@ impl SchedulerState {
             decode_inflight: HashMap::new(),
             budget,
             scheduled: ScheduledStore::new(),
+            scheduled_tasks: HashMap::new(),
         }
     }
 
@@ -1003,33 +1035,39 @@ fn spawn_command(
             }
 
             if let Some(notify) = begin_scheduled_pending(&state, request.id) {
-                tasks.spawn_local(handle_scheduled_decode(
-                    state,
+                let id = request.id;
+                let handle = tasks.spawn_local(handle_scheduled_decode(
+                    Rc::clone(&state),
                     deps.clone(),
                     request,
                     notify,
                 ));
+                register_scheduled_task(&state, id, handle);
             }
         }
         AccessCommand::ScheduledEnsureReady(request) => {
             match try_scheduled_ensure_ready_inline(&state, &deps.profile, &request) {
                 EnsureInline::Handled => {}
                 EnsureInline::NeedsAsync => {
-                    tasks.spawn_local(handle_scheduled_ensure_ready(
-                        state,
+                    let id = request.id;
+                    let handle = tasks.spawn_local(handle_scheduled_ensure_ready(
+                        Rc::clone(&state),
                         deps.clone(),
                         request,
                         None,
                     ));
+                    register_scheduled_task(&state, id, handle);
                 }
                 EnsureInline::Missing => {
                     let owner = begin_scheduled_pending(&state, request.id);
-                    tasks.spawn_local(handle_scheduled_ensure_ready(
-                        state,
+                    let id = request.id;
+                    let handle = tasks.spawn_local(handle_scheduled_ensure_ready(
+                        Rc::clone(&state),
                         deps.clone(),
                         request,
                         owner,
                     ));
+                    register_scheduled_task(&state, id, handle);
                 }
             }
         }
@@ -1348,6 +1386,7 @@ fn try_scheduled_take_inline(
                 if let Some(ScheduledStage::Ready { data, bytes }) =
                     state_ref.scheduled.remove(&request.id)
                 {
+                    state_ref.scheduled_tasks.remove(&request.id);
                     state_ref.budget.release(bytes);
                     Some(Ok(data))
                 } else {
@@ -1360,6 +1399,7 @@ fn try_scheduled_take_inline(
                     bytes,
                 }) = state_ref.scheduled.remove(&request.id)
                 {
+                    state_ref.scheduled_tasks.remove(&request.id);
                     state_ref.budget.release(bytes);
                     materialize_record = Some((bytes, false));
                     Some(Ok(data))
@@ -1371,6 +1411,7 @@ fn try_scheduled_take_inline(
                 if let Some(ScheduledStage::Decoded { bytes, .. }) =
                     state_ref.scheduled.remove(&request.id)
                 {
+                    state_ref.scheduled_tasks.remove(&request.id);
                     state_ref.budget.release(bytes);
                 }
                 materialize_record = Some((0, true));
@@ -1378,10 +1419,12 @@ fn try_scheduled_take_inline(
             }
             TakeInlineAction::FailedMessage(message) => {
                 state_ref.scheduled.remove(&request.id);
+                state_ref.scheduled_tasks.remove(&request.id);
                 Some(Err(AccessError::Io(io::Error::other(message))))
             }
             TakeInlineAction::Cancelled => {
                 state_ref.scheduled.remove(&request.id);
+                state_ref.scheduled_tasks.remove(&request.id);
                 Some(Err(AccessError::Io(io::Error::other(
                     "scheduled item cancelled",
                 ))))
@@ -1404,7 +1447,21 @@ fn try_scheduled_take_inline(
 
 fn log_task_result(result: Option<Result<(), JoinError>>) {
     if let Some(Err(err)) = result {
+        if err.is_cancelled() {
+            return;
+        }
         eprintln!("[access] request task failed: {err}");
+    }
+}
+
+fn register_scheduled_task(state: &StateHandle, id: u64, handle: AbortHandle) {
+    match state.borrow_mut().scheduled_tasks.entry(id) {
+        Entry::Vacant(entry) => {
+            entry.insert(ScheduledTaskHandles::One(handle));
+        }
+        Entry::Occupied(mut entry) => {
+            entry.get_mut().push(handle);
+        }
     }
 }
 
@@ -1457,6 +1514,15 @@ async fn access_item(
     priority: u8,
     keep_decoded: bool,
 ) -> Result<Vec<u8>, AccessError> {
+    if !keep_decoded {
+        if let Some(data) =
+            try_access_item_decode_slice(Rc::clone(&state), io, decode, profile, &item, priority)
+                .await?
+        {
+            return Ok(data);
+        }
+    }
+
     let decoded =
         decoded_item_data(state, io, decode, profile, &item, priority, keep_decoded).await?;
     materialize_decoded(profile, cpu, decoded, &item.slice).await
@@ -1558,6 +1624,77 @@ fn into_materialize_source(decoded: DecodedOutput) -> MaterializeSource {
     }
 }
 
+fn decode_slice_for_item(
+    item: &AccessItem,
+    encoded: &[u8],
+) -> Result<Option<DecodeSlice>, AccessError> {
+    let Some(decoded_size) = item
+        .codec
+        .decoded_size_hint(encoded, item.expected_size)
+        .map_err(AccessError::Codec)?
+    else {
+        return Ok(None);
+    };
+    let plan = item.slice.plan(decoded_size)?;
+    let Some(ranges) = plan.ranges else {
+        return Ok(None);
+    };
+    let ranges = ranges
+        .iter()
+        .map(|range| DecodeRange::new(range.dst_offset, range.src_start, range.src_end))
+        .collect::<Vec<_>>();
+    Ok(Some(DecodeSlice::new(
+        Arc::from(ranges.into_boxed_slice()),
+        plan.output_len,
+    )))
+}
+
+async fn try_access_item_decode_slice(
+    state: StateHandle,
+    io: &dyn IoBackend,
+    decode: &dyn DecodeBackend,
+    profile: &AccessProfile,
+    item: &AccessItem,
+    priority: u8,
+) -> Result<Option<Vec<u8>>, AccessError> {
+    if item.slice == SliceSpec::Full || item.codec.is_identity() {
+        return Ok(None);
+    }
+    let decode_key = DecodeKey::new(item.key, &item.codec, item.expected_size);
+    let chunk = load_chunk(
+        state,
+        io,
+        profile,
+        item.key,
+        priority,
+        true,
+        CacheUse::RawOrDecoded(decode_key),
+    )
+    .await?;
+    if chunk.kind == CachePayloadKind::Decoded {
+        profile.record_decode_cached();
+        return Ok(None);
+    }
+    let Some(decode_slice) = decode_slice_for_item(item, &chunk.data)? else {
+        return Ok(None);
+    };
+    let started = profile.timer(ACCESS_DECODE_SCOPE);
+    let decode_task: DecodeTask = decode.submit_decode(
+        Arc::clone(&item.codec),
+        Arc::clone(&chunk.data),
+        item.expected_size,
+        Some(decode_slice),
+    );
+    let decoded = decode_task.await;
+    profile.record_decode(
+        started,
+        chunk.data.len(),
+        decoded.as_ref().ok().map(Vec::len),
+        decoded.is_err(),
+    );
+    Ok(Some(decoded?))
+}
+
 async fn decoded_item_data(
     state: StateHandle,
     io: &dyn IoBackend,
@@ -1602,6 +1739,7 @@ async fn decoded_item_data(
                         Arc::clone(&item.codec),
                         Arc::clone(&chunk.data),
                         item.expected_size,
+                        None,
                     );
                     let decoded = decode_task.await;
                     profile.record_decode(
@@ -1632,6 +1770,7 @@ async fn decoded_item_data(
                             Arc::clone(&item.codec),
                             Arc::clone(&chunk.data),
                             item.expected_size,
+                            None,
                         );
                         let decoded = decode_task.await;
                         profile.record_decode(
@@ -2228,6 +2367,7 @@ fn cancel_scheduled(state: &StateHandle, profile: &AccessProfile, id: u64) {
     let mut wake = None;
     let mut cancelled = false;
     let mut state_ref = state.borrow_mut();
+    let abort_handles = state_ref.scheduled_tasks.remove(&id);
     match state_ref.scheduled.remove(&id) {
         Some(ScheduledStage::Pending(pending_notify)) => {
             cancelled = true;
@@ -2247,6 +2387,9 @@ fn cancel_scheduled(state: &StateHandle, profile: &AccessProfile, id: u64) {
 
     if cancelled {
         profile.record_scheduled_cancelled();
+    }
+    if let Some(handles) = abort_handles {
+        handles.abort_all();
     }
     if let Some(notify) = wake {
         notify.notify_waiters();
@@ -2286,10 +2429,15 @@ fn finish_scheduled_decode(
         state_ref.scheduled.get(&id),
         Some(ScheduledStage::Cancelled)
     ) {
-        if let Ok(StageDecodeOutput::Staged { bytes, .. }) = result {
-            state_ref.budget.release(bytes);
+        if let Ok(output) = result {
+            match output {
+                StageDecodeOutput::Staged { bytes, .. }
+                | StageDecodeOutput::Ready { bytes, .. } => state_ref.budget.release(bytes),
+                StageDecodeOutput::Cached => {}
+            }
         }
         state_ref.scheduled.remove(&id);
+        state_ref.scheduled_tasks.remove(&id);
         return;
     }
 
@@ -2300,6 +2448,10 @@ fn finish_scheduled_decode(
             Ok(StageDecodeOutput::Staged { data, bytes }) => {
                 staged_bytes = Some(bytes);
                 ScheduledStage::Decoded { data, bytes }
+            }
+            Ok(StageDecodeOutput::Ready { data, bytes }) => {
+                staged_bytes = Some(bytes);
+                ScheduledStage::Ready { data, bytes }
             }
             Err(err) => ScheduledStage::Failed(err.to_string()),
         },
@@ -2314,6 +2466,7 @@ fn finish_scheduled_decode(
 enum StageDecodeOutput {
     Cached,
     Staged { data: StagedBytes, bytes: usize },
+    Ready { data: Vec<u8>, bytes: usize },
 }
 
 async fn decode_for_schedule(
@@ -2353,11 +2506,14 @@ async fn decode_for_schedule(
         }
 
         if !keep_decoded {
+            let decode_slice = decode_slice_for_item(&item, &chunk.data)?;
+            let has_decode_slice = decode_slice.is_some();
             let started = profile.timer(ACCESS_DECODE_SCOPE);
             let decode_task: DecodeTask = decode.submit_decode(
                 Arc::clone(&item.codec),
                 Arc::clone(&chunk.data),
                 item.expected_size,
+                decode_slice,
             );
             let decoded = decode_task.await;
             profile.record_decode(
@@ -2371,8 +2527,14 @@ async fn decode_for_schedule(
 
             let bytes = decoded.len();
             reserve_bytes(profile, Rc::clone(&state), bytes).await?;
-            return Ok(StageDecodeOutput::Staged {
-                data: StagedBytes::Owned(decoded),
+            if !has_decode_slice {
+                return Ok(StageDecodeOutput::Staged {
+                    data: StagedBytes::Owned(decoded),
+                    bytes,
+                });
+            }
+            return Ok(StageDecodeOutput::Ready {
+                data: decoded,
                 bytes,
             });
         }
@@ -2391,6 +2553,7 @@ async fn decode_for_schedule(
                     Arc::clone(&item.codec),
                     Arc::clone(&chunk.data),
                     item.expected_size,
+                    None,
                 );
                 let decoded = decode_task.await;
                 profile.record_decode(
@@ -2589,6 +2752,7 @@ async fn async_ready_from_decode_output(
             )
             .await
         }
+        StageDecodeOutput::Ready { data, bytes } => Ok(ReadyBuffer { data, bytes }),
     }
 }
 
@@ -2613,6 +2777,7 @@ fn finish_scheduled_ready(
             state_ref.budget.release(buffer.bytes);
         }
         state_ref.scheduled.remove(&id);
+        state_ref.scheduled_tasks.remove(&id);
         return;
     }
 
@@ -2834,25 +2999,28 @@ async fn scheduled_take(
     loop {
         let action = {
             let mut state_ref = state.borrow_mut();
-            match state_ref.scheduled.remove(&id) {
-                Some(ScheduledStage::Pending(notify)) => {
-                    let wait = Arc::clone(&notify).notified_owned();
-                    state_ref
-                        .scheduled
-                        .insert(id, ScheduledStage::Pending(Arc::clone(&notify)));
-                    ReadyAction::Wait(wait)
-                }
-                Some(ScheduledStage::Ready { data, bytes }) => {
-                    state_ref.budget.release(bytes);
-                    return Ok(data);
-                }
-                Some(ScheduledStage::Decoded { data, bytes }) => {
-                    ReadyAction::TakeDecoded { data, bytes }
-                }
-                Some(ScheduledStage::Complete) | None => ReadyAction::Direct,
-                Some(ScheduledStage::Failed(message)) => ReadyAction::Failed(message),
-                Some(ScheduledStage::Cancelled) => {
-                    ReadyAction::Failed("scheduled item cancelled".to_string())
+            if let Some(ScheduledStage::Pending(notify)) = state_ref.scheduled.get(&id) {
+                ReadyAction::Wait(Arc::clone(notify).notified_owned())
+            } else {
+                match state_ref.scheduled.remove(&id) {
+                    Some(ScheduledStage::Ready { data, bytes }) => {
+                        state_ref.scheduled_tasks.remove(&id);
+                        state_ref.budget.release(bytes);
+                        return Ok(data);
+                    }
+                    Some(ScheduledStage::Decoded { data, bytes }) => {
+                        state_ref.scheduled_tasks.remove(&id);
+                        ReadyAction::TakeDecoded { data, bytes }
+                    }
+                    Some(ScheduledStage::Complete) | None => {
+                        state_ref.scheduled_tasks.remove(&id);
+                        ReadyAction::Direct
+                    }
+                    Some(ScheduledStage::Failed(message)) => ReadyAction::Failed(message),
+                    Some(ScheduledStage::Cancelled) => {
+                        ReadyAction::Failed("scheduled item cancelled".to_string())
+                    }
+                    Some(ScheduledStage::Pending(_)) => unreachable!("pending stage checked above"),
                 }
             }
         };
@@ -2882,10 +3050,12 @@ async fn scheduled_take(
                     bytes,
                 )
                 .await?;
+                state.borrow_mut().scheduled_tasks.remove(&id);
                 state.borrow_mut().budget.release(buffer.bytes);
                 return Ok(buffer.data);
             }
             ReadyAction::Failed(message) => {
+                state.borrow_mut().scheduled_tasks.remove(&id);
                 return Err(AccessError::Io(io::Error::other(message)));
             }
             ReadyAction::ConvertDecoded { .. }
@@ -3038,6 +3208,7 @@ mod tests {
             _codec: SharedCodec,
             encoded: Arc<[u8]>,
             expected_size: Option<usize>,
+            slice: Option<DecodeSlice>,
         ) -> DecodeTask {
             self.decodes.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
@@ -3050,7 +3221,7 @@ mod tests {
                         });
                     }
                 }
-                Ok(encoded.to_vec())
+                materialize_test_decode_slice(encoded.as_ref(), slice.as_ref())
             })
         }
     }
@@ -3078,10 +3249,42 @@ mod tests {
             codec: SharedCodec,
             encoded: Arc<[u8]>,
             expected_size: Option<usize>,
+            slice: Option<DecodeSlice>,
         ) -> DecodeTask {
             self.decodes.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { codec.decode(&encoded, expected_size) })
+            Box::pin(async move {
+                let decoded = codec.decode(&encoded, expected_size)?;
+                materialize_test_decode_slice(&decoded, slice.as_ref())
+            })
         }
+    }
+
+    fn materialize_test_decode_slice(
+        decoded: &[u8],
+        slice: Option<&DecodeSlice>,
+    ) -> CodecResult<Vec<u8>> {
+        let Some(slice) = slice else {
+            return Ok(decoded.to_vec());
+        };
+        let mut out = vec![0u8; slice.output_len];
+        for range in slice.ranges.iter().copied() {
+            let end =
+                range
+                    .dst_offset
+                    .checked_add(range.len())
+                    .ok_or_else(|| CodecError::Decode {
+                        codec: "test".to_string(),
+                        message: "invalid decode slice".to_string(),
+                    })?;
+            if range.src_start > range.src_end || range.src_end > decoded.len() || end > out.len() {
+                return Err(CodecError::Decode {
+                    codec: "test".to_string(),
+                    message: "invalid decode slice".to_string(),
+                });
+            }
+            out[range.dst_offset..end].copy_from_slice(&decoded[range.src_start..range.src_end]);
+        }
+        Ok(out)
     }
 
     #[derive(Debug)]

@@ -21,11 +21,13 @@ from __future__ import annotations
 import os
 import warnings
 from collections.abc import Mapping as MappingABC
+from dataclasses import dataclass, replace
 from os import PathLike
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from scdata.data._collate import stitch_dense_collate
 from scdata.data._dataloader import ScDataBatch, ScDataLoader
+from scdata.data._dataset import DatasetCollection, DenseDataset, SparseDataset
 from scdata.data._index import CellIndexDataset
 from scdata.data._stats import _bank_config_summary
 from scdata.databank import (
@@ -49,12 +51,19 @@ __all__ = ["Corpus"]
 _GeneAlignment = Literal["strict", "union", "intersection", "none"]
 
 
+@dataclass(frozen=True, slots=True)
+class _CorpusEntry:
+    dataset: DenseDataset | SparseDataset
+    matrix_key: str
+
+
 class Corpus:
     """A registered multi-dataset corpus ready to build training loaders.
 
     Args:
-        paths: Store paths (``.zarr.zip`` archive or ``.zarr`` directory) in
-            ``file_id`` order — the order sampler indices map to.
+        paths: Dataset sources in ``file_id`` order.  Each item may be a store
+            path, ``(path, matrix_key)``, a mapping, or an already-constructed
+            :class:`DenseDataset` / :class:`SparseDataset`.
         bank: Optional pre-built bank.  When ``None`` (default) a bank is
             created from ``bank_config`` and owned by this Corpus (closed on
             :meth:`close`); when supplied, the caller owns it and ``close``
@@ -83,6 +92,7 @@ class Corpus:
         "_owns_bank",
         "_bank_config",
         "_dataset_ids",
+        "_matrix_keys",
         "_gene_names",
         "_missing",
         "_cells_per_file",
@@ -90,7 +100,7 @@ class Corpus:
 
     def __init__(
         self,
-        paths: "Iterable[str | PathLike[str]]",
+        paths: "Iterable[str | PathLike[str] | tuple[str | PathLike[str], str] | Mapping[str, Any] | DenseDataset | SparseDataset]",
         *,
         bank: ScDataBank | None = None,
         bank_config: "DataBankConfig | Mapping[str, Any] | None" = None,
@@ -99,8 +109,8 @@ class Corpus:
         gene_alignment: _GeneAlignment = "strict",
         missing: "MissingGenePolicy | str | None" = None,
     ) -> None:
-        path_list = [os.fspath(p) for p in paths]
-        if not path_list:
+        entries = _resolve_corpus_entries(paths, layer=layer, matrix=matrix)
+        if not entries:
             raise ValueError("paths must be a non-empty iterable of store paths")
         if gene_alignment not in ("strict", "union", "intersection", "none"):
             raise ValueError(
@@ -132,10 +142,11 @@ class Corpus:
         # bank is then closed; an external bank is left open for the caller.
         registered: list[DatasetId] = []
         try:
-            datasets = [launch(p, layer=layer, matrix=matrix) for p in path_list]
+            datasets = [entry.dataset for entry in entries]
             registered = bank.register(datasets)
             # register(Iterable[Dataset]) -> list[DatasetId], in input order.
             self._dataset_ids: tuple[DatasetId, ...] = tuple(registered)
+            self._matrix_keys: tuple[str, ...] = tuple(entry.matrix_key for entry in entries)
             self._cells_per_file: tuple[int, ...] = tuple(
                 bank.dataset_num_cells(did) for did in self._dataset_ids
             )
@@ -163,6 +174,11 @@ class Corpus:
     def dataset_ids(self) -> tuple[DatasetId, ...]:
         """Registered dataset handles, in ``file_id`` order."""
         return self._dataset_ids
+
+    @property
+    def matrix_keys(self) -> tuple[str, ...]:
+        """Selected source matrix key for each ``file_id`` (for example ``"X"``)."""
+        return self._matrix_keys
 
     @property
     def gene_names(self) -> tuple[str, ...] | None:
@@ -264,7 +280,7 @@ class Corpus:
     def from_bank(
         cls,
         bank: ScDataBank,
-        paths: "Iterable[str | PathLike[str]]",
+        paths: "Iterable[str | PathLike[str] | tuple[str | PathLike[str], str] | Mapping[str, Any] | DenseDataset | SparseDataset]",
         *,
         layer: str | None = None,
         matrix: str | None = None,
@@ -367,3 +383,136 @@ def _normalize_bank_config(
     raise TypeError(
         f"bank_config must be DataBankConfig, a mapping, or None; got {type(bank_config).__name__}"
     )
+
+
+def _resolve_corpus_entries(
+    paths: "Iterable[str | PathLike[str] | tuple[str | PathLike[str], str] | Mapping[str, Any] | DenseDataset | SparseDataset]",
+    *,
+    layer: str | None,
+    matrix: str | None,
+) -> tuple[_CorpusEntry, ...]:
+    default_key = _resolve_matrix_key(layer=layer, matrix=matrix)
+    return tuple(_coerce_corpus_item(item, default_key) for item in paths)
+
+
+def _coerce_corpus_item(item: object, default_key: str) -> _CorpusEntry:
+    if isinstance(item, (DenseDataset, SparseDataset)):
+        return _CorpusEntry(item, default_key)
+    if isinstance(item, MappingABC):
+        return _coerce_mapping_item(item, default_key)
+    if isinstance(item, tuple):
+        return _coerce_tuple_item(item)
+    return _coerce_path_item(item, default_key)
+
+
+def _coerce_tuple_item(item: tuple[object, ...]) -> _CorpusEntry:
+    if len(item) != 2:
+        raise TypeError("tuple corpus entries must be (path, matrix_key)")
+    path, matrix = item
+    matrix_key = _resolve_matrix_key(layer=None, matrix=_coerce_selector(matrix, "matrix_key"))
+    return _coerce_path_item(path, matrix_key)
+
+
+def _coerce_mapping_item(item: MappingABC[str, object], default_key: str) -> _CorpusEntry:
+    source_keys = [key for key in ("path", "dataset", "collection") if key in item]
+    if len(source_keys) != 1:
+        raise TypeError("mapping corpus entries must contain exactly one of: path, dataset, collection")
+    matrix_key = _matrix_key_from_mapping(item, default_key)
+
+    source_key = source_keys[0]
+    if source_key == "path":
+        return _coerce_path_item(item["path"], matrix_key)
+    if source_key == "collection":
+        collection = item["collection"]
+        if not isinstance(collection, DatasetCollection):
+            raise TypeError(
+                f"collection must be DatasetCollection, got {type(collection).__name__}"
+            )
+        return _CorpusEntry(collection[matrix_key], matrix_key)
+
+    dataset = item["dataset"]
+    if not isinstance(dataset, (DenseDataset, SparseDataset)):
+        raise TypeError(f"dataset must be DenseDataset or SparseDataset, got {type(dataset).__name__}")
+    if "store_root" in item and item["store_root"] is not None:
+        dataset = _with_store_root(dataset, item["store_root"])
+    return _CorpusEntry(dataset, matrix_key)
+
+
+def _coerce_path_item(path: object, matrix_key: str) -> _CorpusEntry:
+    store_path = _coerce_str_path(path, "corpus path entries")
+    return _CorpusEntry(launch(store_path, matrix=matrix_key), matrix_key)
+
+
+def _with_store_root(
+    dataset: DenseDataset | SparseDataset,
+    store_root: object,
+) -> DenseDataset | SparseDataset:
+    root = _coerce_str_path(store_root, "store_root")
+    return cast(DenseDataset | SparseDataset, replace(dataset, store_root=root))
+
+
+def _coerce_str_path(value: object, context: str) -> str:
+    if not isinstance(value, (str, PathLike)):
+        raise TypeError(f"{context} must be str or PathLike, got {type(value).__name__}")
+    path = os.fspath(value)
+    if not isinstance(path, str):
+        raise TypeError(f"{context} must resolve to a str path, got {type(path).__name__}")
+    return path
+
+
+def _matrix_key_from_mapping(item: MappingABC[str, object], default_key: str) -> str:
+    layer = item.get("layer")
+    selectors = [
+        value
+        for key, value in (
+            ("matrix", item.get("matrix")),
+            ("matrix_key", item.get("matrix_key")),
+            ("X", item.get("X")),
+        )
+        if key in item and value is not None
+    ]
+    if layer is not None and selectors:
+        raise ValueError("mapping corpus entries must pass either layer or a matrix key, not both")
+    if len(selectors) > 1:
+        raise ValueError("mapping corpus entries must pass only one matrix selector")
+    if layer is not None:
+        return _resolve_matrix_key(layer=_coerce_selector(layer, "layer"), matrix=None)
+    if selectors:
+        return _resolve_matrix_key(layer=None, matrix=_coerce_selector(selectors[0], "matrix_key"))
+    return default_key
+
+
+def _coerce_selector(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _resolve_matrix_key(*, layer: str | None, matrix: str | None) -> str:
+    if layer is not None and matrix is not None:
+        raise ValueError("pass either layer= or matrix=, not both")
+    if layer is not None:
+        return _layer_matrix_key(layer)
+    if matrix is None:
+        return "X"
+    key = matrix.strip("/")
+    if key == "X":
+        return "X"
+    if key in ("raw", "raw/X"):
+        return "raw/X"
+    if "/" not in key:
+        return _layer_matrix_key(key)
+    if key.startswith("layers/"):
+        name = key[len("layers/") :]
+        if name and "/" not in name:
+            return key
+    raise ValueError(
+        f"unsupported matrix key {matrix!r}; expected 'X', 'layers/<name>', or 'raw/X'"
+    )
+
+
+def _layer_matrix_key(layer: str) -> str:
+    name = str(layer)
+    if not name or "/" in name:
+        raise ValueError(f"layer names must be non-empty direct children, got {layer!r}")
+    return f"layers/{name}"

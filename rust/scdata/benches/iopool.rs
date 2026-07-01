@@ -230,6 +230,7 @@ fn uring_config(args: &Args) -> IoConfig {
 fn base_config(args: &Args) -> BaseIoConfig {
     BaseIoConfig {
         max_in_flight: args.inflight,
+        queue_capacity: args.inflight.saturating_mul(4).max(args.inflight),
         priority_levels: 2,
         queue_shards: args.shards,
         assume_non_overlapping_reads: true,
@@ -277,6 +278,9 @@ fn parse_args() -> Result<Args, String> {
                 args.duplicate_fanout = parse_next(&mut iter, "--duplicate-fanout")?
             }
             "--backend" => args.backend = next_arg(&mut iter, "--backend")?,
+            "--bench" => {
+                // Cargo passes this to custom bench binaries.
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);

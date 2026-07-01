@@ -4,6 +4,9 @@ use crate::profile::{
     ProfileScopeKind, ProfileSnapshot, ProfileTimer,
 };
 
+use super::super::config::ProjectedSparseDataGroupStrategy;
+use super::super::sparse::SparseProjectedDataGroupProfiler;
+
 crate::scdata_profile_component!(pub(crate) const DATABANK_COMPONENT = "databank");
 
 crate::scdata_profile_scope!(
@@ -98,6 +101,40 @@ const SCATTER_NS: ProfileMetricId =
     ProfileMetricId::duration(DATABANK_PREFETCH_ASSEMBLE_SCOPE, "scatter");
 const SCATTER_CALLS: ProfileMetricId =
     ProfileMetricId::count(DATABANK_PREFETCH_ASSEMBLE_SCOPE, "scatter-calls");
+const SPARSE_PROJECTED_SELECTED_ONLY_CALLS: ProfileMetricId = ProfileMetricId::count(
+    DATABANK_PREFETCH_ASSEMBLE_SCOPE,
+    "sparse-projected-selected-only",
+);
+const SPARSE_PROJECTED_READ_ALL_CALLS: ProfileMetricId = ProfileMetricId::count(
+    DATABANK_PREFETCH_ASSEMBLE_SCOPE,
+    "sparse-projected-read-all",
+);
+const SPARSE_PROJECTED_TOTAL_GROUPS: ProfileMetricId = ProfileMetricId::count(
+    DATABANK_PREFETCH_ASSEMBLE_SCOPE,
+    "sparse-projected-total-groups",
+);
+const SPARSE_PROJECTED_SELECTED_GROUPS: ProfileMetricId = ProfileMetricId::count(
+    DATABANK_PREFETCH_ASSEMBLE_SCOPE,
+    "sparse-projected-selected-groups",
+);
+const SPARSE_PROJECTED_EMPTY_SELECTIONS: ProfileMetricId = ProfileMetricId::count(
+    DATABANK_PREFETCH_ASSEMBLE_SCOPE,
+    "sparse-projected-empty-selections",
+);
+const SPARSE_PROJECTED_INDEX_SCAN_NS: ProfileMetricId = ProfileMetricId::duration(
+    DATABANK_PREFETCH_ASSEMBLE_SCOPE,
+    "sparse-projected-index-scan",
+);
+const SPARSE_PROJECTED_DATA_LOAD_NS: ProfileMetricId =
+    ProfileMetricId::duration(DATABANK_PREFETCH_MEMORY_SCOPE, "sparse-projected-data-load");
+const SPARSE_PROJECTED_DATA_LOAD_CALLS: ProfileMetricId = ProfileMetricId::count(
+    DATABANK_PREFETCH_MEMORY_SCOPE,
+    "sparse-projected-data-load-calls",
+);
+const SPARSE_PROJECTED_SELECTED_BYTES: ProfileMetricId =
+    ProfileMetricId::bytes(DATABANK_PREFETCH_MEMORY_SCOPE, "sparse-projected-selected");
+const SPARSE_PROJECTED_DATA_BYTES: ProfileMetricId =
+    ProfileMetricId::bytes(DATABANK_PREFETCH_MEMORY_SCOPE, "sparse-projected-data");
 const ASSEMBLED_BATCHES: ProfileMetricId =
     ProfileMetricId::count(DATABANK_PREFETCH_ASSEMBLE_SCOPE, "batches");
 const OUTPUT_CELLS: ProfileMetricId =
@@ -400,6 +437,53 @@ impl ScheduledPrefetchProfiler {
         } else {
             println!("{} {}", snapshot.summary_line(), metrics);
         }
+    }
+}
+
+impl SparseProjectedDataGroupProfiler for ScheduledPrefetchProfiler {
+    fn start_sparse_projected_index_scan(&self) -> ProfileTimer {
+        self.timer_for_metric(SPARSE_PROJECTED_INDEX_SCAN_NS)
+    }
+
+    fn record_sparse_projected_index_scan(&self, started: ProfileTimer) {
+        self.record_timer(SPARSE_PROJECTED_INDEX_SCAN_NS, started);
+    }
+
+    fn start_sparse_projected_data_load(&self) -> ProfileTimer {
+        self.timer_for_metric(SPARSE_PROJECTED_DATA_LOAD_NS)
+    }
+
+    fn record_sparse_projected_data_load(&self, started: ProfileTimer, bytes: usize) {
+        self.record(|recorder| {
+            recorder.record_timer(SPARSE_PROJECTED_DATA_LOAD_NS, started);
+            recorder.inc(SPARSE_PROJECTED_DATA_LOAD_CALLS);
+            recorder.add_usize(SPARSE_PROJECTED_DATA_BYTES, bytes);
+        });
+    }
+
+    fn record_sparse_projected_groups(
+        &self,
+        strategy: ProjectedSparseDataGroupStrategy,
+        total_groups: usize,
+        selected_groups: usize,
+        selected_bytes: usize,
+    ) {
+        self.record(|recorder| {
+            match strategy {
+                ProjectedSparseDataGroupStrategy::SelectedOnly => {
+                    recorder.inc(SPARSE_PROJECTED_SELECTED_ONLY_CALLS);
+                }
+                ProjectedSparseDataGroupStrategy::ReadAll => {
+                    recorder.inc(SPARSE_PROJECTED_READ_ALL_CALLS);
+                }
+            }
+            recorder.add_usize(SPARSE_PROJECTED_TOTAL_GROUPS, total_groups);
+            recorder.add_usize(SPARSE_PROJECTED_SELECTED_GROUPS, selected_groups);
+            recorder.add_usize(SPARSE_PROJECTED_SELECTED_BYTES, selected_bytes);
+            if selected_groups == 0 {
+                recorder.inc(SPARSE_PROJECTED_EMPTY_SELECTIONS);
+            }
+        });
     }
 }
 

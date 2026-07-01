@@ -165,43 +165,85 @@ impl GeneAxisPlan {
 
 #[derive(Debug, Clone, Default)]
 pub struct MultiBatchCells {
-    parts: Vec<(usize, Vec<usize>)>,
+    cells: Vec<usize>,
+    parts: Vec<BatchPartRange>,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct BatchPart {
-    pub(super) dataset_idx: usize,
-    pub(super) cells: Vec<usize>,
+#[derive(Debug, Clone, Copy)]
+struct BatchPartRange {
+    dataset_idx: usize,
+    start: usize,
+    len: usize,
 }
 
 impl MultiBatchCells {
     pub fn new(parts: Vec<(usize, Vec<usize>)>) -> Self {
-        Self { parts }
-    }
-
-    pub(super) fn from_single(cells: Vec<usize>) -> Self {
+        let total_cells = parts.iter().map(|(_, cells)| cells.len()).sum();
+        let mut out_cells = Vec::with_capacity(total_cells);
+        let mut out_parts = Vec::with_capacity(parts.len());
+        for (dataset_idx, cells) in parts {
+            let start = out_cells.len();
+            let len = cells.len();
+            out_cells.extend(cells);
+            out_parts.push(BatchPartRange {
+                dataset_idx,
+                start,
+                len,
+            });
+        }
         Self {
-            parts: vec![(0, cells)],
+            cells: out_cells,
+            parts: out_parts,
         }
     }
 
-    pub fn parts(&self) -> &[(usize, Vec<usize>)] {
-        &self.parts
+    pub(crate) fn from_flat_parts(cells: Vec<usize>, parts: Vec<(usize, usize)>) -> Self {
+        let mut start = 0usize;
+        let mut out_parts = Vec::with_capacity(parts.len());
+        for (dataset_idx, len) in parts {
+            out_parts.push(BatchPartRange {
+                dataset_idx,
+                start,
+                len,
+            });
+            start += len;
+        }
+        debug_assert_eq!(start, cells.len());
+        Self {
+            cells,
+            parts: out_parts,
+        }
     }
 
-    pub(super) fn into_parts(self) -> Vec<BatchPart> {
-        self.parts
-            .into_iter()
-            .map(|(dataset_idx, cells)| BatchPart { dataset_idx, cells })
-            .collect()
+    pub(super) fn from_single(cells: Vec<usize>) -> Self {
+        let len = cells.len();
+        Self {
+            cells,
+            parts: vec![BatchPartRange {
+                dataset_idx: 0,
+                start: 0,
+                len,
+            }],
+        }
+    }
+
+    pub(super) fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    pub(super) fn part_slices(&self) -> impl Iterator<Item = (usize, &[usize])> + '_ {
+        self.parts.iter().map(|part| {
+            let end = part.start + part.len;
+            (part.dataset_idx, &self.cells[part.start..end])
+        })
+    }
+
+    pub(super) fn into_cells(self) -> Vec<usize> {
+        self.cells
     }
 
     pub(super) fn total_cells(&self) -> DataBankResult<usize> {
-        self.parts.iter().try_fold(0usize, |total, (_, cells)| {
-            total.checked_add(cells.len()).ok_or_else(|| {
-                DataBankError::InvalidConfig("multi batch cell count overflow".to_string())
-            })
-        })
+        Ok(self.cells.len())
     }
 }
 

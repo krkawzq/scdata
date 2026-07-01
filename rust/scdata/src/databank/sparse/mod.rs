@@ -11,6 +11,7 @@ use crate::codecs::{CodecError, SharedCodec};
 
 use super::array::{Array, Chunk, ChunkRef, ChunkSource, DType, DataValue};
 use super::compute::{ComputeJob, DataBankComputePool};
+use super::config::ProjectedSparseDataGroupStrategy;
 use super::dataset::SparseCsrDataset;
 use super::error::{DataBankError, DataBankResult};
 use super::plan::{self, ByteRange, SparseRowSpan};
@@ -18,6 +19,7 @@ use super::plan::{self, ByteRange, SparseRowSpan};
 use super::gene_axis::*;
 use super::util::*;
 
+mod aot;
 mod load;
 mod memory;
 mod planning;
@@ -96,10 +98,12 @@ pub(crate) fn access_sparse_projected<T: DataValue>(
         access,
         compute,
         access_config,
+        ProjectedSparseDataGroupStrategy::SelectedOnly,
         dataset,
         &plan,
         index_bytes,
         gene_axis,
+        None,
         None,
         None,
         out,

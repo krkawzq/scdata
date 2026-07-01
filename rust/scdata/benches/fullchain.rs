@@ -193,6 +193,7 @@ fn run_codec_case(
             decode_ahead_steps: config.access_decode_ahead,
             ready_ahead_steps: config.access_ready_ahead,
         },
+        ..ScheduledPrefetchConfig::default()
     };
 
     bench_existing_profile_round(
@@ -312,6 +313,7 @@ fn databank_config() -> DataBankConfig {
         io_config: IoConfig::Threaded(ThreadedConfig {
             base: BaseIoConfig {
                 max_in_flight: 256,
+                queue_capacity: 1024,
                 priority_levels: 2,
                 queue_shards: 2,
                 assume_non_overlapping_reads: true,

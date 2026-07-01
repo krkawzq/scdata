@@ -9,7 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 import pytest
 
-from scdata.data import CellBatch, ScDataLoader
+from scdata.data import CellBatch, CellIndexDataset, CellIndexPlan, ScDataLoader
 from scdata.data._dataloader import ScDataBatch
 
 
@@ -24,6 +24,7 @@ class _PrefetchCall(TypedDict):
 class _FakeBank:
     def __init__(self) -> None:
         self.calls: list[_PrefetchCall] = []
+        self.indexed_calls = 0
 
     def prefetch(
         self,
@@ -80,8 +81,38 @@ class _FakeBank:
     ) -> Iterator[CellBatch]:
         return self.prefetch(id, batches, genes=genes, missing=missing, dtype=dtype, config=config)
 
+    def prefetch_indexed(
+        self,
+        id: list[str],
+        plan: CellIndexPlan,
+        genes: Iterable[str] | None = None,
+        missing: object | None = None,
+        dtype: object | None = None,
+        config: object | None = None,
+    ) -> Iterator[CellBatch]:
+        self.indexed_calls += 1
 
-def _patch_fake_torch_base(monkeypatch: pytest.MonkeyPatch) -> None:
+        def batches() -> Iterator[list[tuple[int, NDArray[np.intp]]]]:
+            for dataset_index, cell_index in plan.iter_batches():
+                parts: list[tuple[int, list[int]]] = []
+                for dataset_idx, cell_id in zip(dataset_index, cell_index, strict=True):
+                    ds = int(dataset_idx)
+                    if parts and parts[-1][0] == ds:
+                        parts[-1][1].append(int(cell_id))
+                    else:
+                        parts.append((ds, [int(cell_id)]))
+                yield [
+                    (dataset_idx, np.asarray(cells, dtype=np.intp))
+                    for dataset_idx, cells in parts
+                ]
+
+        return self.prefetch(id, batches(), genes=genes, missing=missing, dtype=dtype, config=config)
+
+
+def _patch_fake_torch_base(
+    monkeypatch: pytest.MonkeyPatch,
+    torch_module: object | None = None,
+) -> None:
     def fake_init(
         self: ScDataLoader,
         dataset: list[tuple[int, int]],
@@ -111,7 +142,10 @@ def _patch_fake_torch_base(monkeypatch: pytest.MonkeyPatch) -> None:
         self.sampler = None
 
     monkeypatch.setattr(ScDataLoader.__mro__[1], "__init__", fake_init, raising=False)
-    monkeypatch.setattr("scdata.data._dataloader.torch", object())
+    monkeypatch.setattr(
+        "scdata.data._dataloader.torch",
+        object() if torch_module is None else torch_module,
+    )
 
 
 def test_sc_dataloader_passes_plain_dict_with_existing_cellbatch(
@@ -184,6 +218,66 @@ def test_sc_dataloader_reuses_torch_batch_sampler_order(
     batches = list(iter(loader))
     assert [batch["cell_ids"].tolist() for batch in batches] == [[2, 0], [3]]
     assert [batch["batch"].cells.tolist() for batch in batches] == [[2, 0], [3]]
+    assert bank.indexed_calls == 0
+
+
+def test_sc_dataloader_uses_cell_index_plan_fastpath(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fake_torch_base(monkeypatch)
+
+    bank = _FakeBank()
+    loader = ScDataLoader(
+        bank,
+        CellIndexDataset([3, 2]),
+        batch_size=2,
+        shuffle=False,
+        dataset_ids=["ds0", "ds1"],
+    )
+
+    batches = list(iter(loader))
+    assert bank.indexed_calls == 1
+    assert [
+        [(dataset_idx, cells.tolist()) for dataset_idx, cells in batch]
+        for batch in bank.calls[0]["batches"]
+    ] == [[(0, [0, 1])], [(0, [2]), (1, [0])], [(1, [1])]]
+    assert [batch["file_ids"].tolist() for batch in batches] == [[0, 0], [0, 1], [1]]
+    assert [batch["cell_ids"].tolist() for batch in batches] == [[0, 1], [2, 0], [1]]
+    assert batches[1]["cells"][0].tolist() == [2]
+    assert batches[1]["cells"][1].tolist() == [0]
+
+
+def test_sc_dataloader_index_fastpath_shuffle_uses_torch_global_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    _patch_fake_torch_base(monkeypatch, torch_module=torch)
+
+    def order_for_seed(seed: int) -> list[int]:
+        torch.manual_seed(seed)
+        bank = _FakeBank()
+        loader = ScDataLoader(
+            bank,
+            CellIndexDataset([10]),
+            batch_size=4,
+            shuffle=True,
+            dataset_ids=["ds0"],
+            collect_stats=False,
+        )
+        list(iter(loader))
+        return [
+            int(cell)
+            for batch in bank.calls[0]["batches"]
+            for _, cells in batch
+            for cell in cells
+        ]
+
+    first = order_for_seed(123)
+    second = order_for_seed(123)
+    different_seed = order_for_seed(124)
+
+    assert first == second
+    assert first != different_seed
 
 
 def test_sc_dataloader_single_gene_string_and_dict_prefetch_config(
