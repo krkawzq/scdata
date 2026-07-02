@@ -3,15 +3,14 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 use crate::access::{
-    AccessHandle, AccessItem, AccessRequest, IoBackend, PrefetchCancel, ScheduledAccess,
+    AccessHandle, AccessItem, IoBackend, PrefetchCancel, ScheduledAccess,
     ScheduledAccessConfig,
 };
 
-use super::super::config::{NativeAccessConfig, NativeMode};
+use super::super::config::NativeAccessConfig;
 use super::super::error::{DataBankError, DataBankResult};
 use super::super::native::{
     load_access_items_blosc_lz4_native, NativeBlockDecodedCache, NativeBlockIndexCache,
@@ -57,45 +56,34 @@ impl NativeScheduledContext {
 /// is the *resolved* strategy actually running. Once resolved to
 /// [`Self::BloscLz4Native`], the native worker runs with zero fallback: a decode
 /// failure is a real error, never a silent retreat to the generic path.
-///
-/// The `BloscLz4Native` variant carries the originating `NativeMode`
-/// transitionally: the native worker's per-item fallback path (removed in
-/// Step 5) still branches on `Force` vs `Auto`, so `build` -> `spawn` needs it
-/// until that fallback is gone. Step 5 drops the field along with the fallback.
 #[derive(Clone)]
 pub(crate) enum AccessStrategy {
     /// Generic access-scheduler chunk reads + decode pool path.
     Generic,
     /// Blosc-LZ4 native direct read + block-level scatter path. Zero fallback.
-    BloscLz4Native {
-        ctx: NativeScheduledContext,
-        mode: NativeMode,
-    },
+    BloscLz4Native(NativeScheduledContext),
 }
 
 impl AccessStrategy {
     /// Whether this session runs on the native execution path. Replaces the
     /// scattered `(native_mode, native)` paired queries.
     pub(crate) fn is_native(&self) -> bool {
-        matches!(self, Self::BloscLz4Native { .. })
+        matches!(self, Self::BloscLz4Native(_))
     }
 
     /// Borrow the native context; only valid when [`Self::is_native`] is true.
-    /// Prefer `if let AccessStrategy::BloscLz4Native { ctx, .. } = &strategy`
-    /// so exhaustiveness guarantees safety, rather than `expect`.
+    /// Prefer `if let AccessStrategy::BloscLz4Native(ctx) = &strategy` so
+    /// exhaustiveness guarantees safety, rather than `expect`.
     pub(crate) fn native_ctx(&self) -> Option<&NativeScheduledContext> {
         match self {
             Self::Generic => None,
-            Self::BloscLz4Native { ctx, .. } => Some(ctx),
+            Self::BloscLz4Native(ctx) => Some(ctx),
         }
     }
 
     /// Build this batch's scheduled access iterator. Replaces the 5-arm
-    /// `build_scheduled_batch_access` match. The originating `NativeMode` is
-    /// taken from the `BloscLz4Native` variant and threaded to
-    /// `NativeScheduledAccess::spawn`, which the worker still uses for its
-    /// per-item fallback decision. Step 5 removes that fallback and the
-    /// `mode` field together.
+    /// `build_scheduled_batch_access` match. The native path runs with zero
+    /// fallback: a decode failure surfaces as an `io::Error` to the consumer.
     pub(crate) fn build(
         &self,
         access: AccessHandle,
@@ -108,12 +96,10 @@ impl AccessStrategy {
             Self::Generic => {
                 build_generic_scheduled_access(access, items, access_config, cancel)
             }
-            Self::BloscLz4Native { ctx, mode } => NativeScheduledAccess::spawn(
-                access,
+            Self::BloscLz4Native(ctx) => NativeScheduledAccess::spawn(
                 ctx.clone(),
                 items,
                 access_config,
-                *mode,
                 cancel,
                 allow_small_command_grouping,
             )
@@ -155,15 +141,13 @@ impl Iterator for ScheduledBatchAccess {
 }
 
 pub(crate) async fn load_native_items_ordered_async(
-    access: AccessHandle,
     native: NativeScheduledContext,
     items: Vec<AccessItem>,
-    native_mode: NativeMode,
     cancel: Arc<PrefetchCancel>,
 ) -> DataBankResult<Vec<Vec<u8>>> {
     let total_items = items.len();
     let batch = items.into_iter().enumerate().collect::<Vec<_>>();
-    let results = load_native_batch_or_fallback(access, native, batch, native_mode, cancel).await;
+    let results = load_native_batch(native, batch, cancel).await;
     let mut ordered = (0..total_items).map(|_| None).collect::<Vec<_>>();
     for (seq, result) in results {
         if seq >= total_items {
@@ -189,19 +173,15 @@ pub(crate) async fn load_native_items_ordered_async(
 }
 
 pub(crate) fn load_native_items_ordered_blocking(
-    access: AccessHandle,
     native: NativeScheduledContext,
     items: Vec<AccessItem>,
-    native_mode: NativeMode,
     cancel: Arc<PrefetchCancel>,
 ) -> DataBankResult<Vec<Vec<u8>>> {
     let (reply, rx) = mpsc::sync_channel(1);
     let executor = Arc::clone(&native.executor);
     executor.submit_ordered(NativeOrderedCommand {
-        access,
         native,
         items,
-        native_mode,
         cancel,
         reply,
     })?;
@@ -249,11 +229,9 @@ pub(crate) struct NativeScheduledAccess {
 
 impl NativeScheduledAccess {
     fn spawn(
-        access: AccessHandle,
         native: NativeScheduledContext,
         items: Vec<AccessItem>,
         access_config: ScheduledAccessConfig,
-        native_mode: NativeMode,
         cancel: Arc<PrefetchCancel>,
         allow_small_command_grouping: bool,
     ) -> DataBankResult<Self> {
@@ -261,10 +239,8 @@ impl NativeScheduledAccess {
         let (tx, rx) = flume::bounded(window.max(1));
         let executor = Arc::clone(&native.executor);
         executor.submit(NativeScheduledCommand {
-            access,
             native,
             items,
-            native_mode,
             cancel,
             allow_small_command_grouping,
             window,
@@ -289,10 +265,8 @@ impl Drop for NativeScheduledAccess {
 }
 
 struct NativeScheduledCommand {
-    access: AccessHandle,
     native: NativeScheduledContext,
     items: Vec<AccessItem>,
-    native_mode: NativeMode,
     cancel: Arc<PrefetchCancel>,
     allow_small_command_grouping: bool,
     window: usize,
@@ -300,10 +274,8 @@ struct NativeScheduledCommand {
 }
 
 struct NativeOrderedCommand {
-    access: AccessHandle,
     native: NativeScheduledContext,
     items: Vec<AccessItem>,
-    native_mode: NativeMode,
     cancel: Arc<PrefetchCancel>,
     reply: mpsc::SyncSender<DataBankResult<Vec<Vec<u8>>>>,
 }
@@ -470,10 +442,8 @@ fn native_scheduled_worker_loop(rx: flume::Receiver<NativeExecutorCommand>) {
         if commands.len() == 1 {
             let command = commands.pop().expect("one command");
             runtime.block_on(run_native_scheduled(
-                command.access,
                 command.native,
                 command.items,
-                command.native_mode,
                 command.cancel,
                 command.window,
                 command.tx,
@@ -507,16 +477,12 @@ fn fail_native_executor_command(command: NativeExecutorCommand, message: String)
 
 async fn run_native_ordered(command: NativeOrderedCommand) {
     let NativeOrderedCommand {
-        access,
         native,
         items,
-        native_mode,
         cancel,
         reply,
     } = command;
-    let result =
-        load_native_items_ordered_async(access, native, items, native_mode, Arc::clone(&cancel))
-            .await;
+    let result = load_native_items_ordered_async(native, items, Arc::clone(&cancel)).await;
     if result.is_err() {
         cancel.cancel_in_flight();
     }
@@ -541,10 +507,8 @@ fn should_group_native_commands(command: &NativeScheduledCommand) -> bool {
 }
 
 async fn run_native_scheduled(
-    access: AccessHandle,
     native: NativeScheduledContext,
     items: Vec<AccessItem>,
-    native_mode: NativeMode,
     cancel: Arc<PrefetchCancel>,
     window: usize,
     tx: flume::Sender<io::Result<Vec<u8>>>,
@@ -578,11 +542,10 @@ async fn run_native_scheduled(
                 };
                 batch.push(next);
             }
-            let access = access.clone();
             let native = native.clone();
             let cancel = Arc::clone(&cancel);
             tasks.spawn(async move {
-                load_native_batch_or_fallback(access, native, batch, native_mode, cancel).await
+                load_native_batch(native, batch, cancel).await
             });
         }
 
@@ -657,11 +620,9 @@ async fn run_native_scheduled(
     }
 }
 
-async fn load_native_batch_or_fallback(
-    access: AccessHandle,
+async fn load_native_batch(
     native: NativeScheduledContext,
     batch: Vec<(usize, AccessItem)>,
-    native_mode: NativeMode,
     cancel: Arc<PrefetchCancel>,
 ) -> Vec<(usize, io::Result<Vec<u8>>)> {
     if cancel.is_cancelled() {
@@ -686,34 +647,31 @@ async fn load_native_batch_or_fallback(
     )
     .await;
 
+    // Zero fallback: the strategy resolved to native at spawn time, so a native
+    // decode failure is a real error. `None` (the loader declined this item —
+    // e.g. a non-lz4 blosc variant or an unsupported block table) and `Err`
+    // (IO / decode error) both surface as `io::Error` rather than retreating to
+    // the generic access path.
     match native_result {
         Ok(results) => {
             let mut out = Vec::with_capacity(batch.len());
-            for ((seq, item), result) in batch.into_iter().zip(results) {
+            for ((seq, _), result) in batch.into_iter().zip(results) {
                 let result = match result {
                     Some(bytes) => Ok(bytes),
-                    None if native_mode == NativeMode::Force => Err(io::Error::other(
-                        "native_mode='force' does not support this access item",
+                    None => Err(io::Error::other(
+                        "native loader returned no result for blosc item",
                     )),
-                    None => load_generic_access_item(access.clone(), item).await,
                 };
                 out.push((seq, result));
             }
             out
         }
-        Err(err) if native_mode == NativeMode::Force || !native.config.fallback_to_generic => {
+        Err(err) => {
             let message = err.to_string();
             batch
                 .into_iter()
                 .map(|(seq, _)| (seq, Err(io::Error::other(message.clone()))))
                 .collect()
-        }
-        Err(_) => {
-            let mut out = Vec::with_capacity(batch.len());
-            for (seq, item) in batch {
-                out.push((seq, load_generic_access_item(access.clone(), item).await));
-            }
-            out
         }
     }
 }
@@ -728,9 +686,7 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
     if commands.is_empty() {
         return;
     }
-    let access = commands[0].access.clone();
     let native = commands[0].native.clone();
-    let native_mode = commands[0].native_mode;
     let mut states = Vec::with_capacity(commands.len());
     let mut slots = Vec::new();
     let mut batch = Vec::new();
@@ -765,8 +721,7 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
     }
 
     if !batch.is_empty() {
-        let results =
-            load_native_batch_or_fallback_uncancelled(access, native, batch, native_mode).await;
+        let results = load_native_batch_uncancelled(native, batch).await;
         for (flat_seq, result) in results {
             let Some(&(command_idx, item_idx)) = slots.get(flat_seq) else {
                 continue;
@@ -801,11 +756,9 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
     }
 }
 
-async fn load_native_batch_or_fallback_uncancelled(
-    access: AccessHandle,
+async fn load_native_batch_uncancelled(
     native: NativeScheduledContext,
     batch: Vec<(usize, AccessItem)>,
-    native_mode: NativeMode,
 ) -> Vec<(usize, io::Result<Vec<u8>>)> {
     let items = batch
         .iter()
@@ -822,52 +775,32 @@ async fn load_native_batch_or_fallback_uncancelled(
     )
     .await;
 
+    // Zero fallback, same as `load_native_batch`: `None` and `Err` both surface
+    // as `io::Error`. This variant is the small-command-grouping path and does
+    // not consult the cancel flag before loading (cancellation is checked per
+    // command in `run_native_scheduled_small_commands`).
     match native_result {
         Ok(results) => {
             let mut out = Vec::with_capacity(batch.len());
-            for ((seq, item), result) in batch.into_iter().zip(results) {
+            for ((seq, _), result) in batch.into_iter().zip(results) {
                 let result = match result {
                     Some(bytes) => Ok(bytes),
-                    None if native_mode == NativeMode::Force => Err(io::Error::other(
-                        "native_mode='force' does not support this access item",
+                    None => Err(io::Error::other(
+                        "native loader returned no result for blosc item",
                     )),
-                    None => load_generic_access_item(access.clone(), item).await,
                 };
                 out.push((seq, result));
             }
             out
         }
-        Err(err) if native_mode == NativeMode::Force || !native.config.fallback_to_generic => {
+        Err(err) => {
             let message = err.to_string();
             batch
                 .into_iter()
                 .map(|(seq, _)| (seq, Err(io::Error::other(message.clone()))))
                 .collect()
         }
-        Err(_) => {
-            let mut out = Vec::with_capacity(batch.len());
-            for (seq, item) in batch {
-                out.push((seq, load_generic_access_item(access.clone(), item).await));
-            }
-            out
-        }
     }
-}
-
-async fn load_generic_access_item(access: AccessHandle, item: AccessItem) -> io::Result<Vec<u8>> {
-    let (reply, rx) = oneshot::channel();
-    access
-        .send_async(AccessRequest {
-            key: item.key,
-            codec: item.codec,
-            expected_size: item.expected_size,
-            slice: item.slice,
-            reply,
-        })
-        .await
-        .map_err(|err| io::Error::other(err.to_string()))?;
-    rx.await
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "native fallback task ended"))?
 }
 
 fn native_window(config: &NativeAccessConfig, access_config: ScheduledAccessConfig) -> usize {

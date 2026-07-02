@@ -40,9 +40,11 @@ pub(crate) async fn load_access_item_blosc_lz4_native(
     item: &AccessItem,
     priority: u8,
 ) -> Result<Option<Vec<u8>>, AccessError> {
-    if item.codec.name() != "blosc" {
-        return Ok(None);
-    }
+    // The dispatch layer guarantees every item reaching the native path is
+    // blosc (`Dataset::is_blosc_codec` precondition at spawn time), so the
+    // `codec.name() != "blosc"` guard is gone. `None` still covers the
+    // remaining decline paths (short chunk, non-lz4 header, unsupported block
+    // table); `load_native_batch` turns those into `io::Error` fail-fast.
     let loader = NativeLoadModule::with_block_cache(io, coalesce, block_cache);
     if item.slice == SliceSpec::Full {
         return load_full_blosc_item(&loader, item, priority)
@@ -155,9 +157,10 @@ pub(crate) async fn load_access_items_blosc_lz4_native(
     let mut requests = Vec::new();
 
     for (item_idx, item) in items.iter().enumerate() {
-        if item.codec.name() != "blosc" {
-            continue;
-        }
+        // The blosc guard is gone: every item on the native path is blosc by
+        // the spawn-time precondition. Decline paths below (short chunk,
+        // non-lz4 header, unsupported block table) leave the slot as `None`,
+        // which `load_native_batch` converts to an `io::Error`.
         if item.slice == SliceSpec::Full {
             append_full_chunk_job(
                 item_idx,

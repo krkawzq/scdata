@@ -444,12 +444,12 @@ pub(crate) fn resolve_strategy(
         (NativeMode::Disabled, _, _) => Ok(Generic),
         (NativeMode::Auto, None, _) => Ok(Generic),
         (NativeMode::Auto, Some(ctx), _) if !ctx.config.enabled => Ok(Generic),
-        (NativeMode::Auto, Some(ctx), true) => Ok(BloscLz4Native { ctx, mode }),
+        (NativeMode::Auto, Some(ctx), true) => Ok(BloscLz4Native(ctx)),
         (NativeMode::Auto, Some(_), false) => Ok(Generic),
         (NativeMode::Force, None, _) => Err(DataBankError::InvalidConfig(
             "native_mode='force' requested but native access context is unavailable".to_string(),
         )),
-        (NativeMode::Force, Some(ctx), true) => Ok(BloscLz4Native { ctx, mode }),
+        (NativeMode::Force, Some(ctx), true) => Ok(BloscLz4Native(ctx)),
         (NativeMode::Force, Some(_), false) => Err(DataBankError::InvalidConfig(
             "native_mode='force' but dataset is not fully blosc".to_string(),
         )),
@@ -495,7 +495,7 @@ mod tests {
 
     fn assert_native(strategy: &AccessStrategy) {
         assert!(
-            matches!(strategy, AccessStrategy::BloscLz4Native { .. }),
+            matches!(strategy, AccessStrategy::BloscLz4Native(_)),
             "expected BloscLz4Native, got Generic",
         );
         assert!(strategy.is_native());

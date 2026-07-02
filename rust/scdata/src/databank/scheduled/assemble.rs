@@ -886,7 +886,6 @@ where
         )
     {
         scatter_selected_sparse_groups_fused_native(
-            access,
             strategy,
             selected_plan,
             selected_groups,
@@ -903,7 +902,6 @@ where
 
     if !selected_data_scheduled {
         if let Some(data_group_bytes) = try_load_selected_sparse_group_bytes_ordered_native(
-            access,
             strategy,
             &selected_plan,
             &selected_groups,
@@ -1195,7 +1193,6 @@ fn read_all_selected_scatter_enabled() -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn scatter_selected_sparse_groups_fused_native<T>(
-    access: &AccessHandle,
     strategy: &AccessStrategy,
     selected_plan: SparseBatchPlan,
     selected_groups: Vec<usize>,
@@ -1213,12 +1210,11 @@ where
     // Reached only after `can_use_selected_sparse_ordered_native(strategy)`
     // returned true, so the strategy is `BloscLz4Native`. Destructure instead
     // of `expect` so exhaustiveness carries the guarantee.
-    let AccessStrategy::BloscLz4Native { ctx: native, mode: native_mode } = strategy else {
+    let AccessStrategy::BloscLz4Native(native) = strategy else {
         return Err(DataBankError::InvalidConfig(
             "fused native scatter requires a native strategy".to_string(),
         ));
     };
-    let native_mode = *native_mode;
     let mut items = Vec::with_capacity(selected_groups.len());
     for &group_index in &selected_groups {
         items.push(file_sparse_group_access_item(
@@ -1230,7 +1226,6 @@ where
     let gene_axis_addr = gene_axis as *const GeneAxisPlan as usize;
     let out_addr = buffer.as_mut_ptr() as usize;
     let out_len = buffer.len();
-    let access_for_job = access.clone();
     let native_for_job = native.clone();
     let cancel_for_job = Arc::clone(cancel);
 
@@ -1240,10 +1235,8 @@ where
         Arc::clone(cancel),
         Box::new(move |runtime| {
             let loaded = runtime.block_on(load_native_items_ordered_async(
-                access_for_job,
                 native_for_job,
                 items,
-                native_mode,
                 Arc::clone(&cancel_for_job),
             ))?;
             if loaded.len() != selected_groups.len() {
@@ -1294,7 +1287,6 @@ where
 }
 
 fn try_load_selected_sparse_group_bytes_ordered_native(
-    access: &AccessHandle,
     strategy: &AccessStrategy,
     plan: &SparseBatchPlan,
     selected_groups: &[usize],
@@ -1307,7 +1299,7 @@ fn try_load_selected_sparse_group_bytes_ordered_native(
     }
     // `can_use_selected_sparse_ordered_native` returned true, so the strategy
     // is `BloscLz4Native`. Destructure instead of `expect`.
-    let AccessStrategy::BloscLz4Native { ctx: native, mode: native_mode } = strategy else {
+    let AccessStrategy::BloscLz4Native(native) = strategy else {
         return Ok(None);
     };
 
@@ -1319,10 +1311,8 @@ fn try_load_selected_sparse_group_bytes_ordered_native(
     }
     let load_started = profiler.start_sparse_projected_data_load();
     let loaded = load_native_items_ordered_blocking(
-        access.clone(),
         native.clone(),
         items,
-        *native_mode,
         Arc::clone(cancel),
     );
     profiler.record_sparse_projected_data_load(
