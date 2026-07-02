@@ -70,6 +70,7 @@ pub(crate) fn plan_sparse_batch_with_value_size(
         index_groups,
         data_groups,
         index_bytes,
+        projected_indices: None,
     })
 }
 
@@ -95,6 +96,9 @@ pub(crate) fn push_sparse_index_pieces(
             index_offset: 0,
             elements: piece.elements,
             bytes: piece.bytes,
+            projection_filtered: false,
+            contiguous_output_start: None,
+            projected_index_offset: None,
         })?;
         Ok(())
     })
@@ -140,9 +144,325 @@ pub(crate) fn push_sparse_data_pieces(
             index_offset,
             elements: piece.elements,
             bytes: piece.bytes,
+            projection_filtered: false,
+            contiguous_output_start: None,
+            projected_index_offset: None,
         })?;
         Ok(())
     })
+}
+
+pub(crate) fn plan_sparse_selected_data_batch(
+    dataset: &SparseCsrDataset,
+    plan: &SparseBatchPlan,
+    index_bytes: &[u8],
+    gene_axis: &GeneAxisPlan,
+) -> DataBankResult<SparseBatchPlan> {
+    let Some(projection) = gene_axis.projection() else {
+        return Ok(SparseBatchPlan {
+            index_pieces: Vec::new(),
+            data_pieces: plan.data_pieces.clone(),
+            index_groups: Vec::new(),
+            data_groups: plan.data_groups.clone(),
+            index_bytes: plan.index_bytes,
+            projected_indices: None,
+        });
+    };
+
+    match dataset.index_dtype {
+        DType::U32 => {
+            plan_sparse_selected_data_batch_typed::<u32>(dataset, plan, index_bytes, projection)
+        }
+        DType::I32 => {
+            plan_sparse_selected_data_batch_typed::<i32>(dataset, plan, index_bytes, projection)
+        }
+        DType::U64 => {
+            plan_sparse_selected_data_batch_typed::<u64>(dataset, plan, index_bytes, projection)
+        }
+        DType::I64 => {
+            plan_sparse_selected_data_batch_typed::<i64>(dataset, plan, index_bytes, projection)
+        }
+        dtype => Err(DataBankError::UnsupportedDType {
+            dtype,
+            context: "CSR indices",
+        }),
+    }
+}
+
+fn plan_sparse_selected_data_batch_typed<I>(
+    dataset: &SparseCsrDataset,
+    plan: &SparseBatchPlan,
+    index_bytes: &[u8],
+    projection: &CompiledGeneProjection,
+) -> DataBankResult<SparseBatchPlan>
+where
+    I: CsrIndex,
+{
+    let mut builder = SparsePieceGroupBuilder::with_capacity(plan.data_pieces.len());
+    let contiguous_selected_sources = projection.contiguous_selected_source_range();
+    let contiguous_selected_source_output_start =
+        projection.contiguous_selected_source_output_start();
+    let mut projected_indices = ProjectedIndexBuilder::new(projection.output_genes());
+    for piece in &plan.data_pieces {
+        push_selected_sparse_data_piece_runs::<I>(
+            dataset,
+            piece,
+            index_bytes,
+            projection,
+            contiguous_selected_sources,
+            contiguous_selected_source_output_start,
+            &mut projected_indices,
+            &mut builder,
+        )?;
+    }
+    let (data_pieces, data_groups) = builder.finish();
+    Ok(SparseBatchPlan {
+        index_pieces: Vec::new(),
+        data_pieces,
+        index_groups: Vec::new(),
+        data_groups,
+        index_bytes: plan.index_bytes,
+        projected_indices: projected_indices.finish(),
+    })
+}
+
+fn push_selected_sparse_data_piece_runs<I>(
+    dataset: &SparseCsrDataset,
+    piece: &SparseReadPiece,
+    index_bytes: &[u8],
+    projection: &CompiledGeneProjection,
+    contiguous_selected_sources: Option<(usize, usize)>,
+    contiguous_selected_source_output_start: Option<(usize, usize)>,
+    projected_indices: &mut ProjectedIndexBuilder,
+    builder: &mut SparsePieceGroupBuilder,
+) -> DataBankResult<()>
+where
+    I: CsrIndex,
+{
+    if piece.elements == 0 {
+        return Ok(());
+    }
+    let value_size = piece.bytes.checked_div(piece.elements).ok_or_else(|| {
+        DataBankError::InvalidArrayMeta("CSR selected data piece has zero elements".to_string())
+    })?;
+    if value_size == 0 || value_size * piece.elements != piece.bytes {
+        return Err(DataBankError::InvalidArrayMeta(
+            "CSR selected data piece byte length is not divisible by elements".to_string(),
+        ));
+    }
+    let index_size = std::mem::size_of::<I>();
+    let index_len = piece.elements.checked_mul(index_size).ok_or_else(|| {
+        DataBankError::InvalidArrayMeta("CSR selected index slice length overflow".to_string())
+    })?;
+    let index_end = piece.index_offset.checked_add(index_len).ok_or_else(|| {
+        DataBankError::InvalidArrayMeta("CSR selected index slice offset overflow".to_string())
+    })?;
+    if index_end > index_bytes.len() {
+        return Err(DataBankError::InvalidArrayMeta(
+            "CSR selected index scan is out of range".to_string(),
+        ));
+    }
+
+    let index_ptr = index_bytes[piece.index_offset..index_end]
+        .as_ptr()
+        .cast::<I>();
+    let mut run_start = None;
+    let mut run_projected_start = None;
+    let sorted_contiguous_end = if super::aot::assume_sorted_csr_indices() {
+        contiguous_selected_sources.map(|(_, end)| end)
+    } else {
+        None
+    };
+    for nz in 0..piece.elements {
+        let gene = unsafe { std::ptr::read_unaligned(index_ptr.add(nz)) }.checked_gene()?;
+        if gene >= dataset.num_genes {
+            return Err(DataBankError::GeneIndexOutOfRange {
+                gene,
+                num_genes: dataset.num_genes,
+            });
+        }
+        if sorted_contiguous_end.is_some_and(|end| gene >= end) {
+            if let Some(start) = run_start.take() {
+                let projected_start = run_projected_start.take();
+                push_selected_sparse_data_run(
+                    piece,
+                    start,
+                    nz,
+                    value_size,
+                    index_size,
+                    None,
+                    projected_start,
+                    builder,
+                )?;
+            }
+            break;
+        }
+        let selected = if let Some((start, end)) = contiguous_selected_sources {
+            gene >= start && gene < end
+        } else {
+            projection.output_for_source(gene).is_some()
+        };
+        if selected {
+            if run_start.is_none() {
+                run_start = Some(nz);
+                run_projected_start = Some(projected_indices.len());
+            }
+            let output_col = if let Some((source_start, output_start)) =
+                contiguous_selected_source_output_start
+            {
+                output_start + (gene - source_start)
+            } else {
+                projection.output_for_source(gene).ok_or_else(|| {
+                    DataBankError::InvalidArrayMeta(
+                        "selected CSR gene is missing from projection".to_string(),
+                    )
+                })?
+            };
+            projected_indices.push(output_col)?;
+        } else if let Some(start) = run_start.take() {
+            let projected_start = run_projected_start.take();
+            push_selected_sparse_data_run(
+                piece,
+                start,
+                nz,
+                value_size,
+                index_size,
+                None,
+                projected_start,
+                builder,
+            )?;
+        }
+    }
+    if let Some(start) = run_start {
+        let projected_start = run_projected_start.take();
+        push_selected_sparse_data_run(
+            piece,
+            start,
+            piece.elements,
+            value_size,
+            index_size,
+            None,
+            projected_start,
+            builder,
+        )?;
+    }
+    Ok(())
+}
+
+fn push_selected_sparse_data_run(
+    piece: &SparseReadPiece,
+    run_start: usize,
+    run_end: usize,
+    value_size: usize,
+    index_size: usize,
+    contiguous_output_start: Option<usize>,
+    projected_index_offset: Option<usize>,
+    builder: &mut SparsePieceGroupBuilder,
+) -> DataBankResult<()> {
+    if run_start >= run_end {
+        return Ok(());
+    }
+    let source_start_delta = run_start.checked_mul(value_size).ok_or_else(|| {
+        DataBankError::InvalidArrayMeta("CSR selected data source start overflow".to_string())
+    })?;
+    let source_end_delta = run_end.checked_mul(value_size).ok_or_else(|| {
+        DataBankError::InvalidArrayMeta("CSR selected data source end overflow".to_string())
+    })?;
+    let source_start = piece
+        .source
+        .start
+        .checked_add(source_start_delta)
+        .ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("CSR selected data source start overflow".to_string())
+        })?;
+    let source_end = piece
+        .source
+        .start
+        .checked_add(source_end_delta)
+        .ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("CSR selected data source end overflow".to_string())
+        })?;
+    if source_end > piece.source.end {
+        return Err(DataBankError::InvalidArrayMeta(
+            "CSR selected data run exceeds original data piece".to_string(),
+        ));
+    }
+    let elements = run_end - run_start;
+    let bytes = source_end - source_start;
+    let index_offset = piece
+        .index_offset
+        .checked_add(run_start.checked_mul(index_size).ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("CSR selected index offset overflow".to_string())
+        })?)
+        .ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("CSR selected index offset overflow".to_string())
+        })?;
+    builder.push(SparseReadPiece {
+        chunk: piece.chunk.clone(),
+        source: ByteRange::new(source_start, source_end)?,
+        group_offset: 0,
+        output_offset: 0,
+        output_row: piece.output_row,
+        index_offset,
+        elements,
+        bytes,
+        projection_filtered: true,
+        contiguous_output_start,
+        projected_index_offset,
+    })
+}
+
+enum ProjectedIndexBuilder {
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+}
+
+impl ProjectedIndexBuilder {
+    fn new(output_genes: usize) -> Self {
+        if output_genes <= usize::from(u16::MAX) + 1 {
+            Self::U16(Vec::new())
+        } else {
+            Self::U32(Vec::new())
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U16(values) => values.len(),
+            Self::U32(values) => values.len(),
+        }
+    }
+
+    fn push(&mut self, output_col: usize) -> DataBankResult<()> {
+        match self {
+            Self::U16(values) => {
+                let value =
+                    u16::try_from(output_col).map_err(|_| DataBankError::GeneIndexOutOfRange {
+                        gene: output_col,
+                        num_genes: usize::from(u16::MAX) + 1,
+                    })?;
+                values.push(value);
+            }
+            Self::U32(values) => {
+                let value = u32::try_from(output_col).map_err(|_| {
+                    DataBankError::CsrIndexInvalid(
+                        "projected output column does not fit in u32".to_string(),
+                    )
+                })?;
+                values.push(value);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Option<ProjectedIndexBuffer> {
+        match self {
+            Self::U16(values) if values.is_empty() => None,
+            Self::U16(values) => Some(ProjectedIndexBuffer::U16(values)),
+            Self::U32(values) if values.is_empty() => None,
+            Self::U32(values) => Some(ProjectedIndexBuffer::U32(values)),
+        }
+    }
 }
 
 pub(crate) struct PlannedRangePiece {
@@ -250,6 +570,28 @@ pub(crate) fn sparse_group_key(chunk: &ChunkRef) -> SparseGroupKey {
             expected_size: item.expected_size,
         },
         ChunkRef::Memory {
+            bytes,
+            codec,
+            expected_size,
+            decoded,
+        } => SparseGroupKey::Memory {
+            ptr: bytes.as_ptr() as usize,
+            len: bytes.len(),
+            codec: codec_id(codec),
+            expected_size: *expected_size,
+            decoded: *decoded,
+        },
+    }
+}
+
+pub(crate) fn sparse_group_source_key(source: &SparseGroupSource) -> SparseGroupKey {
+    match source {
+        SparseGroupSource::AccessItem(item) => SparseGroupKey::File {
+            key: item.key,
+            codec: codec_id(&item.codec),
+            expected_size: item.expected_size,
+        },
+        SparseGroupSource::Memory {
             bytes,
             codec,
             expected_size,

@@ -1,39 +1,47 @@
 use super::super::super::util::decode_error;
 use super::super::super::CodecResult;
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct BloscHeader {
-    pub(super) compversion: u8,
-    pub(super) flags: u8,
-    pub(super) typesize: usize,
-    pub(super) decoded_size: usize,
-    pub(super) blocksize: usize,
-    pub(super) compressed_size: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BloscHeader {
+    pub(crate) compversion: u8,
+    pub(crate) flags: u8,
+    pub(crate) typesize: usize,
+    pub(crate) decoded_size: usize,
+    pub(crate) blocksize: usize,
+    pub(crate) compressed_size: usize,
 }
 
 impl BloscHeader {
-    pub(super) fn compformat(self) -> u8 {
+    pub(crate) fn compformat(self) -> u8 {
         (self.flags & 0xe0) >> 5
     }
 
-    pub(super) fn is_memcpyed(self) -> bool {
+    pub(crate) fn is_memcpyed(self) -> bool {
         self.flags & blosc_src::BLOSC_MEMCPYED as u8 != 0
     }
 
-    pub(super) fn is_byte_shuffled(self) -> bool {
+    pub(crate) fn is_byte_shuffled(self) -> bool {
         self.flags & blosc_src::BLOSC_DOSHUFFLE as u8 != 0 && self.typesize > 1
     }
 
-    pub(super) fn is_bit_shuffled(self) -> bool {
+    pub(crate) fn is_bit_shuffled(self) -> bool {
         self.flags & blosc_src::BLOSC_DOBITSHUFFLE as u8 != 0
     }
 
-    pub(super) fn dont_split(self) -> bool {
+    pub(crate) fn dont_split(self) -> bool {
         self.flags & 0x10 != 0
     }
 }
 
-pub(super) fn blosc_header(codec: &str, encoded: &[u8]) -> CodecResult<BloscHeader> {
+pub(crate) fn blosc_header(codec: &str, encoded: &[u8]) -> CodecResult<BloscHeader> {
+    let header = blosc_header_prefix(codec, encoded)?;
+    if header.compressed_size != encoded.len() {
+        return Err(decode_error(codec, "invalid Blosc buffer"));
+    }
+    Ok(header)
+}
+
+pub(crate) fn blosc_header_prefix(codec: &str, encoded: &[u8]) -> CodecResult<BloscHeader> {
     if encoded.len() < blosc_src::BLOSC_MIN_HEADER_LENGTH as usize {
         return Err(decode_error(codec, "buffer is shorter than a Blosc header"));
     }
@@ -53,9 +61,6 @@ pub(super) fn blosc_header(codec: &str, encoded: &[u8]) -> CodecResult<BloscHead
             format!("Blosc decoded payload is too large: {decoded_size}"),
         ));
     }
-    if compressed_size != encoded.len() {
-        return Err(decode_error(codec, "invalid Blosc buffer"));
-    }
     Ok(BloscHeader {
         compversion: encoded[1],
         flags: encoded[2],
@@ -66,6 +71,6 @@ pub(super) fn blosc_header(codec: &str, encoded: &[u8]) -> CodecResult<BloscHead
     })
 }
 
-pub(super) fn blosc_decoded_size(codec: &str, encoded: &[u8]) -> CodecResult<usize> {
+pub(crate) fn blosc_decoded_size(codec: &str, encoded: &[u8]) -> CodecResult<usize> {
     blosc_header(codec, encoded).map(|header| header.decoded_size)
 }

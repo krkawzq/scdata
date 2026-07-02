@@ -86,6 +86,7 @@ pub(super) struct CompiledGeneProjection {
     pub(super) output_by_source: Vec<usize>,
     pub(super) output_names: Vec<GeneNameView>,
     pub(super) selected_sources: Vec<usize>,
+    contiguous_selected_source_output_start: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -426,10 +427,13 @@ impl CompiledGeneProjection {
         }
 
         selected_sources.sort_unstable();
+        let contiguous_selected_source_output_start =
+            contiguous_selected_source_output_start(&selected_sources, &output_by_source);
         Ok(Self {
             output_by_source,
             output_names,
             selected_sources,
+            contiguous_selected_source_output_start,
         })
     }
 
@@ -448,6 +452,21 @@ impl CompiledGeneProjection {
 
     pub(super) fn has_missing_outputs(&self) -> bool {
         self.selected_sources.len() != self.output_names.len()
+    }
+
+    pub(super) fn contiguous_selected_source_range(&self) -> Option<(usize, usize)> {
+        let (&start, rest) = self.selected_sources.split_first()?;
+        let end = start.checked_add(self.selected_sources.len())?;
+        for (offset, &source) in std::iter::once(&start).chain(rest.iter()).enumerate() {
+            if source != start.checked_add(offset)? {
+                return None;
+            }
+        }
+        Some((start, end))
+    }
+
+    pub(super) fn contiguous_selected_source_output_start(&self) -> Option<(usize, usize)> {
+        self.contiguous_selected_source_output_start
     }
 
     pub(super) fn is_identity(&self, dataset_num_genes: usize) -> bool {
@@ -473,6 +492,30 @@ impl CompiledGeneProjection {
         }
         Some(first_output)
     }
+}
+
+fn contiguous_selected_source_output_start(
+    selected_sources: &[usize],
+    output_by_source: &[usize],
+) -> Option<(usize, usize)> {
+    let (&source_start, rest) = selected_sources.split_first()?;
+    let output_start = *output_by_source.get(source_start)?;
+    if output_start == GENE_NOT_SELECTED {
+        return None;
+    }
+    for (offset, &source) in std::iter::once(&source_start)
+        .chain(rest.iter())
+        .enumerate()
+    {
+        if source != source_start.checked_add(offset)? {
+            return None;
+        }
+        let output = output_start.checked_add(offset)?;
+        if *output_by_source.get(source)? != output {
+            return None;
+        }
+    }
+    Some((source_start, output_start))
 }
 
 pub(super) fn validate_dtype_and_cells<T: DataValue>(

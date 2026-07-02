@@ -98,7 +98,9 @@ class AnnDataZarrZipConverter:
     storage while making both registerable by scdata.
 
     Chunks are compressed by default using ``"blosc.lz4.level5"``.  Pass
-    ``compressor=None`` to write uncompressed chunks.
+    ``compressor=None`` to write uncompressed chunks.  Set ``blocksize`` to a
+    positive number of bytes to override Blosc's auto-selected block size on
+    every compressed array; ``0`` leaves it to Blosc.
     """
 
     smart: bool = True
@@ -107,6 +109,7 @@ class AnnDataZarrZipConverter:
     align_cells: bool = True
     layer_format: _LayerFormat = "preserve"
     compressor: _Compressor = _DEFAULT_COMPRESSOR
+    blocksize: int = 0
     output_dir: str | os.PathLike[str] | None = None
     overwrite: bool = True
     read_kwargs: Mapping[str, Any] = field(default_factory=dict)
@@ -135,6 +138,7 @@ class AnnDataZarrZipConverter:
         align_cells: bool | None = None,
         layer_format: _LayerFormat | None = None,
         compressor: Any = _UNSET,
+        blocksize: int | None = None,
         read_kwargs: Mapping[str, Any] | None = None,
         overwrite: bool | None = None,
     ) -> Path:
@@ -165,6 +169,7 @@ class AnnDataZarrZipConverter:
             chunk_size=self.chunk_size if chunk_size is None else chunk_size,
             align_cells=self.align_cells if align_cells is None else align_cells,
             compressor=self.compressor if compressor is _UNSET else compressor,
+            blocksize=self.blocksize if blocksize is None else blocksize,
             store="zip",
         )
 

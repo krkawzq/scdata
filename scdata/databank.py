@@ -84,6 +84,10 @@ from ._scdata import (
     _FillConfig,
     _IoConfig,
     _MissingGenePolicy,
+    _NativeAccessConfig,
+    _NativeBloscConfig,
+    _NativeLoadCoalesceConfig,
+    _NativeLoadConfig,
     _PrefetchPlan,
     _ScheduledAccessConfig,
     _ScheduledPrefetchConfig,
@@ -109,6 +113,11 @@ __all__ = [
     "AccessConfig",
     "AccessCpuConfig",
     "FillConfig",
+    "NativeAccessConfig",
+    "NativeLoadConfig",
+    "NativeLoadCoalesceConfig",
+    "NativeBloscConfig",
+    "NativeMode",
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
     "ProjectedSparseDataGroupStrategy",
@@ -118,6 +127,7 @@ __all__ = [
 
 ProfileSnapshot = dict[str, Any]
 ProjectedSparseDataGroupStrategy = Literal["selected_only", "read_all"]
+NativeMode = Literal["disabled", "auto", "force"]
 
 
 # ===========================================================================
@@ -505,6 +515,62 @@ class FillConfig(_Config):
 
 
 @dataclass(slots=True)
+class NativeLoadCoalesceConfig(_Config):
+    """Native byte-range coalescing policy."""
+
+    max_window_us: int = 50
+    max_merged_len: int = 1024 * 1024
+    max_gap_bytes: int = 16 * 1024
+    max_waste_ratio: float = 0.10
+    min_children: int = 2
+
+
+@dataclass(slots=True)
+class NativeLoadConfig(_Config):
+    """Native byte-range load scheduler settings."""
+
+    scheduler_workers: int = 1
+    io_workers: int = 4
+    coalesce: NativeLoadCoalesceConfig = field(default_factory=NativeLoadCoalesceConfig)
+
+    def __post_init__(self) -> None:
+        self.coalesce = _coerce_config_value(
+            self.coalesce,
+            NativeLoadCoalesceConfig,
+            "coalesce",
+        )
+
+
+@dataclass(slots=True)
+class NativeBloscConfig(_Config):
+    """Native Blosc-LZ4 block handling settings."""
+
+    preload_block_tables: bool = True
+    full_unshuffle_threshold: float = 0.75
+    max_block_size: int = 2 * 1024 * 1024
+
+
+@dataclass(slots=True)
+class NativeAccessConfig(_Config):
+    """Experimental Blosc-LZ4 native access path settings."""
+
+    enabled: bool = False
+    fallback_to_generic: bool = True
+    fused_workers: int = 4
+    request_prefetch_batches: int = 8
+    request_prefetch_blocks: int = 4096
+    memory_budget_bytes: int = 8 * 1024**3
+    response_queue_bytes_soft_limit: int = 4 * 1024**3
+    response_queue_bytes_hard_limit: int = 6 * 1024**3
+    load: NativeLoadConfig = field(default_factory=NativeLoadConfig)
+    blosc: NativeBloscConfig = field(default_factory=NativeBloscConfig)
+
+    def __post_init__(self) -> None:
+        self.load = _coerce_config_value(self.load, NativeLoadConfig, "load")
+        self.blosc = _coerce_config_value(self.blosc, NativeBloscConfig, "blosc")
+
+
+@dataclass(slots=True)
 class DataBankConfig(_Config):
     """Top-level DataBank configuration.
 
@@ -527,6 +593,7 @@ class DataBankConfig(_Config):
     decode_config: DecodePoolConfig = field(default_factory=DecodePoolConfig)
     access_config: AccessConfig = field(default_factory=AccessConfig)
     fill_config: FillConfig = field(default_factory=FillConfig)
+    native_config: NativeAccessConfig = field(default_factory=NativeAccessConfig)
 
     def __post_init__(self) -> None:
         self.io_config = _coerce_config_value(self.io_config, IoConfig, "io_config")
@@ -541,6 +608,11 @@ class DataBankConfig(_Config):
             "access_config",
         )
         self.fill_config = _coerce_config_value(self.fill_config, FillConfig, "fill_config")
+        self.native_config = _coerce_config_value(
+            self.native_config,
+            NativeAccessConfig,
+            "native_config",
+        )
 
 
 @dataclass(slots=True)
@@ -559,6 +631,7 @@ class ScheduledPrefetchConfig(_Config):
     prefetch_step: int = 8
     access: ScheduledAccessConfig = field(default_factory=ScheduledAccessConfig)
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy = "selected_only"
+    native_mode: NativeMode = "disabled"
 
     def __post_init__(self) -> None:
         self.access = _coerce_config_value(self.access, ScheduledAccessConfig, "access")
@@ -567,6 +640,12 @@ class ScheduledPrefetchConfig(_Config):
             raise ValueError(
                 "projected_sparse_data_strategy must be 'selected_only' or 'read_all', "
                 f"got {self.projected_sparse_data_strategy!r}"
+            )
+        native_allowed = {"disabled", "auto", "force", "off", "on", "true", "false", "forced"}
+        if self.native_mode not in native_allowed:
+            raise ValueError(
+                "native_mode must be 'disabled', 'auto', or 'force', "
+                f"got {self.native_mode!r}"
             )
 
 
@@ -589,6 +668,10 @@ _CONFIG_CLASSES: frozenset[type] = frozenset(
         AccessCpuConfig,
         AccessConfig,
         FillConfig,
+        NativeLoadCoalesceConfig,
+        NativeLoadConfig,
+        NativeBloscConfig,
+        NativeAccessConfig,
         DataBankConfig,
         ScheduledAccessConfig,
         ScheduledPrefetchConfig,
@@ -605,6 +688,10 @@ _RUST_CONFIG_TYPES: dict[type, type] = {
     AccessCpuConfig: _AccessCpuConfig,
     AccessConfig: _AccessConfig,
     FillConfig: _FillConfig,
+    NativeLoadCoalesceConfig: _NativeLoadCoalesceConfig,
+    NativeLoadConfig: _NativeLoadConfig,
+    NativeBloscConfig: _NativeBloscConfig,
+    NativeAccessConfig: _NativeAccessConfig,
     DataBankConfig: _DataBankConfig,
     ScheduledAccessConfig: _ScheduledAccessConfig,
     ScheduledPrefetchConfig: _ScheduledPrefetchConfig,
@@ -658,6 +745,7 @@ def _config_from_rust(config: Any) -> Any:
             decode_config=_config_from_rust(config.decode_config),
             access_config=_config_from_rust(config.access_config),
             fill_config=_config_from_rust(config.fill_config),
+            native_config=_config_from_rust(config.native_config),
         )
     if isinstance(config, _IoConfig):
         if config.kind == "uring":
@@ -727,6 +815,39 @@ def _config_from_rust(config: Any) -> Any:
             min_parallel_bytes=config.min_parallel_bytes,
             cpus=config.cpus,
         )
+    if isinstance(config, _NativeLoadCoalesceConfig):
+        return NativeLoadCoalesceConfig(
+            max_window_us=config.max_window_us,
+            max_merged_len=config.max_merged_len,
+            max_gap_bytes=config.max_gap_bytes,
+            max_waste_ratio=config.max_waste_ratio,
+            min_children=config.min_children,
+        )
+    if isinstance(config, _NativeLoadConfig):
+        return NativeLoadConfig(
+            scheduler_workers=config.scheduler_workers,
+            io_workers=config.io_workers,
+            coalesce=_config_from_rust(config.coalesce),
+        )
+    if isinstance(config, _NativeBloscConfig):
+        return NativeBloscConfig(
+            preload_block_tables=config.preload_block_tables,
+            full_unshuffle_threshold=config.full_unshuffle_threshold,
+            max_block_size=config.max_block_size,
+        )
+    if isinstance(config, _NativeAccessConfig):
+        return NativeAccessConfig(
+            enabled=config.enabled,
+            fallback_to_generic=config.fallback_to_generic,
+            fused_workers=config.fused_workers,
+            request_prefetch_batches=config.request_prefetch_batches,
+            request_prefetch_blocks=config.request_prefetch_blocks,
+            memory_budget_bytes=config.memory_budget_bytes,
+            response_queue_bytes_soft_limit=config.response_queue_bytes_soft_limit,
+            response_queue_bytes_hard_limit=config.response_queue_bytes_hard_limit,
+            load=_config_from_rust(config.load),
+            blosc=_config_from_rust(config.blosc),
+        )
     if isinstance(config, _ScheduledAccessConfig):
         return ScheduledAccessConfig(
             prefetch_step=config.prefetch_step,
@@ -741,6 +862,7 @@ def _config_from_rust(config: Any) -> Any:
                 ProjectedSparseDataGroupStrategy,
                 getattr(config, "projected_sparse_data_strategy", "selected_only"),
             ),
+            native_mode=cast(NativeMode, getattr(config, "native_mode", "disabled")),
         )
     raise TypeError(f"not a Rust config object: {type(config).__name__}")
 

@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::access::{AccessItem, PrefetchCancel, ScheduledAccess};
+use crate::access::PrefetchCancel;
 
 use super::super::array::{DType, DataValue};
+use super::super::config::ProjectedSparseDataGroupStrategy;
 use super::super::dataset::Dataset;
 use super::super::error::DataBankResult;
 use super::super::interner::GeneNameView;
@@ -14,6 +15,51 @@ use super::super::plan::DenseSegment;
 use super::super::dense::*;
 use super::super::gene_axis::*;
 use super::super::sparse::*;
+use super::native_access::{NativeScheduledContext, ScheduledBatchAccess};
+
+const PROJECTED_SPARSE_READ_ALL_SMALL_DATA_GROUPS: usize = 8;
+
+pub(crate) fn should_read_all_small_projected_sparse_plan(
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    has_projection: bool,
+    plan: &SparseBatchPlan,
+) -> bool {
+    has_projection
+        && projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::SelectedOnly
+        && read_all_small_projected_sparse_enabled()
+        && !plan.data_groups.is_empty()
+        && plan.data_groups.len() <= PROJECTED_SPARSE_READ_ALL_SMALL_DATA_GROUPS
+        && sparse_plan_output_rows_are_compact(plan)
+}
+
+fn read_all_small_projected_sparse_enabled() -> bool {
+    std::env::var("SCDATA_READ_ALL_SMALL_PROJECTED_SPARSE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+fn sparse_plan_output_rows_are_compact(plan: &SparseBatchPlan) -> bool {
+    let mut distinct_rows = 0usize;
+    let mut min_row = usize::MAX;
+    let mut max_row = 0usize;
+    let mut last_row = None;
+
+    for piece in &plan.data_pieces {
+        let row = piece.output_row;
+        if last_row != Some(row) {
+            distinct_rows += 1;
+            last_row = Some(row);
+            min_row = min_row.min(row);
+            max_row = max_row.max(row);
+        }
+    }
+
+    if distinct_rows <= 1 {
+        return false;
+    }
+    let span = max_row.saturating_sub(min_row).saturating_add(1);
+    span <= distinct_rows.saturating_mul(2)
+}
 
 // ---------------------------------------------------------------------------
 // Scheduled prefetch
@@ -46,6 +92,8 @@ pub(crate) enum SingleDatasetPlan {
         active_rows: usize,
         plan: SparseBatchPlan,
         dataset: Arc<Dataset>,
+        preloaded_index_bytes: Option<Arc<[u8]>>,
+        selected_data_scheduled: bool,
     },
 }
 
@@ -163,12 +211,12 @@ where
 }
 
 pub(crate) type BatchSeq = u64;
-pub(crate) type ScheduledBatchAccess = ScheduledAccess<std::vec::IntoIter<AccessItem>>;
-
 pub(crate) struct PlannedBatch {
     pub(crate) seq: BatchSeq,
     pub(crate) plan: BatchPlan,
     pub(crate) scheduled: ScheduledBatchAccess,
+    pub(crate) native: Option<NativeScheduledContext>,
+    pub(crate) native_mode: super::super::config::NativeMode,
     pub(crate) cancel: Arc<PrefetchCancel>,
 }
 

@@ -10,8 +10,39 @@ use super::super::util::{
     decode_error, output_too_small, reserve_decode_buffer, vec_with_decode_capacity, verify_size,
 };
 use super::super::CodecResult;
-use header::{blosc_decoded_size, blosc_header};
+use header::{blosc_decoded_size, blosc_header, blosc_header_prefix};
 use lz4_fast::try_blosc_lz4_decode_into;
+
+pub(crate) use header::BloscHeader;
+pub(crate) use lz4_fast::{
+    blosc_lz4_block_split_count, decode_blosc_lz4_block, decode_blosc_lz4_block_partial_prefixes,
+    BloscLz4Block, BloscLz4Plan, ValidatedBloscBlockRange,
+};
+pub(crate) use shuffle::unshuffle_bytes;
+
+pub(crate) fn try_blosc_lz4_plan_from_encoded(
+    codec: &str,
+    encoded: &[u8],
+) -> CodecResult<Option<BloscLz4Plan>> {
+    let header = blosc_header(codec, encoded)?;
+    lz4_fast::try_blosc_lz4_plan(codec, encoded, header)
+}
+
+pub(crate) fn try_blosc_lz4_plan_from_prefix(
+    codec: &str,
+    header_table: &[u8],
+) -> CodecResult<Option<BloscLz4Plan>> {
+    let header = blosc_header_prefix(codec, header_table)?;
+    lz4_fast::try_blosc_lz4_plan_from_header_table(codec, header_table, header)
+}
+
+pub(crate) fn blosc_lz4_header_table_len_from_prefix(
+    codec: &str,
+    header_bytes: &[u8],
+) -> CodecResult<Option<usize>> {
+    let header = blosc_header_prefix(codec, header_bytes)?;
+    lz4_fast::blosc_lz4_header_table_len(codec, header)
+}
 
 #[derive(Debug)]
 pub(crate) struct BloscCodec;

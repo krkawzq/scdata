@@ -89,6 +89,11 @@ try:
         FillConfig,
         IoConfig,
         MissingGenePolicy,
+        NativeAccessConfig,
+        NativeBloscConfig,
+        NativeLoadCoalesceConfig,
+        NativeLoadConfig,
+        NativeMode,
         ProjectedSparseDataGroupStrategy,
         ScheduledAccessConfig,
         ScheduledPrefetchConfig,
@@ -112,6 +117,11 @@ except ModuleNotFoundError as exc:
     AccessConfig = _missing("AccessConfig")  # type: ignore[assignment, misc]
     AccessCpuConfig = _missing("AccessCpuConfig")  # type: ignore[assignment, misc]
     FillConfig = _missing("FillConfig")  # type: ignore[assignment, misc]
+    NativeAccessConfig = _missing("NativeAccessConfig")  # type: ignore[assignment, misc]
+    NativeLoadConfig = _missing("NativeLoadConfig")  # type: ignore[assignment, misc]
+    NativeLoadCoalesceConfig = _missing("NativeLoadCoalesceConfig")  # type: ignore[assignment, misc]
+    NativeBloscConfig = _missing("NativeBloscConfig")  # type: ignore[assignment, misc]
+    NativeMode = _missing("NativeMode")  # type: ignore[assignment, misc]
     ScheduledAccessConfig = _missing("ScheduledAccessConfig")  # type: ignore[assignment, misc]
     ScheduledPrefetchConfig = _missing("ScheduledPrefetchConfig")  # type: ignore[assignment, misc]
     ProjectedSparseDataGroupStrategy = _missing("ProjectedSparseDataGroupStrategy")  # type: ignore[assignment, misc]
@@ -141,6 +151,11 @@ __all__ = [
     "AccessConfig",
     "AccessCpuConfig",
     "FillConfig",
+    "NativeAccessConfig",
+    "NativeLoadConfig",
+    "NativeLoadCoalesceConfig",
+    "NativeBloscConfig",
+    "NativeMode",
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
     "ProjectedSparseDataGroupStrategy",

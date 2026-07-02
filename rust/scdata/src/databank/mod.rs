@@ -14,6 +14,7 @@ mod direct;
 mod error;
 mod gene_axis;
 mod interner;
+pub(crate) mod native;
 mod plan;
 mod profile;
 mod registry;
@@ -29,14 +30,15 @@ pub use array::{
 };
 pub use batch::{MissingGenePolicy, MultiBatchCells, PrefetchCells, PrefetchedBatch};
 pub use config::{
-    DataBankConfig, FillConfig, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
+    DataBankConfig, FillConfig, NativeAccessConfig, NativeBloscConfig, NativeLoadCoalesceConfig,
+    NativeLoadConfig, NativeMode, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
 };
 pub use dataset::{Dense1DSpec, Dense2DSpec, SparseCsrSpec};
 pub use error::{DataBankError, DataBankResult};
 pub use interner::GeneNameView;
 pub use registry::DatasetId;
 
-use crate::access::{AccessHandle, AccessScheduler, ScheduledAccessConfig};
+use crate::access::{AccessHandle, AccessScheduler, IoBackend, ScheduledAccessConfig};
 use crate::codecs::DecodePool;
 use crate::iopool::IoPool;
 use crate::profile::{ProfileRuntime, ProfileSnapshot};
@@ -58,6 +60,7 @@ pub struct DataBank {
     interner: GeneInterner,
     config: DataBankConfig,
     profiler: DataBankProfile,
+    native_io_override: Option<Arc<dyn IoBackend>>,
 }
 
 impl DataBank {
@@ -93,6 +96,7 @@ impl DataBank {
             interner: GeneInterner::new(),
             config,
             profiler,
+            native_io_override: None,
         })
     }
 
@@ -129,6 +133,18 @@ impl DataBank {
         self.access.reset_profile();
         self.io_pool.reset_profile();
         self._decode_pool.reset_profile();
+    }
+
+    fn native_scheduled_io(&self) -> Arc<dyn IoBackend> {
+        if let Some(io) = &self.native_io_override {
+            return Arc::clone(io);
+        }
+        Arc::new(IoPoolBackend::new(Arc::clone(&self.io_pool)))
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn set_native_io_override_for_profile(&mut self, io: Arc<dyn IoBackend>) {
+        self.native_io_override = Some(io);
     }
 
     pub fn register_dense_1d(&mut self, spec: Dense1DSpec) -> DataBankResult<DatasetId> {
@@ -666,13 +682,25 @@ impl DataBank {
                 return Err(err);
             }
         };
-        let result = batch::prefetch_cells_scheduled(
-            &self.access,
-            Arc::clone(&self.compute),
-            dataset,
-            batch_source.into_iter(),
-            config,
-        );
+        let result = if config.native_mode == NativeMode::Disabled {
+            batch::prefetch_cells_scheduled(
+                &self.access,
+                Arc::clone(&self.compute),
+                dataset,
+                batch_source.into_iter(),
+                config,
+            )
+        } else {
+            batch::prefetch_cells_scheduled_with_native(
+                &self.access,
+                Arc::clone(&self.compute),
+                dataset,
+                batch_source.into_iter(),
+                config,
+                self.config.native_config.clone(),
+                self.native_scheduled_io(),
+            )
+        };
         self.profiler
             .record_scheduled(started, DataBankScheduledKind::Single, 1, result.is_err());
         result
@@ -706,15 +734,29 @@ impl DataBank {
                 return Err(err);
             }
         };
-        let result = batch::prefetch_cells_scheduled_by_gene_names(
-            &self.access,
-            Arc::clone(&self.compute),
-            dataset,
-            batch_source.into_iter(),
-            gene_names,
-            missing,
-            config,
-        );
+        let result = if config.native_mode == NativeMode::Disabled {
+            batch::prefetch_cells_scheduled_by_gene_names(
+                &self.access,
+                Arc::clone(&self.compute),
+                dataset,
+                batch_source.into_iter(),
+                gene_names,
+                missing,
+                config,
+            )
+        } else {
+            batch::prefetch_cells_scheduled_by_gene_names_with_native(
+                &self.access,
+                Arc::clone(&self.compute),
+                dataset,
+                batch_source.into_iter(),
+                gene_names,
+                missing,
+                config,
+                self.config.native_config.clone(),
+                self.native_scheduled_io(),
+            )
+        };
         self.profiler.record_scheduled(
             started,
             DataBankScheduledKind::SingleByGeneNames,
@@ -749,13 +791,25 @@ impl DataBank {
                 return Err(err);
             }
         };
-        let result = batch::prefetch_cells_scheduled_multi(
-            &self.access,
-            Arc::clone(&self.compute),
-            datasets,
-            batch_source.into_iter(),
-            config,
-        );
+        let result = if config.native_mode == NativeMode::Disabled {
+            batch::prefetch_cells_scheduled_multi(
+                &self.access,
+                Arc::clone(&self.compute),
+                datasets,
+                batch_source.into_iter(),
+                config,
+            )
+        } else {
+            batch::prefetch_cells_scheduled_multi_with_native(
+                &self.access,
+                Arc::clone(&self.compute),
+                datasets,
+                batch_source.into_iter(),
+                config,
+                self.config.native_config.clone(),
+                self.native_scheduled_io(),
+            )
+        };
         self.profiler.record_scheduled(
             started,
             DataBankScheduledKind::Multi,
@@ -793,15 +847,29 @@ impl DataBank {
                 return Err(err);
             }
         };
-        let result = batch::prefetch_cells_scheduled_multi_by_gene_names(
-            &self.access,
-            Arc::clone(&self.compute),
-            datasets,
-            batch_source.into_iter(),
-            gene_names,
-            missing,
-            config,
-        );
+        let result = if config.native_mode == NativeMode::Disabled {
+            batch::prefetch_cells_scheduled_multi_by_gene_names(
+                &self.access,
+                Arc::clone(&self.compute),
+                datasets,
+                batch_source.into_iter(),
+                gene_names,
+                missing,
+                config,
+            )
+        } else {
+            batch::prefetch_cells_scheduled_multi_by_gene_names_with_native(
+                &self.access,
+                Arc::clone(&self.compute),
+                datasets,
+                batch_source.into_iter(),
+                gene_names,
+                missing,
+                config,
+                self.config.native_config.clone(),
+                self.native_scheduled_io(),
+            )
+        };
         self.profiler.record_scheduled(
             started,
             DataBankScheduledKind::MultiByGeneNames,

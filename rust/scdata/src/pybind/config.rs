@@ -4,7 +4,8 @@ use pyo3::prelude::*;
 use crate::access::{AccessConfig, AccessCpuConfig, ScheduledAccessConfig};
 use crate::codecs::DecodePoolConfig;
 use crate::databank::{
-    DataBankConfig, FillConfig, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
+    DataBankConfig, FillConfig, NativeAccessConfig, NativeBloscConfig, NativeLoadCoalesceConfig,
+    NativeLoadConfig, NativeMode, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
 };
 use crate::iopool::{BaseIoConfig, IoConfig, ThreadedConfig, UringConfig};
 
@@ -18,6 +19,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAccessConfig>()?;
     m.add_class::<PyAccessCpuConfig>()?;
     m.add_class::<PyFillConfig>()?;
+    m.add_class::<PyNativeAccessConfig>()?;
+    m.add_class::<PyNativeLoadConfig>()?;
+    m.add_class::<PyNativeLoadCoalesceConfig>()?;
+    m.add_class::<PyNativeBloscConfig>()?;
     m.add_class::<PyScheduledAccessConfig>()?;
     m.add_class::<PyScheduledPrefetchConfig>()?;
     Ok(())
@@ -572,6 +577,302 @@ impl PyFillConfig {
     }
 }
 
+#[pyclass(name = "_NativeAccessConfig", module = "scdata._scdata")]
+#[derive(Clone)]
+pub(crate) struct PyNativeAccessConfig {
+    inner: NativeAccessConfig,
+}
+
+#[pymethods]
+impl PyNativeAccessConfig {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: NativeAccessConfig::default(),
+        }
+    }
+
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.inner.enabled
+    }
+
+    #[setter]
+    fn set_enabled(&mut self, value: bool) {
+        self.inner.enabled = value;
+    }
+
+    #[getter]
+    fn fallback_to_generic(&self) -> bool {
+        self.inner.fallback_to_generic
+    }
+
+    #[setter]
+    fn set_fallback_to_generic(&mut self, value: bool) {
+        self.inner.fallback_to_generic = value;
+    }
+
+    #[getter]
+    fn fused_workers(&self) -> usize {
+        self.inner.fused_workers
+    }
+
+    #[setter]
+    fn set_fused_workers(&mut self, value: usize) {
+        self.inner.fused_workers = value;
+    }
+
+    #[getter]
+    fn request_prefetch_batches(&self) -> usize {
+        self.inner.request_prefetch_batches
+    }
+
+    #[setter]
+    fn set_request_prefetch_batches(&mut self, value: usize) {
+        self.inner.request_prefetch_batches = value;
+    }
+
+    #[getter]
+    fn request_prefetch_blocks(&self) -> usize {
+        self.inner.request_prefetch_blocks
+    }
+
+    #[setter]
+    fn set_request_prefetch_blocks(&mut self, value: usize) {
+        self.inner.request_prefetch_blocks = value;
+    }
+
+    #[getter]
+    fn memory_budget_bytes(&self) -> usize {
+        self.inner.memory_budget_bytes
+    }
+
+    #[setter]
+    fn set_memory_budget_bytes(&mut self, value: usize) {
+        self.inner.memory_budget_bytes = value;
+    }
+
+    #[getter]
+    fn response_queue_bytes_soft_limit(&self) -> usize {
+        self.inner.response_queue_bytes_soft_limit
+    }
+
+    #[setter]
+    fn set_response_queue_bytes_soft_limit(&mut self, value: usize) {
+        self.inner.response_queue_bytes_soft_limit = value;
+    }
+
+    #[getter]
+    fn response_queue_bytes_hard_limit(&self) -> usize {
+        self.inner.response_queue_bytes_hard_limit
+    }
+
+    #[setter]
+    fn set_response_queue_bytes_hard_limit(&mut self, value: usize) {
+        self.inner.response_queue_bytes_hard_limit = value;
+    }
+
+    #[getter]
+    fn load(&self) -> PyNativeLoadConfig {
+        PyNativeLoadConfig {
+            inner: self.inner.load.clone(),
+        }
+    }
+
+    #[setter]
+    fn set_load(&mut self, value: PyNativeLoadConfig) {
+        self.inner.load = value.inner;
+    }
+
+    #[getter]
+    fn blosc(&self) -> PyNativeBloscConfig {
+        PyNativeBloscConfig {
+            inner: self.inner.blosc.clone(),
+        }
+    }
+
+    #[setter]
+    fn set_blosc(&mut self, value: PyNativeBloscConfig) {
+        self.inner.blosc = value.inner;
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        validate_result(self.inner.validate())
+    }
+}
+
+#[pyclass(name = "_NativeLoadConfig", module = "scdata._scdata")]
+#[derive(Clone)]
+pub(crate) struct PyNativeLoadConfig {
+    inner: NativeLoadConfig,
+}
+
+#[pymethods]
+impl PyNativeLoadConfig {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: NativeLoadConfig::default(),
+        }
+    }
+
+    #[getter]
+    fn scheduler_workers(&self) -> usize {
+        self.inner.scheduler_workers
+    }
+
+    #[setter]
+    fn set_scheduler_workers(&mut self, value: usize) {
+        self.inner.scheduler_workers = value;
+    }
+
+    #[getter]
+    fn io_workers(&self) -> usize {
+        self.inner.io_workers
+    }
+
+    #[setter]
+    fn set_io_workers(&mut self, value: usize) {
+        self.inner.io_workers = value;
+    }
+
+    #[getter]
+    fn coalesce(&self) -> PyNativeLoadCoalesceConfig {
+        PyNativeLoadCoalesceConfig {
+            inner: self.inner.coalesce.clone(),
+        }
+    }
+
+    #[setter]
+    fn set_coalesce(&mut self, value: PyNativeLoadCoalesceConfig) {
+        self.inner.coalesce = value.inner;
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        validate_result(self.inner.validate())
+    }
+}
+
+#[pyclass(name = "_NativeLoadCoalesceConfig", module = "scdata._scdata")]
+#[derive(Clone)]
+pub(crate) struct PyNativeLoadCoalesceConfig {
+    inner: NativeLoadCoalesceConfig,
+}
+
+#[pymethods]
+impl PyNativeLoadCoalesceConfig {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: NativeLoadCoalesceConfig::default(),
+        }
+    }
+
+    #[getter]
+    fn max_window_us(&self) -> u32 {
+        self.inner.max_window_us
+    }
+
+    #[setter]
+    fn set_max_window_us(&mut self, value: u32) {
+        self.inner.max_window_us = value;
+    }
+
+    #[getter]
+    fn max_merged_len(&self) -> usize {
+        self.inner.max_merged_len
+    }
+
+    #[setter]
+    fn set_max_merged_len(&mut self, value: usize) {
+        self.inner.max_merged_len = value;
+    }
+
+    #[getter]
+    fn max_gap_bytes(&self) -> usize {
+        self.inner.max_gap_bytes
+    }
+
+    #[setter]
+    fn set_max_gap_bytes(&mut self, value: usize) {
+        self.inner.max_gap_bytes = value;
+    }
+
+    #[getter]
+    fn max_waste_ratio(&self) -> f32 {
+        self.inner.max_waste_ratio
+    }
+
+    #[setter]
+    fn set_max_waste_ratio(&mut self, value: f32) {
+        self.inner.max_waste_ratio = value;
+    }
+
+    #[getter]
+    fn min_children(&self) -> usize {
+        self.inner.min_children
+    }
+
+    #[setter]
+    fn set_min_children(&mut self, value: usize) {
+        self.inner.min_children = value;
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        validate_result(self.inner.validate())
+    }
+}
+
+#[pyclass(name = "_NativeBloscConfig", module = "scdata._scdata")]
+#[derive(Clone)]
+pub(crate) struct PyNativeBloscConfig {
+    inner: NativeBloscConfig,
+}
+
+#[pymethods]
+impl PyNativeBloscConfig {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: NativeBloscConfig::default(),
+        }
+    }
+
+    #[getter]
+    fn preload_block_tables(&self) -> bool {
+        self.inner.preload_block_tables
+    }
+
+    #[setter]
+    fn set_preload_block_tables(&mut self, value: bool) {
+        self.inner.preload_block_tables = value;
+    }
+
+    #[getter]
+    fn full_unshuffle_threshold(&self) -> f32 {
+        self.inner.full_unshuffle_threshold
+    }
+
+    #[setter]
+    fn set_full_unshuffle_threshold(&mut self, value: f32) {
+        self.inner.full_unshuffle_threshold = value;
+    }
+
+    #[getter]
+    fn max_block_size(&self) -> usize {
+        self.inner.max_block_size
+    }
+
+    #[setter]
+    fn set_max_block_size(&mut self, value: usize) {
+        self.inner.max_block_size = value;
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        validate_result(self.inner.validate())
+    }
+}
+
 #[pyclass(name = "_DataBankConfig", module = "scdata._scdata")]
 #[derive(Clone)]
 pub(crate) struct PyDataBankConfig {
@@ -633,6 +934,18 @@ impl PyDataBankConfig {
     #[setter]
     fn set_fill_config(&mut self, value: PyFillConfig) {
         self.inner.fill_config = value.inner;
+    }
+
+    #[getter]
+    fn native_config(&self) -> PyNativeAccessConfig {
+        PyNativeAccessConfig {
+            inner: self.inner.native_config.clone(),
+        }
+    }
+
+    #[setter]
+    fn set_native_config(&mut self, value: PyNativeAccessConfig) {
+        self.inner.native_config = value.inner;
     }
 
     fn validate(&self) -> PyResult<()> {
@@ -736,6 +1049,17 @@ impl PyScheduledPrefetchConfig {
     fn set_projected_sparse_data_strategy(&mut self, value: &str) -> PyResult<()> {
         self.inner.projected_sparse_data_strategy =
             ProjectedSparseDataGroupStrategy::parse(value).map_err(PyValueError::new_err)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn native_mode(&self) -> &'static str {
+        self.inner.native_mode.as_str()
+    }
+
+    #[setter]
+    fn set_native_mode(&mut self, value: &str) -> PyResult<()> {
+        self.inner.native_mode = NativeMode::parse(value).map_err(PyValueError::new_err)?;
         Ok(())
     }
 

@@ -104,9 +104,14 @@ pub(crate) fn plan_single_dataset_owned(
             let rows = make_sparse_rows(d)?;
             let value_size = d.data.dtype.item_size();
             let plan = plan_sparse_batch_with_value_size(d, &rows, value_size)?;
-            let items = if gene_axis.projection().is_some()
+            let has_projection = gene_axis.projection().is_some();
+            let items = if has_projection
                 && projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::SelectedOnly
-            {
+                && !should_read_all_small_projected_sparse_plan(
+                    projected_sparse_data_strategy,
+                    has_projection,
+                    &plan,
+                ) {
                 sparse_plan_index_file_access_items(&plan)?
             } else {
                 sparse_plan_file_access_items(&plan)?
@@ -117,6 +122,8 @@ pub(crate) fn plan_single_dataset_owned(
                     active_rows,
                     plan,
                     dataset,
+                    preloaded_index_bytes: None,
+                    selected_data_scheduled: false,
                 },
                 items,
             ))

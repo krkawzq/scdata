@@ -3,18 +3,20 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
-use crate::access::{AccessHandle, PrefetchCancel, ScheduledAccessConfig};
+use crate::access::{AccessHandle, AccessItem, PrefetchCancel, ScheduledAccessConfig};
 use crate::profile::ProfileTimer;
 
 use super::super::array::DataValue;
 use super::super::compute::{ComputeJob, DataBankComputePool};
-use super::super::config::ProjectedSparseDataGroupStrategy;
+use super::super::config::{NativeMode, ProjectedSparseDataGroupStrategy};
 use super::super::dataset::Dataset;
 use super::super::error::{DataBankError, DataBankResult};
 
 use super::super::gene_axis::*;
+use super::super::sparse::*;
 
 use super::assemble::*;
+use super::native_access::{build_scheduled_batch_access, NativeScheduledContext};
 use super::planner::*;
 use super::profile::*;
 use super::types::*;
@@ -30,6 +32,8 @@ where
     pub(crate) datasets: Arc<[Arc<Dataset>]>,
     pub(crate) batch_source: I,
     pub(crate) access_config: ScheduledAccessConfig,
+    pub(crate) native_mode: NativeMode,
+    pub(crate) native: Option<NativeScheduledContext>,
     pub(crate) projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     pub(crate) gene_axes: Arc<MultiGeneAxisPlan>,
     pub(crate) tx: flume::Sender<DataBankResult<PrefetchedBatch<T>>>,
@@ -59,7 +63,7 @@ where
     T: DataValue,
 {
     fn new(prefetch_step: usize, worker_count: usize) -> Self {
-        let response_limit = prefetch_step.min(worker_count.saturating_sub(1).max(1));
+        let response_limit = scheduled_response_limit(prefetch_step, worker_count);
         Self {
             next_read_seq: 0,
             next_emit_seq: 0,
@@ -81,6 +85,16 @@ where
             && self.active_responses == 0
             && self.planned_ready.is_empty()
     }
+}
+
+fn scheduled_response_limit(prefetch_step: usize, worker_count: usize) -> usize {
+    let default_limit = prefetch_step.min(worker_count.saturating_sub(1).max(1));
+    std::env::var("SCDATA_SCHEDULED_RESPONSE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .map(|value| value.min(prefetch_step.max(1)).min(worker_count.max(1)))
+        .unwrap_or(default_limit)
 }
 
 struct CompletedQueue<T>
@@ -246,6 +260,8 @@ where
                 batch,
                 Arc::clone(&self.gene_axes),
                 self.access_config,
+                self.native_mode,
+                self.native.clone(),
                 self.projected_sparse_data_strategy,
                 Arc::clone(&self.cancel),
                 planned_tx.clone(),
@@ -436,6 +452,8 @@ pub(crate) fn make_prefetch_request_job(
     batch: MultiBatchCells,
     gene_axes: Arc<MultiGeneAxisPlan>,
     access_config: ScheduledAccessConfig,
+    native_mode: NativeMode,
+    native: Option<NativeScheduledContext>,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     registry: Arc<PrefetchCancelRegistry>,
     planned_tx: flume::Sender<PlannedMessage>,
@@ -459,21 +477,46 @@ pub(crate) fn make_prefetch_request_job(
                     projected_sparse_data_strategy,
                 );
                 profiler.record_request_plan(plan_started);
-                let (plan, items) = planned?;
+                let (mut plan, mut items) = planned?;
                 if registry.is_cancelled() {
                     return Err(DataBankError::PrefetchCancelled);
                 }
                 let cancel = PrefetchCancel::new(access.clone());
+                preplan_selected_sparse_request(
+                    &access,
+                    native.clone(),
+                    native_mode,
+                    access_config,
+                    projected_sparse_data_strategy,
+                    gene_axes.as_ref(),
+                    Arc::clone(&cancel),
+                    &profiler,
+                    &mut plan,
+                    &mut items,
+                )?;
+                if registry.is_cancelled() || cancel.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
                 let schedule_started = profiler.start_request_schedule();
-                let scheduled_result = access.scheduled(items, access_config);
+                let native_for_response = native.clone();
+                let scheduled_result = build_scheduled_batch_access(
+                    access.clone(),
+                    native,
+                    items,
+                    access_config,
+                    native_mode,
+                    Arc::clone(&cancel),
+                    false,
+                );
                 profiler.record_request_schedule(schedule_started);
-                let mut scheduled = scheduled_result?;
-                scheduled.set_cancel_handle(Arc::clone(&cancel));
+                let scheduled = scheduled_result?;
                 registry.register(seq, Arc::clone(&cancel));
                 Ok(Box::new(PlannedBatch {
                     seq,
                     plan,
                     scheduled,
+                    native: native_for_response,
+                    native_mode,
                     cancel,
                 }))
             }))
@@ -491,6 +534,213 @@ pub(crate) fn make_prefetch_request_job(
         profiler.record_request_total(total_started);
         Ok(())
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preplan_selected_sparse_request(
+    access: &AccessHandle,
+    native: Option<NativeScheduledContext>,
+    native_mode: NativeMode,
+    access_config: ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    gene_axes: &MultiGeneAxisPlan,
+    cancel: Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    plan: &mut BatchPlan,
+    items: &mut Vec<AccessItem>,
+) -> DataBankResult<()> {
+    if !preplan_selected_sparse_enabled()
+        || projected_sparse_data_strategy != ProjectedSparseDataGroupStrategy::SelectedOnly
+    {
+        return Ok(());
+    }
+
+    let mut changed = false;
+    match plan {
+        BatchPlan::Single {
+            dataset_idx, plan, ..
+        } => {
+            changed |= preplan_single_selected_sparse_request(
+                access,
+                native.clone(),
+                native_mode,
+                access_config,
+                projected_sparse_data_strategy,
+                gene_axes.axis_for(*dataset_idx)?,
+                Arc::clone(&cancel),
+                profiler,
+                plan,
+            )?;
+        }
+        BatchPlan::Multi(multi) => {
+            for part in &mut multi.parts {
+                changed |= preplan_single_selected_sparse_request(
+                    access,
+                    native.clone(),
+                    native_mode,
+                    access_config,
+                    projected_sparse_data_strategy,
+                    &part.gene_axis,
+                    Arc::clone(&cancel),
+                    profiler,
+                    &mut part.plan,
+                )?;
+                if cancel.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
+            }
+        }
+    }
+    if changed {
+        *items = batch_plan_file_access_items(plan)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preplan_single_selected_sparse_request(
+    access: &AccessHandle,
+    native: Option<NativeScheduledContext>,
+    native_mode: NativeMode,
+    access_config: ScheduledAccessConfig,
+    projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    gene_axis: &GeneAxisPlan,
+    cancel: Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    plan: &mut SingleDatasetPlan,
+) -> DataBankResult<bool> {
+    let SingleDatasetPlan::Sparse {
+        plan: sparse_plan,
+        dataset,
+        preloaded_index_bytes,
+        selected_data_scheduled,
+        ..
+    } = plan
+    else {
+        return Ok(false);
+    };
+    if *selected_data_scheduled || preloaded_index_bytes.is_some() || cancel.is_cancelled() {
+        return Ok(false);
+    }
+    if gene_axis.projection().is_none()
+        || should_read_all_small_projected_sparse_plan(
+            projected_sparse_data_strategy,
+            true,
+            sparse_plan,
+        )
+    {
+        return Ok(false);
+    }
+    let Dataset::SparseCsr(dataset) = dataset.as_ref() else {
+        return Ok(false);
+    };
+
+    let index_items = sparse_plan_index_file_access_items(sparse_plan)?;
+    let mut index_scheduled = build_scheduled_batch_access(
+        access.clone(),
+        native.clone(),
+        index_items,
+        access_config,
+        native_mode,
+        Arc::clone(&cancel),
+        false,
+    )?;
+    let index_bytes =
+        load_sparse_prefetch_indices(access, &cancel, profiler, sparse_plan, &mut index_scheduled)?;
+    if let Some(extra) = index_scheduled.next() {
+        return match extra {
+            Ok(_) => Err(DataBankError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scheduled CSR index preplan returned extra output",
+            ))),
+            Err(err) => Err(DataBankError::Io(err)),
+        };
+    }
+    if cancel.is_cancelled() {
+        return Err(DataBankError::PrefetchCancelled);
+    }
+
+    let selected_plan =
+        plan_sparse_selected_data_batch(dataset, sparse_plan, index_bytes.as_ref(), gene_axis)?;
+    let defer_selected_data = preplan_selected_sparse_defer_data_enabled()
+        && can_defer_selected_sparse_data_to_response(native.as_ref(), native_mode);
+    *sparse_plan = selected_plan;
+    *preloaded_index_bytes = Some(Arc::from(index_bytes.into_boxed_slice()));
+    *selected_data_scheduled = !defer_selected_data;
+    Ok(true)
+}
+
+fn batch_plan_file_access_items(plan: &BatchPlan) -> DataBankResult<Vec<AccessItem>> {
+    let mut items = Vec::new();
+    match plan {
+        BatchPlan::Single { plan, .. } => append_single_plan_file_access_items(plan, &mut items)?,
+        BatchPlan::Multi(multi) => {
+            for part in &multi.parts {
+                append_single_plan_file_access_items(&part.plan, &mut items)?;
+            }
+        }
+    }
+    Ok(items)
+}
+
+fn append_single_plan_file_access_items(
+    plan: &SingleDatasetPlan,
+    items: &mut Vec<AccessItem>,
+) -> DataBankResult<()> {
+    match plan {
+        SingleDatasetPlan::Dense { groups, .. } => {
+            items.append(&mut dense_group_access_items(groups)?);
+        }
+        SingleDatasetPlan::Sparse {
+            plan,
+            preloaded_index_bytes,
+            selected_data_scheduled,
+            ..
+        } => {
+            if !selected_sparse_data_deferred_to_response(
+                plan,
+                preloaded_index_bytes,
+                *selected_data_scheduled,
+            ) {
+                items.append(&mut sparse_plan_file_access_items(plan)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn selected_sparse_data_deferred_to_response(
+    plan: &SparseBatchPlan,
+    preloaded_index_bytes: &Option<Arc<[u8]>>,
+    selected_data_scheduled: bool,
+) -> bool {
+    preloaded_index_bytes.is_some()
+        && !selected_data_scheduled
+        && plan.index_groups.is_empty()
+        && plan.index_pieces.is_empty()
+}
+
+fn preplan_selected_sparse_enabled() -> bool {
+    std::env::var("SCDATA_PREPLAN_SELECTED_SPARSE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+fn preplan_selected_sparse_defer_data_enabled() -> bool {
+    std::env::var("SCDATA_PREPLAN_SELECTED_SPARSE_DEFER_DATA")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn can_defer_selected_sparse_data_to_response(
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
+) -> bool {
+    match (native_mode, native) {
+        (NativeMode::Disabled, _) | (NativeMode::Force, None) | (NativeMode::Auto, None) => false,
+        (NativeMode::Auto, Some(native)) => native.config.enabled,
+        (NativeMode::Force, Some(_)) => true,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -517,6 +767,8 @@ where
             seq,
             plan,
             mut scheduled,
+            native,
+            native_mode,
             cancel,
         } = planned;
         let _guard = ActiveBatchGuard {
@@ -536,6 +788,8 @@ where
                     gene_axes.as_ref(),
                     &cancel,
                     &profiler,
+                    native.as_ref(),
+                    native_mode,
                     plan,
                     &mut scheduled,
                 )?;

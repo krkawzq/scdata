@@ -29,4 +29,6 @@ rust/**/target/
 
 # OS / editor
 .DS_Store
-docs/
+docs/*
+!docs/
+!docs/blosc-lz4-native-refactor.md

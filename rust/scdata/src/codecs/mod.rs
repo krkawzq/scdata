@@ -19,6 +19,12 @@ use std::sync::Arc;
 
 pub use buffer::DecodeBuffer;
 pub use error::{CodecError, CodecResult};
+pub(crate) use impls::{
+    blosc_lz4_block_split_count, blosc_lz4_header_table_len_from_prefix, decode_blosc_lz4_block,
+    decode_blosc_lz4_block_partial_prefixes, try_blosc_lz4_plan_from_encoded,
+    try_blosc_lz4_plan_from_prefix, unshuffle_bytes, BloscHeader, BloscLz4Block, BloscLz4Plan,
+    ValidatedBloscBlockRange,
+};
 pub use impls::{UncompressedCodec, UnsupportedCodec};
 pub use pipeline::CodecPipeline;
 pub use pool::{DecodeFuture, DecodeOutput, DecodePool, DecodePoolConfig, DecodeRequest};

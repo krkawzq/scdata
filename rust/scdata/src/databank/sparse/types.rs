@@ -1,12 +1,13 @@
 use super::*;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SparseBatchPlan {
     pub(crate) index_pieces: Vec<SparseReadPiece>,
     pub(crate) data_pieces: Vec<SparseReadPiece>,
     pub(crate) index_groups: Vec<SparseReadGroup>,
     pub(crate) data_groups: Vec<SparseReadGroup>,
     pub(crate) index_bytes: usize,
+    pub(crate) projected_indices: Option<ProjectedIndexBuffer>,
 }
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,15 @@ pub(crate) struct SparseReadPiece {
     pub(crate) index_offset: usize,
     pub(crate) elements: usize,
     pub(crate) bytes: usize,
+    pub(crate) projection_filtered: bool,
+    pub(crate) contiguous_output_start: Option<usize>,
+    pub(crate) projected_index_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ProjectedIndexBuffer {
+    U16(Vec<u16>),
+    U32(Vec<u32>),
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +83,8 @@ pub(crate) struct SparseProjectionCtx<'a> {
     pub(crate) num_genes: usize,
     pub(crate) output_genes: usize,
     pub(crate) projection: &'a CompiledGeneProjection,
+    pub(crate) contiguous_selected_source_range: Option<(usize, usize)>,
+    pub(crate) contiguous_selected_source_output_start: Option<(usize, usize)>,
 }
 
 impl CsrIndex for u32 {

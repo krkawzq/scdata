@@ -1,13 +1,11 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::access::{
-    AccessHandle, AccessItem, PrefetchCancel, ScheduledAccess, ScheduledAccessConfig,
-};
+use crate::access::{AccessHandle, PrefetchCancel, ScheduledAccessConfig};
 
 use super::super::array::{DType, DataValue};
 use super::super::compute::DataBankComputePool;
-use super::super::config::ProjectedSparseDataGroupStrategy;
+use super::super::config::{NativeMode, ProjectedSparseDataGroupStrategy};
 use super::super::dataset::{Dataset, SparseCsrDataset};
 use super::super::error::{DataBankError, DataBankResult};
 use super::super::plan::DenseSegment;
@@ -17,11 +15,16 @@ use super::super::gene_axis::*;
 use super::super::sparse::*;
 use super::super::util::*;
 
+use super::native_access::{
+    build_scheduled_batch_access, load_native_items_ordered_async,
+    load_native_items_ordered_blocking, run_native_custom_blocking, NativeScheduledContext,
+    ScheduledBatchAccess,
+};
 use super::profile::*;
 use super::types::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_planned_batch<T, J>(
+pub(crate) fn assemble_planned_batch<T>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
@@ -29,12 +32,13 @@ pub(crate) fn assemble_planned_batch<T, J>(
     gene_axes: &MultiGeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
     plan: BatchPlan,
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
 ) -> DataBankResult<PrefetchedBatch<T>>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     let assemble_started = profiler.start_assemble_total();
     let result = match plan {
@@ -45,6 +49,8 @@ where
             projected_sparse_data_strategy,
             cancel,
             profiler,
+            native,
+            native_mode,
             plan,
             scheduled,
         ),
@@ -62,6 +68,8 @@ where
                 gene_axis,
                 cancel,
                 profiler,
+                native,
+                native_mode,
                 cells,
                 plan,
                 scheduled,
@@ -81,7 +89,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_single_planned_batch<T, J>(
+pub(crate) fn assemble_single_planned_batch<T>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
@@ -89,13 +97,14 @@ pub(crate) fn assemble_single_planned_batch<T, J>(
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
     cells: Vec<usize>,
     plan: SingleDatasetPlan,
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
 ) -> DataBankResult<PrefetchedBatch<T>>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     match plan {
         SingleDatasetPlan::Dense {
@@ -112,6 +121,8 @@ where
             active_rows: _,
             plan,
             dataset,
+            preloaded_index_bytes,
+            selected_data_scheduled,
         } => {
             if let Dataset::SparseCsr(dataset) = dataset.as_ref() {
                 assemble_sparse_prefetch_batch(
@@ -122,8 +133,12 @@ where
                     gene_axis,
                     cancel,
                     profiler,
+                    native,
+                    native_mode,
                     cells,
                     plan,
+                    preloaded_index_bytes,
+                    selected_data_scheduled,
                     dataset,
                     scheduled,
                 )
@@ -137,19 +152,20 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_multi_prefetch_batch<T, J>(
+pub(crate) fn assemble_multi_prefetch_batch<T>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
     plan: MultiDatasetPlan,
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
 ) -> DataBankResult<PrefetchedBatch<T>>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     let MultiDatasetPlan {
         output_cells,
@@ -161,7 +177,7 @@ where
         .checked_mul(output_genes)
         .ok_or_else(|| DataBankError::InvalidConfig("multi output length overflow".to_string()))?;
     let alloc_started = profiler.start_alloc();
-    let mut buffer = vec![T::zero(); total];
+    let mut buffer = zeroed_values(total);
     profiler.record_alloc(alloc_started);
 
     for part in parts {
@@ -175,6 +191,8 @@ where
             projected_sparse_data_strategy,
             cancel,
             profiler,
+            native,
+            native_mode,
             part,
             total_cells,
             output_genes,
@@ -191,22 +209,23 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scatter_multi_part_into<T, J>(
+pub(crate) fn scatter_multi_part_into<T>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
     part: MultiBatchPlanPart,
     total_cells: usize,
     output_genes: usize,
     buffer: &mut [T],
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
 ) -> DataBankResult<()>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     match part.plan {
         SingleDatasetPlan::Dense {
@@ -249,6 +268,8 @@ where
             active_rows,
             plan,
             dataset,
+            preloaded_index_bytes,
+            selected_data_scheduled,
         } => {
             if active_rows != part.active_rows {
                 return Err(DataBankError::InvalidConfig(format!(
@@ -276,9 +297,13 @@ where
                 &part.gene_axis,
                 cancel,
                 profiler,
+                native,
+                native_mode,
                 total_cells,
                 active_rows,
                 &plan,
+                preloaded_index_bytes,
+                selected_data_scheduled,
                 dataset,
                 scheduled,
                 buffer,
@@ -289,7 +314,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_dense_prefetch_batch<T, J>(
+pub(crate) fn assemble_dense_prefetch_batch<T>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     gene_axis: &GeneAxisPlan,
@@ -300,11 +325,10 @@ pub(crate) fn assemble_dense_prefetch_batch<T, J>(
     groups: Vec<DenseReadGroup>,
     num_genes: usize,
     src_dtype: DType,
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
 ) -> DataBankResult<PrefetchedBatch<T>>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     let output_genes = gene_axis.output_genes(num_genes);
     let total = cells
@@ -312,7 +336,7 @@ where
         .checked_mul(output_genes)
         .ok_or_else(|| DataBankError::InvalidConfig("dense output length overflow".to_string()))?;
     let alloc_started = profiler.start_alloc();
-    let mut buffer = vec![T::zero(); total];
+    let mut buffer = zeroed_values(total);
     profiler.record_alloc(alloc_started);
     scatter_dense_prefetch_into(
         access,
@@ -337,7 +361,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scatter_dense_prefetch_into<T, J>(
+pub(crate) fn scatter_dense_prefetch_into<T>(
     access: &AccessHandle,
     _compute: &DataBankComputePool,
     gene_axis: &GeneAxisPlan,
@@ -349,12 +373,11 @@ pub(crate) fn scatter_dense_prefetch_into<T, J>(
     groups: &[DenseReadGroup],
     num_genes: usize,
     src_dtype: DType,
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
     buffer: &mut [T],
 ) -> DataBankResult<usize>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     let output_genes = gene_axis.output_genes(num_genes);
     let total = rows
@@ -445,7 +468,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_sparse_prefetch_batch<T, J>(
+pub(crate) fn assemble_sparse_prefetch_batch<T>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
@@ -453,14 +476,17 @@ pub(crate) fn assemble_sparse_prefetch_batch<T, J>(
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
     cells: Vec<usize>,
     plan: SparseBatchPlan,
+    preloaded_index_bytes: Option<Arc<[u8]>>,
+    selected_data_scheduled: bool,
     dataset: &SparseCsrDataset,
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
 ) -> DataBankResult<PrefetchedBatch<T>>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     let output_genes = gene_axis.output_genes(dataset.num_genes);
     let total = cells
@@ -468,7 +494,7 @@ where
         .checked_mul(output_genes)
         .ok_or_else(|| DataBankError::InvalidConfig("sparse output length overflow".to_string()))?;
     let alloc_started = profiler.start_alloc();
-    let mut buffer = vec![T::zero(); total];
+    let mut buffer = zeroed_values(total);
     profiler.record_alloc(alloc_started);
     scatter_sparse_prefetch_into(
         access,
@@ -478,9 +504,13 @@ where
         gene_axis,
         cancel,
         profiler,
+        native,
+        native_mode,
         cells.len(),
         cells.len(),
         &plan,
+        preloaded_index_bytes,
+        selected_data_scheduled,
         dataset,
         scheduled,
         &mut buffer,
@@ -494,7 +524,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scatter_sparse_prefetch_into<T, J>(
+pub(crate) fn scatter_sparse_prefetch_into<T>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
@@ -502,16 +532,19 @@ pub(crate) fn scatter_sparse_prefetch_into<T, J>(
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
     rows: usize,
     active_rows: usize,
     plan: &SparseBatchPlan,
+    preloaded_index_bytes: Option<Arc<[u8]>>,
+    selected_data_scheduled: bool,
     dataset: &SparseCsrDataset,
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
     buffer: &mut [T],
 ) -> DataBankResult<usize>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     let output_genes = gene_axis.output_genes(dataset.num_genes);
     let total = rows
@@ -528,11 +561,23 @@ where
             "sparse active row count {active_rows} exceeds output rows {rows}"
         )));
     }
-    let index_bytes = load_sparse_prefetch_indices(access, cancel, profiler, plan, scheduled)?;
+    let index_bytes = match preloaded_index_bytes {
+        Some(bytes) => bytes,
+        None => Arc::from(
+            load_sparse_prefetch_indices(access, cancel, profiler, plan, scheduled)?
+                .into_boxed_slice(),
+        ),
+    };
 
     if gene_axis.projection().is_some() {
         let scatter_started = profiler.start_scatter();
-        if projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::ReadAll {
+        if projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::ReadAll
+            || should_read_all_small_projected_sparse_plan(
+                projected_sparse_data_strategy,
+                true,
+                plan,
+            )
+        {
             scatter_sparse_prefetch_projected_read_all_data(
                 access,
                 cancel,
@@ -545,18 +590,21 @@ where
                 buffer,
             )?;
         } else {
-            load_sparse_data_groups_and_scatter_projected_checked(
+            scatter_sparse_prefetch_projected_selected_data(
                 access,
                 compute,
                 access_config,
-                projected_sparse_data_strategy,
+                native,
+                native_mode,
                 dataset,
                 plan,
                 index_bytes,
                 gene_axis,
-                Some(cancel),
-                Some(active_rows),
-                Some(profiler),
+                cancel,
+                active_rows,
+                profiler,
+                selected_data_scheduled,
+                scheduled,
                 buffer,
             )?;
         }
@@ -580,20 +628,19 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scatter_sparse_prefetch_projected_read_all_data<T, J>(
+pub(crate) fn scatter_sparse_prefetch_projected_read_all_data<T>(
     access: &AccessHandle,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
     dataset: &SparseCsrDataset,
     plan: &SparseBatchPlan,
-    index_bytes: Vec<u8>,
+    index_bytes: Arc<[u8]>,
     gene_axis: &GeneAxisPlan,
-    scheduled: &mut ScheduledAccess<J>,
+    scheduled: &mut ScheduledBatchAccess,
     buffer: &mut [T],
 ) -> DataBankResult<()>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     let selected_bytes = plan
         .data_groups
@@ -605,6 +652,66 @@ where
         plan.data_groups.len(),
         selected_bytes,
     );
+
+    if read_all_selected_scatter_enabled() {
+        let scan_started = profiler.start_sparse_projected_index_scan();
+        let selected_plan =
+            plan_sparse_selected_data_batch(dataset, plan, index_bytes.as_ref(), gene_axis)?;
+        profiler.record_sparse_projected_index_scan(scan_started);
+
+        let mut data_group_bytes = Vec::with_capacity(plan.data_groups.len());
+        for group in &plan.data_groups {
+            if cancel.is_cancelled() {
+                return Err(DataBankError::PrefetchCancelled);
+            }
+            match &group.source {
+                SparseGroupSource::AccessItem(_) => {
+                    let load_started = profiler.start_sparse_projected_data_load();
+                    let bytes = next_scheduled_bytes(scheduled, profiler);
+                    profiler.record_sparse_projected_data_load(
+                        load_started,
+                        bytes.as_ref().map_or(0, Vec::len),
+                    );
+                    let bytes = bytes?;
+                    if bytes.len() != group.bytes {
+                        return Err(DataBankError::InvalidArrayMeta(format!(
+                            "CSR data group decoded length is {}, expected {}",
+                            bytes.len(),
+                            group.bytes
+                        )));
+                    }
+                    data_group_bytes.push(Arc::from(bytes.into_boxed_slice()));
+                }
+                SparseGroupSource::Memory { .. } => {
+                    let load_started = profiler.start_sparse_projected_data_load();
+                    let bytes = load_sparse_group(access, group);
+                    profiler.record_sparse_projected_data_load(
+                        load_started,
+                        bytes.as_ref().map_or(0, Vec::len),
+                    );
+                    let bytes = bytes?;
+                    if bytes.len() != group.bytes {
+                        return Err(DataBankError::InvalidArrayMeta(format!(
+                            "CSR data group decoded length is {}, expected {}",
+                            bytes.len(),
+                            group.bytes
+                        )));
+                    }
+                    data_group_bytes.push(Arc::from(bytes.into_boxed_slice()));
+                }
+            }
+        }
+        scatter_sparse_read_all_groups_with_selected_plan(
+            dataset,
+            plan,
+            &selected_plan,
+            &index_bytes,
+            &data_group_bytes,
+            gene_axis,
+            buffer,
+        )?;
+        return Ok(());
+    }
 
     for group in &plan.data_groups {
         if cancel.is_cancelled() {
@@ -662,16 +769,233 @@ where
     Ok(())
 }
 
-pub(crate) fn load_sparse_prefetch_indices<J>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scatter_sparse_prefetch_projected_selected_data<T>(
+    access: &AccessHandle,
+    compute: &DataBankComputePool,
+    access_config: &ScheduledAccessConfig,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
+    dataset: &SparseCsrDataset,
+    plan: &SparseBatchPlan,
+    index_bytes: Arc<[u8]>,
+    gene_axis: &GeneAxisPlan,
+    cancel: &Arc<PrefetchCancel>,
+    active_rows: usize,
+    profiler: &ScheduledPrefetchProfiler,
+    selected_data_scheduled: bool,
+    scheduled: &mut ScheduledBatchAccess,
+    buffer: &mut [T],
+) -> DataBankResult<()>
+where
+    T: DataValue,
+{
+    if plan.data_groups.is_empty() {
+        return Ok(());
+    }
+
+    if selected_data_scheduled {
+        let selected_bytes = sparse_data_group_bytes(plan);
+        profiler.record_sparse_projected_groups(
+            ProjectedSparseDataGroupStrategy::SelectedOnly,
+            plan.data_groups.len(),
+            plan.data_groups.len(),
+            selected_bytes,
+        );
+        let mut data_group_bytes = Vec::with_capacity(plan.data_groups.len());
+        for group in &plan.data_groups {
+            if cancel.is_cancelled() {
+                return Err(DataBankError::PrefetchCancelled);
+            }
+            let load_started = profiler.start_sparse_projected_data_load();
+            let bytes = load_selected_sparse_group(access, Some(scheduled), group);
+            profiler.record_sparse_projected_data_load(
+                load_started,
+                bytes.as_ref().map_or(0, Vec::len),
+            );
+            let bytes = bytes?;
+            data_group_bytes.push(Arc::from(bytes.into_boxed_slice()));
+        }
+        let scatter_started = profiler.start_scatter();
+        let result = scatter_sparse_data_groups_projected_checked_with_projected_indices(
+            dataset,
+            plan,
+            index_bytes.as_ref(),
+            &data_group_bytes,
+            gene_axis,
+            buffer,
+        );
+        profiler.record_scatter(scatter_started);
+        result?;
+        return Ok(());
+    }
+
+    let selected_plan = if selected_sparse_plan_is_preplanned(plan) {
+        plan.clone()
+    } else {
+        let scan_started = profiler.start_sparse_projected_index_scan();
+        let selected_plan =
+            plan_sparse_selected_data_batch(dataset, plan, index_bytes.as_ref(), gene_axis)?;
+        profiler.record_sparse_projected_index_scan(scan_started);
+        selected_plan
+    };
+
+    let selected_groups = all_sparse_data_group_indices(&selected_plan);
+    let selected_bytes = sparse_data_group_bytes(&selected_plan);
+    profiler.record_sparse_projected_groups(
+        ProjectedSparseDataGroupStrategy::SelectedOnly,
+        plan.data_groups.len(),
+        selected_plan.data_groups.len(),
+        selected_bytes,
+    );
+    if selected_plan.data_groups.is_empty() {
+        return Ok(());
+    }
+
+    let output_genes = gene_axis.output_genes(dataset.num_genes);
+    let output_rows = row_count_for_width(buffer.len(), output_genes);
+    let parallel_rows = active_rows.min(output_rows);
+    let parallel_bytes = parallel_rows
+        .checked_mul(output_genes)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<T>()))
+        .ok_or_else(|| {
+            DataBankError::InvalidConfig("sparse active output byte length overflow".to_string())
+        })?;
+    if !selected_data_scheduled && compute.should_parallelize(parallel_rows, parallel_bytes) {
+        let load_started = profiler.start_sparse_projected_data_load();
+        let data_group_bytes = load_selected_sparse_group_bytes(
+            access,
+            access_config,
+            native,
+            native_mode,
+            &selected_plan,
+            &selected_groups,
+            cancel,
+        );
+        profiler.record_sparse_projected_data_load(
+            load_started,
+            data_group_bytes.as_ref().map_or(0, |_| selected_bytes),
+        );
+        let data_group_bytes = data_group_bytes?;
+        if try_scatter_sparse_rows_parallel_checked_with_group_indices(
+            compute,
+            dataset,
+            &selected_plan,
+            Arc::clone(&index_bytes),
+            data_group_bytes,
+            output_genes,
+            gene_axis.projection().cloned(),
+            None,
+            buffer,
+        )? {
+            return Ok(());
+        }
+    }
+
+    if !selected_data_scheduled
+        && selected_sparse_fused_scatter_enabled()
+        && can_use_selected_sparse_ordered_native(
+            native,
+            native_mode,
+            &selected_plan,
+            &selected_groups,
+            cancel,
+        )
+    {
+        scatter_selected_sparse_groups_fused_native(
+            access,
+            native.expect("native availability checked"),
+            native_mode,
+            selected_plan,
+            selected_groups,
+            Arc::clone(&index_bytes),
+            dataset,
+            gene_axis,
+            cancel,
+            profiler,
+            selected_bytes,
+            buffer,
+        )?;
+        return Ok(());
+    }
+
+    if !selected_data_scheduled {
+        if let Some(data_group_bytes) = try_load_selected_sparse_group_bytes_ordered_native(
+            access,
+            native,
+            native_mode,
+            &selected_plan,
+            &selected_groups,
+            cancel,
+            profiler,
+            selected_bytes,
+        )? {
+            if cancel.is_cancelled() {
+                return Err(DataBankError::PrefetchCancelled);
+            }
+            scatter_sparse_data_groups_projected_checked_with_projected_indices(
+                dataset,
+                &selected_plan,
+                index_bytes.as_ref(),
+                &data_group_bytes,
+                gene_axis,
+                buffer,
+            )?;
+            return Ok(());
+        }
+    }
+
+    let mut scheduled = schedule_selected_sparse_file_groups(
+        access,
+        access_config,
+        native,
+        native_mode,
+        &selected_plan,
+        &selected_groups,
+        cancel,
+    )?;
+    for &group_index in &selected_groups {
+        if cancel.is_cancelled() {
+            return Err(DataBankError::PrefetchCancelled);
+        }
+        let group = &selected_plan.data_groups[group_index];
+        if try_scatter_sparse_memory_identity_data_group_projected_checked(
+            dataset,
+            &selected_plan.data_pieces,
+            group,
+            index_bytes.as_ref(),
+            gene_axis,
+            buffer,
+        )? {
+            continue;
+        }
+
+        let load_started = profiler.start_sparse_projected_data_load();
+        let bytes = load_selected_sparse_group(access, scheduled.as_mut(), group);
+        profiler
+            .record_sparse_projected_data_load(load_started, bytes.as_ref().map_or(0, Vec::len));
+        let bytes = bytes?;
+        scatter_sparse_data_group_projected_checked_with_projected_indices(
+            dataset,
+            &selected_plan.data_pieces,
+            group,
+            index_bytes.as_ref(),
+            &bytes,
+            gene_axis,
+            selected_plan.projected_indices.as_ref(),
+            buffer,
+        )?;
+    }
+    finish_scheduled_batch_access(scheduled)
+}
+
+pub(crate) fn load_sparse_prefetch_indices(
     access: &AccessHandle,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
     plan: &SparseBatchPlan,
-    scheduled: &mut ScheduledAccess<J>,
-) -> DataBankResult<Vec<u8>>
-where
-    J: Iterator<Item = AccessItem>,
-{
+    scheduled: &mut ScheduledBatchAccess,
+) -> DataBankResult<Vec<u8>> {
     let alloc_started = profiler.start_alloc();
     let mut index_bytes = zeroed_byte_vec(plan.index_bytes);
     profiler.record_alloc(alloc_started);
@@ -720,21 +1044,20 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scatter_sparse_prefetch_data<T, J>(
+pub(crate) fn scatter_sparse_prefetch_data<T>(
     access: &AccessHandle,
     _compute: &DataBankComputePool,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
     dataset: &SparseCsrDataset,
     plan: &SparseBatchPlan,
-    index_bytes: Vec<u8>,
-    scheduled: &mut ScheduledAccess<J>,
+    index_bytes: Arc<[u8]>,
+    scheduled: &mut ScheduledBatchAccess,
     _active_rows: usize,
     buffer: &mut [T],
 ) -> DataBankResult<()>
 where
     T: DataValue,
-    J: Iterator<Item = AccessItem>,
 {
     // The parallel-scatter branch is intentionally absent here: this function
     // runs inside a compute worker, where `should_parallelize` is guarded by
@@ -790,13 +1113,10 @@ where
     Ok(())
 }
 
-pub(crate) fn next_scheduled_bytes<J>(
-    scheduled: &mut ScheduledAccess<J>,
+pub(crate) fn next_scheduled_bytes(
+    scheduled: &mut ScheduledBatchAccess,
     profiler: &ScheduledPrefetchProfiler,
-) -> DataBankResult<Vec<u8>>
-where
-    J: Iterator<Item = AccessItem>,
-{
+) -> DataBankResult<Vec<u8>> {
     let drain_started = profiler.start_scheduled_drain();
     let result = match scheduled.next() {
         Some(Ok(bytes)) => Ok(bytes),
@@ -808,4 +1128,318 @@ where
     };
     profiler.record_scheduled_drain(drain_started, result.as_ref().map_or(0, Vec::len));
     result
+}
+
+fn sparse_data_group_bytes(plan: &SparseBatchPlan) -> usize {
+    plan.data_groups
+        .iter()
+        .fold(0usize, |total, group| total.saturating_add(group.bytes))
+}
+
+fn all_sparse_data_group_indices(plan: &SparseBatchPlan) -> Vec<usize> {
+    (0..plan.data_groups.len()).collect()
+}
+
+fn selected_sparse_plan_is_preplanned(plan: &SparseBatchPlan) -> bool {
+    plan.index_groups.is_empty() && plan.index_pieces.is_empty() && plan.projected_indices.is_some()
+}
+
+fn load_selected_sparse_group_bytes(
+    access: &AccessHandle,
+    access_config: &ScheduledAccessConfig,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
+    plan: &SparseBatchPlan,
+    selected_groups: &[usize],
+    cancel: &Arc<PrefetchCancel>,
+) -> DataBankResult<Vec<Arc<[u8]>>> {
+    let mut scheduled = schedule_selected_sparse_file_groups(
+        access,
+        access_config,
+        native,
+        native_mode,
+        plan,
+        selected_groups,
+        cancel,
+    )?;
+    let mut out = Vec::with_capacity(selected_groups.len());
+    for &group_index in selected_groups {
+        if cancel.is_cancelled() {
+            return Err(DataBankError::PrefetchCancelled);
+        }
+        let group = &plan.data_groups[group_index];
+        let bytes = load_selected_sparse_group(access, scheduled.as_mut(), group)?;
+        if bytes.len() != group.bytes {
+            return Err(DataBankError::InvalidArrayMeta(format!(
+                "CSR data group decoded length is {}, expected {}",
+                bytes.len(),
+                group.bytes
+            )));
+        }
+        out.push(Arc::from(bytes.into_boxed_slice()));
+    }
+    finish_scheduled_batch_access(scheduled)?;
+    Ok(out)
+}
+
+fn can_use_selected_sparse_ordered_native(
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
+    plan: &SparseBatchPlan,
+    selected_groups: &[usize],
+    cancel: &Arc<PrefetchCancel>,
+) -> bool {
+    if native_mode == NativeMode::Disabled || selected_groups.is_empty() || cancel.is_cancelled() {
+        return false;
+    }
+    let Some(native) = native else {
+        return false;
+    };
+    if native_mode == NativeMode::Auto && !native.config.enabled {
+        return false;
+    }
+    selected_groups.iter().all(|&group_index| {
+        matches!(
+            plan.data_groups[group_index].source,
+            SparseGroupSource::AccessItem(_)
+        )
+    })
+}
+
+fn selected_sparse_fused_scatter_enabled() -> bool {
+    std::env::var("SCDATA_NATIVE_FUSED_SCATTER")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn read_all_selected_scatter_enabled() -> bool {
+    std::env::var("SCDATA_READALL_SELECTED_SCATTER")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scatter_selected_sparse_groups_fused_native<T>(
+    access: &AccessHandle,
+    native: &NativeScheduledContext,
+    native_mode: NativeMode,
+    selected_plan: SparseBatchPlan,
+    selected_groups: Vec<usize>,
+    index_bytes: Arc<[u8]>,
+    dataset: &SparseCsrDataset,
+    gene_axis: &GeneAxisPlan,
+    cancel: &Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    selected_bytes: usize,
+    buffer: &mut [T],
+) -> DataBankResult<()>
+where
+    T: DataValue,
+{
+    let mut items = Vec::with_capacity(selected_groups.len());
+    for &group_index in &selected_groups {
+        items.push(file_sparse_group_access_item(
+            &selected_plan.data_groups[group_index],
+        ));
+    }
+
+    let dataset_addr = dataset as *const SparseCsrDataset as usize;
+    let gene_axis_addr = gene_axis as *const GeneAxisPlan as usize;
+    let out_addr = buffer.as_mut_ptr() as usize;
+    let out_len = buffer.len();
+    let access_for_job = access.clone();
+    let native_for_job = native.clone();
+    let cancel_for_job = Arc::clone(cancel);
+
+    let load_started = profiler.start_sparse_projected_data_load();
+    let result = run_native_custom_blocking(
+        native.clone(),
+        Arc::clone(cancel),
+        Box::new(move |runtime| {
+            let loaded = runtime.block_on(load_native_items_ordered_async(
+                access_for_job,
+                native_for_job,
+                items,
+                native_mode,
+                Arc::clone(&cancel_for_job),
+            ))?;
+            if loaded.len() != selected_groups.len() {
+                return Err(DataBankError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native fused selected CSR data returned wrong group count",
+                )));
+            }
+
+            let mut data_group_bytes = Vec::with_capacity(loaded.len());
+            for (&group_index, bytes) in selected_groups.iter().zip(loaded) {
+                let group = &selected_plan.data_groups[group_index];
+                if bytes.len() != group.bytes {
+                    return Err(DataBankError::InvalidArrayMeta(format!(
+                        "CSR data group decoded length is {}, expected {}",
+                        bytes.len(),
+                        group.bytes
+                    )));
+                }
+                data_group_bytes.push(Arc::from(bytes.into_boxed_slice()));
+            }
+            if cancel_for_job.is_cancelled() {
+                return Err(DataBankError::PrefetchCancelled);
+            }
+
+            // SAFETY: the custom native command is submitted synchronously and
+            // `run_native_custom_blocking` does not return until this closure has
+            // finished. The referenced dataset, gene axis and output buffer are
+            // all owned by the active assemble call for that whole interval.
+            let dataset = unsafe { &*(dataset_addr as *const SparseCsrDataset) };
+            let gene_axis = unsafe { &*(gene_axis_addr as *const GeneAxisPlan) };
+            let out = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut T, out_len) };
+            scatter_sparse_data_groups_projected_checked_with_projected_indices(
+                dataset,
+                &selected_plan,
+                index_bytes.as_ref(),
+                &data_group_bytes,
+                gene_axis,
+                out,
+            )
+        }),
+    );
+    profiler.record_sparse_projected_data_load(
+        load_started,
+        result.as_ref().map_or(0, |_| selected_bytes),
+    );
+    result
+}
+
+fn try_load_selected_sparse_group_bytes_ordered_native(
+    access: &AccessHandle,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
+    plan: &SparseBatchPlan,
+    selected_groups: &[usize],
+    cancel: &Arc<PrefetchCancel>,
+    profiler: &ScheduledPrefetchProfiler,
+    selected_bytes: usize,
+) -> DataBankResult<Option<Vec<Arc<[u8]>>>> {
+    if !can_use_selected_sparse_ordered_native(native, native_mode, plan, selected_groups, cancel) {
+        return Ok(None);
+    }
+    let native = native.expect("native availability checked");
+
+    let mut items = Vec::with_capacity(selected_groups.len());
+    for &group_index in selected_groups {
+        items.push(file_sparse_group_access_item(
+            &plan.data_groups[group_index],
+        ));
+    }
+    let load_started = profiler.start_sparse_projected_data_load();
+    let loaded = load_native_items_ordered_blocking(
+        access.clone(),
+        native.clone(),
+        items,
+        native_mode,
+        Arc::clone(cancel),
+    );
+    profiler.record_sparse_projected_data_load(
+        load_started,
+        loaded.as_ref().map_or(0, |_| selected_bytes),
+    );
+    let loaded = loaded?;
+
+    if loaded.len() != selected_groups.len() {
+        return Err(DataBankError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native ordered selected CSR data returned wrong group count",
+        )));
+    }
+    let mut out = Vec::with_capacity(loaded.len());
+    for (&group_index, bytes) in selected_groups.iter().zip(loaded) {
+        let group = &plan.data_groups[group_index];
+        if bytes.len() != group.bytes {
+            return Err(DataBankError::InvalidArrayMeta(format!(
+                "CSR data group decoded length is {}, expected {}",
+                bytes.len(),
+                group.bytes
+            )));
+        }
+        out.push(Arc::from(bytes.into_boxed_slice()));
+    }
+    Ok(Some(out))
+}
+
+fn schedule_selected_sparse_file_groups(
+    access: &AccessHandle,
+    access_config: &ScheduledAccessConfig,
+    native: Option<&NativeScheduledContext>,
+    native_mode: NativeMode,
+    plan: &SparseBatchPlan,
+    selected_groups: &[usize],
+    cancel: &Arc<PrefetchCancel>,
+) -> DataBankResult<Option<ScheduledBatchAccess>> {
+    if cancel.is_cancelled() {
+        return Err(DataBankError::PrefetchCancelled);
+    }
+
+    let mut items = Vec::new();
+    for &group_index in selected_groups {
+        let group = &plan.data_groups[group_index];
+        if matches!(group.source, SparseGroupSource::AccessItem(_)) {
+            items.push(file_sparse_group_access_item(group));
+        }
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    build_scheduled_batch_access(
+        access.clone(),
+        native.cloned(),
+        items,
+        *access_config,
+        native_mode,
+        Arc::clone(cancel),
+        true,
+    )
+    .map(Some)
+}
+
+fn load_selected_sparse_group(
+    access: &AccessHandle,
+    scheduled: Option<&mut ScheduledBatchAccess>,
+    group: &SparseReadGroup,
+) -> DataBankResult<Vec<u8>> {
+    match &group.source {
+        SparseGroupSource::AccessItem(_) => {
+            let scheduled = scheduled.ok_or_else(|| {
+                DataBankError::InvalidArrayMeta(
+                    "CSR file group missing scheduled reader".to_string(),
+                )
+            })?;
+            next_dynamic_scheduled_bytes(scheduled)
+        }
+        SparseGroupSource::Memory { .. } => load_sparse_group(access, group),
+    }
+}
+
+fn next_dynamic_scheduled_bytes(scheduled: &mut ScheduledBatchAccess) -> DataBankResult<Vec<u8>> {
+    match scheduled.next() {
+        Some(Ok(bytes)) => Ok(bytes),
+        Some(Err(err)) => Err(DataBankError::Io(err)),
+        None => Err(DataBankError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "scheduled CSR data access ended before selected data was complete",
+        ))),
+    }
+}
+
+fn finish_scheduled_batch_access(scheduled: Option<ScheduledBatchAccess>) -> DataBankResult<()> {
+    let Some(mut scheduled) = scheduled else {
+        return Ok(());
+    };
+    match scheduled.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(DataBankError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "scheduled CSR data access returned extra output",
+        ))),
+        Some(Err(err)) => Err(DataBankError::Io(err)),
+    }
 }

@@ -78,6 +78,12 @@ def make_config(
     decode_workers: int,
     access_workers: int,
     fill_workers: int,
+    native_enabled: bool,
+    native_fused_workers: int,
+    native_prefetch_blocks: int,
+    native_coalesce_max_gap_bytes: int,
+    native_coalesce_max_waste_ratio: float,
+    native_coalesce_max_merged_len: int,
 ) -> DataBankConfig:
     return DataBankConfig.make(
         backend="threaded",
@@ -88,6 +94,15 @@ def make_config(
         access__cache_capacity_bytes=memory_gib * 1024**3 * 3 // 4,
         access__memory_budget_bytes=memory_gib * 1024**3,
         access__scheduler_shards=access_workers,
+        native__enabled=native_enabled,
+        native__fused_workers=native_fused_workers,
+        native__request_prefetch_blocks=native_prefetch_blocks,
+        native__memory_budget_bytes=memory_gib * 1024**3,
+        native__response_queue_bytes_soft_limit=memory_gib * 1024**3 // 2,
+        native__response_queue_bytes_hard_limit=memory_gib * 1024**3 * 3 // 4,
+        native__load__coalesce__max_gap_bytes=native_coalesce_max_gap_bytes,
+        native__load__coalesce__max_waste_ratio=native_coalesce_max_waste_ratio,
+        native__load__coalesce__max_merged_len=native_coalesce_max_merged_len,
     )
 
 
@@ -290,6 +305,7 @@ def bench_scheduled(
             ready_ahead_steps=args.ready_ahead_steps,
         ),
         projected_sparse_data_strategy=args.projected_sparse_data_strategy,
+        native_mode=args.native_mode,
     )
     total_batches = (len(order) + args.batch_size - 1) // args.batch_size
     cells = batches = bytes_read = checksum = 0
@@ -342,6 +358,12 @@ def run_once(args: argparse.Namespace) -> dict:
         decode_workers,
         access_workers,
         fill_workers,
+        args.native_enabled,
+        args.native_fused_workers,
+        args.native_prefetch_blocks,
+        args.native_coalesce_max_gap_bytes,
+        args.native_coalesce_max_waste_ratio,
+        args.native_coalesce_max_merged_len,
     )
     bank = ScDataBank(cfg)
     try:
@@ -368,6 +390,15 @@ def run_once(args: argparse.Namespace) -> dict:
         "dtype": args.dtype,
         "gene_mode": args.gene_mode,
         "projected_sparse_data_strategy": args.projected_sparse_data_strategy,
+        "native_mode": args.native_mode,
+        "native_enabled": args.native_enabled,
+        "native_fused_workers": args.native_fused_workers,
+        "native_prefetch_blocks": args.native_prefetch_blocks,
+        "native_coalesce": {
+            "max_gap_bytes": args.native_coalesce_max_gap_bytes,
+            "max_waste_ratio": args.native_coalesce_max_waste_ratio,
+            "max_merged_len": args.native_coalesce_max_merged_len,
+        },
         "genes": args.genes,
         "threads": args.threads,
         "workers": {
@@ -403,6 +434,21 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         choices=("selected_only", "read_all"),
         default="selected_only",
     )
+    parser.add_argument(
+        "--native-mode",
+        choices=("disabled", "auto", "force"),
+        default="disabled",
+    )
+    parser.add_argument(
+        "--native-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--native-fused-workers", type=int, default=4)
+    parser.add_argument("--native-prefetch-blocks", type=int, default=4096)
+    parser.add_argument("--native-coalesce-max-gap-bytes", type=int, default=16 * 1024)
+    parser.add_argument("--native-coalesce-max-waste-ratio", type=float, default=0.10)
+    parser.add_argument("--native-coalesce-max-merged-len", type=int, default=1024 * 1024)
     parser.add_argument(
         "--genes",
         type=int,
@@ -470,6 +516,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error("--decode-ahead-steps must be positive")
     if args.ready_ahead_steps < 1:
         parser.error("--ready-ahead-steps must be positive")
+    if args.native_fused_workers < 1:
+        parser.error("--native-fused-workers must be positive")
+    if args.native_prefetch_blocks < 1:
+        parser.error("--native-prefetch-blocks must be positive")
+    if args.native_coalesce_max_gap_bytes < 0:
+        parser.error("--native-coalesce-max-gap-bytes must be non-negative")
+    if not 0 <= args.native_coalesce_max_waste_ratio <= 1:
+        parser.error("--native-coalesce-max-waste-ratio must be in [0, 1]")
+    if args.native_coalesce_max_merged_len < 1:
+        parser.error("--native-coalesce-max-merged-len must be positive")
     try:
         resolve_worker_counts(
             threads=args.threads,

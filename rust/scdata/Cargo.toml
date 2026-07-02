@@ -40,6 +40,21 @@ half = "2"
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # io-uring is Linux-only; on other platforms always use threaded backend
 
+[[bin]]
+name = "native_synthetic_io"
+path = "src/bin/native_synthetic_io.rs"
+required-features = ["profile"]
+
+[[bin]]
+name = "native_real_io"
+path = "src/bin/native_real_io.rs"
+required-features = ["profile"]
+
+[[bin]]
+name = "iopool_diag"
+path = "src/bin/iopool_diag.rs"
+required-features = ["profile"]
+
 [[bench]]
 name = "modules"
 path = "benches/modules.rs"

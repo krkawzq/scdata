@@ -30,6 +30,12 @@ pub type DecodeTask = Pin<Box<dyn Future<Output = CodecResult<Vec<u8>>> + Send>>
 pub trait IoBackend: Send + Sync + 'static {
     /// Submit a positioned read and return a future for the compressed bytes.
     fn submit_read(&self, file: FileRef, offset: u64, len: usize, priority: u8) -> IoTask;
+
+    /// Return true when the backend completes reads inline and Tokio task
+    /// spawning would dominate the read itself.
+    fn prefers_inline_reads(&self) -> bool {
+        false
+    }
 }
 
 /// Decode backend used by the access scheduler.

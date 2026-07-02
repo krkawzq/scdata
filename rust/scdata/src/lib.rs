@@ -8,6 +8,10 @@ pub mod iopool;
 pub mod profile;
 
 #[doc(hidden)]
+#[cfg(feature = "profile")]
+pub mod synthetic;
+
+#[doc(hidden)]
 #[cfg(feature = "python-extension")]
 pub mod pybind;
 

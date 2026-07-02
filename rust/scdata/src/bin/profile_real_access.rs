@@ -1,11 +1,15 @@
+#![recursion_limit = "256"]
+
 use _scdata::access::{AccessConfig, AccessCpuConfig, ScheduledAccessConfig};
 use _scdata::codecs::DecodePoolConfig;
 use _scdata::databank::{
     ArrayCodecSpec, ArrayGridSpec, ArrayOrder, ArraySpec, ChunkSourceSpec, ChunkSpec, DType,
     DataBank, DataBankConfig, DataValue, Dense1DSpec, Dense2DSpec, EdgeChunkLayout, FillConfig,
-    MissingGenePolicy, MultiBatchCells, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
-    SparseCsrSpec,
+    MissingGenePolicy, MultiBatchCells, NativeAccessConfig, NativeMode,
+    ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig, SparseCsrSpec,
 };
+#[cfg(feature = "uring")]
+use _scdata::iopool::UringConfig;
 use _scdata::iopool::{IoConfig, ThreadedConfig};
 use _scdata::profile::{ProfileMetricKind, ProfileSnapshot};
 use numpy::PyReadonlyArray1;
@@ -224,6 +228,33 @@ def make_plan(dataset_index, cell_index, batch_size):
     return CellIndexPlan(ds, ci, int(batch_size))
 
 
+def plan_arrays_for_order(counts, max_cells, seed, order):
+    counts = np.asarray(counts, dtype=np.int64)
+    offsets = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
+    total = int(counts.sum())
+    n = min(int(max_cells), total)
+    order = str(order)
+    if order == "sequential":
+        flat = np.arange(n, dtype=np.int64)
+    else:
+        rng = np.random.default_rng(int(seed))
+        if n == total:
+            flat = np.arange(total, dtype=np.int64)
+            rng.shuffle(flat)
+        else:
+            flat = rng.choice(total, size=n, replace=False).astype(np.int64, copy=False)
+        if order == "grouped":
+            flat.sort()
+        elif order != "random":
+            raise ValueError(f"unknown order {order!r}")
+    dataset_idx = np.searchsorted(offsets[1:], flat, side="right")
+    local_cells = flat - offsets[dataset_idx]
+    return (
+        dataset_idx.astype(np.uint64, copy=False).tolist(),
+        local_cells.astype(np.uint64, copy=False).tolist(),
+    )
+
+
 def prefetch_indexed(bank, ids, plan, genes, dtype, config):
     missing = "zero" if genes is not None else None
     return bank.prefetch_indexed(ids, plan, genes=genes, missing=missing, dtype=dtype, config=config)
@@ -398,13 +429,22 @@ struct Args {
     decode_ahead_steps: Vec<usize>,
     ready_ahead_steps: Vec<usize>,
     threads: usize,
+    io_backend: IoBackendArg,
     io_workers: usize,
+    uring_entries: u32,
     decode_workers: usize,
     access_workers: usize,
     fill_workers: usize,
     memory_gib: usize,
     gene_mode: String,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    native_mode: NativeMode,
+    native_enabled: bool,
+    native_fused_workers: usize,
+    native_prefetch_blocks: usize,
+    native_coalesce_max_gap_bytes: usize,
+    native_coalesce_max_waste_ratio: f32,
+    native_coalesce_max_merged_len: usize,
     genes: usize,
     dtype: String,
     seed: u64,
@@ -415,6 +455,41 @@ struct Args {
     io_threads: usize,
     io_max_bytes_per_read: usize,
     reuse_bank: bool,
+    profile: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IoBackendArg {
+    Threaded,
+    #[cfg(feature = "uring")]
+    Uring,
+}
+
+impl IoBackendArg {
+    fn parse(value: &str) -> AppResult<Self> {
+        match value {
+            "threaded" => Ok(Self::Threaded),
+            "uring" => {
+                #[cfg(feature = "uring")]
+                {
+                    Ok(Self::Uring)
+                }
+                #[cfg(not(feature = "uring"))]
+                {
+                    Err("--io-backend uring requires the 'uring' feature".into())
+                }
+            }
+            other => Err(format!("--io-backend must be threaded|uring, got {other:?}").into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Threaded => "threaded",
+            #[cfg(feature = "uring")]
+            Self::Uring => "uring",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -522,10 +597,8 @@ impl SimpleRng {
 
 fn main() -> AppResult<()> {
     let args = parse_args()?;
-    env::set_var("SCDATA_PROFILE", "1");
-    env::set_var("SCDATA_PROFILE_LABEL", "profile-real-access");
-    env::set_var("SCDATA_PROFILE_COMPONENTS", "all");
-    env::set_var("SCDATA_PROFILE_SCOPES", "all");
+    configure_profile(&args);
+    pyo3::prepare_freethreaded_python();
 
     let mut writer = open_writer(&args)?;
     let mut ranges = Vec::new();
@@ -631,23 +704,10 @@ fn main() -> AppResult<()> {
         }
 
         if matches!(args.mode, Mode::Both | Mode::Scheduled) && args.engine == Engine::RustCore {
-            let total = counts.iter().copied().sum::<usize>();
-            let sample_n = args.max_cells.unwrap_or(total).min(total);
-            let base_sample = sampled_global_indices(total, sample_n, args.seed);
-            let offsets = offsets(&counts);
             let cases = case_configs(&args);
             let specs = build_rust_dataset_specs(&catalog)?;
             for (case_idx, case) in cases.iter().enumerate() {
-                run_case_rust_core(
-                    &mut writer,
-                    &args,
-                    &specs,
-                    &counts,
-                    &offsets,
-                    &base_sample,
-                    case_idx,
-                    case,
-                )?;
+                run_case_rust_core(&helper, &mut writer, &args, &specs, &counts, case_idx, case)?;
             }
         }
 
@@ -693,6 +753,25 @@ fn helper_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     )
 }
 
+fn case_plan_arrays(
+    helper: &Bound<'_, PyModule>,
+    counts: &[usize],
+    args: &Args,
+    case_idx: usize,
+    case: &CaseConfig,
+) -> AppResult<(Vec<usize>, Vec<usize>)> {
+    let total = counts.iter().copied().sum::<usize>();
+    let sample_n = args.max_cells.unwrap_or(total).min(total);
+    let seed = args.seed ^ case_idx as u64;
+    helper
+        .call_method1(
+            "plan_arrays_for_order",
+            (counts.to_vec(), sample_n, seed, case.order.as_str()),
+        )?
+        .extract()
+        .map_err(Into::into)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_case(
     _py: Python<'_>,
@@ -703,14 +782,13 @@ fn run_case(
     ids: &Bound<'_, PyAny>,
     catalog: &Bound<'_, PyAny>,
     counts: &[usize],
-    offsets: &[usize],
-    base_sample: &[usize],
+    _offsets: &[usize],
+    _base_sample: &[usize],
     case_idx: usize,
     case: &CaseConfig,
     register_seconds: f64,
 ) -> AppResult<()> {
-    let order = ordered_indices(base_sample, counts, case.order, args.seed ^ case_idx as u64);
-    let (dataset_index, cell_index) = plan_arrays(&order, offsets);
+    let (dataset_index, cell_index) = case_plan_arrays(helper, counts, args, case_idx, case)?;
     let plan_stats = plan_stats(&dataset_index, case.batch_size);
     let plan_started = Instant::now();
     let plan = helper.call_method1(
@@ -744,6 +822,7 @@ fn run_case(
     let mut measured_bytes = 0usize;
     let mut checksum = 0u64;
     let mut seen_batches = 0usize;
+    let mut cpu_started: Option<ProcessCpuSample> = None;
 
     for item in stream.try_iter()? {
         let batch = item?;
@@ -758,6 +837,7 @@ fn run_case(
         }
         if started.is_none() {
             started = Some(Instant::now());
+            cpu_started = process_cpu_sample();
         }
         measured_batches += 1;
         measured_cells += cells;
@@ -771,6 +851,7 @@ fn run_case(
     let seconds = started
         .map(|started| started.elapsed().as_secs_f64())
         .unwrap_or(0.0);
+    let cpu = cpu_usage_json(cpu_started, process_cpu_sample(), seconds, args.threads);
     let profile_text: String = helper.call_method1("profile_json", (bank,))?.extract()?;
     let profile: Value = serde_json::from_str(&profile_text).unwrap_or_else(|_| {
         json!({
@@ -791,16 +872,28 @@ fn run_case(
             "decode_ahead_steps": case.decode_ahead_steps,
             "ready_ahead_steps": case.ready_ahead_steps,
             "threads": args.threads,
+            "io_backend": args.io_backend.as_str(),
+            "uring_entries": args.uring_entries,
             "io_workers": databank_io_workers(args),
             "decode_workers": databank_decode_workers(args),
             "access_workers": databank_access_workers(args),
             "fill_workers": databank_fill_workers(args),
             "memory_gib": args.memory_gib,
             "gene_mode": args.gene_mode,
+            "projected_sparse_data_strategy": args.projected_sparse_data_strategy.as_str(),
+            "native_mode": args.native_mode.as_str(),
+            "native_enabled": args.native_enabled,
+            "native_fused_workers": args.native_fused_workers,
+            "native_prefetch_blocks": args.native_prefetch_blocks,
+            "native_coalesce": {
+                "max_gap_bytes": args.native_coalesce_max_gap_bytes,
+                "max_waste_ratio": args.native_coalesce_max_waste_ratio,
+                "max_merged_len": args.native_coalesce_max_merged_len,
+            },
             "genes": args.genes,
             "dtype": args.dtype,
             "datasets": counts.len(),
-            "sampled_cells": order.len(),
+            "sampled_cells": cell_index.len(),
             "warmup_batches": args.warmup_batches,
             "seen_batches": seen_batches,
             "measured_batches": measured_batches,
@@ -810,6 +903,7 @@ fn run_case(
             "batches_per_s": rate(measured_batches, seconds),
             "cells_per_s": rate(measured_cells, seconds),
             "output_gb_per_s": measured_bytes as f64 / seconds.max(f64::MIN_POSITIVE) / 1e9,
+            "cpu": cpu,
             "checksum": checksum,
             "register_seconds": register_seconds,
             "stream_setup_seconds": stream_setup_seconds,
@@ -823,17 +917,15 @@ fn run_case(
 
 #[allow(clippy::too_many_arguments)]
 fn run_case_rust_core(
+    helper: &Bound<'_, PyModule>,
     writer: &mut Option<File>,
     args: &Args,
     specs: &[RustDatasetSpec],
     counts: &[usize],
-    offsets: &[usize],
-    base_sample: &[usize],
     case_idx: usize,
     case: &CaseConfig,
 ) -> AppResult<()> {
-    let order = ordered_indices(base_sample, counts, case.order, args.seed ^ case_idx as u64);
-    let (dataset_index, cell_index) = plan_arrays(&order, offsets);
+    let (dataset_index, cell_index) = case_plan_arrays(helper, counts, args, case_idx, case)?;
     let plan_stats = plan_stats(&dataset_index, case.batch_size);
     let batches = build_multi_batches(&dataset_index, &cell_index, case.batch_size);
     let output_dtype = resolve_output_dtype(specs, &args.dtype)?;
@@ -846,6 +938,7 @@ fn run_case_rust_core(
             ready_ahead_steps: case.ready_ahead_steps,
         },
         projected_sparse_data_strategy: args.projected_sparse_data_strategy,
+        native_mode: args.native_mode,
     };
 
     let mut bank = DataBank::new(rust_databank_config(args))?;
@@ -871,6 +964,7 @@ fn run_case_rust_core(
             config,
             args.warmup_batches,
             args.measure_batches,
+            args.threads,
         )?,
         DType::U32 => consume_rust_prefetch::<u32>(
             &bank,
@@ -880,6 +974,7 @@ fn run_case_rust_core(
             config,
             args.warmup_batches,
             args.measure_batches,
+            args.threads,
         )?,
         other => {
             return Err(format!(
@@ -903,6 +998,8 @@ fn run_case_rust_core(
             "decode_ahead_steps": case.decode_ahead_steps,
             "ready_ahead_steps": case.ready_ahead_steps,
             "threads": args.threads,
+            "io_backend": args.io_backend.as_str(),
+            "uring_entries": args.uring_entries,
             "io_workers": databank_io_workers(args),
             "decode_workers": databank_decode_workers(args),
             "access_workers": databank_access_workers(args),
@@ -910,11 +1007,20 @@ fn run_case_rust_core(
             "memory_gib": args.memory_gib,
             "gene_mode": args.gene_mode,
             "projected_sparse_data_strategy": args.projected_sparse_data_strategy.as_str(),
+            "native_mode": args.native_mode.as_str(),
+            "native_enabled": args.native_enabled,
+            "native_fused_workers": args.native_fused_workers,
+            "native_prefetch_blocks": args.native_prefetch_blocks,
+            "native_coalesce": {
+                "max_gap_bytes": args.native_coalesce_max_gap_bytes,
+                "max_waste_ratio": args.native_coalesce_max_waste_ratio,
+                "max_merged_len": args.native_coalesce_max_merged_len,
+            },
             "genes": args.genes,
             "dtype": args.dtype,
             "output_dtype": dtype_name(output_dtype),
             "datasets": counts.len(),
-            "sampled_cells": order.len(),
+            "sampled_cells": cell_index.len(),
             "warmup_batches": args.warmup_batches,
             "seen_batches": measured.seen_batches,
             "measured_batches": measured.measured_batches,
@@ -924,6 +1030,7 @@ fn run_case_rust_core(
             "batches_per_s": rate(measured.measured_batches, measured.seconds),
             "cells_per_s": rate(measured.measured_cells, measured.seconds),
             "output_gb_per_s": measured.measured_bytes as f64 / measured.seconds.max(f64::MIN_POSITIVE) / 1e9,
+            "cpu": measured.cpu,
             "checksum": measured.checksum,
             "register_seconds": register_seconds,
             "stream_setup_seconds": stream_setup_seconds.max(0.0),
@@ -948,6 +1055,7 @@ struct RustMeasure {
     measured_bytes: usize,
     checksum: u64,
     seconds: f64,
+    cpu: Value,
     databank_profile: Value,
     access_profile: Value,
     io_profile: Value,
@@ -962,6 +1070,7 @@ fn consume_rust_prefetch<T>(
     config: ScheduledPrefetchConfig,
     warmup_batches: usize,
     measure_batches: usize,
+    configured_threads: usize,
 ) -> AppResult<RustMeasure>
 where
     T: DataValue + ChecksumValue,
@@ -984,6 +1093,7 @@ where
     let mut measured_cells = 0usize;
     let mut measured_bytes = 0usize;
     let mut checksum = 0u64;
+    let mut cpu_started: Option<ProcessCpuSample> = None;
 
     while let Some(batch) = stream.next() {
         let batch = batch?;
@@ -996,6 +1106,7 @@ where
         }
         if started.is_none() {
             started = Some(Instant::now());
+            cpu_started = process_cpu_sample();
         }
         measured_batches += 1;
         measured_cells += batch.cells.len();
@@ -1014,6 +1125,12 @@ where
     let seconds = started
         .map(|started| started.elapsed().as_secs_f64())
         .unwrap_or(0.0);
+    let cpu = cpu_usage_json(
+        cpu_started,
+        process_cpu_sample(),
+        seconds,
+        configured_threads,
+    );
     drop(stream);
     let databank_profile = profile_snapshot_json(bank.profile_snapshot_and_reset());
     let access_profile = profile_snapshot_json(bank.access_profile_snapshot_and_reset());
@@ -1026,6 +1143,7 @@ where
         measured_bytes,
         checksum,
         seconds,
+        cpu,
         databank_profile,
         access_profile,
         io_profile,
@@ -1067,6 +1185,69 @@ fn profile_snapshot_json(snapshot: ProfileSnapshot) -> Value {
         "scopes": snapshot.scopes.len(),
         "enabled_scopes": snapshot.enabled_scope_count(),
         "metrics": metrics,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProcessCpuSample {
+    user_s: f64,
+    system_s: f64,
+}
+
+fn process_cpu_sample() -> Option<ProcessCpuSample> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let fields = after_comm.split_whitespace().collect::<Vec<_>>();
+    let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
+    let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+    let ticks_per_second = clock_ticks_per_second();
+    Some(ProcessCpuSample {
+        user_s: user_ticks as f64 / ticks_per_second,
+        system_s: system_ticks as f64 / ticks_per_second,
+    })
+}
+
+fn clock_ticks_per_second() -> f64 {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks > 0 {
+        ticks as f64
+    } else {
+        100.0
+    }
+}
+
+fn cpu_usage_json(
+    start: Option<ProcessCpuSample>,
+    end: Option<ProcessCpuSample>,
+    wall_s: f64,
+    configured_threads: usize,
+) -> Value {
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let denominator_threads = configured_threads.max(available).max(1);
+    let (Some(start), Some(end)) = (start, end) else {
+        return json!({
+            "available_parallelism": available,
+            "configured_threads": configured_threads,
+            "denominator_threads": denominator_threads,
+            "measured": false,
+        });
+    };
+    let user_s = (end.user_s - start.user_s).max(0.0);
+    let system_s = (end.system_s - start.system_s).max(0.0);
+    let total_s = user_s + system_s;
+    let avg_cores = total_s / wall_s.max(f64::MIN_POSITIVE);
+    json!({
+        "available_parallelism": available,
+        "configured_threads": configured_threads,
+        "denominator_threads": denominator_threads,
+        "measured": true,
+        "user_s": user_s,
+        "system_s": system_s,
+        "total_s": total_s,
+        "avg_cores": avg_cores,
+        "util_pct_of_threads": avg_cores / denominator_threads as f64 * 100.0,
     })
 }
 
@@ -1150,11 +1331,20 @@ fn databank_fill_workers(args: &Args) -> usize {
 
 fn rust_databank_config(args: &Args) -> DataBankConfig {
     let access_memory_bytes = args.memory_gib * 1024 * 1024 * 1024;
-    DataBankConfig {
-        io_config: IoConfig::Threaded(ThreadedConfig {
+    let io_config = match args.io_backend {
+        IoBackendArg::Threaded => IoConfig::Threaded(ThreadedConfig {
             num_workers: databank_io_workers(args),
             ..ThreadedConfig::default()
         }),
+        #[cfg(feature = "uring")]
+        IoBackendArg::Uring => IoConfig::Uring(UringConfig {
+            entries: args.uring_entries,
+            drivers: databank_io_workers(args),
+            ..UringConfig::default()
+        }),
+    };
+    DataBankConfig {
+        io_config,
         decode_config: DecodePoolConfig {
             num_workers: databank_decode_workers(args),
             ..DecodePoolConfig::default()
@@ -1172,6 +1362,28 @@ fn rust_databank_config(args: &Args) -> DataBankConfig {
         fill_config: FillConfig {
             num_workers: databank_fill_workers(args),
             ..FillConfig::default()
+        },
+        native_config: NativeAccessConfig {
+            enabled: args.native_enabled,
+            fused_workers: args.native_fused_workers,
+            request_prefetch_blocks: args.native_prefetch_blocks,
+            memory_budget_bytes: access_memory_bytes,
+            response_queue_bytes_soft_limit: access_memory_bytes / 2,
+            response_queue_bytes_hard_limit: access_memory_bytes * 3 / 4,
+            load: _scdata::databank::NativeLoadConfig {
+                scheduler_workers: databank_fill_workers(args)
+                    .max(args.native_fused_workers)
+                    .max(1),
+                io_workers: databank_io_workers(args).max(1),
+                coalesce: _scdata::databank::NativeLoadCoalesceConfig {
+                    max_gap_bytes: args.native_coalesce_max_gap_bytes,
+                    max_waste_ratio: args.native_coalesce_max_waste_ratio,
+                    max_merged_len: args.native_coalesce_max_merged_len,
+                    .._scdata::databank::NativeLoadCoalesceConfig::default()
+                },
+                .._scdata::databank::NativeLoadConfig::default()
+            },
+            ..NativeAccessConfig::default()
         },
     }
 }
@@ -1756,22 +1968,6 @@ fn sampled_global_indices(total: usize, n: usize, seed: u64) -> Vec<usize> {
     out
 }
 
-fn ordered_indices(base: &[usize], counts: &[usize], order: Order, seed: u64) -> Vec<usize> {
-    let mut out = match order {
-        Order::Sequential => {
-            let total = counts.iter().copied().sum::<usize>();
-            (0..base.len().min(total)).collect()
-        }
-        _ => base.to_vec(),
-    };
-    match order {
-        Order::Random => shuffle(&mut out, &mut SimpleRng::new(seed ^ 0x5151_5151)),
-        Order::Grouped => out.sort_unstable(),
-        Order::Sequential => {}
-    }
-    out
-}
-
 fn shuffle(values: &mut [usize], rng: &mut SimpleRng) {
     if values.len() <= 1 {
         return;
@@ -1791,18 +1987,6 @@ fn offsets(counts: &[usize]) -> Vec<usize> {
         out.push(acc);
     }
     out
-}
-
-fn plan_arrays(order: &[usize], offsets: &[usize]) -> (Vec<usize>, Vec<usize>) {
-    let mut dataset_index = Vec::with_capacity(order.len());
-    let mut cell_index = Vec::with_capacity(order.len());
-    for global in order {
-        let pos = offsets.partition_point(|offset| offset <= global);
-        let dataset = pos.saturating_sub(1);
-        dataset_index.push(dataset);
-        cell_index.push(global - offsets[dataset]);
-    }
-    (dataset_index, cell_index)
 }
 
 fn plan_stats(dataset_index: &[usize], batch_size: usize) -> Value {
@@ -1937,6 +2121,8 @@ fn args_json(args: &Args) -> Value {
         "decode_ahead_steps": args.decode_ahead_steps,
         "ready_ahead_steps": args.ready_ahead_steps,
         "threads": args.threads,
+        "io_backend": args.io_backend.as_str(),
+        "uring_entries": args.uring_entries,
         "io_workers": databank_io_workers(args),
         "decode_workers": databank_decode_workers(args),
         "access_workers": databank_access_workers(args),
@@ -1944,6 +2130,15 @@ fn args_json(args: &Args) -> Value {
         "memory_gib": args.memory_gib,
         "gene_mode": args.gene_mode,
         "projected_sparse_data_strategy": args.projected_sparse_data_strategy.as_str(),
+        "native_mode": args.native_mode.as_str(),
+        "native_enabled": args.native_enabled,
+        "native_fused_workers": args.native_fused_workers,
+        "native_prefetch_blocks": args.native_prefetch_blocks,
+        "native_coalesce": {
+            "max_gap_bytes": args.native_coalesce_max_gap_bytes,
+            "max_waste_ratio": args.native_coalesce_max_waste_ratio,
+            "max_merged_len": args.native_coalesce_max_merged_len,
+        },
         "genes": args.genes,
         "dtype": args.dtype,
         "seed": args.seed,
@@ -1954,7 +2149,22 @@ fn args_json(args: &Args) -> Value {
         "io_threads": args.io_threads,
         "io_max_bytes_per_read": args.io_max_bytes_per_read,
         "reuse_bank": args.reuse_bank,
+        "profile": args.profile,
     })
+}
+
+fn configure_profile(args: &Args) {
+    if args.profile {
+        env::set_var("SCDATA_PROFILE", "1");
+        env::set_var("SCDATA_PROFILE_LABEL", "profile-real-access");
+        env::set_var("SCDATA_PROFILE_COMPONENTS", "all");
+        env::set_var("SCDATA_PROFILE_SCOPES", "all");
+    } else {
+        env::remove_var("SCDATA_PROFILE");
+        env::remove_var("SCDATA_PROFILE_LABEL");
+        env::remove_var("SCDATA_PROFILE_COMPONENTS");
+        env::remove_var("SCDATA_PROFILE_SCOPES");
+    }
 }
 
 fn parse_args() -> AppResult<Args> {
@@ -1972,13 +2182,22 @@ fn parse_args() -> AppResult<Args> {
         decode_ahead_steps: vec![32],
         ready_ahead_steps: vec![16],
         threads: 96,
+        io_backend: IoBackendArg::Threaded,
         io_workers: 0,
+        uring_entries: 1024,
         decode_workers: 0,
         access_workers: 0,
         fill_workers: 0,
         memory_gib: 128,
         gene_mode: "first".to_string(),
         projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy::SelectedOnly,
+        native_mode: NativeMode::Disabled,
+        native_enabled: false,
+        native_fused_workers: 4,
+        native_prefetch_blocks: 4096,
+        native_coalesce_max_gap_bytes: 16 * 1024,
+        native_coalesce_max_waste_ratio: 0.10,
+        native_coalesce_max_merged_len: 1024 * 1024,
         genes: 0,
         dtype: "stored".to_string(),
         seed: 0,
@@ -1989,6 +2208,7 @@ fn parse_args() -> AppResult<Args> {
         io_threads: 32,
         io_max_bytes_per_read: 0,
         reuse_bank: false,
+        profile: true,
     };
 
     let mut iter = env::args().skip(1).peekable();
@@ -2003,6 +2223,10 @@ fn parse_args() -> AppResult<Args> {
         }
         if arg == "--no-io" {
             args.io_samples = 0;
+            continue;
+        }
+        if arg == "--no-profile" {
+            args.profile = false;
             continue;
         }
         let (key, value) = if let Some((key, value)) = arg.split_once('=') {
@@ -2039,7 +2263,9 @@ fn parse_args() -> AppResult<Args> {
             "--decode-ahead-steps" => args.decode_ahead_steps = parse_usize_list(&value, &key)?,
             "--ready-ahead-steps" => args.ready_ahead_steps = parse_usize_list(&value, &key)?,
             "--threads" => args.threads = parse_usize(&value, &key)?,
+            "--io-backend" => args.io_backend = IoBackendArg::parse(&value)?,
             "--io-workers" => args.io_workers = parse_usize(&value, &key)?,
+            "--uring-entries" => args.uring_entries = parse_u32(&value, &key)?,
             "--decode-workers" => args.decode_workers = parse_usize(&value, &key)?,
             "--access-workers" => args.access_workers = parse_usize(&value, &key)?,
             "--fill-workers" => args.fill_workers = parse_usize(&value, &key)?,
@@ -2048,6 +2274,19 @@ fn parse_args() -> AppResult<Args> {
             "--projected-sparse-data-strategy" | "--sparse-data-strategy" => {
                 args.projected_sparse_data_strategy =
                     ProjectedSparseDataGroupStrategy::parse(&value)?;
+            }
+            "--native-mode" => args.native_mode = NativeMode::parse(&value)?,
+            "--native-enabled" => args.native_enabled = parse_bool(&value, &key)?,
+            "--native-fused-workers" => args.native_fused_workers = parse_usize(&value, &key)?,
+            "--native-prefetch-blocks" => args.native_prefetch_blocks = parse_usize(&value, &key)?,
+            "--native-coalesce-max-gap-bytes" => {
+                args.native_coalesce_max_gap_bytes = parse_usize(&value, &key)?
+            }
+            "--native-coalesce-max-waste-ratio" => {
+                args.native_coalesce_max_waste_ratio = parse_f32(&value, &key)?
+            }
+            "--native-coalesce-max-merged-len" => {
+                args.native_coalesce_max_merged_len = parse_usize(&value, &key)?
             }
             "--genes" => args.genes = parse_usize(&value, &key)?,
             "--dtype" => args.dtype = value,
@@ -2064,6 +2303,7 @@ fn parse_args() -> AppResult<Args> {
             "--io-samples" => args.io_samples = parse_usize(&value, &key)?,
             "--io-threads" => args.io_threads = parse_usize(&value, &key)?,
             "--io-max-bytes-per-read" => args.io_max_bytes_per_read = parse_usize(&value, &key)?,
+            "--profile" => args.profile = parse_bool(&value, &key)?,
             other => return Err(format!("unknown argument `{other}`").into()),
         }
     }
@@ -2088,8 +2328,14 @@ fn validate_args(args: &Args) -> AppResult<()> {
         || args.access_prefetch_steps.iter().any(|&x| x == 0)
         || args.decode_ahead_steps.iter().any(|&x| x == 0)
         || args.ready_ahead_steps.iter().any(|&x| x == 0)
+        || args.native_fused_workers == 0
+        || args.native_prefetch_blocks == 0
+        || args.native_coalesce_max_merged_len == 0
     {
         return Err("batch/prefetch/decode/ready values must be positive".into());
+    }
+    if !(0.0..=1.0).contains(&args.native_coalesce_max_waste_ratio) {
+        return Err("--native-coalesce-max-waste-ratio must be in [0, 1]".into());
     }
     match args.gene_mode.as_str() {
         "first" | "native" => {}
@@ -2102,6 +2348,26 @@ fn parse_usize(value: &str, name: &str) -> AppResult<usize> {
     value
         .parse::<usize>()
         .map_err(|err| format!("{name} expects usize, got `{value}`: {err}").into())
+}
+
+fn parse_u32(value: &str, name: &str) -> AppResult<u32> {
+    value
+        .parse::<u32>()
+        .map_err(|err| format!("{name} expects u32, got `{value}`: {err}").into())
+}
+
+fn parse_bool(value: &str, name: &str) -> AppResult<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("{name} expects bool, got `{other}`").into()),
+    }
+}
+
+fn parse_f32(value: &str, name: &str) -> AppResult<f32> {
+    value
+        .parse::<f32>()
+        .map_err(|err| format!("{name} expects f32, got `{value}`: {err}").into())
 }
 
 fn parse_usize_list(value: &str, name: &str) -> AppResult<Vec<usize>> {
@@ -2183,7 +2449,9 @@ Key options:
   --decode-ahead-steps A,B            Default: 32.
   --ready-ahead-steps A,B             Default: 16.
   --threads N                         Must be divisible by 4. Default: 96.
+  --io-backend threaded|uring          Rust-core DataBank IO backend. Default: threaded.
   --io-workers N                      DataBank IO workers. 0 means --threads/4.
+  --uring-entries N                   io_uring SQ/CQ entries when --io-backend=uring. Default: 1024.
   --decode-workers N                  Decode workers. 0 means --threads/4.
   --access-workers N                  Access CPU workers. 0 means --threads/4.
   --fill-workers N                    DataBank request/response/fill workers. 0 means --threads/4.
@@ -2191,12 +2459,20 @@ Key options:
   --gene-mode first|native            Default: first.
   --projected-sparse-data-strategy selected_only|read_all
                                       Default: selected_only.
+  --native-mode disabled|auto|force   Scheduled native Blosc-LZ4 mode. Default: disabled.
+  --native-enabled true|false         Enable native path for auto mode. Default: false.
+  --native-fused-workers N            Native fused worker hint. Default: 4.
+  --native-prefetch-blocks N          Native block prefetch window. Default: 4096.
+  --native-coalesce-max-gap-bytes N    Native range coalesce max gap. Default: 16384.
+  --native-coalesce-max-waste-ratio X  Native range coalesce max waste ratio. Default: 0.10.
+  --native-coalesce-max-merged-len N   Native range coalesce max merged length. Default: 1048576.
   --genes N                           0 means all genes in first dataset. Default: 0.
   --warmup-batches N                  Default: 2.
   --measure-batches N                 0 means all measured batches. Default: 64.
   --io-samples N                      Default: 2000. Use --no-io to disable.
   --io-threads N                      Default: 32.
   --io-max-bytes-per-read N           0 means full chunk range. Default: 0.
+  --no-profile                        Disable profile instrumentation for release throughput.
   --out PATH                          JSONL output path. Use '-' for stdout only.
   --reuse-bank                        Reuse one ScDataBank across scheduled cases.
 "#

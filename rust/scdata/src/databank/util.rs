@@ -164,8 +164,29 @@ pub(super) fn zero_values<T: DataValue>(out: &mut [T]) {
     }
 }
 
+pub(super) fn zeroed_values<T: DataValue>(len: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(len);
+    if len != 0 {
+        // SAFETY: DataValue is sealed to numeric primitives plus transparent
+        // u16 half wrappers. Their zero value is represented by all-zero bytes.
+        unsafe {
+            ptr::write_bytes(out.as_mut_ptr(), 0, len);
+            out.set_len(len);
+        }
+    }
+    out
+}
+
 pub(super) fn zeroed_byte_vec(len: usize) -> Vec<u8> {
-    vec![0; len]
+    let mut out = Vec::with_capacity(len);
+    if len != 0 {
+        // SAFETY: allocated capacity is `len`, and u8 zero is all-zero bytes.
+        unsafe {
+            ptr::write_bytes(out.as_mut_ptr(), 0, len);
+            out.set_len(len);
+        }
+    }
+    out
 }
 
 pub(super) fn load_memory_group(

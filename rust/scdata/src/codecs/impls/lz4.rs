@@ -5,6 +5,16 @@ use super::super::util::{
 };
 use super::super::CodecResult;
 
+unsafe extern "C" {
+    fn LZ4_decompress_safe_partial(
+        source: *const lz4_sys::c_char,
+        dest: *mut lz4_sys::c_char,
+        compressed_size: lz4_sys::c_int,
+        target_output_size: lz4_sys::c_int,
+        max_decompressed_size: lz4_sys::c_int,
+    ) -> lz4_sys::c_int;
+}
+
 #[derive(Debug)]
 pub(crate) struct Lz4Codec;
 
@@ -166,6 +176,57 @@ pub(crate) fn lz4_decompress_raw_into(
         return Err(decode_error(
             codec,
             format!("LZ4 decompressor returned {written}"),
+        ));
+    }
+    verify_size(codec, written as usize, Some(output.len()))?;
+    Ok(())
+}
+
+pub(crate) fn lz4_decompress_raw_partial_into(
+    codec: &str,
+    compressed: &[u8],
+    output: &mut [u8],
+    decoded_size: usize,
+) -> CodecResult<()> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    if output.len() > decoded_size {
+        return Err(decode_error(
+            codec,
+            "LZ4 partial target exceeds decoded payload size",
+        ));
+    }
+    if output.len() == decoded_size {
+        return lz4_decompress_raw_into(codec, compressed, output);
+    }
+
+    let compressed_size = i32::try_from(compressed.len()).map_err(|_| {
+        decode_error(
+            codec,
+            format!("LZ4 compressed payload is too large: {}", compressed.len()),
+        )
+    })?;
+    let target_output_size = i32::try_from(output.len()).map_err(|_| {
+        decode_error(
+            codec,
+            format!("LZ4 partial decoded payload is too large: {}", output.len()),
+        )
+    })?;
+
+    let written = unsafe {
+        LZ4_decompress_safe_partial(
+            compressed.as_ptr().cast::<lz4_sys::c_char>(),
+            output.as_mut_ptr().cast::<lz4_sys::c_char>(),
+            compressed_size,
+            target_output_size,
+            target_output_size,
+        )
+    };
+    if written < 0 {
+        return Err(decode_error(
+            codec,
+            format!("LZ4 partial decompressor returned {written}"),
         ));
     }
     verify_size(codec, written as usize, Some(output.len()))?;

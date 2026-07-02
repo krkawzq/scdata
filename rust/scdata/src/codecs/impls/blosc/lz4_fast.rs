@@ -6,13 +6,41 @@ use super::super::super::util::{
     decode_error, output_too_small, reserve_decode_buffer, verify_size,
 };
 use super::super::super::CodecResult;
-use super::super::lz4_decompress_raw_into;
+use super::super::{lz4_decompress_raw_into, lz4_decompress_raw_partial_into};
 use super::header::BloscHeader;
 use super::shuffle::unshuffle_bytes;
 
 thread_local! {
     static BLOSC_LZ4_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static BLOSC_LZ4_BLOCK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BloscLz4Plan {
+    pub(crate) header: BloscHeader,
+    pub(crate) blocks: Vec<ValidatedBloscBlockRange>,
+    pub(crate) memcpyed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidatedBloscBlockRange {
+    pub(crate) block_idx: usize,
+    pub(crate) payload_relative_offset: usize,
+    pub(crate) compressed_len: usize,
+    pub(crate) decoded_offset: usize,
+    pub(crate) decoded_len: usize,
+    pub(crate) leftover: bool,
+}
+
+impl ValidatedBloscBlockRange {
+    fn as_block(self) -> BloscLz4Block {
+        BloscLz4Block {
+            size: self.decoded_len,
+            leftover: self.leftover,
+            src_offset: self.payload_relative_offset,
+            src_limit: self.payload_relative_offset + self.compressed_len,
+        }
+    }
 }
 
 pub(super) fn try_blosc_lz4_decode_into(
@@ -53,15 +81,9 @@ pub(super) fn try_blosc_lz4_decode_slice(
     header: BloscHeader,
     slice: &DecodeSlice,
 ) -> CodecResult<Option<Vec<u8>>> {
-    if header.compformat() != blosc_src::BLOSC_LZ4_FORMAT as u8 {
+    let Some(plan) = try_blosc_lz4_plan(codec, encoded, header)? else {
         return Ok(None);
-    }
-    if header.compversion != blosc_src::BLOSC_LZ4_VERSION_FORMAT as u8 {
-        return Err(decode_error(codec, "unsupported Blosc LZ4 format version"));
-    }
-    if header.flags & 0x08 != 0 || header.is_bit_shuffled() {
-        return Ok(None);
-    }
+    };
     validate_decode_slice(codec, header.decoded_size, slice)?;
     if slice.output_len == 0 {
         return Ok(Some(Vec::new()));
@@ -70,28 +92,17 @@ pub(super) fn try_blosc_lz4_decode_slice(
         return Ok(Some(vec![0u8; slice.output_len]));
     }
 
-    if header.is_memcpyed() {
-        if header.decoded_size + blosc_src::BLOSC_MAX_OVERHEAD as usize != header.compressed_size {
-            return Err(decode_error(codec, "invalid Blosc memcpy buffer"));
-        }
-        let source = &encoded[blosc_src::BLOSC_MAX_OVERHEAD as usize
-            ..blosc_src::BLOSC_MAX_OVERHEAD as usize + header.decoded_size];
+    if plan.memcpyed {
+        let source = memcpyed_source(codec, encoded, header)?;
         return Ok(Some(materialize_decode_slice(codec, source, slice)?));
     }
 
-    validate_lz4_header(codec, header)?;
-    let nblocks = header.decoded_size.div_ceil(header.blocksize);
-    let bstarts_bytes = block_table_bytes(codec, nblocks)?;
-    if bstarts_bytes > header.compressed_size {
-        return Err(decode_error(codec, "invalid Blosc block table"));
-    }
-
-    let touched = touched_blocks(codec, header, slice, nblocks)?;
+    let touched = touched_blocks(codec, header, slice, plan.blocks.len())?;
     let touched_count = touched.iter().filter(|&&touched| touched).count();
     if touched_count == 0 {
         return Ok(Some(vec![0u8; slice.output_len]));
     }
-    if touched_count == nblocks {
+    if touched_count == plan.blocks.len() {
         return Ok(None);
     }
 
@@ -115,57 +126,186 @@ pub(super) fn try_blosc_lz4_decode_slice(
             }
 
             let mut out = vec![0u8; slice.output_len];
-            let leftover = header.decoded_size % header.blocksize;
-            let mut decoded_offset = 0usize;
-            for (block_idx, &is_touched) in touched.iter().enumerate() {
-                let is_last = block_idx + 1 == nblocks;
-                let bsize = if is_last && leftover > 0 {
-                    leftover
-                } else {
-                    header.blocksize
-                };
+            for (block, &is_touched) in plan.blocks.iter().zip(touched.iter()) {
                 if !is_touched {
-                    decoded_offset += bsize;
                     continue;
                 }
-                let src_offset = block_start(codec, encoded, block_idx)?;
-                if src_offset < bstarts_bytes {
-                    return Err(decode_error(codec, "invalid Blosc block offset"));
-                }
-                let src_limit = if is_last {
-                    header.compressed_size
-                } else {
-                    block_start(codec, encoded, block_idx + 1)?
-                };
-                if src_offset >= src_limit || src_limit > header.compressed_size {
-                    return Err(decode_error(codec, "invalid Blosc block offset"));
-                }
-                let block = BloscLz4Block {
-                    size: bsize,
-                    leftover: is_last && leftover > 0,
-                    src_offset,
-                    src_limit,
-                };
                 if header.is_byte_shuffled() {
-                    let shuffled_block = &mut scratch[..bsize];
-                    decode_blosc_lz4_block(codec, encoded, header, block, shuffled_block)?;
+                    let shuffled_block = &mut scratch[..block.decoded_len];
+                    decode_blosc_lz4_block(
+                        codec,
+                        encoded,
+                        header,
+                        block.as_block(),
+                        shuffled_block,
+                    )?;
                     copy_shuffled_block_ranges(
                         header.typesize,
                         shuffled_block,
-                        decoded_offset,
+                        block.decoded_offset,
                         slice,
                         &mut out,
                     );
                 } else {
-                    let decoded_block = &mut block_scratch[..bsize];
-                    decode_blosc_lz4_block(codec, encoded, header, block, decoded_block)?;
-                    copy_block_ranges(decoded_block, decoded_offset, slice, &mut out);
+                    let decoded_block = &mut block_scratch[..block.decoded_len];
+                    decode_blosc_lz4_block(
+                        codec,
+                        encoded,
+                        header,
+                        block.as_block(),
+                        decoded_block,
+                    )?;
+                    copy_block_ranges(decoded_block, block.decoded_offset, slice, &mut out);
                 }
-                decoded_offset += bsize;
             }
             Ok(Some(out))
         })
     })
+}
+
+pub(crate) fn try_blosc_lz4_plan(
+    codec: &str,
+    encoded: &[u8],
+    header: BloscHeader,
+) -> CodecResult<Option<BloscLz4Plan>> {
+    try_blosc_lz4_plan_inner(codec, encoded, header, true)
+}
+
+pub(crate) fn try_blosc_lz4_plan_from_header_table(
+    codec: &str,
+    header_table: &[u8],
+    header: BloscHeader,
+) -> CodecResult<Option<BloscLz4Plan>> {
+    try_blosc_lz4_plan_inner(codec, header_table, header, false)
+}
+
+pub(crate) fn blosc_lz4_header_table_len(
+    codec: &str,
+    header: BloscHeader,
+) -> CodecResult<Option<usize>> {
+    if header.compformat() != blosc_src::BLOSC_LZ4_FORMAT as u8 {
+        return Ok(None);
+    }
+    if header.compversion != blosc_src::BLOSC_LZ4_VERSION_FORMAT as u8 {
+        return Err(decode_error(codec, "unsupported Blosc LZ4 format version"));
+    }
+    if header.flags & 0x08 != 0 || header.is_bit_shuffled() {
+        return Ok(None);
+    }
+    if header.decoded_size == 0 || header.is_memcpyed() {
+        return Ok(Some(blosc_src::BLOSC_MIN_HEADER_LENGTH as usize));
+    }
+
+    validate_lz4_header(codec, header)?;
+    let nblocks = header.decoded_size.div_ceil(header.blocksize);
+    let table_len = block_table_bytes(codec, nblocks)?;
+    if table_len > header.compressed_size {
+        return Err(decode_error(codec, "invalid Blosc block table"));
+    }
+    Ok(Some(table_len))
+}
+
+fn try_blosc_lz4_plan_inner(
+    codec: &str,
+    encoded: &[u8],
+    header: BloscHeader,
+    require_payload: bool,
+) -> CodecResult<Option<BloscLz4Plan>> {
+    if header.compformat() != blosc_src::BLOSC_LZ4_FORMAT as u8 {
+        return Ok(None);
+    }
+    if header.compversion != blosc_src::BLOSC_LZ4_VERSION_FORMAT as u8 {
+        return Err(decode_error(codec, "unsupported Blosc LZ4 format version"));
+    }
+    if header.flags & 0x08 != 0 || header.is_bit_shuffled() {
+        return Ok(None);
+    }
+    if header.decoded_size == 0 {
+        return Ok(Some(BloscLz4Plan {
+            header,
+            blocks: Vec::new(),
+            memcpyed: false,
+        }));
+    }
+    if header.is_memcpyed() {
+        if require_payload {
+            let _ = memcpyed_source(codec, encoded, header)?;
+        } else if header.decoded_size + blosc_src::BLOSC_MAX_OVERHEAD as usize
+            != header.compressed_size
+        {
+            return Err(decode_error(codec, "invalid Blosc memcpy buffer"));
+        }
+        return Ok(Some(BloscLz4Plan {
+            header,
+            blocks: vec![ValidatedBloscBlockRange {
+                block_idx: 0,
+                payload_relative_offset: blosc_src::BLOSC_MAX_OVERHEAD as usize,
+                compressed_len: header.decoded_size,
+                decoded_offset: 0,
+                decoded_len: header.decoded_size,
+                leftover: false,
+            }],
+            memcpyed: true,
+        }));
+    }
+
+    validate_lz4_header(codec, header)?;
+    let nblocks = header.decoded_size.div_ceil(header.blocksize);
+    let bstarts_bytes = block_table_bytes(codec, nblocks)?;
+    if bstarts_bytes > header.compressed_size {
+        return Err(decode_error(codec, "invalid Blosc block table"));
+    }
+    if encoded.len() < bstarts_bytes {
+        return Err(decode_error(
+            codec,
+            "buffer is shorter than a Blosc block table",
+        ));
+    }
+
+    let leftover = header.decoded_size % header.blocksize;
+    let mut blocks = Vec::with_capacity(nblocks);
+    let mut decoded_offset = 0usize;
+    let mut previous_src_offset = None;
+    for block_idx in 0..nblocks {
+        let is_last = block_idx + 1 == nblocks;
+        let bsize = if is_last && leftover > 0 {
+            leftover
+        } else {
+            header.blocksize
+        };
+        let src_offset = block_start(codec, encoded, block_idx)?;
+        if src_offset < bstarts_bytes {
+            return Err(decode_error(codec, "invalid Blosc block offset"));
+        }
+        if let Some(previous) = previous_src_offset {
+            if src_offset < previous {
+                return Err(decode_error(codec, "invalid Blosc block offset"));
+            }
+        }
+        let src_limit = if is_last {
+            header.compressed_size
+        } else {
+            block_start(codec, encoded, block_idx + 1)?
+        };
+        if src_offset >= src_limit || src_limit > header.compressed_size {
+            return Err(decode_error(codec, "invalid Blosc block offset"));
+        }
+        blocks.push(ValidatedBloscBlockRange {
+            block_idx,
+            payload_relative_offset: src_offset,
+            compressed_len: src_limit - src_offset,
+            decoded_offset,
+            decoded_len: bsize,
+            leftover: is_last && leftover > 0,
+        });
+        previous_src_offset = Some(src_offset);
+        decoded_offset += bsize;
+    }
+    Ok(Some(BloscLz4Plan {
+        header,
+        blocks,
+        memcpyed: false,
+    }))
 }
 
 fn blosc_lz4_decode_into(
@@ -333,6 +473,18 @@ fn materialize_decode_slice(
     Ok(out)
 }
 
+fn memcpyed_source<'a>(
+    codec: &str,
+    encoded: &'a [u8],
+    header: BloscHeader,
+) -> CodecResult<&'a [u8]> {
+    if header.decoded_size + blosc_src::BLOSC_MAX_OVERHEAD as usize != header.compressed_size {
+        return Err(decode_error(codec, "invalid Blosc memcpy buffer"));
+    }
+    Ok(&encoded[blosc_src::BLOSC_MAX_OVERHEAD as usize
+        ..blosc_src::BLOSC_MAX_OVERHEAD as usize + header.decoded_size])
+}
+
 fn copy_block_ranges(block: &[u8], block_offset: usize, slice: &DecodeSlice, out: &mut [u8]) {
     let block_end = block_offset + block.len();
     for range in slice.ranges.iter().copied() {
@@ -384,22 +536,36 @@ fn copy_shuffled_block_ranges(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BloscLz4Block {
-    size: usize,
-    leftover: bool,
-    src_offset: usize,
-    src_limit: usize,
+pub(crate) struct BloscLz4Block {
+    pub(crate) size: usize,
+    pub(crate) leftover: bool,
+    pub(crate) src_offset: usize,
+    pub(crate) src_limit: usize,
 }
 
-fn decode_blosc_lz4_block(
+pub(crate) fn decode_blosc_lz4_block(
     codec: &str,
     encoded: &[u8],
     header: BloscHeader,
     block: BloscLz4Block,
     output: &mut [u8],
 ) -> CodecResult<()> {
-    let mut src_offset = block.src_offset;
-    let nsplits = if !header.dont_split()
+    decode_blosc_lz4_block_inner(codec, encoded, header, block, None, output)
+}
+
+pub(crate) fn decode_blosc_lz4_block_partial_prefixes(
+    codec: &str,
+    encoded: &[u8],
+    header: BloscHeader,
+    block: BloscLz4Block,
+    split_prefixes: &[usize],
+    output: &mut [u8],
+) -> CodecResult<()> {
+    decode_blosc_lz4_block_inner(codec, encoded, header, block, Some(split_prefixes), output)
+}
+
+pub(crate) fn blosc_lz4_block_split_count(header: BloscHeader, block: BloscLz4Block) -> usize {
+    if !header.dont_split()
         && header.typesize <= 16
         && header.blocksize / header.typesize >= 128
         && !block.leftover
@@ -407,10 +573,30 @@ fn decode_blosc_lz4_block(
         header.typesize
     } else {
         1
-    };
+    }
+}
+
+fn decode_blosc_lz4_block_inner(
+    codec: &str,
+    encoded: &[u8],
+    header: BloscHeader,
+    block: BloscLz4Block,
+    split_prefixes: Option<&[usize]>,
+    output: &mut [u8],
+) -> CodecResult<()> {
+    let mut src_offset = block.src_offset;
+    let nsplits = blosc_lz4_block_split_count(header, block);
+    if let Some(prefixes) = split_prefixes {
+        if prefixes.len() != nsplits {
+            return Err(decode_error(
+                codec,
+                "invalid Blosc partial split prefix count",
+            ));
+        }
+    }
     let split_size = split_size(codec, block.size, nsplits)?;
     let mut output_offset = 0usize;
-    for _ in 0..nsplits {
+    for split_idx in 0..nsplits {
         if src_offset + 4 > block.src_limit {
             return Err(decode_error(codec, "invalid Blosc split offset"));
         }
@@ -429,15 +615,30 @@ fn decode_blosc_lz4_block(
             return Err(decode_error(codec, "invalid Blosc split output size"));
         }
 
-        let split_output = &mut output[output_offset..next_output_offset];
-        if compressed_size == split_size {
-            split_output.copy_from_slice(&encoded[src_offset..src_offset + compressed_size]);
-        } else {
-            lz4_decompress_raw_into(
-                codec,
-                &encoded[src_offset..src_offset + compressed_size],
-                split_output,
-            )?;
+        let requested_prefix = split_prefixes
+            .map(|prefixes| prefixes[split_idx])
+            .unwrap_or(split_size);
+        if requested_prefix > split_size {
+            return Err(decode_error(codec, "invalid Blosc partial split prefix"));
+        }
+        if requested_prefix > 0 {
+            let split_output = &mut output[output_offset..output_offset + requested_prefix];
+            if compressed_size == split_size {
+                split_output.copy_from_slice(&encoded[src_offset..src_offset + requested_prefix]);
+            } else if requested_prefix == split_size {
+                lz4_decompress_raw_into(
+                    codec,
+                    &encoded[src_offset..src_offset + compressed_size],
+                    split_output,
+                )?;
+            } else {
+                lz4_decompress_raw_partial_into(
+                    codec,
+                    &encoded[src_offset..src_offset + compressed_size],
+                    split_output,
+                    split_size,
+                )?;
+            }
         }
         src_offset += compressed_size;
         output_offset = next_output_offset;

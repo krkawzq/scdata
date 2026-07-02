@@ -1,4 +1,4 @@
-pub(super) fn unshuffle_bytes(typesize: usize, shuffled: &[u8], output: &mut [u8]) {
+pub(crate) fn unshuffle_bytes(typesize: usize, shuffled: &[u8], output: &mut [u8]) {
     debug_assert_eq!(shuffled.len(), output.len());
     match typesize {
         2 => unshuffle_2(shuffled, output),

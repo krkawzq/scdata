@@ -27,4 +27,5 @@ pub use scheduler::{
     AccessConfig, AccessHandle, AccessItem, AccessRequest, AccessScheduler, PrefetchCancel,
     PrefetchRequest, ScheduledAccess, ScheduledAccessConfig,
 };
+pub(crate) use slice::SliceShape;
 pub use slice::{RangeCopy, SliceSpec};

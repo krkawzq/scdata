@@ -158,19 +158,25 @@ pub(crate) fn load_sparse_selected_data_group_bytes(
     }
 }
 
-fn sparse_selected_data_group_bytes(plan: &SparseBatchPlan, selected_groups: &[usize]) -> usize {
-    selected_groups.iter().fold(0usize, |total, &group_index| {
-        total.saturating_add(plan.data_groups[group_index].bytes)
-    })
+fn sparse_data_group_bytes(plan: &SparseBatchPlan) -> usize {
+    plan.data_groups
+        .iter()
+        .fold(0usize, |total, group| total.saturating_add(group.bytes))
 }
 
-fn sparse_selected_groups_cover_all(plan: &SparseBatchPlan, selected_groups: &[usize]) -> bool {
-    selected_groups.len() == plan.data_groups.len()
-        && selected_groups
-            .iter()
-            .copied()
-            .enumerate()
-            .all(|(expected, group_index)| expected == group_index)
+fn all_sparse_data_group_indices(plan: &SparseBatchPlan) -> Vec<usize> {
+    (0..plan.data_groups.len()).collect()
+}
+
+fn sparse_data_only_plan_from(plan: &SparseBatchPlan) -> SparseBatchPlan {
+    SparseBatchPlan {
+        index_pieces: Vec::new(),
+        data_pieces: plan.data_pieces.clone(),
+        index_groups: Vec::new(),
+        data_groups: plan.data_groups.clone(),
+        index_bytes: plan.index_bytes,
+        projected_indices: None,
+    }
 }
 
 fn profile_sparse_projected_data_load<R>(
@@ -208,39 +214,30 @@ pub(crate) fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue
     // borrow from this shared `Arc<[u8]>` instead of cloning the whole buffer.
     let index_bytes: Arc<[u8]> = Arc::from(index_bytes.into_boxed_slice());
 
-    let selected_groups = match projected_sparse_data_strategy {
+    let selected_plan = match projected_sparse_data_strategy {
         ProjectedSparseDataGroupStrategy::SelectedOnly => {
             let scan_started =
                 profiler.map(SparseProjectedDataGroupProfiler::start_sparse_projected_index_scan);
-            let mut selected_groups = Vec::with_capacity(plan.data_groups.len());
-            for (group_index, group) in plan.data_groups.iter().enumerate() {
-                if sparse_data_group_has_selected_values(
-                    dataset,
-                    &plan.data_pieces,
-                    group,
-                    index_bytes.as_ref(),
-                    gene_axis,
-                )? {
-                    selected_groups.push(group_index);
-                }
-            }
+            let selected_plan =
+                plan_sparse_selected_data_batch(dataset, plan, index_bytes.as_ref(), gene_axis)?;
             if let (Some(profiler), Some(started)) = (profiler, scan_started) {
                 profiler.record_sparse_projected_index_scan(started);
             }
-            selected_groups
+            selected_plan
         }
-        ProjectedSparseDataGroupStrategy::ReadAll => (0..plan.data_groups.len()).collect(),
+        ProjectedSparseDataGroupStrategy::ReadAll => sparse_data_only_plan_from(plan),
     };
-    let selected_bytes = sparse_selected_data_group_bytes(plan, &selected_groups);
+    let selected_groups = all_sparse_data_group_indices(&selected_plan);
+    let selected_bytes = sparse_data_group_bytes(&selected_plan);
     if let Some(profiler) = profiler {
         profiler.record_sparse_projected_groups(
             projected_sparse_data_strategy,
             plan.data_groups.len(),
-            selected_groups.len(),
+            selected_plan.data_groups.len(),
             selected_bytes,
         );
     }
-    if selected_groups.is_empty() {
+    if selected_plan.data_groups.is_empty() {
         return Ok(());
     }
 
@@ -259,25 +256,20 @@ pub(crate) fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue
                 load_sparse_selected_data_group_bytes(
                     access,
                     access_config,
-                    plan,
+                    &selected_plan,
                     &selected_groups,
                     cancel,
                 )
             })?;
-        let loaded_group_indices = if sparse_selected_groups_cover_all(plan, &selected_groups) {
-            None
-        } else {
-            Some(selected_groups.clone())
-        };
         if try_scatter_sparse_rows_parallel_checked_with_group_indices(
             compute,
             dataset,
-            plan,
+            &selected_plan,
             Arc::clone(&index_bytes),
             data_group_bytes,
             output_genes,
             gene_axis.projection().cloned(),
-            loaded_group_indices,
+            None,
             out,
         )? {
             return Ok(());
@@ -286,7 +278,7 @@ pub(crate) fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue
 
     if selected_groups.iter().all(|&group_index| {
         matches!(
-            plan.data_groups[group_index].source,
+            selected_plan.data_groups[group_index].source,
             SparseGroupSource::AccessItem(_)
         )
     }) {
@@ -294,7 +286,7 @@ pub(crate) fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue
             schedule_sparse_selected_file_groups(
                 access,
                 access_config,
-                plan,
+                &selected_plan,
                 &selected_groups,
                 cancel,
             )
@@ -306,17 +298,18 @@ pub(crate) fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue
                     return Err(DataBankError::PrefetchCancelled);
                 }
             }
-            let group = &plan.data_groups[group_index];
+            let group = &selected_plan.data_groups[group_index];
             let bytes = profile_sparse_projected_data_load(profiler, group.bytes, || {
                 next_scheduled_sparse_group_bytes(&mut scheduled)
             })?;
-            scatter_sparse_data_group_projected_checked(
+            scatter_sparse_data_group_projected_checked_with_projected_indices(
                 dataset,
-                &plan.data_pieces,
+                &selected_plan.data_pieces,
                 group,
                 index_bytes.as_ref(),
                 &bytes,
                 gene_axis,
+                selected_plan.projected_indices.as_ref(),
                 out,
             )?;
         }
@@ -326,13 +319,13 @@ pub(crate) fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue
             schedule_sparse_selected_file_groups(
                 access,
                 access_config,
-                plan,
+                &selected_plan,
                 &selected_groups,
                 cancel,
             )
         })?;
         for &group_index in &selected_groups {
-            let group = &plan.data_groups[group_index];
+            let group = &selected_plan.data_groups[group_index];
             if let Some(cancel) = cancel {
                 if cancel.is_cancelled() {
                     return Err(DataBankError::PrefetchCancelled);
@@ -340,7 +333,7 @@ pub(crate) fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue
             }
             if try_scatter_sparse_memory_identity_data_group_projected_checked(
                 dataset,
-                &plan.data_pieces,
+                &selected_plan.data_pieces,
                 group,
                 index_bytes.as_ref(),
                 gene_axis,
@@ -365,13 +358,14 @@ pub(crate) fn load_sparse_data_groups_and_scatter_projected_checked<T: DataValue
                     })?
                 }
             };
-            scatter_sparse_data_group_projected_checked(
+            scatter_sparse_data_group_projected_checked_with_projected_indices(
                 dataset,
-                &plan.data_pieces,
+                &selected_plan.data_pieces,
                 group,
                 index_bytes.as_ref(),
                 &bytes,
                 gene_axis,
+                selected_plan.projected_indices.as_ref(),
                 out,
             )?;
         }
@@ -1020,6 +1014,8 @@ where
             scatter_sparse_values_to_row_checked_typed::<T, I>(
                 num_genes,
                 projection,
+                piece.projection_filtered,
+                piece.contiguous_output_start,
                 piece.elements,
                 &index_bytes[piece.index_offset..index_end],
                 &data_bytes[piece.group_offset..data_end],
@@ -1034,6 +1030,8 @@ where
 pub(crate) fn scatter_sparse_values_to_row_checked_typed<T, I>(
     num_genes: usize,
     projection: Option<&CompiledGeneProjection>,
+    projection_filtered: bool,
+    contiguous_output_start: Option<usize>,
     elements: usize,
     index_bytes: &[u8],
     data_bytes: &[u8],
@@ -1070,7 +1068,24 @@ where
             num_genes,
             output_genes: row_out.len(),
             projection,
+            contiguous_selected_source_range: projection.contiguous_selected_source_range(),
+            contiguous_selected_source_output_start: projection
+                .contiguous_selected_source_output_start(),
         };
+        if projection_filtered {
+            return unsafe {
+                super::aot::scatter_sparse_values_projected_selected_aot_unchecked::<T, I>(
+                    projection,
+                    0,
+                    elements,
+                    index_bytes,
+                    data_bytes,
+                    src_dtype,
+                    contiguous_output_start,
+                    row_out,
+                )
+            };
+        }
         return super::aot::scatter_sparse_values_projected_aot_checked::<T, I>(
             projection,
             0,
@@ -1256,175 +1271,6 @@ pub(crate) fn scatter_sparse_data_group_checked_from_decoded_source<T: DataValue
     }
 }
 
-pub(crate) fn sparse_data_group_has_selected_values(
-    dataset: &SparseCsrDataset,
-    pieces: &[SparseReadPiece],
-    group: &SparseReadGroup,
-    index_bytes: &[u8],
-    gene_axis: &GeneAxisPlan,
-) -> DataBankResult<bool> {
-    let Some(projection) = gene_axis.projection() else {
-        return Ok(true);
-    };
-    if projection.selected_sources.is_empty() {
-        return validate_sparse_data_group_indices(dataset, pieces, group, index_bytes)
-            .map(|_| false);
-    }
-
-    match dataset.index_dtype {
-        DType::U32 => sparse_data_group_has_selected_values_typed::<u32>(
-            dataset.num_genes,
-            pieces,
-            group,
-            index_bytes,
-            projection,
-        ),
-        DType::I32 => sparse_data_group_has_selected_values_typed::<i32>(
-            dataset.num_genes,
-            pieces,
-            group,
-            index_bytes,
-            projection,
-        ),
-        DType::U64 => sparse_data_group_has_selected_values_typed::<u64>(
-            dataset.num_genes,
-            pieces,
-            group,
-            index_bytes,
-            projection,
-        ),
-        DType::I64 => sparse_data_group_has_selected_values_typed::<i64>(
-            dataset.num_genes,
-            pieces,
-            group,
-            index_bytes,
-            projection,
-        ),
-        dtype => Err(DataBankError::UnsupportedDType {
-            dtype,
-            context: "CSR indices",
-        }),
-    }
-}
-
-pub(crate) fn validate_sparse_data_group_indices(
-    dataset: &SparseCsrDataset,
-    pieces: &[SparseReadPiece],
-    group: &SparseReadGroup,
-    index_bytes: &[u8],
-) -> DataBankResult<()> {
-    match dataset.index_dtype {
-        DType::U32 => validate_sparse_data_group_indices_typed::<u32>(
-            dataset.num_genes,
-            pieces,
-            group,
-            index_bytes,
-        ),
-        DType::I32 => validate_sparse_data_group_indices_typed::<i32>(
-            dataset.num_genes,
-            pieces,
-            group,
-            index_bytes,
-        ),
-        DType::U64 => validate_sparse_data_group_indices_typed::<u64>(
-            dataset.num_genes,
-            pieces,
-            group,
-            index_bytes,
-        ),
-        DType::I64 => validate_sparse_data_group_indices_typed::<i64>(
-            dataset.num_genes,
-            pieces,
-            group,
-            index_bytes,
-        ),
-        dtype => Err(DataBankError::UnsupportedDType {
-            dtype,
-            context: "CSR indices",
-        }),
-    }
-}
-
-pub(crate) fn sparse_data_group_has_selected_values_typed<I>(
-    num_genes: usize,
-    pieces: &[SparseReadPiece],
-    group: &SparseReadGroup,
-    index_bytes: &[u8],
-    projection: &CompiledGeneProjection,
-) -> DataBankResult<bool>
-where
-    I: CsrIndex,
-{
-    let index_size = mem::size_of::<I>();
-    for &piece_index in &group.parts {
-        let piece = pieces.get(piece_index).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR data group piece index is invalid".to_string())
-        })?;
-        let index_len = piece.elements.checked_mul(index_size).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR index slice length overflow".to_string())
-        })?;
-        let index_end = piece.index_offset.checked_add(index_len).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR index slice offset overflow".to_string())
-        })?;
-        if index_end > index_bytes.len() {
-            return Err(DataBankError::InvalidArrayMeta(
-                "CSR index grouped scan is out of range".to_string(),
-            ));
-        }
-        let index_ptr = index_bytes[piece.index_offset..index_end]
-            .as_ptr()
-            .cast::<I>();
-        for nz in 0..piece.elements {
-            let gene = unsafe { ptr::read_unaligned(index_ptr.add(nz)) }.checked_gene()?;
-            if gene >= num_genes {
-                return Err(DataBankError::GeneIndexOutOfRange { gene, num_genes });
-            }
-            if projection.output_for_source(gene).is_some() {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-pub(crate) fn validate_sparse_data_group_indices_typed<I>(
-    num_genes: usize,
-    pieces: &[SparseReadPiece],
-    group: &SparseReadGroup,
-    index_bytes: &[u8],
-) -> DataBankResult<()>
-where
-    I: CsrIndex,
-{
-    let index_size = mem::size_of::<I>();
-    for &piece_index in &group.parts {
-        let piece = pieces.get(piece_index).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR data group piece index is invalid".to_string())
-        })?;
-        let index_len = piece.elements.checked_mul(index_size).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR index slice length overflow".to_string())
-        })?;
-        let index_end = piece.index_offset.checked_add(index_len).ok_or_else(|| {
-            DataBankError::InvalidArrayMeta("CSR index slice offset overflow".to_string())
-        })?;
-        if index_end > index_bytes.len() {
-            return Err(DataBankError::InvalidArrayMeta(
-                "CSR index grouped scan is out of range".to_string(),
-            ));
-        }
-        let index_ptr = index_bytes[piece.index_offset..index_end]
-            .as_ptr()
-            .cast::<I>();
-        for nz in 0..piece.elements {
-            let gene = unsafe { ptr::read_unaligned(index_ptr.add(nz)) }.checked_gene()?;
-            if gene >= num_genes {
-                return Err(DataBankError::GeneIndexOutOfRange { gene, num_genes });
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn scatter_sparse_data_group_projected_checked<T: DataValue>(
     dataset: &SparseCsrDataset,
     pieces: &[SparseReadPiece],
@@ -1432,6 +1278,28 @@ pub(crate) fn scatter_sparse_data_group_projected_checked<T: DataValue>(
     index_bytes: &[u8],
     data_bytes: &[u8],
     gene_axis: &GeneAxisPlan,
+    out: &mut [T],
+) -> DataBankResult<()> {
+    scatter_sparse_data_group_projected_checked_with_projected_indices(
+        dataset,
+        pieces,
+        group,
+        index_bytes,
+        data_bytes,
+        gene_axis,
+        None,
+        out,
+    )
+}
+
+pub(crate) fn scatter_sparse_data_group_projected_checked_with_projected_indices<T: DataValue>(
+    dataset: &SparseCsrDataset,
+    pieces: &[SparseReadPiece],
+    group: &SparseReadGroup,
+    index_bytes: &[u8],
+    data_bytes: &[u8],
+    gene_axis: &GeneAxisPlan,
+    projected_indices: Option<&ProjectedIndexBuffer>,
     out: &mut [T],
 ) -> DataBankResult<()> {
     if data_bytes.len() != group.bytes {
@@ -1455,6 +1323,9 @@ pub(crate) fn scatter_sparse_data_group_projected_checked<T: DataValue>(
         num_genes: dataset.num_genes,
         output_genes: projection.output_genes(),
         projection,
+        contiguous_selected_source_range: projection.contiguous_selected_source_range(),
+        contiguous_selected_source_output_start: projection
+            .contiguous_selected_source_output_start(),
     };
 
     match dataset.index_dtype {
@@ -1465,6 +1336,7 @@ pub(crate) fn scatter_sparse_data_group_projected_checked<T: DataValue>(
             index_bytes,
             data_bytes,
             dataset.data.dtype,
+            projected_indices,
             out,
         ),
         DType::I32 => scatter_sparse_data_group_projected_checked_typed::<T, i32>(
@@ -1474,6 +1346,7 @@ pub(crate) fn scatter_sparse_data_group_projected_checked<T: DataValue>(
             index_bytes,
             data_bytes,
             dataset.data.dtype,
+            projected_indices,
             out,
         ),
         DType::U64 => scatter_sparse_data_group_projected_checked_typed::<T, u64>(
@@ -1483,6 +1356,7 @@ pub(crate) fn scatter_sparse_data_group_projected_checked<T: DataValue>(
             index_bytes,
             data_bytes,
             dataset.data.dtype,
+            projected_indices,
             out,
         ),
         DType::I64 => scatter_sparse_data_group_projected_checked_typed::<T, i64>(
@@ -1492,6 +1366,7 @@ pub(crate) fn scatter_sparse_data_group_projected_checked<T: DataValue>(
             index_bytes,
             data_bytes,
             dataset.data.dtype,
+            projected_indices,
             out,
         ),
         dtype => Err(DataBankError::UnsupportedDType {
@@ -1499,6 +1374,428 @@ pub(crate) fn scatter_sparse_data_group_projected_checked<T: DataValue>(
             context: "CSR indices",
         }),
     }
+}
+
+pub(crate) fn scatter_sparse_data_groups_projected_checked_with_projected_indices<T: DataValue>(
+    dataset: &SparseCsrDataset,
+    plan: &SparseBatchPlan,
+    index_bytes: &[u8],
+    data_group_bytes: &[Arc<[u8]>],
+    gene_axis: &GeneAxisPlan,
+    out: &mut [T],
+) -> DataBankResult<()> {
+    if try_scatter_projected_groups_fast_copy_cast(dataset, plan, data_group_bytes, gene_axis, out)?
+    {
+        return Ok(());
+    }
+    if data_group_bytes.len() != plan.data_groups.len() {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "CSR loaded data group count is {}, expected {}",
+            data_group_bytes.len(),
+            plan.data_groups.len()
+        )));
+    }
+    let Some(projection) = gene_axis.projection() else {
+        for (group, data_bytes) in plan.data_groups.iter().zip(data_group_bytes) {
+            scatter_sparse_data_group_checked(
+                dataset,
+                &plan.data_pieces,
+                group,
+                index_bytes,
+                data_bytes,
+                out,
+            )?;
+        }
+        return Ok(());
+    };
+    let projection = SparseProjectionCtx {
+        num_genes: dataset.num_genes,
+        output_genes: projection.output_genes(),
+        projection,
+        contiguous_selected_source_range: projection.contiguous_selected_source_range(),
+        contiguous_selected_source_output_start: projection
+            .contiguous_selected_source_output_start(),
+    };
+
+    macro_rules! dispatch {
+        ($index:ty) => {{
+            for (group, data_bytes) in plan.data_groups.iter().zip(data_group_bytes) {
+                scatter_sparse_data_group_projected_checked_typed::<T, $index>(
+                    projection,
+                    &plan.data_pieces,
+                    group,
+                    index_bytes,
+                    data_bytes,
+                    dataset.data.dtype,
+                    plan.projected_indices.as_ref(),
+                    out,
+                )?;
+            }
+            Ok(())
+        }};
+    }
+
+    match dataset.index_dtype {
+        DType::U32 => dispatch!(u32),
+        DType::I32 => dispatch!(i32),
+        DType::U64 => dispatch!(u64),
+        DType::I64 => dispatch!(i64),
+        dtype => Err(DataBankError::UnsupportedDType {
+            dtype,
+            context: "CSR indices",
+        }),
+    }
+}
+
+pub(crate) fn scatter_sparse_read_all_groups_with_selected_plan<T: DataValue>(
+    dataset: &SparseCsrDataset,
+    read_all_plan: &SparseBatchPlan,
+    selected_plan: &SparseBatchPlan,
+    index_bytes: &[u8],
+    read_all_group_bytes: &[Arc<[u8]>],
+    gene_axis: &GeneAxisPlan,
+    out: &mut [T],
+) -> DataBankResult<()> {
+    if read_all_group_bytes.len() != read_all_plan.data_groups.len() {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "CSR read-all loaded data group count is {}, expected {}",
+            read_all_group_bytes.len(),
+            read_all_plan.data_groups.len()
+        )));
+    }
+    if selected_plan.data_groups.is_empty() {
+        return Ok(());
+    }
+
+    let read_all_keys = read_all_plan
+        .data_groups
+        .iter()
+        .map(|group| sparse_group_source_key(&group.source))
+        .collect::<Vec<_>>();
+    let mut adjusted_pieces = selected_plan.data_pieces.clone();
+
+    for selected_group in &selected_plan.data_groups {
+        let selected_key = sparse_group_source_key(&selected_group.source);
+        let Some(read_all_group_idx) = read_all_keys
+            .iter()
+            .position(|&read_all_key| read_all_key == selected_key)
+        else {
+            return Err(DataBankError::InvalidArrayMeta(
+                "CSR selected group has no matching read-all group".to_string(),
+            ));
+        };
+        let read_all_group = &read_all_plan.data_groups[read_all_group_idx];
+        let read_all_bytes = &read_all_group_bytes[read_all_group_idx];
+
+        let mut adjusted_group = selected_group.clone();
+        adjusted_group.bytes = read_all_bytes.len();
+        for &piece_index in &adjusted_group.parts {
+            let piece = adjusted_pieces.get_mut(piece_index).ok_or_else(|| {
+                DataBankError::InvalidArrayMeta(
+                    "CSR selected group piece index is invalid".to_string(),
+                )
+            })?;
+            piece.group_offset =
+                read_all_group_offset_for_selected_piece(read_all_plan, read_all_group, piece)?;
+            let end = piece.group_offset.checked_add(piece.bytes).ok_or_else(|| {
+                DataBankError::InvalidArrayMeta(
+                    "CSR selected read-all source offset overflow".to_string(),
+                )
+            })?;
+            if end > read_all_bytes.len() {
+                return Err(DataBankError::InvalidArrayMeta(
+                    "CSR selected read-all source exceeds loaded group".to_string(),
+                ));
+            }
+        }
+
+        scatter_sparse_data_group_projected_checked_with_projected_indices(
+            dataset,
+            &adjusted_pieces,
+            &adjusted_group,
+            index_bytes,
+            read_all_bytes,
+            gene_axis,
+            selected_plan.projected_indices.as_ref(),
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+fn read_all_group_offset_for_selected_piece(
+    read_all_plan: &SparseBatchPlan,
+    read_all_group: &SparseReadGroup,
+    selected_piece: &SparseReadPiece,
+) -> DataBankResult<usize> {
+    for &read_all_piece_index in &read_all_group.parts {
+        let read_all_piece = read_all_plan
+            .data_pieces
+            .get(read_all_piece_index)
+            .ok_or_else(|| {
+                DataBankError::InvalidArrayMeta(
+                    "CSR read-all group piece index is invalid".to_string(),
+                )
+            })?;
+        if read_all_piece.output_row == selected_piece.output_row
+            && read_all_piece.source.start <= selected_piece.source.start
+            && selected_piece.source.end <= read_all_piece.source.end
+        {
+            let delta = selected_piece.source.start - read_all_piece.source.start;
+            return read_all_piece
+                .group_offset
+                .checked_add(delta)
+                .ok_or_else(|| {
+                    DataBankError::InvalidArrayMeta(
+                        "CSR selected read-all group offset overflow".to_string(),
+                    )
+                });
+        }
+    }
+    Err(DataBankError::InvalidArrayMeta(
+        "CSR selected piece has no containing read-all piece".to_string(),
+    ))
+}
+
+fn try_scatter_projected_groups_fast_copy_cast<T: DataValue>(
+    dataset: &SparseCsrDataset,
+    plan: &SparseBatchPlan,
+    data_group_bytes: &[Arc<[u8]>],
+    gene_axis: &GeneAxisPlan,
+    out: &mut [T],
+) -> DataBankResult<bool> {
+    let output_genes = gene_axis.output_genes(dataset.num_genes);
+    let Some(projected_indices) = plan.projected_indices.as_ref() else {
+        return Ok(false);
+    };
+    if data_group_bytes.len() != plan.data_groups.len() {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "CSR loaded data group count is {}, expected {}",
+            data_group_bytes.len(),
+            plan.data_groups.len()
+        )));
+    }
+    match (T::DTYPE, dataset.data.dtype, projected_indices) {
+        (DType::U16, DType::U16, ProjectedIndexBuffer::U16(cols)) => unsafe {
+            scatter_projected_groups_copy_fast::<T, u16, u16>(
+                output_genes,
+                plan,
+                data_group_bytes,
+                cols,
+                out,
+            )?;
+            Ok(true)
+        },
+        (DType::U16, DType::U16, ProjectedIndexBuffer::U32(cols)) => unsafe {
+            scatter_projected_groups_copy_fast::<T, u16, u32>(
+                output_genes,
+                plan,
+                data_group_bytes,
+                cols,
+                out,
+            )?;
+            Ok(true)
+        },
+        (DType::U32, DType::U32, ProjectedIndexBuffer::U16(cols)) => unsafe {
+            scatter_projected_groups_copy_fast::<T, u32, u16>(
+                output_genes,
+                plan,
+                data_group_bytes,
+                cols,
+                out,
+            )?;
+            Ok(true)
+        },
+        (DType::U32, DType::U32, ProjectedIndexBuffer::U32(cols)) => unsafe {
+            scatter_projected_groups_copy_fast::<T, u32, u32>(
+                output_genes,
+                plan,
+                data_group_bytes,
+                cols,
+                out,
+            )?;
+            Ok(true)
+        },
+        (DType::U32, DType::U16, ProjectedIndexBuffer::U16(cols)) => unsafe {
+            scatter_projected_groups_u16_to_u32_fast::<T, u16>(
+                output_genes,
+                plan,
+                data_group_bytes,
+                cols,
+                out,
+            )?;
+            Ok(true)
+        },
+        (DType::U32, DType::U16, ProjectedIndexBuffer::U32(cols)) => unsafe {
+            scatter_projected_groups_u16_to_u32_fast::<T, u32>(
+                output_genes,
+                plan,
+                data_group_bytes,
+                cols,
+                out,
+            )?;
+            Ok(true)
+        },
+        _ => Ok(false),
+    }
+}
+
+unsafe fn scatter_projected_groups_copy_fast<T, D, O>(
+    output_genes: usize,
+    plan: &SparseBatchPlan,
+    data_group_bytes: &[Arc<[u8]>],
+    projected_cols: &[O],
+    out: &mut [T],
+) -> DataBankResult<()>
+where
+    T: DataValue,
+    D: Copy,
+    O: super::aot::ProjectedCol,
+{
+    debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<D>());
+    let out_ptr = out.as_mut_ptr().cast::<D>();
+    for (group, data_bytes) in plan.data_groups.iter().zip(data_group_bytes) {
+        for &piece_index in &group.parts {
+            let piece = plan.data_pieces.get(piece_index).ok_or_else(|| {
+                DataBankError::InvalidArrayMeta("CSR data group piece index is invalid".to_string())
+            })?;
+            scatter_projected_piece_copy_fast::<D, O>(
+                output_genes,
+                piece,
+                data_bytes,
+                projected_cols,
+                out_ptr,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+unsafe fn scatter_projected_piece_copy_fast<D, O>(
+    output_genes: usize,
+    piece: &SparseReadPiece,
+    data_bytes: &[u8],
+    projected_cols: &[O],
+    out_ptr: *mut D,
+) -> DataBankResult<()>
+where
+    D: Copy,
+    O: super::aot::ProjectedCol,
+{
+    let Some(projected_index_offset) = piece.projected_index_offset else {
+        return Err(DataBankError::InvalidArrayMeta(
+            "CSR projected index offset missing for fast scatter".to_string(),
+        ));
+    };
+    let projected_index_end = projected_index_offset
+        .checked_add(piece.elements)
+        .ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("CSR projected index slice offset overflow".to_string())
+        })?;
+    let data_end = piece.group_offset.checked_add(piece.bytes).ok_or_else(|| {
+        DataBankError::InvalidArrayMeta("CSR data group offset overflow".to_string())
+    })?;
+    if projected_index_end > projected_cols.len() || data_end > data_bytes.len() {
+        return Err(DataBankError::InvalidArrayMeta(
+            "CSR projected fast scatter is out of range".to_string(),
+        ));
+    }
+    let row_base = piece
+        .output_row
+        .checked_mul(output_genes)
+        .ok_or_else(|| DataBankError::InvalidConfig("sparse output row overflow".to_string()))?;
+    let col_ptr = projected_cols[projected_index_offset..projected_index_end].as_ptr();
+    let data_ptr = data_bytes[piece.group_offset..data_end]
+        .as_ptr()
+        .cast::<D>();
+    for nz in 0..piece.elements {
+        let output_col = unsafe { (*col_ptr.add(nz)).to_usize() };
+        debug_assert!(
+            output_col < output_genes,
+            "projected CSR output column out of range"
+        );
+        let value = unsafe { std::ptr::read_unaligned(data_ptr.add(nz)) };
+        unsafe { std::ptr::write(out_ptr.add(row_base + output_col), value) };
+    }
+    Ok(())
+}
+
+unsafe fn scatter_projected_groups_u16_to_u32_fast<T, O>(
+    output_genes: usize,
+    plan: &SparseBatchPlan,
+    data_group_bytes: &[Arc<[u8]>],
+    projected_cols: &[O],
+    out: &mut [T],
+) -> DataBankResult<()>
+where
+    T: DataValue,
+    O: super::aot::ProjectedCol,
+{
+    debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<u32>());
+    let out_ptr = out.as_mut_ptr().cast::<u32>();
+    for (group, data_bytes) in plan.data_groups.iter().zip(data_group_bytes) {
+        for &piece_index in &group.parts {
+            let piece = plan.data_pieces.get(piece_index).ok_or_else(|| {
+                DataBankError::InvalidArrayMeta("CSR data group piece index is invalid".to_string())
+            })?;
+            scatter_projected_piece_u16_to_u32_fast(
+                output_genes,
+                piece,
+                data_bytes,
+                projected_cols,
+                out_ptr,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+unsafe fn scatter_projected_piece_u16_to_u32_fast<O>(
+    output_genes: usize,
+    piece: &SparseReadPiece,
+    data_bytes: &[u8],
+    projected_cols: &[O],
+    out_ptr: *mut u32,
+) -> DataBankResult<()>
+where
+    O: super::aot::ProjectedCol,
+{
+    let Some(projected_index_offset) = piece.projected_index_offset else {
+        return Err(DataBankError::InvalidArrayMeta(
+            "CSR projected index offset missing for fast scatter".to_string(),
+        ));
+    };
+    let projected_index_end = projected_index_offset
+        .checked_add(piece.elements)
+        .ok_or_else(|| {
+            DataBankError::InvalidArrayMeta("CSR projected index slice offset overflow".to_string())
+        })?;
+    let data_end = piece.group_offset.checked_add(piece.bytes).ok_or_else(|| {
+        DataBankError::InvalidArrayMeta("CSR data group offset overflow".to_string())
+    })?;
+    if projected_index_end > projected_cols.len() || data_end > data_bytes.len() {
+        return Err(DataBankError::InvalidArrayMeta(
+            "CSR projected fast scatter is out of range".to_string(),
+        ));
+    }
+    let row_base = piece
+        .output_row
+        .checked_mul(output_genes)
+        .ok_or_else(|| DataBankError::InvalidConfig("sparse output row overflow".to_string()))?;
+    let col_ptr = projected_cols[projected_index_offset..projected_index_end].as_ptr();
+    let data_ptr = data_bytes[piece.group_offset..data_end]
+        .as_ptr()
+        .cast::<u16>();
+    for nz in 0..piece.elements {
+        let output_col = unsafe { (*col_ptr.add(nz)).to_usize() };
+        debug_assert!(
+            output_col < output_genes,
+            "projected CSR output column out of range"
+        );
+        let value = unsafe { std::ptr::read_unaligned(data_ptr.add(nz)) } as u32;
+        unsafe { std::ptr::write(out_ptr.add(row_base + output_col), value) };
+    }
+    Ok(())
 }
 
 pub(crate) fn try_scatter_sparse_memory_identity_data_group_projected_checked<T: DataValue>(
@@ -1565,6 +1862,9 @@ pub(crate) fn scatter_sparse_data_group_projected_checked_from_decoded_source<T:
         num_genes: dataset.num_genes,
         output_genes: projection.output_genes(),
         projection,
+        contiguous_selected_source_range: projection.contiguous_selected_source_range(),
+        contiguous_selected_source_output_start: projection
+            .contiguous_selected_source_output_start(),
     };
 
     match dataset.index_dtype {
@@ -1720,6 +2020,7 @@ pub(crate) fn scatter_sparse_data_group_projected_checked_typed<T, I>(
     index_bytes: &[u8],
     data_bytes: &[u8],
     src_dtype: DType,
+    projected_indices: Option<&ProjectedIndexBuffer>,
     out: &mut [T],
 ) -> DataBankResult<()>
 where
@@ -1745,15 +2046,80 @@ where
                 "CSR data grouped scatter is out of range".to_string(),
             ));
         }
-        scatter_sparse_values_projected_checked_typed::<T, I>(
-            projection,
-            piece.output_row,
-            piece.elements,
-            &index_bytes[piece.index_offset..index_end],
-            &data_bytes[piece.group_offset..data_end],
-            src_dtype,
-            out,
-        )?;
+        if piece.projection_filtered {
+            if let (Some(projected_indices), Some(projected_index_offset)) =
+                (projected_indices, piece.projected_index_offset)
+            {
+                let projected_index_end = projected_index_offset
+                    .checked_add(piece.elements)
+                    .ok_or_else(|| {
+                        DataBankError::InvalidArrayMeta(
+                            "CSR projected index slice offset overflow".to_string(),
+                        )
+                    })?;
+                match projected_indices {
+                    ProjectedIndexBuffer::U16(values) => {
+                        if projected_index_end > values.len() {
+                            return Err(DataBankError::InvalidArrayMeta(
+                                "CSR projected u16 index slice is out of range".to_string(),
+                            ));
+                        }
+                        unsafe {
+                            super::aot::scatter_sparse_values_projected_cols_aot_unchecked::<T, u16>(
+                                piece.output_row,
+                                projection.output_genes,
+                                piece.elements,
+                                &values[projected_index_offset..projected_index_end],
+                                &data_bytes[piece.group_offset..data_end],
+                                src_dtype,
+                                out,
+                            )
+                        }?;
+                    }
+                    ProjectedIndexBuffer::U32(values) => {
+                        if projected_index_end > values.len() {
+                            return Err(DataBankError::InvalidArrayMeta(
+                                "CSR projected u32 index slice is out of range".to_string(),
+                            ));
+                        }
+                        unsafe {
+                            super::aot::scatter_sparse_values_projected_cols_aot_unchecked::<T, u32>(
+                                piece.output_row,
+                                projection.output_genes,
+                                piece.elements,
+                                &values[projected_index_offset..projected_index_end],
+                                &data_bytes[piece.group_offset..data_end],
+                                src_dtype,
+                                out,
+                            )
+                        }?;
+                    }
+                }
+                continue;
+            }
+            unsafe {
+                super::aot::scatter_sparse_values_projected_selected_aot_unchecked::<T, I>(
+                    projection,
+                    piece.output_row,
+                    piece.elements,
+                    &index_bytes[piece.index_offset..index_end],
+                    &data_bytes[piece.group_offset..data_end],
+                    src_dtype,
+                    piece.contiguous_output_start,
+                    out,
+                )
+            }?;
+        } else {
+            scatter_sparse_values_projected_checked_typed::<T, I>(
+                projection,
+                piece.output_row,
+                piece.elements,
+                &index_bytes[piece.index_offset..index_end],
+                &data_bytes[piece.group_offset..data_end],
+                src_dtype,
+                out,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1794,15 +2160,30 @@ where
                 "CSR data projected direct scatter is out of range".to_string(),
             ));
         }
-        scatter_sparse_values_projected_checked_typed::<T, I>(
-            projection,
-            piece.output_row,
-            piece.elements,
-            &index_bytes[piece.index_offset..index_end],
-            &decoded[piece.source.start..piece.source.end],
-            src_dtype,
-            out,
-        )?;
+        if piece.projection_filtered {
+            unsafe {
+                super::aot::scatter_sparse_values_projected_selected_aot_unchecked::<T, I>(
+                    projection,
+                    piece.output_row,
+                    piece.elements,
+                    &index_bytes[piece.index_offset..index_end],
+                    &decoded[piece.source.start..piece.source.end],
+                    src_dtype,
+                    piece.contiguous_output_start,
+                    out,
+                )
+            }?;
+        } else {
+            scatter_sparse_values_projected_checked_typed::<T, I>(
+                projection,
+                piece.output_row,
+                piece.elements,
+                &index_bytes[piece.index_offset..index_end],
+                &decoded[piece.source.start..piece.source.end],
+                src_dtype,
+                out,
+            )?;
+        }
     }
     Ok(())
 }

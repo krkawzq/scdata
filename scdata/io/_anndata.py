@@ -76,6 +76,7 @@ def write_zarr(
     align_cells: bool = True,
     store: _Store = "zip",
     compressor: _Compressor = _DEFAULT_COMPRESSOR,
+    blocksize: int = 0,
 ) -> Path:
     """Write an :class:`anndata.AnnData` as a scdata zarr v3 store.
 
@@ -114,6 +115,13 @@ def write_zarr(
     compressor:
         Chunk compressor.  Defaults to ``"blosc.lz4.level5"``.  Pass ``None``
         or ``"none"`` for uncompressed chunks.
+    blocksize:
+        Blosc block size in bytes, applied to every Blosc-compressed array
+        (``X``, ``layers``, ``raw.X``, and CSR ``indptr`` / ``indices`` /
+        ``data``).  ``0`` (default) lets Blosc pick the block size.  A positive
+        value overrides any blocksize embedded in ``compressor``.  Ignored when
+        ``compressor`` is ``None``.  Smaller blocks reduce read amplification
+        for random partial access at the cost of compression ratio.
     """
     import zarr
     from anndata._io.specs import write_elem
@@ -128,6 +136,7 @@ def write_zarr(
         chunk_size=chunk_size,
         store=store,
         compressor=compressor,
+        blocksize=blocksize,
     )
     tmp_root: Path | None = None
     if store == "zip":
@@ -164,6 +173,7 @@ def write_zarr(
                     chunk_size=chunk_size,
                     align_cells=align_cells,
                     compressor=compressor,
+                    blocksize=blocksize,
                 )
 
             _write_x(
@@ -173,6 +183,7 @@ def write_zarr(
                 chunk_size=chunk_size,
                 align_cells=align_cells,
                 compressor=compressor,
+                blocksize=blocksize,
             )
             _write_layers(
                 g,
@@ -181,6 +192,7 @@ def write_zarr(
                 chunk_size=chunk_size,
                 align_cells=align_cells,
                 compressor=compressor,
+                blocksize=blocksize,
             )
 
         if store == "zip":
@@ -211,6 +223,7 @@ def _write_x(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
+    blocksize: int = 0,
 ) -> None:
     """Write the X array/group in the requested layout."""
     _write_matrix(
@@ -223,6 +236,7 @@ def _write_x(
         chunk_size=chunk_size,
         align_cells=align_cells,
         compressor=compressor,
+        blocksize=blocksize,
     )
 
 
@@ -234,6 +248,7 @@ def _write_layers(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
+    blocksize: int = 0,
 ) -> None:
     """Write all AnnData layers using the same scdata matrix layouts as X."""
     if not adata.layers:
@@ -253,6 +268,7 @@ def _write_layers(
             chunk_size=chunk_size,
             align_cells=align_cells,
             compressor=compressor,
+            blocksize=blocksize,
         )
 
 
@@ -264,6 +280,7 @@ def _write_raw(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
+    blocksize: int = 0,
 ) -> None:
     """Write ``adata.raw`` so ``raw.X`` uses the same scdata layout as ``X``.
 
@@ -295,6 +312,7 @@ def _write_raw(
         chunk_size=chunk_size,
         align_cells=align_cells,
         compressor=compressor,
+        blocksize=blocksize,
     )
 
 
@@ -309,6 +327,7 @@ def _write_matrix(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
+    blocksize: int = 0,
 ) -> None:
     """Write one dense or CSR matrix under ``g[name]`` in a scdata layout."""
     from scipy import sparse as _sparse
@@ -330,6 +349,7 @@ def _write_matrix(
             chunk_shape,
             attrs=_matrix_attrs("dense2d", n_obs, n_var),
             compressor=compressor,
+            blocksize=blocksize,
         )
     elif format == "dense1d":
         dense = matrix.toarray() if _sparse.issparse(matrix) else np.asarray(matrix)
@@ -342,6 +362,7 @@ def _write_matrix(
             chunk_shape,
             attrs=_matrix_attrs("dense1d", n_obs, n_var),
             compressor=compressor,
+            blocksize=blocksize,
         )
     elif format == "sparse":
         if _sparse.isspmatrix_csr(matrix):
@@ -358,6 +379,7 @@ def _write_matrix(
             chunk_size=chunk_size,
             align_cells=align_cells,
             compressor=compressor,
+            blocksize=blocksize,
         )
     else:  # pragma: no cover - Literal exhausts the cases
         raise StoreError(f"unsupported X format: {format!r}")
@@ -422,6 +444,7 @@ def _create_dense_array(
     *,
     attrs: dict[str, Any],
     compressor: _Compressor,
+    blocksize: int = 0,
 ) -> None:
     """Create a v3 dense array with the scdata default codec pipeline."""
     from zarr.codecs import BytesCodec
@@ -435,7 +458,7 @@ def _create_dense_array(
         shards=None,
         filters=(),
         serializer=BytesCodec(endian="little"),
-        compressors=_zarr_compressors(np.dtype(data.dtype), compressor),
+        compressors=_zarr_compressors(np.dtype(data.dtype), compressor, blocksize=blocksize),
         fill_value=_fill_value_for(data.dtype),
     )
     arr.attrs.update(attrs)
@@ -450,6 +473,7 @@ def _write_csr_group(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
+    blocksize: int = 0,
 ) -> None:
     """Write a CSR matrix as an anndata-compatible v3 group.
 
@@ -484,6 +508,7 @@ def _write_csr_group(
             "encoding-version": "0.2.0",
         },
         compressor=compressor,
+        blocksize=blocksize,
     )
 
     if align_cells:
@@ -495,6 +520,7 @@ def _write_csr_group(
             boundaries,
             csr.indices.dtype,
             compressor=compressor,
+            blocksize=blocksize,
         )
         _write_rectilinear_array(
             sub,
@@ -503,6 +529,7 @@ def _write_csr_group(
             boundaries,
             csr.data.dtype,
             compressor=compressor,
+            blocksize=blocksize,
         )
     else:
         nnz_chunks = _resolve_chunk_size_1d(chunk_size, 1, align_cells=False)
@@ -516,6 +543,7 @@ def _write_csr_group(
                 "encoding-version": "0.2.0",
             },
             compressor=compressor,
+            blocksize=blocksize,
         )
         _create_dense_array(
             sub,
@@ -527,6 +555,7 @@ def _write_csr_group(
                 "encoding-version": "0.2.0",
             },
             compressor=compressor,
+            blocksize=blocksize,
         )
 
 
@@ -577,6 +606,7 @@ def _write_rectilinear_array(
     dtype: Any,
     *,
     compressor: _Compressor,
+    blocksize: int = 0,
 ) -> None:
     """Write a 1D array with a rectilinear (variable-length) chunk grid.
 
@@ -603,6 +633,7 @@ def _write_rectilinear_array(
             (1,),
             attrs=attrs,
             compressor=compressor,
+            blocksize=blocksize,
         )
         return
 
@@ -617,7 +648,7 @@ def _write_rectilinear_array(
                 "chunk_shapes": [runs],
             },
         },
-        codecs=_v3_codecs(np_dtype, compressor),
+        codecs=_v3_codecs(np_dtype, compressor, blocksize=blocksize),
         fill_value=_fill_value_for(np_dtype),
         attrs=attrs,
     )
@@ -630,7 +661,7 @@ def _write_rectilinear_array(
         if end <= start:
             continue
         chunk_bytes = np.ascontiguousarray(values[start:end]).astype(np_dtype, copy=False).tobytes()
-        chunk_bytes = _encode_chunk_bytes(chunk_bytes, np_dtype, compressor)
+        chunk_bytes = _encode_chunk_bytes(chunk_bytes, np_dtype, compressor, blocksize=blocksize)
         _store_set_bytes(store, f"{base}/{i}", chunk_bytes)
 
 
@@ -772,10 +803,12 @@ def _v3_bytes_codecs(np_dtype: np.dtype) -> list[dict[str, Any]]:
     return [serializer]
 
 
-def _v3_codecs(np_dtype: np.dtype, compressor: _Compressor) -> list[dict[str, Any]]:
+def _v3_codecs(
+    np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int = 0
+) -> list[dict[str, Any]]:
     """Return the v3 serializer plus optional BytesBytes compressor codecs."""
     codecs = _v3_bytes_codecs(np_dtype)
-    cfg = _compressor_config(compressor, np_dtype)
+    cfg = _compressor_config(compressor, np_dtype, blocksize_override=blocksize)
     if cfg is None:
         return codecs
     if cfg["id"] == "blosc":
@@ -795,9 +828,11 @@ def _v3_codecs(np_dtype: np.dtype, compressor: _Compressor) -> list[dict[str, An
     raise StoreError(f"unsupported compressor id: {cfg['id']!r}")
 
 
-def _zarr_compressors(np_dtype: np.dtype, compressor: _Compressor) -> tuple[Any, ...]:
+def _zarr_compressors(
+    np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int = 0
+) -> tuple[Any, ...]:
     """Return zarr v3 BytesBytes codec objects for dense arrays."""
-    cfg = _compressor_config(compressor, np_dtype)
+    cfg = _compressor_config(compressor, np_dtype, blocksize_override=blocksize)
     if cfg is None:
         return ()
     if cfg["id"] == "blosc":
@@ -815,9 +850,11 @@ def _zarr_compressors(np_dtype: np.dtype, compressor: _Compressor) -> tuple[Any,
     raise StoreError(f"unsupported compressor id: {cfg['id']!r}")
 
 
-def _encode_chunk_bytes(raw: bytes, np_dtype: np.dtype, compressor: _Compressor) -> bytes:
+def _encode_chunk_bytes(
+    raw: bytes, np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int = 0
+) -> bytes:
     """Apply the write compressor to one manually-written chunk."""
-    cfg = _compressor_config(compressor, np_dtype)
+    cfg = _compressor_config(compressor, np_dtype, blocksize_override=blocksize)
     if cfg is None:
         return raw
     if cfg["id"] == "blosc":
@@ -835,18 +872,37 @@ def _encode_chunk_bytes(raw: bytes, np_dtype: np.dtype, compressor: _Compressor)
     raise StoreError(f"unsupported compressor id: {cfg['id']!r}")
 
 
-def _compressor_config(compressor: _Compressor, np_dtype: np.dtype) -> dict[str, Any] | None:
-    """Normalize public compressor input to a numcodecs-compatible config."""
+def _compressor_config(
+    compressor: _Compressor,
+    np_dtype: np.dtype,
+    *,
+    blocksize_override: int = 0,
+) -> dict[str, Any] | None:
+    """Normalize public compressor input to a numcodecs-compatible config.
+
+    When ``blocksize_override`` is positive and the resolved compressor is
+    Blosc, it overrides any blocksize embedded in ``compressor`` (whether from
+    a mapping or the default).  A zero override leaves the compressor's own
+    blocksize untouched, preserving the previous behavior.
+    """
     if compressor is None:
         return None
     if isinstance(compressor, str):
-        return _compressor_config_from_string(compressor, np_dtype)
-    if isinstance(compressor, Mapping):
-        return _compressor_config_from_mapping(compressor, np_dtype)
-    raise StoreError(
-        "compressor must be None, a string such as 'blosc.lz4.level5', "
-        f"or a mapping, got {type(compressor).__name__}"
-    )
+        cfg = _compressor_config_from_string(compressor, np_dtype)
+    elif isinstance(compressor, Mapping):
+        cfg = _compressor_config_from_mapping(compressor, np_dtype)
+    else:
+        raise StoreError(
+            "compressor must be None, a string such as 'blosc.lz4.level5', "
+            f"or a mapping, got {type(compressor).__name__}"
+        )
+    if (
+        cfg is not None
+        and cfg.get("id") == "blosc"
+        and int(blocksize_override) > 0
+    ):
+        cfg["blocksize"] = int(blocksize_override)
+    return cfg
 
 
 def _compressor_config_from_string(text: str, np_dtype: np.dtype) -> dict[str, Any] | None:
@@ -1030,6 +1086,7 @@ def _validate_write_options(
     chunk_size: int | list[int] | tuple[int, ...],
     store: str,
     compressor: _Compressor,
+    blocksize: int = 0,
 ) -> None:
     """Validate cheap write options before touching the output path."""
     if store not in ("zip", "dir"):
@@ -1038,6 +1095,8 @@ def _validate_write_options(
         raise StoreError(f"unsupported X format: {format!r}")
     if layer_format not in ("preserve", "auto", "dense2d", "dense1d", "sparse"):
         raise StoreError(f"unsupported layer_format {layer_format!r}")
+    if int(blocksize) < 0:
+        raise StoreError(f"blosc blocksize must be non-negative, got {blocksize}")
     _validate_chunk_size_values(chunk_size)
     _compressor_config(compressor, np.dtype("float32"))
 
