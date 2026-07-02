@@ -10,11 +10,6 @@ pub use super::scheduled::{
     prefetch_cells_scheduled_multi, prefetch_cells_scheduled_multi_by_gene_names, PrefetchCells,
     PrefetchedBatch,
 };
-pub(super) use super::scheduled::{
-    prefetch_cells_scheduled_by_gene_names_with_native,
-    prefetch_cells_scheduled_multi_by_gene_names_with_native,
-    prefetch_cells_scheduled_multi_with_native, prefetch_cells_scheduled_with_native,
-};
 
 #[cfg(test)]
 use super::gene_axis::*;

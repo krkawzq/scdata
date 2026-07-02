@@ -1131,6 +1131,8 @@ fn unregister_defers_file_release_for_retained_prefetch_dataset() {
         Arc::clone(&dataset),
         batches.into_iter(),
         ScheduledPrefetchConfig::default(),
+        bank.config.native_config.clone(),
+        bank.native_scheduled_io(),
     )
     .expect("prefetch retained dataset");
     let collected: Vec<Vec<u32>> = prefetch

@@ -979,7 +979,6 @@ fn scheduled_databank_config(config: &NativeSyntheticConfig) -> DataBankConfig {
         },
         native_config: NativeAccessConfig {
             enabled: true,
-            fallback_to_generic: false,
             fused_workers: native_workers,
             request_prefetch_blocks: 16_384,
             memory_budget_bytes,

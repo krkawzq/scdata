@@ -115,7 +115,6 @@ impl NativeMode {
 #[derive(Debug, Clone)]
 pub struct NativeAccessConfig {
     pub enabled: bool,
-    pub fallback_to_generic: bool,
     pub fused_workers: usize,
     pub request_prefetch_batches: usize,
     pub request_prefetch_blocks: usize,
@@ -130,7 +129,6 @@ impl Default for NativeAccessConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            fallback_to_generic: true,
             fused_workers: 4,
             request_prefetch_batches: 8,
             request_prefetch_blocks: 4096,

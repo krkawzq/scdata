@@ -43,6 +43,8 @@ pub fn prefetch_cells_scheduled<T, I>(
     dataset: Arc<Dataset>,
     batch_source: I,
     config: ScheduledPrefetchConfig,
+    native_config: NativeAccessConfig,
+    native_io: Arc<dyn IoBackend>,
 ) -> DataBankResult<PrefetchCells<T>>
 where
     T: DataValue,
@@ -59,6 +61,7 @@ where
                 "scheduled prefetch output dtype cannot hold source values (float→int forbidden)",
         });
     }
+    let native = build_native_ctx(&config, native_config, native_io)?;
     spawn_prefetch_cells(
         access.clone(),
         compute,
@@ -66,7 +69,7 @@ where
         batch_source,
         GeneAxisPlan::dataset_order(),
         config,
-        None,
+        native,
     )
 }
 
@@ -76,6 +79,8 @@ pub fn prefetch_cells_scheduled_multi<T, I>(
     datasets: Arc<[Arc<Dataset>]>,
     batch_source: I,
     config: ScheduledPrefetchConfig,
+    native_config: NativeAccessConfig,
+    native_io: Arc<dyn IoBackend>,
 ) -> DataBankResult<PrefetchCells<T>>
 where
     T: DataValue,
@@ -85,6 +90,7 @@ where
     config.validate().map_err(DataBankError::InvalidConfig)?;
     validate_multi_cast::<T>(&datasets)?;
     let gene_axes = MultiGeneAxisPlan::dataset_order(datasets.as_ref())?;
+    let native = build_native_ctx(&config, native_config, native_io)?;
     spawn_prefetch_cells_multi(
         access.clone(),
         compute,
@@ -92,7 +98,7 @@ where
         batch_source,
         gene_axes,
         config,
-        None,
+        native,
     )
 }
 
@@ -104,6 +110,8 @@ pub fn prefetch_cells_scheduled_by_gene_names<T, I, G>(
     gene_names: &[G],
     missing: MissingGenePolicy,
     config: ScheduledPrefetchConfig,
+    native_config: NativeAccessConfig,
+    native_io: Arc<dyn IoBackend>,
 ) -> DataBankResult<PrefetchCells<T>>
 where
     T: DataValue,
@@ -122,6 +130,7 @@ where
         });
     }
     let gene_axis = GeneAxisPlan::requested(dataset.as_ref(), gene_names, missing)?;
+    let native = build_native_ctx(&config, native_config, native_io)?;
     spawn_prefetch_cells(
         access.clone(),
         compute,
@@ -129,7 +138,7 @@ where
         batch_source,
         gene_axis,
         config,
-        None,
+        native,
     )
 }
 
@@ -141,141 +150,6 @@ pub fn prefetch_cells_scheduled_multi_by_gene_names<T, I, G>(
     gene_names: &[G],
     missing: MissingGenePolicy,
     config: ScheduledPrefetchConfig,
-) -> DataBankResult<PrefetchCells<T>>
-where
-    T: DataValue,
-    I: Iterator + Send + 'static,
-    I::Item: Into<MultiBatchCells> + Send,
-    G: AsRef<str>,
-{
-    config.validate().map_err(DataBankError::InvalidConfig)?;
-    validate_multi_cast::<T>(&datasets)?;
-    let gene_axes = MultiGeneAxisPlan::requested(datasets.as_ref(), gene_names, missing)?;
-    spawn_prefetch_cells_multi(
-        access.clone(),
-        compute,
-        datasets,
-        batch_source,
-        gene_axes,
-        config,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prefetch_cells_scheduled_with_native<T, I>(
-    access: &AccessHandle,
-    compute: Arc<DataBankComputePool>,
-    dataset: Arc<Dataset>,
-    batch_source: I,
-    config: ScheduledPrefetchConfig,
-    native_config: NativeAccessConfig,
-    native_io: Arc<dyn IoBackend>,
-) -> DataBankResult<PrefetchCells<T>>
-where
-    T: DataValue,
-    I: Iterator + Send + 'static,
-    I::Item: AsRef<[usize]> + Send,
-{
-    config.validate().map_err(DataBankError::InvalidConfig)?;
-    let src_dtype = dataset.data_dtype();
-    if !src_dtype.can_cast_to(T::DTYPE) {
-        return Err(DataBankError::CannotCast {
-            src: src_dtype,
-            dst: T::DTYPE,
-            reason:
-                "scheduled prefetch output dtype cannot hold source values (float→int forbidden)",
-        });
-    }
-    spawn_prefetch_cells(
-        access.clone(),
-        compute,
-        dataset,
-        batch_source,
-        GeneAxisPlan::dataset_order(),
-        config,
-        Some(NativeScheduledContext::new(native_io, native_config)?),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prefetch_cells_scheduled_by_gene_names_with_native<T, I, G>(
-    access: &AccessHandle,
-    compute: Arc<DataBankComputePool>,
-    dataset: Arc<Dataset>,
-    batch_source: I,
-    gene_names: &[G],
-    missing: MissingGenePolicy,
-    config: ScheduledPrefetchConfig,
-    native_config: NativeAccessConfig,
-    native_io: Arc<dyn IoBackend>,
-) -> DataBankResult<PrefetchCells<T>>
-where
-    T: DataValue,
-    I: Iterator + Send + 'static,
-    I::Item: AsRef<[usize]> + Send,
-    G: AsRef<str>,
-{
-    config.validate().map_err(DataBankError::InvalidConfig)?;
-    let src_dtype = dataset.data_dtype();
-    if !src_dtype.can_cast_to(T::DTYPE) {
-        return Err(DataBankError::CannotCast {
-            src: src_dtype,
-            dst: T::DTYPE,
-            reason:
-                "scheduled prefetch output dtype cannot hold source values (float→int forbidden)",
-        });
-    }
-    let gene_axis = GeneAxisPlan::requested(dataset.as_ref(), gene_names, missing)?;
-    spawn_prefetch_cells(
-        access.clone(),
-        compute,
-        dataset,
-        batch_source,
-        gene_axis,
-        config,
-        Some(NativeScheduledContext::new(native_io, native_config)?),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prefetch_cells_scheduled_multi_with_native<T, I>(
-    access: &AccessHandle,
-    compute: Arc<DataBankComputePool>,
-    datasets: Arc<[Arc<Dataset>]>,
-    batch_source: I,
-    config: ScheduledPrefetchConfig,
-    native_config: NativeAccessConfig,
-    native_io: Arc<dyn IoBackend>,
-) -> DataBankResult<PrefetchCells<T>>
-where
-    T: DataValue,
-    I: Iterator + Send + 'static,
-    I::Item: Into<MultiBatchCells> + Send,
-{
-    config.validate().map_err(DataBankError::InvalidConfig)?;
-    validate_multi_cast::<T>(&datasets)?;
-    let gene_axes = MultiGeneAxisPlan::dataset_order(datasets.as_ref())?;
-    spawn_prefetch_cells_multi(
-        access.clone(),
-        compute,
-        datasets,
-        batch_source,
-        gene_axes,
-        config,
-        Some(NativeScheduledContext::new(native_io, native_config)?),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prefetch_cells_scheduled_multi_by_gene_names_with_native<T, I, G>(
-    access: &AccessHandle,
-    compute: Arc<DataBankComputePool>,
-    datasets: Arc<[Arc<Dataset>]>,
-    batch_source: I,
-    gene_names: &[G],
-    missing: MissingGenePolicy,
-    config: ScheduledPrefetchConfig,
     native_config: NativeAccessConfig,
     native_io: Arc<dyn IoBackend>,
 ) -> DataBankResult<PrefetchCells<T>>
@@ -288,6 +162,7 @@ where
     config.validate().map_err(DataBankError::InvalidConfig)?;
     validate_multi_cast::<T>(&datasets)?;
     let gene_axes = MultiGeneAxisPlan::requested(datasets.as_ref(), gene_names, missing)?;
+    let native = build_native_ctx(&config, native_config, native_io)?;
     spawn_prefetch_cells_multi(
         access.clone(),
         compute,
@@ -295,8 +170,23 @@ where
         batch_source,
         gene_axes,
         config,
-        Some(NativeScheduledContext::new(native_io, native_config)?),
+        native,
     )
+}
+
+/// Build the native scheduled context when the caller requested a non-disabled
+/// native mode, otherwise `None`. The context (carrying any profile
+/// `native_io_override`) must be constructed before `resolve_strategy` runs in
+/// `spawn_prefetch_cells_multi` — see §5.9 migration point 2.
+fn build_native_ctx(
+    config: &ScheduledPrefetchConfig,
+    native_config: NativeAccessConfig,
+    native_io: Arc<dyn IoBackend>,
+) -> DataBankResult<Option<NativeScheduledContext>> {
+    if config.native_mode == NativeMode::Disabled {
+        return Ok(None);
+    }
+    Ok(Some(NativeScheduledContext::new(native_io, native_config)?))
 }
 
 pub(crate) fn validate_multi_cast<T: DataValue>(datasets: &[Arc<Dataset>]) -> DataBankResult<()> {
@@ -397,19 +287,6 @@ where
         cancel,
         producer: Some(handle),
     })
-}
-
-fn ensure_native_mode_available(
-    config: ScheduledPrefetchConfig,
-    native: Option<&NativeScheduledContext>,
-) -> DataBankResult<()> {
-    match (config.native_mode, native) {
-        (NativeMode::Disabled | NativeMode::Auto, _) => Ok(()),
-        (NativeMode::Force, Some(_)) => Ok(()),
-        (NativeMode::Force, None) => Err(DataBankError::InvalidConfig(
-            "native_mode='force' requested but native access context is unavailable".to_string(),
-        )),
-    }
 }
 
 /// Resolve the actual execution strategy once, at spawn time.

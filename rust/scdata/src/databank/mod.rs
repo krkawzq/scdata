@@ -682,25 +682,15 @@ impl DataBank {
                 return Err(err);
             }
         };
-        let result = if config.native_mode == NativeMode::Disabled {
-            batch::prefetch_cells_scheduled(
-                &self.access,
-                Arc::clone(&self.compute),
-                dataset,
-                batch_source.into_iter(),
-                config,
-            )
-        } else {
-            batch::prefetch_cells_scheduled_with_native(
-                &self.access,
-                Arc::clone(&self.compute),
-                dataset,
-                batch_source.into_iter(),
-                config,
-                self.config.native_config.clone(),
-                self.native_scheduled_io(),
-            )
-        };
+        let result = batch::prefetch_cells_scheduled(
+            &self.access,
+            Arc::clone(&self.compute),
+            dataset,
+            batch_source.into_iter(),
+            config,
+            self.config.native_config.clone(),
+            self.native_scheduled_io(),
+        );
         self.profiler
             .record_scheduled(started, DataBankScheduledKind::Single, 1, result.is_err());
         result
@@ -734,29 +724,17 @@ impl DataBank {
                 return Err(err);
             }
         };
-        let result = if config.native_mode == NativeMode::Disabled {
-            batch::prefetch_cells_scheduled_by_gene_names(
-                &self.access,
-                Arc::clone(&self.compute),
-                dataset,
-                batch_source.into_iter(),
-                gene_names,
-                missing,
-                config,
-            )
-        } else {
-            batch::prefetch_cells_scheduled_by_gene_names_with_native(
-                &self.access,
-                Arc::clone(&self.compute),
-                dataset,
-                batch_source.into_iter(),
-                gene_names,
-                missing,
-                config,
-                self.config.native_config.clone(),
-                self.native_scheduled_io(),
-            )
-        };
+        let result = batch::prefetch_cells_scheduled_by_gene_names(
+            &self.access,
+            Arc::clone(&self.compute),
+            dataset,
+            batch_source.into_iter(),
+            gene_names,
+            missing,
+            config,
+            self.config.native_config.clone(),
+            self.native_scheduled_io(),
+        );
         self.profiler.record_scheduled(
             started,
             DataBankScheduledKind::SingleByGeneNames,
@@ -791,25 +769,15 @@ impl DataBank {
                 return Err(err);
             }
         };
-        let result = if config.native_mode == NativeMode::Disabled {
-            batch::prefetch_cells_scheduled_multi(
-                &self.access,
-                Arc::clone(&self.compute),
-                datasets,
-                batch_source.into_iter(),
-                config,
-            )
-        } else {
-            batch::prefetch_cells_scheduled_multi_with_native(
-                &self.access,
-                Arc::clone(&self.compute),
-                datasets,
-                batch_source.into_iter(),
-                config,
-                self.config.native_config.clone(),
-                self.native_scheduled_io(),
-            )
-        };
+        let result = batch::prefetch_cells_scheduled_multi(
+            &self.access,
+            Arc::clone(&self.compute),
+            datasets,
+            batch_source.into_iter(),
+            config,
+            self.config.native_config.clone(),
+            self.native_scheduled_io(),
+        );
         self.profiler.record_scheduled(
             started,
             DataBankScheduledKind::Multi,
@@ -847,29 +815,17 @@ impl DataBank {
                 return Err(err);
             }
         };
-        let result = if config.native_mode == NativeMode::Disabled {
-            batch::prefetch_cells_scheduled_multi_by_gene_names(
-                &self.access,
-                Arc::clone(&self.compute),
-                datasets,
-                batch_source.into_iter(),
-                gene_names,
-                missing,
-                config,
-            )
-        } else {
-            batch::prefetch_cells_scheduled_multi_by_gene_names_with_native(
-                &self.access,
-                Arc::clone(&self.compute),
-                datasets,
-                batch_source.into_iter(),
-                gene_names,
-                missing,
-                config,
-                self.config.native_config.clone(),
-                self.native_scheduled_io(),
-            )
-        };
+        let result = batch::prefetch_cells_scheduled_multi_by_gene_names(
+            &self.access,
+            Arc::clone(&self.compute),
+            datasets,
+            batch_source.into_iter(),
+            gene_names,
+            missing,
+            config,
+            self.config.native_config.clone(),
+            self.native_scheduled_io(),
+        );
         self.profiler.record_scheduled(
             started,
             DataBankScheduledKind::MultiByGeneNames,
