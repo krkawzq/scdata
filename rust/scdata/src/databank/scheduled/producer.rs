@@ -8,7 +8,7 @@ use crate::profile::ProfileTimer;
 
 use super::super::array::DataValue;
 use super::super::compute::{ComputeJob, DataBankComputePool};
-use super::super::config::{NativeMode, ProjectedSparseDataGroupStrategy};
+use super::super::config::ProjectedSparseDataGroupStrategy;
 use super::super::dataset::Dataset;
 use super::super::error::{DataBankError, DataBankResult};
 
@@ -16,7 +16,7 @@ use super::super::gene_axis::*;
 use super::super::sparse::*;
 
 use super::assemble::*;
-use super::native_access::{AccessStrategy, NativeScheduledContext};
+use super::native_access::AccessStrategy;
 use super::planner::*;
 use super::profile::*;
 use super::types::*;
@@ -32,8 +32,7 @@ where
     pub(crate) datasets: Arc<[Arc<Dataset>]>,
     pub(crate) batch_source: I,
     pub(crate) access_config: ScheduledAccessConfig,
-    pub(crate) native_mode: NativeMode,
-    pub(crate) native: Option<NativeScheduledContext>,
+    pub(crate) strategy: AccessStrategy,
     pub(crate) projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     pub(crate) gene_axes: Arc<MultiGeneAxisPlan>,
     pub(crate) tx: flume::Sender<DataBankResult<PrefetchedBatch<T>>>,
@@ -260,8 +259,7 @@ where
                 batch,
                 Arc::clone(&self.gene_axes),
                 self.access_config,
-                self.native_mode,
-                self.native.clone(),
+                self.strategy.clone(),
                 self.projected_sparse_data_strategy,
                 Arc::clone(&self.cancel),
                 planned_tx.clone(),
@@ -452,8 +450,7 @@ pub(crate) fn make_prefetch_request_job(
     batch: MultiBatchCells,
     gene_axes: Arc<MultiGeneAxisPlan>,
     access_config: ScheduledAccessConfig,
-    native_mode: NativeMode,
-    native: Option<NativeScheduledContext>,
+    strategy: AccessStrategy,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     registry: Arc<PrefetchCancelRegistry>,
     planned_tx: flume::Sender<PlannedMessage>,
@@ -484,8 +481,7 @@ pub(crate) fn make_prefetch_request_job(
                 let cancel = PrefetchCancel::new(access.clone());
                 preplan_selected_sparse_request(
                     &access,
-                    native.clone(),
-                    native_mode,
+                    &strategy,
                     access_config,
                     projected_sparse_data_strategy,
                     gene_axes.as_ref(),
@@ -497,17 +493,15 @@ pub(crate) fn make_prefetch_request_job(
                 if registry.is_cancelled() || cancel.is_cancelled() {
                     return Err(DataBankError::PrefetchCancelled);
                 }
+                // Profile migration point 1 (§5.9): strategy.build() must stay
+                // inside the start_request_schedule / record_request_schedule
+                // span — do not move it into AccessStrategy::build.
                 let schedule_started = profiler.start_request_schedule();
-                let native_for_response = native.clone();
-                // Transitional: construct the strategy from (native_mode,
-                // native) and delegate to AccessStrategy::build. Step 3
-                // replaces this with a single resolve_strategy() at spawn.
-                let strategy = AccessStrategy::from_mode_and_ctx(native_mode, native)?;
+                let strategy_for_response = strategy.clone();
                 let scheduled_result = strategy.build(
                     access.clone(),
                     items,
                     access_config,
-                    native_mode,
                     Arc::clone(&cancel),
                     false,
                 );
@@ -518,8 +512,7 @@ pub(crate) fn make_prefetch_request_job(
                     seq,
                     plan,
                     scheduled,
-                    native: native_for_response,
-                    native_mode,
+                    strategy: strategy_for_response,
                     cancel,
                 }))
             }))
@@ -542,8 +535,7 @@ pub(crate) fn make_prefetch_request_job(
 #[allow(clippy::too_many_arguments)]
 fn preplan_selected_sparse_request(
     access: &AccessHandle,
-    native: Option<NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     access_config: ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     gene_axes: &MultiGeneAxisPlan,
@@ -565,8 +557,7 @@ fn preplan_selected_sparse_request(
         } => {
             changed |= preplan_single_selected_sparse_request(
                 access,
-                native.clone(),
-                native_mode,
+                strategy,
                 access_config,
                 projected_sparse_data_strategy,
                 gene_axes.axis_for(*dataset_idx)?,
@@ -579,8 +570,7 @@ fn preplan_selected_sparse_request(
             for part in &mut multi.parts {
                 changed |= preplan_single_selected_sparse_request(
                     access,
-                    native.clone(),
-                    native_mode,
+                    strategy,
                     access_config,
                     projected_sparse_data_strategy,
                     &part.gene_axis,
@@ -603,8 +593,7 @@ fn preplan_selected_sparse_request(
 #[allow(clippy::too_many_arguments)]
 fn preplan_single_selected_sparse_request(
     access: &AccessHandle,
-    native: Option<NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     access_config: ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     gene_axis: &GeneAxisPlan,
@@ -639,12 +628,10 @@ fn preplan_single_selected_sparse_request(
     };
 
     let index_items = sparse_plan_index_file_access_items(sparse_plan)?;
-    let index_strategy = AccessStrategy::from_mode_and_ctx(native_mode, native.clone())?;
-    let mut index_scheduled = index_strategy.build(
+    let mut index_scheduled = strategy.build(
         access.clone(),
         index_items,
         access_config,
-        native_mode,
         Arc::clone(&cancel),
         false,
     )?;
@@ -666,7 +653,7 @@ fn preplan_single_selected_sparse_request(
     let selected_plan =
         plan_sparse_selected_data_batch(dataset, sparse_plan, index_bytes.as_ref(), gene_axis)?;
     let defer_selected_data = preplan_selected_sparse_defer_data_enabled()
-        && can_defer_selected_sparse_data_to_response(native.as_ref(), native_mode);
+        && can_defer_selected_sparse_data_to_response(strategy);
     *sparse_plan = selected_plan;
     *preloaded_index_bytes = Some(Arc::from(index_bytes.into_boxed_slice()));
     *selected_data_scheduled = !defer_selected_data;
@@ -735,15 +722,15 @@ fn preplan_selected_sparse_defer_data_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn can_defer_selected_sparse_data_to_response(
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
-) -> bool {
-    match (native_mode, native) {
-        (NativeMode::Disabled, _) | (NativeMode::Force, None) | (NativeMode::Auto, None) => false,
-        (NativeMode::Auto, Some(native)) => native.config.enabled,
-        (NativeMode::Force, Some(_)) => true,
-    }
+/// Whether selected sparse data can be deferred to the response phase.
+///
+/// Deferral is only meaningful on the native path: the response worker must
+/// be able to reconstruct the scheduled native access, which only exists when
+/// the strategy resolved to `BloscLz4Native`. With the strategy resolved at
+/// spawn time, the old `(native_mode, native)` pairing collapses to
+/// `strategy.is_native()`.
+fn can_defer_selected_sparse_data_to_response(strategy: &AccessStrategy) -> bool {
+    strategy.is_native()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -770,8 +757,7 @@ where
             seq,
             plan,
             mut scheduled,
-            native,
-            native_mode,
+            strategy,
             cancel,
         } = planned;
         let _guard = ActiveBatchGuard {
@@ -791,8 +777,7 @@ where
                     gene_axes.as_ref(),
                     &cancel,
                     &profiler,
-                    native.as_ref(),
-                    native_mode,
+                    &strategy,
                     plan,
                     &mut scheduled,
                 )?;

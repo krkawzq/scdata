@@ -359,7 +359,13 @@ where
     I: Iterator + Send + 'static,
     I::Item: Into<MultiBatchCells> + Send,
 {
-    ensure_native_mode_available(config, native.as_ref())?;
+    // Resolve the access strategy once, at spawn time. `native` (the
+    // `NativeScheduledContext`, including any profile `native_io_override`)
+    // is constructed by the caller before this point — see §5.9 migration
+    // point 2: the override must be injected into the context before
+    // `resolve_strategy` runs, which is why the context is built upstream.
+    let precondition = datasets.iter().all(|d| d.is_blosc_codec());
+    let strategy = resolve_strategy(config.native_mode, native, precondition)?;
     let output_names = gene_axes.output_names.clone();
     let retained_datasets = Arc::clone(&datasets);
     let prefetch_step = config.prefetch_step;
@@ -372,8 +378,7 @@ where
         datasets,
         batch_source,
         access_config: config.access,
-        native_mode: config.native_mode,
-        native,
+        strategy,
         projected_sparse_data_strategy: config.projected_sparse_data_strategy,
         gene_axes: Arc::new(gene_axes),
         tx,
@@ -439,12 +444,12 @@ pub(crate) fn resolve_strategy(
         (NativeMode::Disabled, _, _) => Ok(Generic),
         (NativeMode::Auto, None, _) => Ok(Generic),
         (NativeMode::Auto, Some(ctx), _) if !ctx.config.enabled => Ok(Generic),
-        (NativeMode::Auto, Some(ctx), true) => Ok(BloscLz4Native(ctx)),
+        (NativeMode::Auto, Some(ctx), true) => Ok(BloscLz4Native { ctx, mode }),
         (NativeMode::Auto, Some(_), false) => Ok(Generic),
         (NativeMode::Force, None, _) => Err(DataBankError::InvalidConfig(
             "native_mode='force' requested but native access context is unavailable".to_string(),
         )),
-        (NativeMode::Force, Some(ctx), true) => Ok(BloscLz4Native(ctx)),
+        (NativeMode::Force, Some(ctx), true) => Ok(BloscLz4Native { ctx, mode }),
         (NativeMode::Force, Some(_), false) => Err(DataBankError::InvalidConfig(
             "native_mode='force' but dataset is not fully blosc".to_string(),
         )),
@@ -490,7 +495,7 @@ mod tests {
 
     fn assert_native(strategy: &AccessStrategy) {
         assert!(
-            matches!(strategy, AccessStrategy::BloscLz4Native(_)),
+            matches!(strategy, AccessStrategy::BloscLz4Native { .. }),
             "expected BloscLz4Native, got Generic",
         );
         assert!(strategy.is_native());

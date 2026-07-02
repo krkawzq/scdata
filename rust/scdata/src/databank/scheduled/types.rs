@@ -15,7 +15,7 @@ use super::super::plan::DenseSegment;
 use super::super::dense::*;
 use super::super::gene_axis::*;
 use super::super::sparse::*;
-use super::native_access::{NativeScheduledContext, ScheduledBatchAccess};
+use super::native_access::{AccessStrategy, ScheduledBatchAccess};
 
 const PROJECTED_SPARSE_READ_ALL_SMALL_DATA_GROUPS: usize = 8;
 
@@ -215,8 +215,7 @@ pub(crate) struct PlannedBatch {
     pub(crate) seq: BatchSeq,
     pub(crate) plan: BatchPlan,
     pub(crate) scheduled: ScheduledBatchAccess,
-    pub(crate) native: Option<NativeScheduledContext>,
-    pub(crate) native_mode: super::super::config::NativeMode,
+    pub(crate) strategy: AccessStrategy,
     pub(crate) cancel: Arc<PrefetchCancel>,
 }
 

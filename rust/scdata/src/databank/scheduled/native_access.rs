@@ -57,46 +57,50 @@ impl NativeScheduledContext {
 /// is the *resolved* strategy actually running. Once resolved to
 /// [`Self::BloscLz4Native`], the native worker runs with zero fallback: a decode
 /// failure is a real error, never a silent retreat to the generic path.
+///
+/// The `BloscLz4Native` variant carries the originating `NativeMode`
+/// transitionally: the native worker's per-item fallback path (removed in
+/// Step 5) still branches on `Force` vs `Auto`, so `build` -> `spawn` needs it
+/// until that fallback is gone. Step 5 drops the field along with the fallback.
 #[derive(Clone)]
 pub(crate) enum AccessStrategy {
     /// Generic access-scheduler chunk reads + decode pool path.
     Generic,
     /// Blosc-LZ4 native direct read + block-level scatter path. Zero fallback.
-    BloscLz4Native(NativeScheduledContext),
+    BloscLz4Native {
+        ctx: NativeScheduledContext,
+        mode: NativeMode,
+    },
 }
 
 impl AccessStrategy {
     /// Whether this session runs on the native execution path. Replaces the
     /// scattered `(native_mode, native)` paired queries.
     pub(crate) fn is_native(&self) -> bool {
-        matches!(self, Self::BloscLz4Native(_))
+        matches!(self, Self::BloscLz4Native { .. })
     }
 
     /// Borrow the native context; only valid when [`Self::is_native`] is true.
-    /// Prefer `if let AccessStrategy::BloscLz4Native(ctx) = &strategy { ... }`
+    /// Prefer `if let AccessStrategy::BloscLz4Native { ctx, .. } = &strategy`
     /// so exhaustiveness guarantees safety, rather than `expect`.
     pub(crate) fn native_ctx(&self) -> Option<&NativeScheduledContext> {
         match self {
             Self::Generic => None,
-            Self::BloscLz4Native(ctx) => Some(ctx),
+            Self::BloscLz4Native { ctx, .. } => Some(ctx),
         }
     }
 
     /// Build this batch's scheduled access iterator. Replaces the 5-arm
-    /// `build_scheduled_batch_access` match.
-    ///
-    /// `native_mode` is a transitional parameter: the call sites have not yet
-    /// switched to `resolve_strategy`, so they still construct the strategy
-    /// from `(native_mode, native)` and must thread `native_mode` through to
-    /// `NativeScheduledAccess::spawn` (which the worker still uses for its
-    /// per-item fallback decision). Once Step 5 removes the fallback, `spawn`
-    /// drops `native_mode` and so does this method.
+    /// `build_scheduled_batch_access` match. The originating `NativeMode` is
+    /// taken from the `BloscLz4Native` variant and threaded to
+    /// `NativeScheduledAccess::spawn`, which the worker still uses for its
+    /// per-item fallback decision. Step 5 removes that fallback and the
+    /// `mode` field together.
     pub(crate) fn build(
         &self,
         access: AccessHandle,
         items: Vec<AccessItem>,
         access_config: ScheduledAccessConfig,
-        native_mode: NativeMode,
         cancel: Arc<PrefetchCancel>,
         allow_small_command_grouping: bool,
     ) -> DataBankResult<ScheduledBatchAccess> {
@@ -104,39 +108,16 @@ impl AccessStrategy {
             Self::Generic => {
                 build_generic_scheduled_access(access, items, access_config, cancel)
             }
-            Self::BloscLz4Native(ctx) => NativeScheduledAccess::spawn(
+            Self::BloscLz4Native { ctx, mode } => NativeScheduledAccess::spawn(
                 access,
                 ctx.clone(),
                 items,
                 access_config,
-                native_mode,
+                *mode,
                 cancel,
                 allow_small_command_grouping,
             )
             .map(ScheduledBatchAccess::Native),
-        }
-    }
-
-    /// Transitional constructor from the legacy `(native_mode, native)` pair.
-    ///
-    /// Replicates the strategy-selection logic of `build_scheduled_batch_access`
-    /// without spawning, producing a resolved `AccessStrategy`. This exists
-    /// only for Step 2, where call sites still hold the legacy pair; Step 3
-    /// replaces them with a single `resolve_strategy()` at spawn time and
-    /// deletes this helper.
-    pub(crate) fn from_mode_and_ctx(
-        native_mode: NativeMode,
-        native: Option<NativeScheduledContext>,
-    ) -> DataBankResult<Self> {
-        match (native_mode, native) {
-            (NativeMode::Disabled, _) => Ok(Self::Generic),
-            (NativeMode::Auto, None) => Ok(Self::Generic),
-            (NativeMode::Auto, Some(ctx)) if !ctx.config.enabled => Ok(Self::Generic),
-            (NativeMode::Auto | NativeMode::Force, Some(ctx)) => Ok(Self::BloscLz4Native(ctx)),
-            (NativeMode::Force, None) => Err(DataBankError::InvalidConfig(
-                "native_mode='force' requested but native access context is unavailable"
-                    .to_string(),
-            )),
         }
     }
 }

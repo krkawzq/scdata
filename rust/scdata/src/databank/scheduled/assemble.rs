@@ -5,7 +5,7 @@ use crate::access::{AccessHandle, PrefetchCancel, ScheduledAccessConfig};
 
 use super::super::array::{DType, DataValue};
 use super::super::compute::DataBankComputePool;
-use super::super::config::{NativeMode, ProjectedSparseDataGroupStrategy};
+use super::super::config::ProjectedSparseDataGroupStrategy;
 use super::super::dataset::{Dataset, SparseCsrDataset};
 use super::super::error::{DataBankError, DataBankResult};
 use super::super::plan::DenseSegment;
@@ -17,7 +17,7 @@ use super::super::util::*;
 
 use super::native_access::{
     load_native_items_ordered_async, load_native_items_ordered_blocking,
-    run_native_custom_blocking, AccessStrategy, NativeScheduledContext, ScheduledBatchAccess,
+    run_native_custom_blocking, AccessStrategy, ScheduledBatchAccess,
 };
 use super::profile::*;
 use super::types::*;
@@ -31,8 +31,7 @@ pub(crate) fn assemble_planned_batch<T>(
     gene_axes: &MultiGeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     plan: BatchPlan,
     scheduled: &mut ScheduledBatchAccess,
 ) -> DataBankResult<PrefetchedBatch<T>>
@@ -48,8 +47,7 @@ where
             projected_sparse_data_strategy,
             cancel,
             profiler,
-            native,
-            native_mode,
+            strategy,
             plan,
             scheduled,
         ),
@@ -67,8 +65,7 @@ where
                 gene_axis,
                 cancel,
                 profiler,
-                native,
-                native_mode,
+                strategy,
                 cells,
                 plan,
                 scheduled,
@@ -96,8 +93,7 @@ pub(crate) fn assemble_single_planned_batch<T>(
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     cells: Vec<usize>,
     plan: SingleDatasetPlan,
     scheduled: &mut ScheduledBatchAccess,
@@ -132,8 +128,7 @@ where
                     gene_axis,
                     cancel,
                     profiler,
-                    native,
-                    native_mode,
+                    strategy,
                     cells,
                     plan,
                     preloaded_index_bytes,
@@ -158,8 +153,7 @@ pub(crate) fn assemble_multi_prefetch_batch<T>(
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     plan: MultiDatasetPlan,
     scheduled: &mut ScheduledBatchAccess,
 ) -> DataBankResult<PrefetchedBatch<T>>
@@ -190,8 +184,7 @@ where
             projected_sparse_data_strategy,
             cancel,
             profiler,
-            native,
-            native_mode,
+            strategy,
             part,
             total_cells,
             output_genes,
@@ -215,8 +208,7 @@ pub(crate) fn scatter_multi_part_into<T>(
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     part: MultiBatchPlanPart,
     total_cells: usize,
     output_genes: usize,
@@ -296,8 +288,7 @@ where
                 &part.gene_axis,
                 cancel,
                 profiler,
-                native,
-                native_mode,
+                strategy,
                 total_cells,
                 active_rows,
                 &plan,
@@ -475,8 +466,7 @@ pub(crate) fn assemble_sparse_prefetch_batch<T>(
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     cells: Vec<usize>,
     plan: SparseBatchPlan,
     preloaded_index_bytes: Option<Arc<[u8]>>,
@@ -503,8 +493,7 @@ where
         gene_axis,
         cancel,
         profiler,
-        native,
-        native_mode,
+        strategy,
         cells.len(),
         cells.len(),
         &plan,
@@ -531,8 +520,7 @@ pub(crate) fn scatter_sparse_prefetch_into<T>(
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     rows: usize,
     active_rows: usize,
     plan: &SparseBatchPlan,
@@ -593,8 +581,7 @@ where
                 access,
                 compute,
                 access_config,
-                native,
-                native_mode,
+                strategy,
                 dataset,
                 plan,
                 index_bytes,
@@ -773,8 +760,7 @@ pub(crate) fn scatter_sparse_prefetch_projected_selected_data<T>(
     access: &AccessHandle,
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     dataset: &SparseCsrDataset,
     plan: &SparseBatchPlan,
     index_bytes: Arc<[u8]>,
@@ -865,8 +851,7 @@ where
         let data_group_bytes = load_selected_sparse_group_bytes(
             access,
             access_config,
-            native,
-            native_mode,
+            strategy,
             &selected_plan,
             &selected_groups,
             cancel,
@@ -894,8 +879,7 @@ where
     if !selected_data_scheduled
         && selected_sparse_fused_scatter_enabled()
         && can_use_selected_sparse_ordered_native(
-            native,
-            native_mode,
+            strategy,
             &selected_plan,
             &selected_groups,
             cancel,
@@ -903,8 +887,7 @@ where
     {
         scatter_selected_sparse_groups_fused_native(
             access,
-            native.expect("native availability checked"),
-            native_mode,
+            strategy,
             selected_plan,
             selected_groups,
             Arc::clone(&index_bytes),
@@ -921,8 +904,7 @@ where
     if !selected_data_scheduled {
         if let Some(data_group_bytes) = try_load_selected_sparse_group_bytes_ordered_native(
             access,
-            native,
-            native_mode,
+            strategy,
             &selected_plan,
             &selected_groups,
             cancel,
@@ -947,8 +929,7 @@ where
     let mut scheduled = schedule_selected_sparse_file_groups(
         access,
         access_config,
-        native,
-        native_mode,
+        strategy,
         &selected_plan,
         &selected_groups,
         cancel,
@@ -1146,8 +1127,7 @@ fn selected_sparse_plan_is_preplanned(plan: &SparseBatchPlan) -> bool {
 fn load_selected_sparse_group_bytes(
     access: &AccessHandle,
     access_config: &ScheduledAccessConfig,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     plan: &SparseBatchPlan,
     selected_groups: &[usize],
     cancel: &Arc<PrefetchCancel>,
@@ -1155,8 +1135,7 @@ fn load_selected_sparse_group_bytes(
     let mut scheduled = schedule_selected_sparse_file_groups(
         access,
         access_config,
-        native,
-        native_mode,
+        strategy,
         plan,
         selected_groups,
         cancel,
@@ -1182,27 +1161,24 @@ fn load_selected_sparse_group_bytes(
 }
 
 fn can_use_selected_sparse_ordered_native(
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     plan: &SparseBatchPlan,
     selected_groups: &[usize],
     cancel: &Arc<PrefetchCancel>,
 ) -> bool {
-    if native_mode == NativeMode::Disabled || selected_groups.is_empty() || cancel.is_cancelled() {
-        return false;
-    }
-    let Some(native) = native else {
-        return false;
-    };
-    if native_mode == NativeMode::Auto && !native.config.enabled {
-        return false;
-    }
-    selected_groups.iter().all(|&group_index| {
-        matches!(
-            plan.data_groups[group_index].source,
-            SparseGroupSource::AccessItem(_)
-        )
-    })
+    // The `(native_mode, native)` prefix is gone: the strategy is already
+    // resolved at spawn time, so `Auto + disabled context` would have
+    // retreated to `Generic` before reaching here. The remaining conditions
+    // are the ones that actually matter for ordered native eligibility.
+    strategy.is_native()
+        && !selected_groups.is_empty()
+        && !cancel.is_cancelled()
+        && selected_groups.iter().all(|&group_index| {
+            matches!(
+                plan.data_groups[group_index].source,
+                SparseGroupSource::AccessItem(_)
+            )
+        })
 }
 
 fn selected_sparse_fused_scatter_enabled() -> bool {
@@ -1220,8 +1196,7 @@ fn read_all_selected_scatter_enabled() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn scatter_selected_sparse_groups_fused_native<T>(
     access: &AccessHandle,
-    native: &NativeScheduledContext,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     selected_plan: SparseBatchPlan,
     selected_groups: Vec<usize>,
     index_bytes: Arc<[u8]>,
@@ -1235,6 +1210,15 @@ fn scatter_selected_sparse_groups_fused_native<T>(
 where
     T: DataValue,
 {
+    // Reached only after `can_use_selected_sparse_ordered_native(strategy)`
+    // returned true, so the strategy is `BloscLz4Native`. Destructure instead
+    // of `expect` so exhaustiveness carries the guarantee.
+    let AccessStrategy::BloscLz4Native { ctx: native, mode: native_mode } = strategy else {
+        return Err(DataBankError::InvalidConfig(
+            "fused native scatter requires a native strategy".to_string(),
+        ));
+    };
+    let native_mode = *native_mode;
     let mut items = Vec::with_capacity(selected_groups.len());
     for &group_index in &selected_groups {
         items.push(file_sparse_group_access_item(
@@ -1311,18 +1295,21 @@ where
 
 fn try_load_selected_sparse_group_bytes_ordered_native(
     access: &AccessHandle,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     plan: &SparseBatchPlan,
     selected_groups: &[usize],
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
     selected_bytes: usize,
 ) -> DataBankResult<Option<Vec<Arc<[u8]>>>> {
-    if !can_use_selected_sparse_ordered_native(native, native_mode, plan, selected_groups, cancel) {
+    if !can_use_selected_sparse_ordered_native(strategy, plan, selected_groups, cancel) {
         return Ok(None);
     }
-    let native = native.expect("native availability checked");
+    // `can_use_selected_sparse_ordered_native` returned true, so the strategy
+    // is `BloscLz4Native`. Destructure instead of `expect`.
+    let AccessStrategy::BloscLz4Native { ctx: native, mode: native_mode } = strategy else {
+        return Ok(None);
+    };
 
     let mut items = Vec::with_capacity(selected_groups.len());
     for &group_index in selected_groups {
@@ -1335,7 +1322,7 @@ fn try_load_selected_sparse_group_bytes_ordered_native(
         access.clone(),
         native.clone(),
         items,
-        native_mode,
+        *native_mode,
         Arc::clone(cancel),
     );
     profiler.record_sparse_projected_data_load(
@@ -1368,8 +1355,7 @@ fn try_load_selected_sparse_group_bytes_ordered_native(
 fn schedule_selected_sparse_file_groups(
     access: &AccessHandle,
     access_config: &ScheduledAccessConfig,
-    native: Option<&NativeScheduledContext>,
-    native_mode: NativeMode,
+    strategy: &AccessStrategy,
     plan: &SparseBatchPlan,
     selected_groups: &[usize],
     cancel: &Arc<PrefetchCancel>,
@@ -1388,13 +1374,11 @@ fn schedule_selected_sparse_file_groups(
     if items.is_empty() {
         return Ok(None);
     }
-    let strategy = AccessStrategy::from_mode_and_ctx(native_mode, native.cloned())?;
     strategy
         .build(
             access.clone(),
             items,
             *access_config,
-            native_mode,
             Arc::clone(cancel),
             true,
         )
