@@ -84,10 +84,10 @@ from ._scdata import (
     _FillConfig,
     _IoConfig,
     _MissingGenePolicy,
-    _NativeAccessConfig,
-    _NativeBloscConfig,
-    _NativeLoadCoalesceConfig,
-    _NativeLoadConfig,
+    _FastAccessConfig,
+    _FastBloscConfig,
+    _FastLoadCoalesceConfig,
+    _FastLoadConfig,
     _PrefetchPlan,
     _ScheduledAccessConfig,
     _ScheduledPrefetchConfig,
@@ -113,11 +113,11 @@ __all__ = [
     "AccessConfig",
     "AccessCpuConfig",
     "FillConfig",
-    "NativeAccessConfig",
-    "NativeLoadConfig",
-    "NativeLoadCoalesceConfig",
-    "NativeBloscConfig",
-    "NativeMode",
+    "FastAccessConfig",
+    "FastLoadConfig",
+    "FastLoadCoalesceConfig",
+    "FastBloscConfig",
+    "FastMode",
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
     "ProjectedSparseDataGroupStrategy",
@@ -127,7 +127,30 @@ __all__ = [
 
 ProfileSnapshot = dict[str, Any]
 ProjectedSparseDataGroupStrategy = Literal["selected_only", "read_all"]
-NativeMode = Literal["disabled", "auto", "force"]
+
+
+class FastMode:
+    """String constants for :attr:`ScheduledPrefetchConfig.fast_mode`.
+
+    The fast path is the Blosc-LZ4 direct decode route that bypasses the
+    generic access scheduler.  Use the class attributes instead of bare
+    strings for discoverability; bare strings (``"auto"``, ``"force"``,
+    ``"disabled"``) and common aliases (``"on"``, ``"off"``, ``"true"`` …) are
+    also accepted.
+
+    - ``FastMode.DISABLED`` — never use the fast path (the default; runs the
+      generic access-scheduler route).
+    - ``FastMode.AUTO`` — use the fast path when every registered dataset uses
+      the Blosc-LZ4 codec, otherwise silently fall back to generic.  Requires
+      :attr:`DataBankConfig.fast_config` ``.enabled = True`` (see
+      :meth:`FastAccessConfig.fast`).
+    - ``FastMode.FORCE`` — require the fast path; raise if any dataset is not
+      Blosc-LZ4 or the fast path is not configured.  No fallback.
+    """
+
+    DISABLED = "disabled"
+    AUTO = "auto"
+    FORCE = "force"
 
 
 # ===========================================================================
@@ -515,8 +538,8 @@ class FillConfig(_Config):
 
 
 @dataclass(slots=True)
-class NativeLoadCoalesceConfig(_Config):
-    """Native byte-range coalescing policy."""
+class FastLoadCoalesceConfig(_Config):
+    """Fast path byte-range coalescing policy."""
 
     max_window_us: int = 50
     max_merged_len: int = 1024 * 1024
@@ -526,24 +549,24 @@ class NativeLoadCoalesceConfig(_Config):
 
 
 @dataclass(slots=True)
-class NativeLoadConfig(_Config):
-    """Native byte-range load scheduler settings."""
+class FastLoadConfig(_Config):
+    """Fast path byte-range load scheduler settings."""
 
     scheduler_workers: int = 1
     io_workers: int = 4
-    coalesce: NativeLoadCoalesceConfig = field(default_factory=NativeLoadCoalesceConfig)
+    coalesce: FastLoadCoalesceConfig = field(default_factory=FastLoadCoalesceConfig)
 
     def __post_init__(self) -> None:
         self.coalesce = _coerce_config_value(
             self.coalesce,
-            NativeLoadCoalesceConfig,
+            FastLoadCoalesceConfig,
             "coalesce",
         )
 
 
 @dataclass(slots=True)
-class NativeBloscConfig(_Config):
-    """Native Blosc-LZ4 block handling settings."""
+class FastBloscConfig(_Config):
+    """Fast path Blosc-LZ4 block handling settings."""
 
     preload_block_tables: bool = True
     full_unshuffle_threshold: float = 0.75
@@ -551,23 +574,53 @@ class NativeBloscConfig(_Config):
 
 
 @dataclass(slots=True)
-class NativeAccessConfig(_Config):
-    """Experimental Blosc-LZ4 native access path settings."""
+class FastAccessConfig(_Config):
+    """Fast (Blosc-LZ4 native) access path settings.
+
+    The fast path decodes Blosc-LZ4-compressed blocks directly, bypassing the
+    generic access scheduler.  It is gated by :attr:`enabled` at the bank level
+    *and* by :attr:`ScheduledPrefetchConfig.fast_mode` per prefetch call: set
+    ``fast_config = FastAccessConfig.fast()`` on :class:`DataBankConfig` and
+    ``fast_mode = FastMode.AUTO`` on the prefetch config to engage it.
+
+    Use :meth:`fast` for a tuned enabling preset; the default is disabled
+    (conservative).  Once resolved, the fast path runs with zero fallback — a
+    decode failure is a real error, never a silent retreat to generic.
+    """
 
     enabled: bool = False
-    fallback_to_generic: bool = True
     fused_workers: int = 4
     request_prefetch_batches: int = 8
     request_prefetch_blocks: int = 4096
     memory_budget_bytes: int = 8 * 1024**3
     response_queue_bytes_soft_limit: int = 4 * 1024**3
     response_queue_bytes_hard_limit: int = 6 * 1024**3
-    load: NativeLoadConfig = field(default_factory=NativeLoadConfig)
-    blosc: NativeBloscConfig = field(default_factory=NativeBloscConfig)
+    load: FastLoadConfig = field(default_factory=FastLoadConfig)
+    blosc: FastBloscConfig = field(default_factory=FastBloscConfig)
 
     def __post_init__(self) -> None:
-        self.load = _coerce_config_value(self.load, NativeLoadConfig, "load")
-        self.blosc = _coerce_config_value(self.blosc, NativeBloscConfig, "blosc")
+        self.load = _coerce_config_value(self.load, FastLoadConfig, "load")
+        self.blosc = _coerce_config_value(self.blosc, FastBloscConfig, "blosc")
+
+    @classmethod
+    def fast(cls) -> "FastAccessConfig":
+        """Preset enabling the fast path with tuned defaults.
+
+        Equivalent to ``FastAccessConfig(enabled=True)`` but named for intent.
+        Pair with ``ScheduledPrefetchConfig.make(fast_mode=FastMode.AUTO)`` on
+        the prefetch call; the fast path then engages automatically when every
+        registered dataset uses the Blosc-LZ4 codec.
+        """
+        return cls(enabled=True)
+
+    @classmethod
+    def safe(cls) -> "FastAccessConfig":
+        """Preset keeping the fast path disabled (the conservative default).
+
+        The fast path is not built; prefetch always runs the generic
+        access-scheduler route regardless of ``fast_mode``.
+        """
+        return cls(enabled=False)
 
 
 @dataclass(slots=True)
@@ -593,7 +646,7 @@ class DataBankConfig(_Config):
     decode_config: DecodePoolConfig = field(default_factory=DecodePoolConfig)
     access_config: AccessConfig = field(default_factory=AccessConfig)
     fill_config: FillConfig = field(default_factory=FillConfig)
-    native_config: NativeAccessConfig = field(default_factory=NativeAccessConfig)
+    fast_config: FastAccessConfig = field(default_factory=FastAccessConfig)
 
     def __post_init__(self) -> None:
         self.io_config = _coerce_config_value(self.io_config, IoConfig, "io_config")
@@ -608,10 +661,10 @@ class DataBankConfig(_Config):
             "access_config",
         )
         self.fill_config = _coerce_config_value(self.fill_config, FillConfig, "fill_config")
-        self.native_config = _coerce_config_value(
-            self.native_config,
-            NativeAccessConfig,
-            "native_config",
+        self.fast_config = _coerce_config_value(
+            self.fast_config,
+            FastAccessConfig,
+            "fast_config",
         )
 
 
@@ -626,12 +679,25 @@ class ScheduledAccessConfig(_Config):
 
 @dataclass(slots=True)
 class ScheduledPrefetchConfig(_Config):
-    """Per-call settings for scheduled DataBank cell prefetch."""
+    """Per-call settings for scheduled DataBank cell prefetch.
+
+    Args:
+        prefetch_step: Number of decoded batches kept ahead of the consumer.
+        access: Look-ahead distances for the scheduled access layer.
+        projected_sparse_data_strategy: How projected sparse gene groups are
+            read — ``"selected_only"`` (default) or ``"read_all"``.
+        fast_mode: Whether to engage the fast Blosc-LZ4 path.  One of
+            :class:`FastMode` (``DISABLED`` / ``AUTO`` / ``FORCE``); bare
+            strings and aliases (``"on"``, ``"off"``, ``"true"`` …) also work.
+            ``AUTO`` engages the fast path when every dataset is Blosc-LZ4 and
+            :attr:`DataBankConfig.fast_config` is enabled; ``FORCE`` requires
+            it (hard error otherwise).  See :class:`FastMode` for details.
+    """
 
     prefetch_step: int = 8
     access: ScheduledAccessConfig = field(default_factory=ScheduledAccessConfig)
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy = "selected_only"
-    native_mode: NativeMode = "disabled"
+    fast_mode: str = FastMode.DISABLED
 
     def __post_init__(self) -> None:
         self.access = _coerce_config_value(self.access, ScheduledAccessConfig, "access")
@@ -641,11 +707,11 @@ class ScheduledPrefetchConfig(_Config):
                 "projected_sparse_data_strategy must be 'selected_only' or 'read_all', "
                 f"got {self.projected_sparse_data_strategy!r}"
             )
-        native_allowed = {"disabled", "auto", "force", "off", "on", "true", "false", "forced"}
-        if self.native_mode not in native_allowed:
+        fast_allowed = {"disabled", "auto", "force", "off", "on", "true", "false", "forced"}
+        if self.fast_mode not in fast_allowed:
             raise ValueError(
-                "native_mode must be 'disabled', 'auto', or 'force', "
-                f"got {self.native_mode!r}"
+                "fast_mode must be 'disabled' (FastMode.DISABLED), 'auto' (FastMode.AUTO), "
+                f"or 'force' (FastMode.FORCE); got {self.fast_mode!r}"
             )
 
 
@@ -668,10 +734,10 @@ _CONFIG_CLASSES: frozenset[type] = frozenset(
         AccessCpuConfig,
         AccessConfig,
         FillConfig,
-        NativeLoadCoalesceConfig,
-        NativeLoadConfig,
-        NativeBloscConfig,
-        NativeAccessConfig,
+        FastLoadCoalesceConfig,
+        FastLoadConfig,
+        FastBloscConfig,
+        FastAccessConfig,
         DataBankConfig,
         ScheduledAccessConfig,
         ScheduledPrefetchConfig,
@@ -688,10 +754,10 @@ _RUST_CONFIG_TYPES: dict[type, type] = {
     AccessCpuConfig: _AccessCpuConfig,
     AccessConfig: _AccessConfig,
     FillConfig: _FillConfig,
-    NativeLoadCoalesceConfig: _NativeLoadCoalesceConfig,
-    NativeLoadConfig: _NativeLoadConfig,
-    NativeBloscConfig: _NativeBloscConfig,
-    NativeAccessConfig: _NativeAccessConfig,
+    FastLoadCoalesceConfig: _FastLoadCoalesceConfig,
+    FastLoadConfig: _FastLoadConfig,
+    FastBloscConfig: _FastBloscConfig,
+    FastAccessConfig: _FastAccessConfig,
     DataBankConfig: _DataBankConfig,
     ScheduledAccessConfig: _ScheduledAccessConfig,
     ScheduledPrefetchConfig: _ScheduledPrefetchConfig,
@@ -745,7 +811,7 @@ def _config_from_rust(config: Any) -> Any:
             decode_config=_config_from_rust(config.decode_config),
             access_config=_config_from_rust(config.access_config),
             fill_config=_config_from_rust(config.fill_config),
-            native_config=_config_from_rust(config.native_config),
+            fast_config=_config_from_rust(config.fast_config),
         )
     if isinstance(config, _IoConfig):
         if config.kind == "uring":
@@ -815,30 +881,29 @@ def _config_from_rust(config: Any) -> Any:
             min_parallel_bytes=config.min_parallel_bytes,
             cpus=config.cpus,
         )
-    if isinstance(config, _NativeLoadCoalesceConfig):
-        return NativeLoadCoalesceConfig(
+    if isinstance(config, _FastLoadCoalesceConfig):
+        return FastLoadCoalesceConfig(
             max_window_us=config.max_window_us,
             max_merged_len=config.max_merged_len,
             max_gap_bytes=config.max_gap_bytes,
             max_waste_ratio=config.max_waste_ratio,
             min_children=config.min_children,
         )
-    if isinstance(config, _NativeLoadConfig):
-        return NativeLoadConfig(
+    if isinstance(config, _FastLoadConfig):
+        return FastLoadConfig(
             scheduler_workers=config.scheduler_workers,
             io_workers=config.io_workers,
             coalesce=_config_from_rust(config.coalesce),
         )
-    if isinstance(config, _NativeBloscConfig):
-        return NativeBloscConfig(
+    if isinstance(config, _FastBloscConfig):
+        return FastBloscConfig(
             preload_block_tables=config.preload_block_tables,
             full_unshuffle_threshold=config.full_unshuffle_threshold,
             max_block_size=config.max_block_size,
         )
-    if isinstance(config, _NativeAccessConfig):
-        return NativeAccessConfig(
+    if isinstance(config, _FastAccessConfig):
+        return FastAccessConfig(
             enabled=config.enabled,
-            fallback_to_generic=config.fallback_to_generic,
             fused_workers=config.fused_workers,
             request_prefetch_batches=config.request_prefetch_batches,
             request_prefetch_blocks=config.request_prefetch_blocks,
@@ -862,7 +927,7 @@ def _config_from_rust(config: Any) -> Any:
                 ProjectedSparseDataGroupStrategy,
                 getattr(config, "projected_sparse_data_strategy", "selected_only"),
             ),
-            native_mode=cast(NativeMode, getattr(config, "native_mode", "disabled")),
+            fast_mode=cast(str, getattr(config, "fast_mode", FastMode.DISABLED)),
         )
     raise TypeError(f"not a Rust config object: {type(config).__name__}")
 
@@ -1502,7 +1567,12 @@ class ScDataBank:
             rust_missing_value,
             rust_config,
         )
-        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
+        return PrefetchIterator(
+            inner,
+            gene_names=tuple(inner.gene_names),
+            resolved_strategy=inner.resolved_strategy,
+            fallback_reason=inner.fallback_reason,
+        )
 
     def prefetch_multi(
         self,
@@ -1541,7 +1611,12 @@ class ScDataBank:
             rust_missing_value,
             rust_config,
         )
-        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
+        return PrefetchIterator(
+            inner,
+            gene_names=tuple(inner.gene_names),
+            resolved_strategy=inner.resolved_strategy,
+            fallback_reason=inner.fallback_reason,
+        )
 
     def prefetch_indexed(
         self,
@@ -1581,7 +1656,12 @@ class ScDataBank:
             rust_missing_value,
             rust_config,
         )
-        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
+        return PrefetchIterator(
+            inner,
+            gene_names=tuple(inner.gene_names),
+            resolved_strategy=inner.resolved_strategy,
+            fallback_reason=inner.fallback_reason,
+        )
 
     @staticmethod
     def _coerce_prefetch_ids(id: DatasetId | SequenceABC[DatasetId]) -> tuple[DatasetId, ...]:
@@ -1608,7 +1688,12 @@ class ScDataBank:
         rust_config = _config_to_rust(config)
         plan = _PrefetchPlan.single(batches)
         inner = self._core().prefetch_cells_raw(id._rust, plan, rust_config)
-        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
+        return PrefetchIterator(
+            inner,
+            gene_names=tuple(inner.gene_names),
+            resolved_strategy=inner.resolved_strategy,
+            fallback_reason=inner.fallback_reason,
+        )
 
     def _prefetch_genes(
         self,
@@ -1631,7 +1716,12 @@ class ScDataBank:
             rust_missing,
             rust_config,
         )
-        return PrefetchIterator(inner, gene_names=tuple(inner.gene_names))
+        return PrefetchIterator(
+            inner,
+            gene_names=tuple(inner.gene_names),
+            resolved_strategy=inner.resolved_strategy,
+            fallback_reason=inner.fallback_reason,
+        )
 
     def __repr__(self) -> str:
         state = "closed" if self.is_closed else "open"

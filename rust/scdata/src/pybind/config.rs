@@ -19,10 +19,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAccessConfig>()?;
     m.add_class::<PyAccessCpuConfig>()?;
     m.add_class::<PyFillConfig>()?;
-    m.add_class::<PyNativeAccessConfig>()?;
-    m.add_class::<PyNativeLoadConfig>()?;
-    m.add_class::<PyNativeLoadCoalesceConfig>()?;
-    m.add_class::<PyNativeBloscConfig>()?;
+    m.add_class::<PyFastAccessConfig>()?;
+    m.add_class::<PyFastLoadConfig>()?;
+    m.add_class::<PyFastLoadCoalesceConfig>()?;
+    m.add_class::<PyFastBloscConfig>()?;
     m.add_class::<PyScheduledAccessConfig>()?;
     m.add_class::<PyScheduledPrefetchConfig>()?;
     Ok(())
@@ -577,14 +577,14 @@ impl PyFillConfig {
     }
 }
 
-#[pyclass(name = "_NativeAccessConfig", module = "scdata._scdata")]
+#[pyclass(name = "_FastAccessConfig", module = "scdata._scdata")]
 #[derive(Clone)]
-pub(crate) struct PyNativeAccessConfig {
+pub(crate) struct PyFastAccessConfig {
     inner: NativeAccessConfig,
 }
 
 #[pymethods]
-impl PyNativeAccessConfig {
+impl PyFastAccessConfig {
     #[new]
     fn new() -> Self {
         Self {
@@ -663,26 +663,26 @@ impl PyNativeAccessConfig {
     }
 
     #[getter]
-    fn load(&self) -> PyNativeLoadConfig {
-        PyNativeLoadConfig {
+    fn load(&self) -> PyFastLoadConfig {
+        PyFastLoadConfig {
             inner: self.inner.load.clone(),
         }
     }
 
     #[setter]
-    fn set_load(&mut self, value: PyNativeLoadConfig) {
+    fn set_load(&mut self, value: PyFastLoadConfig) {
         self.inner.load = value.inner;
     }
 
     #[getter]
-    fn blosc(&self) -> PyNativeBloscConfig {
-        PyNativeBloscConfig {
+    fn blosc(&self) -> PyFastBloscConfig {
+        PyFastBloscConfig {
             inner: self.inner.blosc.clone(),
         }
     }
 
     #[setter]
-    fn set_blosc(&mut self, value: PyNativeBloscConfig) {
+    fn set_blosc(&mut self, value: PyFastBloscConfig) {
         self.inner.blosc = value.inner;
     }
 
@@ -691,14 +691,14 @@ impl PyNativeAccessConfig {
     }
 }
 
-#[pyclass(name = "_NativeLoadConfig", module = "scdata._scdata")]
+#[pyclass(name = "_FastLoadConfig", module = "scdata._scdata")]
 #[derive(Clone)]
-pub(crate) struct PyNativeLoadConfig {
+pub(crate) struct PyFastLoadConfig {
     inner: NativeLoadConfig,
 }
 
 #[pymethods]
-impl PyNativeLoadConfig {
+impl PyFastLoadConfig {
     #[new]
     fn new() -> Self {
         Self {
@@ -727,14 +727,14 @@ impl PyNativeLoadConfig {
     }
 
     #[getter]
-    fn coalesce(&self) -> PyNativeLoadCoalesceConfig {
-        PyNativeLoadCoalesceConfig {
+    fn coalesce(&self) -> PyFastLoadCoalesceConfig {
+        PyFastLoadCoalesceConfig {
             inner: self.inner.coalesce.clone(),
         }
     }
 
     #[setter]
-    fn set_coalesce(&mut self, value: PyNativeLoadCoalesceConfig) {
+    fn set_coalesce(&mut self, value: PyFastLoadCoalesceConfig) {
         self.inner.coalesce = value.inner;
     }
 
@@ -743,14 +743,14 @@ impl PyNativeLoadConfig {
     }
 }
 
-#[pyclass(name = "_NativeLoadCoalesceConfig", module = "scdata._scdata")]
+#[pyclass(name = "_FastLoadCoalesceConfig", module = "scdata._scdata")]
 #[derive(Clone)]
-pub(crate) struct PyNativeLoadCoalesceConfig {
+pub(crate) struct PyFastLoadCoalesceConfig {
     inner: NativeLoadCoalesceConfig,
 }
 
 #[pymethods]
-impl PyNativeLoadCoalesceConfig {
+impl PyFastLoadCoalesceConfig {
     #[new]
     fn new() -> Self {
         Self {
@@ -813,14 +813,14 @@ impl PyNativeLoadCoalesceConfig {
     }
 }
 
-#[pyclass(name = "_NativeBloscConfig", module = "scdata._scdata")]
+#[pyclass(name = "_FastBloscConfig", module = "scdata._scdata")]
 #[derive(Clone)]
-pub(crate) struct PyNativeBloscConfig {
+pub(crate) struct PyFastBloscConfig {
     inner: NativeBloscConfig,
 }
 
 #[pymethods]
-impl PyNativeBloscConfig {
+impl PyFastBloscConfig {
     #[new]
     fn new() -> Self {
         Self {
@@ -927,14 +927,14 @@ impl PyDataBankConfig {
     }
 
     #[getter]
-    fn native_config(&self) -> PyNativeAccessConfig {
-        PyNativeAccessConfig {
+    fn fast_config(&self) -> PyFastAccessConfig {
+        PyFastAccessConfig {
             inner: self.inner.native_config.clone(),
         }
     }
 
     #[setter]
-    fn set_native_config(&mut self, value: PyNativeAccessConfig) {
+    fn set_fast_config(&mut self, value: PyFastAccessConfig) {
         self.inner.native_config = value.inner;
     }
 
@@ -1043,12 +1043,12 @@ impl PyScheduledPrefetchConfig {
     }
 
     #[getter]
-    fn native_mode(&self) -> &'static str {
+    fn fast_mode(&self) -> &'static str {
         self.inner.native_mode.as_str()
     }
 
     #[setter]
-    fn set_native_mode(&mut self, value: &str) -> PyResult<()> {
+    fn set_fast_mode(&mut self, value: &str) -> PyResult<()> {
         self.inner.native_mode = NativeMode::parse(value).map_err(PyValueError::new_err)?;
         Ok(())
     }

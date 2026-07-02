@@ -333,6 +333,8 @@ pub(crate) struct PyPrefetchCells {
     inner: Option<PrefetchDispatch>,
     gene_names: Vec<String>,
     prefetch_step: usize,
+    resolved_strategy: &'static str,
+    fallback_reason: Option<&'static str>,
 }
 
 impl PyPrefetchCells {
@@ -341,10 +343,14 @@ impl PyPrefetchCells {
             .map(<[String]>::to_vec)
             .unwrap_or_else(|| inner.gene_names());
         let prefetch_step = inner.prefetch_step();
+        let resolved_strategy = inner.resolved_strategy();
+        let fallback_reason = inner.fallback_reason();
         Self {
             inner: Some(inner),
             gene_names,
             prefetch_step,
+            resolved_strategy,
+            fallback_reason,
         }
     }
 }
@@ -359,6 +365,20 @@ impl PyPrefetchCells {
     #[getter]
     fn gene_names(&self) -> Vec<String> {
         self.gene_names.clone()
+    }
+
+    /// Stable short name of the resolved access strategy: `"blosc_lz4_fast"`
+    /// (fast path engaged) or `"generic"` (standard access-scheduler path).
+    #[getter]
+    fn resolved_strategy(&self) -> &'static str {
+        self.resolved_strategy
+    }
+
+    /// Why the fast path fell back to `generic` when requested but not engaged;
+    /// `None` when the fast path is active or fast mode was not requested.
+    #[getter]
+    fn fallback_reason(&self) -> Option<&'static str> {
+        self.fallback_reason
     }
 
     fn __iter__(slf: Py<Self>) -> Py<Self> {
@@ -442,6 +462,40 @@ impl PrefetchDispatch {
             Self::F64(iter) => prefetch_gene_names(iter),
             Self::F16(iter) => prefetch_gene_names(iter),
             Self::BF16(iter) => prefetch_gene_names(iter),
+        }
+    }
+
+    fn resolved_strategy(&self) -> &'static str {
+        match self {
+            Self::U8(iter) => iter.resolved_strategy(),
+            Self::I8(iter) => iter.resolved_strategy(),
+            Self::U16(iter) => iter.resolved_strategy(),
+            Self::I16(iter) => iter.resolved_strategy(),
+            Self::U32(iter) => iter.resolved_strategy(),
+            Self::I32(iter) => iter.resolved_strategy(),
+            Self::U64(iter) => iter.resolved_strategy(),
+            Self::I64(iter) => iter.resolved_strategy(),
+            Self::F32(iter) => iter.resolved_strategy(),
+            Self::F64(iter) => iter.resolved_strategy(),
+            Self::F16(iter) => iter.resolved_strategy(),
+            Self::BF16(iter) => iter.resolved_strategy(),
+        }
+    }
+
+    fn fallback_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::U8(iter) => iter.fallback_reason(),
+            Self::I8(iter) => iter.fallback_reason(),
+            Self::U16(iter) => iter.fallback_reason(),
+            Self::I16(iter) => iter.fallback_reason(),
+            Self::U32(iter) => iter.fallback_reason(),
+            Self::I32(iter) => iter.fallback_reason(),
+            Self::U64(iter) => iter.fallback_reason(),
+            Self::I64(iter) => iter.fallback_reason(),
+            Self::F32(iter) => iter.fallback_reason(),
+            Self::F64(iter) => iter.fallback_reason(),
+            Self::F16(iter) => iter.fallback_reason(),
+            Self::BF16(iter) => iter.fallback_reason(),
         }
     }
 }

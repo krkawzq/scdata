@@ -363,7 +363,11 @@ impl NativeLoadModule {
             "native load id span too small"
         );
         let mut by_id: Vec<Option<NativeLoadCompletion>> = (0..id_span).map(|_| None).collect();
-        let request_by_id = build_request_by_id(output_order, min_id, id_span)?;
+        let request_by_id = if self.block_cache.is_some() {
+            Some(build_request_by_id(output_order, min_id, id_span)?)
+        } else {
+            None
+        };
         while let Some(joined) = pending.join_next().await {
             let (slot, read, bytes) = joined
                 .map_err(|err| io::Error::other(format!("native load task panicked: {err}")))??;
@@ -398,18 +402,20 @@ impl NativeLoadModule {
                         "native load child id out of range",
                     ));
                 }
-                let request = request_by_id[idx].ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "native load child request missing",
-                    )
-                })?;
                 by_id[idx] = Some(NativeLoadCompletion {
                     request_id: child.request_id,
                     bytes: Arc::clone(&bytes),
                     range: start..end,
                 });
-                self.insert_child_cache(request, &bytes, start, end);
+                if let Some(request_by_id) = request_by_id.as_ref() {
+                    let request = request_by_id[idx].ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "native load child request missing",
+                        )
+                    })?;
+                    self.insert_child_cache(request, &bytes, start, end);
+                }
             }
         }
 
@@ -456,7 +462,11 @@ impl NativeLoadModule {
             "native load id span too small"
         );
         let mut by_id: Vec<Option<NativeLoadCompletion>> = (0..id_span).map(|_| None).collect();
-        let request_by_id = build_request_by_id(output_order, min_id, id_span)?;
+        let request_by_id = if self.block_cache.is_some() {
+            Some(build_request_by_id(output_order, min_id, id_span)?)
+        } else {
+            None
+        };
 
         for read in reads {
             let bytes = self
@@ -493,18 +503,20 @@ impl NativeLoadModule {
                         "native load child id out of range",
                     ));
                 }
-                let request = request_by_id[idx].ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "native inline load child request missing",
-                    )
-                })?;
                 by_id[idx] = Some(NativeLoadCompletion {
                     request_id: child.request_id,
                     bytes: Arc::clone(&bytes),
                     range: start..end,
                 });
-                self.insert_child_cache(request, &bytes, start, end);
+                if let Some(request_by_id) = request_by_id.as_ref() {
+                    let request = request_by_id[idx].ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "native inline load child request missing",
+                        )
+                    })?;
+                    self.insert_child_cache(request, &bytes, start, end);
+                }
             }
         }
 

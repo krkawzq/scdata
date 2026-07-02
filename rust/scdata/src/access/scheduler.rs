@@ -4358,7 +4358,13 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_sliced_staged_decode_requires_output_budget() {
+    fn scheduled_sliced_decode_returns_slice_within_budget() {
+        // With `keep_decoded=false` and a non-identity slice, the scheduled
+        // decode path decodes the slice directly (4 bytes) instead of staging
+        // the full decoded output (8 bytes) and then scatter-copying into a
+        // separate output buffer. Peak memory is the slice output (4), which
+        // fits the budget (8), so the batch succeeds — it no longer needs an
+        // output buffer on top of a full staging buffer.
         let io = StaticIo::new(b"x");
         let (decode, decodes) = CodecBackedDecode::counted();
         let config = AccessConfig {
@@ -4390,9 +4396,53 @@ mod tests {
             )
             .expect("scheduled");
 
+        let data = recv_scheduled_next_timeout(scheduled, Duration::from_secs(1))
+            .expect("scheduled item")
+            .expect("sliced decode fits the budget");
+        assert_eq!(data, vec![b'z'; 4]);
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn scheduled_sliced_decode_rejects_slice_exceeding_budget() {
+        // Because the slice is decoded directly, the memory gate is the slice
+        // output length, not (staging + output). A 4-byte slice cannot fit a
+        // 3-byte budget, so the reservation fails with a memory-budget error
+        // after the decode has run once.
+        let io = StaticIo::new(b"x");
+        let (decode, decodes) = CodecBackedDecode::counted();
+        let config = AccessConfig {
+            queue_capacity: 32,
+            scheduler_shards: 1,
+            cache_capacity_bytes: 1,
+            memory_budget_bytes: 3,
+            default_io_priority: 0,
+            keep_decoded: false,
+            cpu: test_cpu_config(),
+            profile: AccessProfile::disabled(),
+        };
+        let handle = AccessScheduler::spawn(config, Box::new(io), Box::new(decode)).expect("spawn");
+        let key = ChunkKey::new(FileRef(1), 0, 1);
+        let codec: SharedCodec = Arc::new(ExpandCodec {
+            byte: b'z',
+            output_len: 8,
+        });
+        let item = AccessItem::new(key, codec, Some(8)).with_slice(Some(vec![0, 0, 4]));
+
+        let scheduled = handle
+            .scheduled(
+                vec![item],
+                ScheduledAccessConfig {
+                    prefetch_step: 0,
+                    decode_ahead_steps: 0,
+                    ready_ahead_steps: 0,
+                },
+            )
+            .expect("scheduled");
+
         let err = recv_scheduled_next_timeout(scheduled, Duration::from_secs(1))
             .expect("scheduled item")
-            .expect_err("scatter-copy needs an output buffer in addition to staging");
+            .expect_err("slice output must fit the budget");
         assert!(err.to_string().contains("memory budget"));
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
     }

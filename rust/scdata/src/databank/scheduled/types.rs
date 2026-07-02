@@ -158,6 +158,8 @@ where
     pub(crate) output_names: Vec<GeneNameView>,
     pub(crate) _datasets: Arc<[Arc<Dataset>]>,
     pub(crate) prefetch_step: usize,
+    pub(crate) resolved_strategy: &'static str,
+    pub(crate) fallback_reason: Option<&'static str>,
     pub(crate) cancel: Arc<PrefetchCancelRegistry>,
     pub(crate) producer: Option<thread::JoinHandle<()>>,
 }
@@ -174,6 +176,20 @@ where
 
     pub fn gene_names(&self) -> &[GeneNameView] {
         &self.output_names
+    }
+
+    /// Stable short name of the resolved access strategy for this session:
+    /// `"blosc_lz4_fast"` (the native Blosc-LZ4 fast path engaged) or
+    /// `"generic"` (the standard access-scheduler path).
+    pub fn resolved_strategy(&self) -> &'static str {
+        self.resolved_strategy
+    }
+
+    /// Why the fast path fell back to `generic`, when it was requested
+    /// (`fast_mode` = `auto`/`force`) but did not engage. `None` when the fast
+    /// path is active, or when fast mode was not requested.
+    pub fn fallback_reason(&self) -> Option<&'static str> {
+        self.fallback_reason
     }
 }
 

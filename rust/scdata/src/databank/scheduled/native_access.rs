@@ -6,8 +6,7 @@ use std::thread;
 use tokio::task::JoinSet;
 
 use crate::access::{
-    AccessHandle, AccessItem, IoBackend, PrefetchCancel, ScheduledAccess,
-    ScheduledAccessConfig,
+    AccessHandle, AccessItem, IoBackend, PrefetchCancel, ScheduledAccess, ScheduledAccessConfig,
 };
 
 use super::super::config::NativeAccessConfig;
@@ -83,9 +82,7 @@ impl AccessStrategy {
         allow_small_command_grouping: bool,
     ) -> DataBankResult<ScheduledBatchAccess> {
         match self {
-            Self::Generic => {
-                build_generic_scheduled_access(access, items, access_config, cancel)
-            }
+            Self::Generic => build_generic_scheduled_access(access, items, access_config, cancel),
             Self::BloscLz4Native(ctx) => NativeScheduledAccess::spawn(
                 ctx.clone(),
                 items,
@@ -96,6 +93,28 @@ impl AccessStrategy {
             .map(ScheduledBatchAccess::Native),
         }
     }
+}
+
+/// The resolved access strategy for one prefetch session, plus a user-facing
+/// label and optional fallback reason for observability.
+///
+/// Produced once at spawn time by `resolve_strategy` (see `scheduled/mod.rs`).
+/// `strategy` is the resolved [`AccessStrategy`] the session actually runs;
+/// `label` is a stable short name (`"generic"` / `"blosc_lz4_fast"`) surfaced to
+/// Python via `PrefetchCells.resolved_strategy`; `reason` is `Some` when the
+/// fast path was *requested* (`auto`/`force`) but the session fell back to
+/// generic, explaining why — it is `None` when the fast path is active, or when
+/// fast mode was not requested (`disabled`).
+#[derive(Clone)]
+pub(crate) struct ResolvedStrategy {
+    pub(crate) strategy: AccessStrategy,
+    pub(crate) label: &'static str,
+    pub(crate) reason: Option<&'static str>,
+}
+
+impl ResolvedStrategy {
+    pub(crate) const GENERIC_LABEL: &'static str = "generic";
+    pub(crate) const FAST_LABEL: &'static str = "blosc_lz4_fast";
 }
 
 fn native_block_payload_cache_from_env() -> Option<Arc<NativeBlockPayloadCache>> {
@@ -522,7 +541,7 @@ async fn run_native_scheduled(
                 source_done = true;
                 break;
             };
-            let batch_size = native_item_batch_size(&native.config);
+            let batch_size = native_item_batch_size(&native);
             let mut batch = Vec::with_capacity(batch_size);
             batch.push(first);
             while batch.len() < batch_size {
@@ -534,9 +553,7 @@ async fn run_native_scheduled(
             }
             let native = native.clone();
             let cancel = Arc::clone(&cancel);
-            tasks.spawn(async move {
-                load_native_batch(native, batch, cancel).await
-            });
+            tasks.spawn(async move { load_native_batch(native, batch, cancel).await });
         }
 
         // Reclaim every already-finished task without awaiting. On a
@@ -805,7 +822,25 @@ fn native_window(config: &NativeAccessConfig, access_config: ScheduledAccessConf
         .min(access_window.max(config.fused_workers.max(1)))
 }
 
-fn native_item_batch_size(config: &NativeAccessConfig) -> usize {
+fn native_item_batch_size(native: &NativeScheduledContext) -> usize {
+    if let Some(value) = std::env::var("SCDATA_NATIVE_ITEM_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+    {
+        return value.clamp(8, 4096);
+    }
+    if native.block_cache.is_none() && native.decoded_cache.is_none() {
+        return native
+            .config
+            .fused_workers
+            .saturating_mul(8)
+            .clamp(128, 512);
+    }
+    native_item_batch_size_from_config(&native.config)
+}
+
+fn native_item_batch_size_from_config(config: &NativeAccessConfig) -> usize {
     config.fused_workers.saturating_mul(4).clamp(8, 256)
 }
 
@@ -813,8 +848,8 @@ fn native_batch_multi_item_min() -> usize {
     8
 }
 
-fn native_small_command_group_max_items(config: &NativeAccessConfig) -> usize {
-    native_item_batch_size(config)
+fn native_small_command_group_max_items(native: &NativeScheduledContext) -> usize {
+    native_item_batch_size(native)
         .min(16)
         .max(native_batch_multi_item_min())
 }
@@ -825,14 +860,408 @@ fn native_command_group_max_items(command: &NativeScheduledCommand) -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&value| value > 1)
-            .unwrap_or_else(|| native_item_batch_size(&command.native.config).saturating_mul(4))
+            .unwrap_or_else(|| native_item_batch_size(&command.native).saturating_mul(4))
             .clamp(native_batch_multi_item_min(), 4096);
     }
-    native_small_command_group_max_items(&command.native.config)
+    native_small_command_group_max_items(&command.native)
 }
 
 fn native_cross_command_grouping_enabled() -> bool {
     std::env::var("SCDATA_NATIVE_COMMAND_GROUPING")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        load_native_batch, load_native_items_ordered_async, load_native_items_ordered_blocking,
+        AccessStrategy, NativeScheduledContext, ScheduledBatchAccess,
+    };
+    use crate::access::{
+        AccessConfig, AccessCpuConfig, AccessHandle, AccessItem, AccessProfile, AccessScheduler,
+        ChunkKey, DecodeBackend, DecodeTask, FileRef, IoBackend, IoTask, PrefetchCancel,
+        ScheduledAccessConfig, SliceSpec,
+    };
+    use crate::codecs::{codec_from_json_str, CodecError, DecodeSlice, SharedCodec};
+    use crate::databank::config::{
+        NativeAccessConfig, NativeBloscConfig, NativeLoadCoalesceConfig, NativeLoadConfig,
+    };
+    use std::io;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Re-implementation of the `manual_blosc_lz4_raw_blocks` fixture from
+    /// `native::item::tests` — builds an uncompressed-block Blosc-LZ4 chunk
+    /// whose decode is the concatenation of `blocks`. Self-contained so this
+    /// module's tests do not depend on a private sibling test helper.
+    fn manual_blosc_lz4_raw_blocks(blocks: &[&[u8]]) -> Vec<u8> {
+        assert!(!blocks.is_empty());
+        let blocksize = blocks[0].len();
+        assert!(blocks.iter().all(|block| block.len() == blocksize));
+        let decoded_size = blocks.iter().map(|block| block.len()).sum::<usize>();
+        let table_bytes = blocks.len() * 4;
+        let compressed_size =
+            blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + table_bytes + decoded_size + table_bytes;
+        let mut encoded = vec![0u8; blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + table_bytes];
+        encoded[0] = blosc_src::BLOSC_VERSION_FORMAT as u8;
+        encoded[1] = blosc_src::BLOSC_LZ4_VERSION_FORMAT as u8;
+        encoded[2] = (blosc_src::BLOSC_LZ4_FORMAT << 5) as u8;
+        encoded[3] = 1;
+        encoded[4..8].copy_from_slice(&(decoded_size as u32).to_le_bytes());
+        encoded[8..12].copy_from_slice(&(blocksize as u32).to_le_bytes());
+        encoded[12..16].copy_from_slice(&(compressed_size as u32).to_le_bytes());
+
+        let mut offset = blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + table_bytes;
+        for (idx, block) in blocks.iter().enumerate() {
+            let table_offset = blosc_src::BLOSC_MIN_HEADER_LENGTH as usize + idx * 4;
+            encoded[table_offset..table_offset + 4].copy_from_slice(&(offset as i32).to_le_bytes());
+            encoded.extend_from_slice(&(block.len() as i32).to_le_bytes());
+            encoded.extend_from_slice(block);
+            offset += 4 + block.len();
+        }
+        assert_eq!(encoded.len(), compressed_size);
+        encoded
+    }
+
+    /// `IoBackend` serving a single in-memory byte buffer at `base_offset`.
+    /// Same shape as the fixture in `native::item::tests` (minus the read log,
+    /// which these tests do not assert on).
+    struct RangeIo {
+        file: FileRef,
+        base_offset: u64,
+        bytes: Arc<[u8]>,
+    }
+
+    impl RangeIo {
+        fn new(file: FileRef, base_offset: u64, bytes: Vec<u8>) -> Self {
+            Self {
+                file,
+                base_offset,
+                bytes: Arc::from(bytes.into_boxed_slice()),
+            }
+        }
+    }
+
+    impl IoBackend for RangeIo {
+        fn submit_read(&self, file: FileRef, offset: u64, len: usize, _priority: u8) -> IoTask {
+            assert_eq!(file, self.file);
+            let start = usize::try_from(offset - self.base_offset).expect("offset");
+            let end = start + len;
+            let data: Arc<[u8]> = Arc::from(self.bytes[start..end].to_vec().into_boxed_slice());
+            Box::pin(async move { Ok(data) })
+        }
+    }
+
+    /// `IoBackend` that always fails — exercises the `Err` half of zero-fallback.
+    struct ErrorIo;
+    impl IoBackend for ErrorIo {
+        fn submit_read(&self, _file: FileRef, _offset: u64, _len: usize, _priority: u8) -> IoTask {
+            Box::pin(async move { Err(io::Error::new(io::ErrorKind::UnexpectedEof, "boom")) })
+        }
+    }
+
+    /// `IoBackend`/`DecodeBackend` stubs backing the `AccessHandle` that only
+    /// exists to construct a `PrefetchCancel`. The native path never drives them
+    /// — the handle is used solely for `cancel_in_flight` →
+    /// `send_scheduled_cancel`, a no-op on an idle scheduler.
+    struct CancelIo;
+    impl IoBackend for CancelIo {
+        fn submit_read(&self, _file: FileRef, _offset: u64, _len: usize, _priority: u8) -> IoTask {
+            Box::pin(async { Err(io::Error::new(io::ErrorKind::UnexpectedEof, "cancel-only io")) })
+        }
+    }
+
+    struct CancelDecode;
+    impl DecodeBackend for CancelDecode {
+        fn submit_decode(
+            &self,
+            _codec: SharedCodec,
+            _encoded: Arc<[u8]>,
+            _expected_size: Option<usize>,
+            _slice: Option<DecodeSlice>,
+        ) -> DecodeTask {
+            Box::pin(async { Err(CodecError::Unsupported { codec: "cancel-only".to_string() }) })
+        }
+    }
+
+    fn blosc_codec() -> SharedCodec {
+        codec_from_json_str(r#"{"id":"blosc","cname":"lz4"}"#).expect("codec")
+    }
+
+    fn native_config() -> NativeAccessConfig {
+        NativeAccessConfig {
+            enabled: true,
+            fused_workers: 1,
+            request_prefetch_batches: 1,
+            request_prefetch_blocks: 4,
+            memory_budget_bytes: 4096,
+            response_queue_bytes_soft_limit: 1024,
+            response_queue_bytes_hard_limit: 2048,
+            load: NativeLoadConfig {
+                scheduler_workers: 1,
+                io_workers: 1,
+                coalesce: NativeLoadCoalesceConfig::default(),
+            },
+            blosc: NativeBloscConfig::default(),
+        }
+    }
+
+    fn make_ctx(io: Arc<dyn IoBackend>) -> NativeScheduledContext {
+        NativeScheduledContext::new(io, native_config()).expect("native context")
+    }
+
+    /// Build a minimal `AccessHandle` + `PrefetchCancel` pair. The handle backs
+    /// the cancel; the native path otherwise ignores it.
+    fn make_cancel() -> (AccessHandle, Arc<PrefetchCancel>) {
+        let config = AccessConfig {
+            queue_capacity: 4,
+            scheduler_shards: 1,
+            cache_capacity_bytes: 16,
+            memory_budget_bytes: 32,
+            default_io_priority: 0,
+            keep_decoded: false,
+            cpu: AccessCpuConfig {
+                num_workers: 1,
+                queue_capacity: 4,
+                cpus: None,
+            },
+            profile: AccessProfile::disabled(),
+        };
+        let handle = AccessScheduler::spawn(config, Box::new(CancelIo), Box::new(CancelDecode))
+            .expect("access handle");
+        let cancel = PrefetchCancel::new(handle.clone());
+        (handle, cancel)
+    }
+
+    /// Build `n` distinct whole-chunk Blosc-LZ4 items laid out contiguously in
+    /// one buffer. Item `i` decodes to `[b'A'+i; 4] ++ [b'0'+i; 4]`.
+    fn distinct_chunks(n: usize) -> (Arc<dyn IoBackend>, Vec<AccessItem>, Vec<Vec<u8>>) {
+        let file = FileRef::new(7);
+        let codec = blosc_codec();
+        let mut buffer = Vec::new();
+        let mut items = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..n {
+            let block_a = vec![b'A' + i as u8; 4];
+            let block_b = vec![b'0' + i as u8; 4];
+            let encoded = manual_blosc_lz4_raw_blocks(&[&block_a, &block_b]);
+            let offset = 1000u64 + buffer.len() as u64;
+            buffer.extend_from_slice(&encoded);
+            items.push(AccessItem::new(
+                ChunkKey::new(file, offset, encoded.len()),
+                codec.clone(),
+                Some(8),
+            ));
+            expected.push([&block_a[..], &block_b].concat());
+        }
+        let io: Arc<dyn IoBackend> = Arc::new(RangeIo::new(file, 1000, buffer));
+        (io, items, expected)
+    }
+
+    /// Drain a `ScheduledBatchAccess` on a worker thread with a hard timeout so
+    /// a stuck native executor fails the test instead of hanging the suite.
+    fn drain_timeout(mut scheduled: ScheduledBatchAccess, timeout: Duration) -> Vec<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<io::Result<Vec<u8>>>>();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            while let Some(item) = scheduled.next() {
+                out.push(item);
+            }
+            let _ = tx.send(out);
+        });
+        rx.recv_timeout(timeout)
+            .expect("native scheduled iterator did not drain in time")
+            .into_iter()
+            .map(|r| r.expect("native item"))
+            .collect()
+    }
+
+    /// Drive a native async future on a dedicated current-thread runtime with a
+    /// hard timeout. `tokio::time` is not enabled in this crate, so the timeout
+    /// is enforced via an `mpsc::recv_timeout` on the test thread.
+    fn run_async_timeout<F, T>(future: F, timeout: Duration, label: &str) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel::<T>();
+        let label = label.to_string();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("native test runtime");
+            let result = runtime.block_on(future);
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(timeout)
+            .unwrap_or_else(|_| panic!("{label} did not complete in time"))
+    }
+
+    // ----- zero-fallback: `load_native_batch` mapping -------------------------
+
+    #[tokio::test]
+    async fn load_native_batch_maps_none_to_io_error() {
+        // Zero-fallback (`None` half): a sliced item whose chunk is shorter than
+        // the minimal Blosc header declines to `None` inside the native loader.
+        // `load_native_batch` must surface that as an `io::Error` for the slot —
+        // never a silent retreat to the generic access path.
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let io = Arc::new(RangeIo::new(file, 1000, encoded.clone()));
+        let ctx = make_ctx(io);
+        let (_handle, cancel) = make_cancel();
+        let codec = blosc_codec();
+        let short = AccessItem::new(ChunkKey::new(file, 2000, 8), codec.clone(), Some(4))
+            .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let normal = AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec, Some(8))
+            .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let batch = vec![(0_usize, short), (1, normal)];
+
+        let out = load_native_batch(ctx, batch, cancel).await;
+
+        assert_eq!(out.len(), 2);
+        let err = out[0].1.as_ref().expect_err("None must become io::Error");
+        assert!(err.to_string().contains("no result"), "{err}");
+        assert_eq!(out[1].1.as_ref().expect("normal ok").as_slice(), b"abcd");
+    }
+
+    #[tokio::test]
+    async fn load_native_batch_maps_decode_error_to_io_error() {
+        // Zero-fallback (`Err` half): an IO failure inside the native loader
+        // surfaces as `io::Error` for every item in the batch, never a silent
+        // retreat.
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let ctx = make_ctx(Arc::new(ErrorIo));
+        let (_handle, cancel) = make_cancel();
+        let codec = blosc_codec();
+        let item = AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec, Some(8))
+            .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let batch = vec![(0_usize, item.clone()), (1, item)];
+
+        let out = load_native_batch(ctx, batch, cancel).await;
+
+        assert_eq!(out.len(), 2);
+        for (_, result) in &out {
+            let err = result.as_ref().expect_err("Err must propagate to every item");
+            assert!(err.to_string().contains("boom"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn load_native_batch_returns_decoded_bytes_in_order() {
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let io = Arc::new(RangeIo::new(file, 1000, encoded.clone()));
+        let ctx = make_ctx(io);
+        let (_handle, cancel) = make_cancel();
+        let codec = blosc_codec();
+        let item = |slice: SliceSpec| {
+            AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec.clone(), Some(8))
+                .with_slice_spec(slice)
+        };
+        let batch = vec![
+            (0_usize, item(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"))),
+            (1, item(SliceSpec::from_triples(vec![0, 4, 8]).expect("slice"))),
+        ];
+
+        let out = load_native_batch(ctx, batch, cancel).await;
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].1.as_ref().expect("ok").as_slice(), b"abcd");
+        assert_eq!(out[1].1.as_ref().expect("ok").as_slice(), b"efgh");
+    }
+
+    // ----- scheduled iterator + dispatch -------------------------------------
+
+    #[test]
+    fn access_strategy_build_native_dispatches_ordered_output() {
+        // `AccessStrategy::BloscLz4Native(ctx).build(...)` must dispatch to the
+        // native scheduled iterator (`ScheduledBatchAccess::Native`) and emit
+        // every item's decoded bytes in submission order. The native arm ignores
+        // `access`; it is only the cancel's backing handle.
+        let (io, items, expected) = distinct_chunks(5);
+        let ctx = make_ctx(io);
+        let (handle, cancel) = make_cancel();
+        let access_config = ScheduledAccessConfig {
+            prefetch_step: 4,
+            decode_ahead_steps: 4,
+            ready_ahead_steps: 4,
+        };
+        let strategy = AccessStrategy::BloscLz4Native(ctx);
+        let scheduled = strategy
+            .build(handle, items, access_config, cancel, false)
+            .expect("native build");
+
+        let got = drain_timeout(scheduled, Duration::from_secs(5));
+        assert_eq!(got.len(), expected.len());
+        for (got, expected) in got.iter().zip(&expected) {
+            assert_eq!(got.as_slice(), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn load_native_items_ordered_async_returns_in_order() {
+        let (io, items, expected) = distinct_chunks(5);
+        let ctx = make_ctx(io);
+        let (_handle, cancel) = make_cancel();
+        let out = run_async_timeout(
+            load_native_items_ordered_async(ctx, items, cancel),
+            Duration::from_secs(5),
+            "ordered async",
+        )
+        .expect("ordered async");
+        assert_eq!(out.len(), expected.len());
+        for (got, expected) in out.iter().zip(&expected) {
+            assert_eq!(got.as_slice(), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn load_native_items_ordered_blocking_returns_in_order() {
+        // The blocking ordered path submits an `Ordered` command to the native
+        // executor and waits on a sync channel. Driven on a worker thread with a
+        // timeout so a stuck executor fails the test instead of hanging it.
+        let (io, items, expected) = distinct_chunks(5);
+        let ctx = make_ctx(io);
+        let (_handle, cancel) = make_cancel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = load_native_items_ordered_blocking(ctx, items, cancel);
+            let _ = tx.send(result);
+        });
+        let out = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ordered blocking did not complete in time")
+            .expect("ordered blocking");
+        worker.join().expect("worker thread");
+        assert_eq!(out.len(), expected.len());
+        for (got, expected) in out.iter().zip(&expected) {
+            assert_eq!(got.as_slice(), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn load_native_items_ordered_async_propagates_decode_error() {
+        // Zero-fallback through the ordered-async wrapper: an IO error must
+        // surface as `DataBankError::Io`, not a silent empty/generic retreat.
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let ctx = make_ctx(Arc::new(ErrorIo));
+        let (_handle, cancel) = make_cancel();
+        let codec = blosc_codec();
+        let item = AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec, Some(8))
+            .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let items = vec![item];
+
+        let err = run_async_timeout(
+            load_native_items_ordered_async(ctx, items, cancel),
+            Duration::from_secs(5),
+            "ordered async",
+        )
+        .expect_err("IO error must propagate");
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
 }

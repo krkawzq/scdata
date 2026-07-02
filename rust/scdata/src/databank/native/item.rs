@@ -696,4 +696,228 @@ mod tests {
         assert_eq!(encoded.len(), compressed_size);
         encoded
     }
+
+    /// `IoBackend` that always fails — exercises the zero-fallback error origin
+    /// (`load_access_items_blosc_lz4_native` returns `Err`, never a silent `None`
+    /// or a retreat to the generic path).
+    struct ErrorIo;
+
+    impl IoBackend for ErrorIo {
+        fn submit_read(&self, _file: FileRef, _offset: u64, _len: usize, _priority: u8) -> IoTask {
+            Box::pin(async move { Err(io::Error::new(io::ErrorKind::UnexpectedEof, "boom")) })
+        }
+    }
+
+    fn blosc_codec() -> crate::codecs::SharedCodec {
+        codec_from_json_str(r#"{"id":"blosc","cname":"lz4"}"#).expect("codec")
+    }
+
+    #[tokio::test]
+    async fn batch_loads_multiple_sliced_items_in_order() {
+        // >1 items exercises the batch arm (cross-item coalesce + multi-output
+        // scatter), not the single-item fallback. Two slices of one chunk come
+        // back in submission order.
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let base_offset = 1000;
+        let io = Arc::new(RangeIo::new(file, base_offset, encoded.clone()));
+        let codec = blosc_codec();
+        let item = |slice: SliceSpec| {
+            AccessItem::new(
+                ChunkKey::new(file, base_offset, encoded.len()),
+                codec.clone(),
+                Some(8),
+            )
+            .with_slice_spec(slice)
+        };
+        let items = vec![
+            item(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice")), // "abcd"
+            item(SliceSpec::from_triples(vec![0, 4, 8]).expect("slice")), // "efgh"
+        ];
+
+        let out = load_access_items_blosc_lz4_native(
+            io,
+            coalesce_config(),
+            &index_cache(),
+            None,
+            None,
+            &items,
+            0,
+        )
+        .await
+        .expect("native batch");
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].as_deref(), Some(b"abcd".as_slice()));
+        assert_eq!(out[1].as_deref(), Some(b"efgh".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn batch_dedups_shared_block_reads_across_items() {
+        // Both slices live in block 0 (decoded bytes 0..4 = "abcd"). The batch
+        // planner keys block reads by `(file, offset, len)` in
+        // `block_job_by_range`, so the second item reuses the first's block job
+        // instead of re-reading the block payload.
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let base_offset = 1000;
+        let io = Arc::new(RangeIo::new(file, base_offset, encoded.clone()));
+        let codec = blosc_codec();
+        let item = |slice: SliceSpec| {
+            AccessItem::new(
+                ChunkKey::new(file, base_offset, encoded.len()),
+                codec.clone(),
+                Some(8),
+            )
+            .with_slice_spec(slice)
+        };
+        let items = vec![
+            item(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice")), // "abcd"
+            item(SliceSpec::from_triples(vec![0, 0, 2]).expect("slice")), // "ab"
+        ];
+
+        let out = load_access_items_blosc_lz4_native(
+            io.clone(),
+            coalesce_config(),
+            &index_cache(),
+            None,
+            None,
+            &items,
+            0,
+        )
+        .await
+        .expect("native batch");
+
+        assert_eq!(out[0].as_deref(), Some(b"abcd".as_slice()));
+        assert_eq!(out[1].as_deref(), Some(b"ab".as_slice()));
+        // One optimistic header+table read (covers the whole 40 B chunk) + one
+        // block-0 payload read, shared across both items.
+        assert_eq!(io.reads(), vec![(1000, 40), (1024, 8)]);
+    }
+
+    #[tokio::test]
+    async fn batch_mixed_full_and_sliced_items() {
+        // A `Full` item (whole-chunk decode) alongside a sliced item on the same
+        // chunk: the full-chunk job and the block-slice job take different code
+        // paths through the batch planner but must both land correct output.
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let base_offset = 1000;
+        let io = Arc::new(RangeIo::new(file, base_offset, encoded.clone()));
+        let codec = blosc_codec();
+        let key = ChunkKey::new(file, base_offset, encoded.len());
+        let items = vec![
+            AccessItem::new(key, codec.clone(), Some(8)), // Full → "abcdefgh"
+            AccessItem::new(key, codec.clone(), Some(8))
+                .with_slice_spec(SliceSpec::from_triples(vec![0, 4, 8]).expect("slice")), // "efgh"
+        ];
+
+        let out = load_access_items_blosc_lz4_native(
+            io,
+            coalesce_config(),
+            &index_cache(),
+            None,
+            None,
+            &items,
+            0,
+        )
+        .await
+        .expect("native batch");
+
+        assert_eq!(out[0].as_deref(), Some(b"abcdefgh".as_slice()));
+        assert_eq!(out[1].as_deref(), Some(b"efgh".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn batch_leaves_none_for_short_chunk_with_slice() {
+        // A sliced item whose chunk is shorter than the minimal Blosc header
+        // (16 B) declines on the native path: the batch loop `continue`s, leaving
+        // the slot as `None`. This `None` is the zero-fallback source —
+        // `load_native_batch` turns it into an `io::Error` rather than retreating
+        // to the generic path (see `native_access::tests`).
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let io = Arc::new(RangeIo::new(file, 1000, encoded.clone()));
+        let codec = blosc_codec();
+        let short = AccessItem::new(ChunkKey::new(file, 2000, 8), codec.clone(), Some(4))
+            .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let normal =
+            AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec.clone(), Some(8))
+                .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let items = vec![short, normal];
+
+        let out = load_access_items_blosc_lz4_native(
+            io,
+            coalesce_config(),
+            &index_cache(),
+            None,
+            None,
+            &items,
+            0,
+        )
+        .await
+        .expect("decline is Ok(None), not Err");
+
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_none(), "short chunk with slice must decline to None");
+        assert_eq!(out[1].as_deref(), Some(b"abcd".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn batch_propagates_io_error() {
+        // An IO failure while building the block index surfaces as `Err` — never
+        // a silent `None` or a generic-path retreat. This is the `Err` half of
+        // the zero-fallback contract.
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let io = Arc::new(ErrorIo);
+        let codec = blosc_codec();
+        let item = AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec, Some(8))
+            .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let items = vec![item.clone(), item];
+
+        let err = load_access_items_blosc_lz4_native(
+            io,
+            coalesce_config(),
+            &index_cache(),
+            None,
+            None,
+            &items,
+            0,
+        )
+        .await
+        .expect_err("IO error must propagate, not decline to None");
+
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_expected_size_mismatch() {
+        // `expected_size` is validated against the block-index decoded size
+        // before any payload read. A mismatch is a hard `CodecError::SizeMismatch`
+        // — not a decline-to-`None`.
+        let encoded = manual_blosc_lz4_raw_blocks(&[b"abcd", b"efgh"]);
+        let file = FileRef::new(7);
+        let io = Arc::new(RangeIo::new(file, 1000, encoded.clone()));
+        let codec = blosc_codec();
+        let item = AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec, Some(99))
+            .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let items = vec![item.clone(), item];
+
+        let err = load_access_items_blosc_lz4_native(
+            io,
+            coalesce_config(),
+            &index_cache(),
+            None,
+            None,
+            &items,
+            0,
+        )
+        .await
+        .expect_err("size mismatch must error");
+
+        let msg = err.to_string();
+        assert!(msg.contains("size mismatch"), "{msg}");
+        assert!(msg.contains("expected 99"), "{msg}");
+    }
 }
