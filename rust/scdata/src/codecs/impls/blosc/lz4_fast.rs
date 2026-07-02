@@ -519,8 +519,8 @@ fn copy_shuffled_block_ranges(
         if start >= end {
             continue;
         }
-        let mut dst = range.dst_offset + (start - range.src_start);
-        for pos in start..end {
+        let dst_start = range.dst_offset + (start - range.src_start);
+        for (pos, dst) in (start..end).zip(dst_start..) {
             let rel = pos - block_offset;
             let src = if rel < main_len {
                 let element = rel / typesize;
@@ -530,7 +530,6 @@ fn copy_shuffled_block_ranges(
                 rel
             };
             out[dst] = shuffled[src];
-            dst += 1;
         }
     }
 }

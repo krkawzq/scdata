@@ -843,8 +843,7 @@ fn copy_shuffled_range(
         }
     }
 
-    let mut dst = dst;
-    for rel in rel_start..rel_end {
+    for (rel, dst) in (rel_start..rel_end).zip(dst..) {
         let src = if rel < main_len {
             let element = rel / typesize;
             let byte = rel % typesize;
@@ -856,7 +855,6 @@ fn copy_shuffled_range(
             return Err(decode_error("native shuffled block range exceeds buffer"));
         }
         output[dst] = shuffled[src];
-        dst += 1;
     }
     Ok(())
 }
@@ -886,7 +884,6 @@ fn copy_shuffled_range_2(
             let value = (*s0.add(elem) as u16) | ((*s1.add(elem) as u16) << 8);
             std::ptr::write_unaligned(out.add(idx), value);
         }
-        return;
     }
     #[cfg(not(target_endian = "little"))]
     {
@@ -923,7 +920,6 @@ fn copy_shuffled_range_4(
                 | ((*s3.add(elem) as u32) << 24);
             std::ptr::write_unaligned(out.add(idx), value);
         }
-        return;
     }
     #[cfg(not(target_endian = "little"))]
     {

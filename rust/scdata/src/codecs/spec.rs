@@ -38,6 +38,10 @@ impl DecodeRange {
     pub fn len(self) -> usize {
         self.src_end - self.src_start
     }
+
+    pub fn is_empty(self) -> bool {
+        self.src_start == self.src_end
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -50,15 +50,18 @@ _Store = Literal["zip", "dir"]
 _Compressor = str | Mapping[str, Any] | None
 
 # scdata marker stored in matrix array/group ``attributes`` so :func:`read_zarr`
-# can recover the layout without guessing from shape.  ``scdata-x`` is the
-# legacy spelling; new stores write both for compatibility.
+# can recover the layout without guessing from shape.
 _SCDATA_MATRIX_ATTR = "scdata-matrix"
-_SCDATA_X_ATTR = "scdata-x"
 _SCDATA_SHAPE_2D = "scdata-shape-2d"
 
 # Default chunk element count when ``chunk_size`` is an int.
 _DEFAULT_CHUNK_ELEMENTS = 1_000_000
 _DEFAULT_COMPRESSOR = "blosc.lz4.level5"
+# Default Blosc block size in bytes. 64 KiB bounds read amplification for
+# random partial access on the native fast path while keeping compression
+# ratio near Blosc's auto-selected value. ``0`` (Blosc auto) remains the
+# per-call escape hatch.
+_DEFAULT_BLOCKSIZE = 64 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -70,13 +73,13 @@ def write_zarr(
     adata: "AnnData",
     path: str | os.PathLike[str],
     *,
-    format: _XFormat = "dense2d",
-    layer_format: _LayerFormat = "preserve",
+    format: _XFormat = "sparse",
+    layer_format: _LayerFormat = "sparse",
     chunk_size: int | list[int] | tuple[int, ...] = _DEFAULT_CHUNK_ELEMENTS,
     align_cells: bool = True,
     store: _Store = "zip",
     compressor: _Compressor = _DEFAULT_COMPRESSOR,
-    blocksize: int = 0,
+    blocksize: int = _DEFAULT_BLOCKSIZE,
 ) -> Path:
     """Write an :class:`anndata.AnnData` as a scdata zarr v3 store.
 
@@ -118,10 +121,11 @@ def write_zarr(
     blocksize:
         Blosc block size in bytes, applied to every Blosc-compressed array
         (``X``, ``layers``, ``raw.X``, and CSR ``indptr`` / ``indices`` /
-        ``data``).  ``0`` (default) lets Blosc pick the block size.  A positive
-        value overrides any blocksize embedded in ``compressor``.  Ignored when
-        ``compressor`` is ``None``.  Smaller blocks reduce read amplification
-        for random partial access at the cost of compression ratio.
+        ``data``).  Defaults to ``64 * 1024`` (64 KiB), which bounds read
+        amplification for random partial access on the native fast path.
+        ``0`` lets Blosc pick the block size; a positive value overrides any
+        blocksize embedded in ``compressor``.  Ignored when ``compressor`` is
+        ``None``.
     """
     import zarr
     from anndata._io.specs import write_elem
@@ -390,7 +394,6 @@ def _matrix_attrs(kind: str, n_obs: int, n_var: int) -> dict[str, Any]:
         "encoding-type": "array",
         "encoding-version": "0.2.0",
         _SCDATA_MATRIX_ATTR: kind,
-        _SCDATA_X_ATTR: kind,
         _SCDATA_SHAPE_2D: [int(n_obs), int(n_var)],
     }
 
@@ -490,7 +493,6 @@ def _write_csr_group(
             "encoding-version": "0.1.0",
             "shape": [int(csr.shape[0]), int(csr.shape[1])],
             _SCDATA_MATRIX_ATTR: "sparse",
-            _SCDATA_X_ATTR: "sparse",
         }
     )
 
@@ -623,7 +625,6 @@ def _write_rectilinear_array(
         "encoding-type": "array",
         "encoding-version": "0.2.0",
         _SCDATA_MATRIX_ATTR: "sparse-vlen",
-        _SCDATA_X_ATTR: "sparse-vlen",
     }
     if total == 0:
         _create_dense_array(
@@ -1341,7 +1342,7 @@ def _node_attrs(elem: Any) -> dict[str, Any]:
 
 
 def _matrix_kind(attrs: dict[str, Any]) -> Any:
-    return attrs.get(_SCDATA_MATRIX_ATTR) or attrs.get(_SCDATA_X_ATTR)
+    return attrs.get(_SCDATA_MATRIX_ATTR)
 
 
 def _is_matrix_root(name: str) -> bool:

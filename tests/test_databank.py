@@ -8,7 +8,15 @@ from typing import Any
 import numpy as np
 import pytest
 
-from scdata import DataBankConfig, IoConfig, MissingGenePolicy, ScDataBank
+from scdata import (
+    DataBankConfig,
+    FastAccessConfig,
+    FastMode,
+    IoConfig,
+    MissingGenePolicy,
+    ScheduledPrefetchConfig,
+    ScDataBank,
+)
 from scdata._scdata import DataBankError
 from scdata.data import CellIndexPlan, DatasetCollection, DenseDataset, DType, SparseDataset
 from scdata.io import launch, launch_all, write_zarr
@@ -759,6 +767,92 @@ def test_launch_single_matrix_raw_key(tmp_path: Path) -> None:
     did = bank.register(raw_ds)
     out = np.asarray(bank.load(did, [0, 1, 2], dtype="f32")).reshape(3, 3)
     assert np.array_equal(out, raw_expected)
+
+
+def _raw_fast_store(tmp_path: Path) -> tuple[Path, np.ndarray, np.ndarray]:
+    """A cell-aligned CSR store whose raw.X is large enough for the fast path.
+
+    The native Blosc-LZ4 fast path declines chunks below the 16-byte Blosc
+    header floor, so raw.X's CSR ``data`` array must hold enough nonzeros to
+    produce a real compressed block — ``_raw_sparse_store``'s 9-entry raw is
+    too small to reliably engage it.  X and raw.X share the cell axis but have
+    separate gene spaces (8 vs 6 genes).
+    """
+    rng = np.random.default_rng(0)
+    n_obs, n_var = 64, 8
+    x_dense = (rng.random((n_obs, n_var), dtype=np.float32) > 0.5).astype(np.float32)
+    raw_dense = (rng.random((n_obs, 6), dtype=np.float32) > 0.5).astype(np.float32) * 7.0
+    x_matrix = sp.csr_matrix(x_dense)
+    raw_matrix = sp.csr_matrix(raw_dense)
+    adata = ad.AnnData(
+        X=x_matrix,
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_var)]),
+    )
+    adata.raw = ad.AnnData(X=raw_matrix, var=pd.DataFrame(index=[f"r{i}" for i in range(6)]))
+    root = write_zarr(
+        adata,
+        tmp_path / "raw_fast.zarr",
+        format="sparse",
+        chunk_size=(8,),
+        align_cells=True,
+        store="dir",
+    )
+    return root, x_dense, raw_dense
+
+
+def test_raw_fast_path_engages_and_round_trips(tmp_path: Path) -> None:
+    """raw.X must be eligible for the native Blosc-LZ4 fast path, not just X.
+
+    raw.X is written by ``_write_raw`` through the same ``_write_matrix`` as X,
+    so it carries the same cell-aligned CSR layout, Blosc-LZ4 compressor, and
+    ``scdata-matrix`` marker the fast path requires.  ``FastMode.FORCE`` raises
+    if any registered dataset is not fast-eligible, so engaging it for a bank
+    that also holds raw.X proves raw.X is fast-eligible — and the decoded
+    output must still match.
+    """
+    root, x_expected, raw_expected = _raw_fast_store(tmp_path)
+
+    dc = launch_all(root)
+    assert dc.raw is not None
+    assert isinstance(dc.raw, SparseDataset)
+    # raw.X carries its own gene space, distinct from X's.
+    assert dc.raw.num_cells == dc.x.num_cells
+    assert dc.raw.num_genes == 6
+    assert tuple(dc.raw.gene_names) == tuple(f"r{i}" for i in range(6))
+
+    bank = ScDataBank(DataBankConfig.make(fast_config=FastAccessConfig.fast()))
+    registered = bank.register_all(dc)
+    assert set(registered) == {"X", "raw/X"}
+
+    # FORCE: any non-fast-eligible dataset raises.  Engaging the iterator
+    # without error proves raw.X (alongside X) is fast-eligible.  The strategy
+    # is read off the iterator before consumption (CellBatch itself does not
+    # carry it).
+    raw_did = registered["raw/X"]
+    fast_config = ScheduledPrefetchConfig.make(fast_mode=FastMode.FORCE)
+    raw_iter = bank.prefetch(raw_did, [list(range(8)), list(range(8, 16))], config=fast_config)
+    assert raw_iter.resolved_strategy == "blosc_lz4_fast"
+    assert raw_iter.fallback_reason is None
+    batches = list(raw_iter)
+    assert len(batches) == 2
+
+    # Decoded raw output matches the source matrix (rows 0..15).
+    raw_out = np.concatenate(
+        [np.asarray(b.data).reshape(b.cells.shape[0], 6) for b in batches], axis=0
+    )
+    assert np.array_equal(raw_out, raw_expected[:16])
+
+    # X loads correctly via the same fast bank and matches its own gene space.
+    x_did = registered["X"]
+    x_iter = bank.prefetch(x_did, [list(range(8)), list(range(8, 16))], config=fast_config)
+    assert x_iter.resolved_strategy == "blosc_lz4_fast"
+    assert x_iter.fallback_reason is None
+    x_batches = list(x_iter)
+    x_out = np.concatenate(
+        [np.asarray(b.data).reshape(b.cells.shape[0], 8) for b in x_batches], axis=0
+    )
+    assert np.array_equal(x_out, x_expected[:16])
 
 
 def test_launch_all_without_raw(tmp_path: Path) -> None:

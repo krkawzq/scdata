@@ -743,8 +743,8 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
     }
 
     for (command_idx, state) in states.into_iter().enumerate() {
-        for item_idx in 0..state.item_count {
-            let result = completed[command_idx][item_idx].take().unwrap_or_else(|| {
+        for slot in completed[command_idx].iter_mut().take(state.item_count) {
+            let result = slot.take().unwrap_or_else(|| {
                 Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "native grouped scheduled item missing output",
@@ -1061,11 +1061,11 @@ mod tests {
 
     /// Drain a `ScheduledBatchAccess` on a worker thread with a hard timeout so
     /// a stuck native executor fails the test instead of hanging the suite.
-    fn drain_timeout(mut scheduled: ScheduledBatchAccess, timeout: Duration) -> Vec<Vec<u8>> {
+    fn drain_timeout(scheduled: ScheduledBatchAccess, timeout: Duration) -> Vec<Vec<u8>> {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<io::Result<Vec<u8>>>>();
         std::thread::spawn(move || {
             let mut out = Vec::new();
-            while let Some(item) = scheduled.next() {
+            for item in scheduled {
                 out.push(item);
             }
             let _ = tx.send(out);

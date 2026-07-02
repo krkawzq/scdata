@@ -11,7 +11,7 @@ use _scdata::access::{AccessConfig, AccessCpuConfig, AccessProfile, ScheduledAcc
 use _scdata::codecs::DecodePoolConfig;
 use _scdata::databank::{
     ArrayCodecSpec, DataBank, DataBankConfig, EdgeChunkLayout, FillConfig, MissingGenePolicy,
-    ScheduledPrefetchConfig,
+    NativeAccessConfig, ScheduledPrefetchConfig,
 };
 use _scdata::iopool::{BaseIoConfig, IoConfig, ThreadedConfig};
 use support::chunks::{
@@ -543,6 +543,7 @@ fn databank_config(args: &Args) -> DataBankConfig {
             min_parallel_bytes: 1,
             cpus: None,
         },
+        native_config: NativeAccessConfig::default(),
     }
 }
 

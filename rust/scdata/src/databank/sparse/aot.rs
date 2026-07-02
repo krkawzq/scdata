@@ -89,6 +89,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn scatter_sparse_values_projected_selected_aot_unchecked<T, I>(
     projection: SparseProjectionCtx<'_>,
     output_row: usize,

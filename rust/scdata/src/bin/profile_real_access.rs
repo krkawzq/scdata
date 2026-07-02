@@ -657,7 +657,7 @@ fn main() -> AppResult<()> {
                         &args,
                         &bank,
                         &ids,
-                        &catalog,
+                        catalog,
                         &counts,
                         &offsets,
                         &base_sample,
@@ -689,7 +689,7 @@ fn main() -> AppResult<()> {
                         &args,
                         &bank,
                         &ids,
-                        &catalog,
+                        catalog,
                         &counts,
                         &offsets,
                         &base_sample,
@@ -705,7 +705,7 @@ fn main() -> AppResult<()> {
 
         if matches!(args.mode, Mode::Both | Mode::Scheduled) && args.engine == Engine::RustCore {
             let cases = case_configs(&args);
-            let specs = build_rust_dataset_specs(&catalog)?;
+            let specs = build_rust_dataset_specs(catalog)?;
             for (case_idx, case) in cases.iter().enumerate() {
                 run_case_rust_core(&helper, &mut writer, &args, &specs, &counts, case_idx, case)?;
             }
@@ -1062,6 +1062,7 @@ struct RustMeasure {
     decode_profile: Value,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consume_rust_prefetch<T>(
     bank: &DataBank,
     ids: &[_scdata::databank::DatasetId],
@@ -1095,7 +1096,7 @@ where
     let mut checksum = 0u64;
     let mut cpu_started: Option<ProcessCpuSample> = None;
 
-    while let Some(batch) = stream.next() {
+    for batch in &mut stream {
         let batch = batch?;
         seen_batches += 1;
         if seen_batches <= warmup_batches {
@@ -1381,7 +1382,6 @@ fn rust_databank_config(args: &Args) -> DataBankConfig {
                     max_merged_len: args.native_coalesce_max_merged_len,
                     .._scdata::databank::NativeLoadCoalesceConfig::default()
                 },
-                .._scdata::databank::NativeLoadConfig::default()
             },
             ..NativeAccessConfig::default()
         },
@@ -1689,7 +1689,7 @@ fn validate_regular_grid(shape: &[usize], chunk_shape: &[usize]) -> AppResult<()
     if shape.len() != chunk_shape.len() {
         return Err("shape rank != chunk_shape rank".into());
     }
-    if chunk_shape.iter().any(|&chunk| chunk == 0) {
+    if chunk_shape.contains(&0) {
         return Err("chunk_shape values must be positive".into());
     }
     Ok(())
@@ -1800,7 +1800,7 @@ fn bench_io_ranges(
 ) -> AppResult<Value> {
     let threads = threads.max(1).min(ranges.len().max(1));
     let mut order: Vec<usize> = (0..ranges.len()).collect();
-    shuffle(&mut order, &mut SimpleRng::new(seed ^ 0xA11C_E5));
+    shuffle(&mut order, &mut SimpleRng::new(seed ^ 0xA1_1C_E5));
 
     let mut files = HashMap::<String, Arc<File>>::new();
     for range in ranges {
@@ -2323,11 +2323,11 @@ fn validate_args(args: &Args) -> AppResult<()> {
     {
         return Err("worker counts must be positive".into());
     }
-    if args.batch_sizes.iter().any(|&x| x == 0)
-        || args.prefetch_steps.iter().any(|&x| x == 0)
-        || args.access_prefetch_steps.iter().any(|&x| x == 0)
-        || args.decode_ahead_steps.iter().any(|&x| x == 0)
-        || args.ready_ahead_steps.iter().any(|&x| x == 0)
+    if args.batch_sizes.contains(&0)
+        || args.prefetch_steps.contains(&0)
+        || args.access_prefetch_steps.contains(&0)
+        || args.decode_ahead_steps.contains(&0)
+        || args.ready_ahead_steps.contains(&0)
         || args.native_fused_workers == 0
         || args.native_prefetch_blocks == 0
         || args.native_coalesce_max_merged_len == 0

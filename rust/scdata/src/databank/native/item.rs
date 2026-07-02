@@ -386,6 +386,7 @@ fn output_buffer_for_slice_plan(slice_plan: &NativeSliceBlockPlan) -> Vec<u8> {
     }
 }
 
+#[allow(clippy::uninit_vec)]
 fn uninit_u8_vec(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     // SAFETY: callers use this only for `NativeSliceBlockPlan::output_fully_covered`,

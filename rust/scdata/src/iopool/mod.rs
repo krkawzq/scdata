@@ -1032,6 +1032,7 @@ impl QueueCore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_limiter_and_profile(
         priority_levels: usize,
         queue_capacity: usize,

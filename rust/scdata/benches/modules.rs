@@ -17,7 +17,7 @@ use _scdata::codecs::{
 };
 use _scdata::databank::{
     ArrayCodecSpec, DType, DataBank, DataBankConfig, EdgeChunkLayout, FillConfig,
-    MissingGenePolicy, ScheduledPrefetchConfig,
+    MissingGenePolicy, NativeAccessConfig, ScheduledPrefetchConfig,
 };
 use _scdata::iopool::{BaseIoConfig, IoCommand, IoConfig, IoPool, ThreadedConfig};
 use _scdata::profile::ProfileRegistry;
@@ -502,5 +502,6 @@ fn databank_config() -> DataBankConfig {
             min_parallel_bytes: 1,
             cpus: None,
         },
+        native_config: NativeAccessConfig::default(),
     }
 }

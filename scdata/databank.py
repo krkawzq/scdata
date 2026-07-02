@@ -1295,11 +1295,12 @@ class ScDataBank:
         raise TypeError(f"unsupported dataset type: {type(ds).__name__}")
 
     def register_all(self, datasets: DatasetCollection) -> dict[str, DatasetId]:
-        """Register ``X`` and all layers from a :class:`DatasetCollection`.
+        """Register ``X``, all layers, and ``raw.X`` from a :class:`DatasetCollection`.
 
-        Returns a mapping keyed by matrix path: ``"X"`` and
-        ``"layers/<name>"``.  If any layer fails to register, all datasets
-        registered by this call are unregistered before re-raising.
+        Returns a mapping keyed by matrix path: ``"X"``, ``"layers/<name>"``,
+        and ``"raw/X"`` (only when the collection has a ``raw`` dataset).  If
+        any matrix fails to register, all datasets registered by this call are
+        unregistered before re-raising.
         """
         if not isinstance(datasets, DatasetCollection):
             raise TypeError(f"unsupported dataset collection type: {type(datasets).__name__}")

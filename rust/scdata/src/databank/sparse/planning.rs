@@ -226,6 +226,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_selected_sparse_data_piece_runs<I>(
     dataset: &SparseCsrDataset,
     piece: &SparseReadPiece,
@@ -349,6 +350,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_selected_sparse_data_run(
     piece: &SparseReadPiece,
     run_start: usize,

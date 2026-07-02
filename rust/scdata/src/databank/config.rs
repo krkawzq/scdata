@@ -5,18 +5,13 @@ use crate::codecs::DecodePoolConfig;
 use crate::iopool::IoConfig;
 
 /// Data loading strategy for projected sparse CSR data groups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProjectedSparseDataGroupStrategy {
     /// Scan CSR indices first and load only data groups containing requested genes.
+    #[default]
     SelectedOnly,
     /// Load every data group covered by the planned CSR rows.
     ReadAll,
-}
-
-impl Default for ProjectedSparseDataGroupStrategy {
-    fn default() -> Self {
-        Self::SelectedOnly
-    }
 }
 
 impl ProjectedSparseDataGroupStrategy {
@@ -77,17 +72,12 @@ impl DataBankConfig {
 }
 
 /// Per-call routing for the Blosc-LZ4 native access path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NativeMode {
+    #[default]
     Disabled,
     Auto,
     Force,
-}
-
-impl Default for NativeMode {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 impl NativeMode {

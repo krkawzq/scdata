@@ -886,18 +886,20 @@ fn scheduled_prefetch_dense_2d_matches_direct_access() {
 
 #[test]
 fn scheduled_prefetch_waits_when_iopool_queue_is_full() {
-    let mut config = DataBankConfig::default();
-    config.io_config = IoConfig::Threaded(ThreadedConfig {
-        base: BaseIoConfig {
-            max_in_flight: 1,
-            queue_capacity: 1,
-            priority_levels: 3,
-            queue_shards: 1,
-            assume_non_overlapping_reads: false,
-        },
-        num_workers: 1,
-        cpus: None,
-    });
+    let mut config = DataBankConfig {
+        io_config: IoConfig::Threaded(ThreadedConfig {
+            base: BaseIoConfig {
+                max_in_flight: 1,
+                queue_capacity: 1,
+                priority_levels: 3,
+                queue_shards: 1,
+                assume_non_overlapping_reads: false,
+            },
+            num_workers: 1,
+            cpus: None,
+        }),
+        ..DataBankConfig::default()
+    };
     config.access_config.queue_capacity = 8;
     config.fill_config.parallel = true;
     config.fill_config.num_workers = 2;

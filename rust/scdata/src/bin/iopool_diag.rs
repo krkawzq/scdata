@@ -160,7 +160,7 @@ fn make_config(args: &Args, backend: &str, workers: usize) -> Result<IoConfig, S
         max_in_flight: 4096,
         queue_capacity: 16384,
         priority_levels: 3,
-        queue_shards: workers.max(1).min(16),
+        queue_shards: workers.clamp(1, 16),
         assume_non_overlapping_reads: true,
     };
     base.validate().map_err(|e| e.to_string())?;
@@ -215,7 +215,7 @@ fn run_single_thread_depth(
     let counter = AtomicU64::new(0);
     let next_offset = || {
         let idx = counter.fetch_add(1, Ordering::Relaxed);
-        (idx as u64 * args.read_size as u64) % (max_offset + 1)
+        (idx * args.read_size as u64) % (max_offset + 1)
     };
 
     // warmup
@@ -323,7 +323,7 @@ fn run_multi_thread(
             s.spawn(move || {
                 let next = || {
                     let idx = counter.fetch_add(1, Ordering::Relaxed);
-                    (idx as u64 * args.read_size as u64) % (max_offset + 1)
+                    (idx * args.read_size as u64) % (max_offset + 1)
                 };
                 let rounds = (warmup_per_thread / depth.max(1)).max(1);
                 for _ in 0..rounds {
@@ -344,7 +344,7 @@ fn run_multi_thread(
             s.spawn(move || {
                 let next = || {
                     let idx = counter.fetch_add(1, Ordering::Relaxed);
-                    (idx as u64 * args.read_size as u64) % (max_offset + 1)
+                    (idx * args.read_size as u64) % (max_offset + 1)
                 };
                 let rounds = (ops_per_thread / depth.max(1)).max(1);
                 let mut local = 0u64;
@@ -438,7 +438,7 @@ fn run_multi_pool(
                 s.spawn(move || {
                     let next = || {
                         let idx = counter.fetch_add(1, Ordering::Relaxed);
-                        (idx as u64 * args.read_size as u64) % (max_offset + 1)
+                        (idx * args.read_size as u64) % (max_offset + 1)
                     };
                     let rounds = (warmup_per_pool / depth.max(1)).max(1);
                     for _ in 0..rounds {
@@ -461,7 +461,7 @@ fn run_multi_pool(
             s.spawn(move || {
                 let next = || {
                     let idx = counter.fetch_add(1, Ordering::Relaxed);
-                    (idx as u64 * args.read_size as u64) % (max_offset + 1)
+                    (idx * args.read_size as u64) % (max_offset + 1)
                 };
                 let rounds = (ops_per_pool / depth.max(1)).max(1);
                 let mut local = 0u64;
@@ -493,6 +493,7 @@ fn run_multi_pool(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_result(
     test: &str,
     backend: &str,

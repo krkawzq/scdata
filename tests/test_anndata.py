@@ -137,6 +137,7 @@ def test_write_zarr_sparse_rectilinear_registers_with_databank(
         chunk_size=(4,),
         align_cells=True,
         store="dir",
+        blocksize=0,
     )
 
     ds = launch(root)

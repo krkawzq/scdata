@@ -916,6 +916,7 @@ fn scheduled_synthetic_sparse_spec(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scheduled_synthetic_array_spec(
     total_len: usize,
     dtype: DType,
@@ -988,7 +989,6 @@ fn scheduled_databank_config(config: &NativeSyntheticConfig) -> DataBankConfig {
                 scheduler_workers: native_workers,
                 io_workers,
                 coalesce: config.coalesce.clone(),
-                ..crate::databank::NativeLoadConfig::default()
             },
             ..NativeAccessConfig::default()
         },
@@ -1603,6 +1603,7 @@ pub fn run_native_real_io_bench(config: NativeRealIoConfig) -> Result<Value, Str
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_real_io_workers(
     synth: &NativeSyntheticConfig,
     io: &Arc<dyn IoBackend>,
@@ -1665,6 +1666,7 @@ fn run_real_io_workers(
 
 /// Like `process_synthetic_batch`, but reads the chunk from a real file at a
 /// per-chunk stride instead of the virtual backend's single-payload mapping.
+#[allow(clippy::too_many_arguments)]
 async fn process_real_io_batch(
     batch_cells: &[usize],
     config: &NativeSyntheticConfig,
