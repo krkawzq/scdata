@@ -603,16 +603,6 @@ impl PyNativeAccessConfig {
     }
 
     #[getter]
-    fn fallback_to_generic(&self) -> bool {
-        self.inner.fallback_to_generic
-    }
-
-    #[setter]
-    fn set_fallback_to_generic(&mut self, value: bool) {
-        self.inner.fallback_to_generic = value;
-    }
-
-    #[getter]
     fn fused_workers(&self) -> usize {
         self.inner.fused_workers
     }

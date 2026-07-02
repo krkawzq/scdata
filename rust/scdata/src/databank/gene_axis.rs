@@ -198,6 +198,7 @@ impl MultiBatchCells {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_flat_parts(cells: Vec<usize>, parts: Vec<(usize, usize)>) -> Self {
         let mut start = 0usize;
         let mut out_parts = Vec::with_capacity(parts.len());

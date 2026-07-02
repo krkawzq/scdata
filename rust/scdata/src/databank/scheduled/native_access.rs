@@ -71,16 +71,6 @@ impl AccessStrategy {
         matches!(self, Self::BloscLz4Native(_))
     }
 
-    /// Borrow the native context; only valid when [`Self::is_native`] is true.
-    /// Prefer `if let AccessStrategy::BloscLz4Native(ctx) = &strategy` so
-    /// exhaustiveness guarantees safety, rather than `expect`.
-    pub(crate) fn native_ctx(&self) -> Option<&NativeScheduledContext> {
-        match self {
-            Self::Generic => None,
-            Self::BloscLz4Native(ctx) => Some(ctx),
-        }
-    }
-
     /// Build this batch's scheduled access iterator. Replaces the 5-arm
     /// `build_scheduled_batch_access` match. The native path runs with zero
     /// fallback: a decode failure surfaces as an `io::Error` to the consumer.

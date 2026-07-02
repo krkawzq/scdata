@@ -144,9 +144,14 @@ pub(crate) struct NativeBlockPayloadCache {
 
 impl NativeBlockPayloadCache {
     pub(crate) fn new(capacity_bytes: usize) -> Self {
-        const SHARDS: usize = 8;
-        let shard_capacity = capacity_bytes.div_ceil(SHARDS).max(1);
-        let shards = (0..SHARDS)
+        const DEFAULT_SHARDS: usize = 8;
+        let shard_count = std::env::var("SCDATA_NATIVE_BLOCK_CACHE_SHARDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(DEFAULT_SHARDS);
+        let shard_capacity = capacity_bytes.div_ceil(shard_count).max(1);
+        let shards = (0..shard_count)
             .map(|_| NativeBlockPayloadCacheShard::new(shard_capacity))
             .collect();
         Self { shards }
@@ -233,8 +238,20 @@ impl NativeLoadModule {
             return Ok(Vec::new());
         }
 
-        let reads = coalesce_load_requests_presorted(requests, &self.coalesce);
-        self.load_coalesced(requests, reads).await
+        if self.block_cache.is_none() {
+            let reads = coalesce_load_requests_presorted(requests, &self.coalesce);
+            return self
+                .load_misses_coalesced(requests, requests, Vec::new(), reads)
+                .await;
+        }
+
+        let (cached, misses) = self.split_cached_requests(requests);
+        if misses.is_empty() {
+            return merge_cached_and_loaded_completions(requests, cached, Vec::new());
+        }
+        let reads = coalesce_load_requests_presorted(&misses, &self.coalesce);
+        self.load_misses_coalesced(requests, &misses, cached, reads)
+            .await
     }
 
     pub(crate) async fn load_unsorted(
@@ -245,39 +262,46 @@ impl NativeLoadModule {
             return Ok(Vec::new());
         }
 
-        let reads = coalesce_load_requests(requests, &self.coalesce);
-        self.load_coalesced(requests, reads).await
+        if self.block_cache.is_none() {
+            let reads = coalesce_load_requests(requests, &self.coalesce);
+            return self
+                .load_misses_coalesced(requests, requests, Vec::new(), reads)
+                .await;
+        }
+
+        let (cached, misses) = self.split_cached_requests(requests);
+        if misses.is_empty() {
+            return merge_cached_and_loaded_completions(requests, cached, Vec::new());
+        }
+        let reads = coalesce_load_requests(&misses, &self.coalesce);
+        self.load_misses_coalesced(requests, &misses, cached, reads)
+            .await
     }
 
-    async fn load_coalesced(
+    async fn load_misses_coalesced(
         &self,
-        output_order: &[NativeLoadRequest],
+        original_order: &[NativeLoadRequest],
+        miss_order: &[NativeLoadRequest],
+        cached: Vec<NativeLoadCompletion>,
         reads: Vec<CoalescedRead>,
     ) -> io::Result<Vec<NativeLoadCompletion>> {
-        let original_order = output_order.to_vec();
-        let (cached, output_order, reads) = self.split_cached_completions(output_order, reads)?;
         if reads.is_empty() {
-            return merge_cached_and_loaded_completions(&original_order, cached, Vec::new());
+            return merge_cached_and_loaded_completions(original_order, cached, Vec::new());
         }
         let loaded = if self.io.prefers_inline_reads() {
-            self.load_coalesced_inline(&output_order, reads).await?
+            self.load_coalesced_inline(miss_order, reads).await?
         } else {
-            self.load_coalesced_parallel(&output_order, reads).await?
+            self.load_coalesced_parallel(miss_order, reads).await?
         };
-        merge_cached_and_loaded_completions(&original_order, cached, loaded)
+        merge_cached_and_loaded_completions(original_order, cached, loaded)
     }
 
-    fn split_cached_completions(
+    fn split_cached_requests(
         &self,
         output_order: &[NativeLoadRequest],
-        reads: Vec<CoalescedRead>,
-    ) -> io::Result<(
-        Vec<NativeLoadCompletion>,
-        Vec<NativeLoadRequest>,
-        Vec<CoalescedRead>,
-    )> {
+    ) -> (Vec<NativeLoadCompletion>, Vec<NativeLoadRequest>) {
         let Some(cache) = &self.block_cache else {
-            return Ok((Vec::new(), output_order.to_vec(), reads));
+            return (Vec::new(), output_order.to_vec());
         };
         let mut cached = Vec::new();
         let mut misses = Vec::new();
@@ -288,67 +312,7 @@ impl NativeLoadModule {
                 misses.push(*request);
             }
         }
-        if cached.is_empty() {
-            return Ok((cached, misses, reads));
-        }
-        if misses.is_empty() {
-            return Ok((cached, Vec::new(), Vec::new()));
-        }
-        let mut miss_by_id = HashMap::with_capacity(misses.len());
-        for request in &misses {
-            miss_by_id.insert(request.id, *request);
-        }
-        let mut filtered_reads = Vec::new();
-        for mut read in reads {
-            read.children
-                .retain(|child| miss_by_id.contains_key(&child.request_id));
-            if read.children.is_empty() {
-                continue;
-            }
-            let first_child = read
-                .children
-                .iter()
-                .map(|child| child.relative_offset)
-                .min();
-            let last_child = read.children.iter().try_fold(0usize, |end, child| {
-                child
-                    .relative_offset
-                    .checked_add(child.len)
-                    .map(|child_end| end.max(child_end))
-            });
-            let (Some(first_child), Some(last_child)) = (first_child, last_child) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "native cached read child overflow",
-                ));
-            };
-            read.offset = read.offset.checked_add(first_child as u64).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "native cached read offset overflow",
-                )
-            })?;
-            read.len = last_child.checked_sub(first_child).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "native cached read length underflow",
-                )
-            })?;
-            for child in &mut read.children {
-                child.relative_offset =
-                    child
-                        .relative_offset
-                        .checked_sub(first_child)
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "native cached child offset underflow",
-                            )
-                        })?;
-            }
-            filtered_reads.push(read);
-        }
-        Ok((cached, misses, filtered_reads))
+        (cached, misses)
     }
 
     async fn load_coalesced_parallel(
@@ -399,6 +363,7 @@ impl NativeLoadModule {
             "native load id span too small"
         );
         let mut by_id: Vec<Option<NativeLoadCompletion>> = (0..id_span).map(|_| None).collect();
+        let request_by_id = build_request_by_id(output_order, min_id, id_span)?;
         while let Some(joined) = pending.join_next().await {
             let (slot, read, bytes) = joined
                 .map_err(|err| io::Error::other(format!("native load task panicked: {err}")))??;
@@ -433,12 +398,18 @@ impl NativeLoadModule {
                         "native load child id out of range",
                     ));
                 }
+                let request = request_by_id[idx].ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native load child request missing",
+                    )
+                })?;
                 by_id[idx] = Some(NativeLoadCompletion {
                     request_id: child.request_id,
                     bytes: Arc::clone(&bytes),
                     range: start..end,
                 });
-                self.insert_child_cache(output_order, child.request_id, &bytes, start, end);
+                self.insert_child_cache(request, &bytes, start, end);
             }
         }
 
@@ -485,6 +456,7 @@ impl NativeLoadModule {
             "native load id span too small"
         );
         let mut by_id: Vec<Option<NativeLoadCompletion>> = (0..id_span).map(|_| None).collect();
+        let request_by_id = build_request_by_id(output_order, min_id, id_span)?;
 
         for read in reads {
             let bytes = self
@@ -521,12 +493,18 @@ impl NativeLoadModule {
                         "native load child id out of range",
                     ));
                 }
+                let request = request_by_id[idx].ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native inline load child request missing",
+                    )
+                })?;
                 by_id[idx] = Some(NativeLoadCompletion {
                     request_id: child.request_id,
                     bytes: Arc::clone(&bytes),
                     range: start..end,
                 });
-                self.insert_child_cache(output_order, child.request_id, &bytes, start, end);
+                self.insert_child_cache(request, &bytes, start, end);
             }
         }
 
@@ -548,8 +526,7 @@ impl NativeLoadModule {
 
     fn insert_child_cache(
         &self,
-        output_order: &[NativeLoadRequest],
-        request_id: u64,
+        request: NativeLoadRequest,
         bytes: &Arc<[u8]>,
         start: usize,
         end: usize,
@@ -557,18 +534,37 @@ impl NativeLoadModule {
         let Some(cache) = &self.block_cache else {
             return;
         };
-        let Some(request) = output_order
-            .iter()
-            .copied()
-            .find(|request| request.id == request_id)
-        else {
-            return;
+        let cached = if start == 0 && end == bytes.len() {
+            Arc::clone(bytes)
+        } else {
+            Arc::from(bytes[start..end].to_vec().into_boxed_slice())
         };
-        cache.insert(
-            request,
-            Arc::from(bytes[start..end].to_vec().into_boxed_slice()),
-        );
+        cache.insert(request, cached);
     }
+}
+
+fn build_request_by_id(
+    output_order: &[NativeLoadRequest],
+    min_id: u64,
+    id_span: usize,
+) -> io::Result<Vec<Option<NativeLoadRequest>>> {
+    let mut by_id = vec![None; id_span];
+    for request in output_order {
+        let idx = usize::try_from(request.id - min_id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native load request id overflow",
+            )
+        })?;
+        if idx >= by_id.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native load request id out of range",
+            ));
+        }
+        by_id[idx] = Some(*request);
+    }
+    Ok(by_id)
 }
 
 fn merge_cached_and_loaded_completions(
@@ -578,6 +574,9 @@ fn merge_cached_and_loaded_completions(
 ) -> io::Result<Vec<NativeLoadCompletion>> {
     if cached.is_empty() {
         return Ok(loaded);
+    }
+    if loaded.is_empty() && cached.len() == output_order.len() {
+        return Ok(cached);
     }
     let mut by_id = cached
         .into_iter()

@@ -37,6 +37,7 @@ use types::*;
 /// producer. Completed batches are stored in a bounded queue of depth
 /// `prefetch_step`; `next()` only pops that completed queue and blocks only
 /// when the producer cannot keep up.
+#[allow(clippy::too_many_arguments)]
 pub fn prefetch_cells_scheduled<T, I>(
     access: &AccessHandle,
     compute: Arc<DataBankComputePool>,
@@ -73,6 +74,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prefetch_cells_scheduled_multi<T, I>(
     access: &AccessHandle,
     compute: Arc<DataBankComputePool>,
@@ -102,6 +104,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prefetch_cells_scheduled_by_gene_names<T, I, G>(
     access: &AccessHandle,
     compute: Arc<DataBankComputePool>,
@@ -142,6 +145,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prefetch_cells_scheduled_multi_by_gene_names<T, I, G>(
     access: &AccessHandle,
     compute: Arc<DataBankComputePool>,
@@ -367,7 +371,6 @@ mod tests {
             "expected Generic, got native",
         );
         assert!(!strategy.is_native());
-        assert!(strategy.native_ctx().is_none());
     }
 
     fn assert_native(strategy: &AccessStrategy) {
@@ -376,7 +379,6 @@ mod tests {
             "expected BloscLz4Native, got Generic",
         );
         assert!(strategy.is_native());
-        assert!(strategy.native_ctx().is_some());
     }
 
     #[test]
