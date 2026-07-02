@@ -30,8 +30,9 @@ pub use array::{
 };
 pub use batch::{MissingGenePolicy, MultiBatchCells, PrefetchCells, PrefetchedBatch};
 pub use config::{
-    DataBankConfig, FillConfig, NativeAccessConfig, NativeBloscConfig, NativeLoadCoalesceConfig,
-    NativeLoadConfig, NativeMode, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
+    DataBankConfig, FillConfig, NativeAccessConfig, NativeBloscConfig, NativeCacheConfig,
+    NativeLoadCoalesceConfig, NativeLoadConfig, NativeMode, ProjectedSparseDataGroupStrategy,
+    ScheduledPrefetchConfig, SmallProjectedSparsePolicy,
 };
 pub use dataset::{Dense1DSpec, Dense2DSpec, SparseCsrSpec};
 pub use error::{DataBankError, DataBankResult};

@@ -11,6 +11,7 @@ import pytest
 from scdata import (
     DataBankConfig,
     FastAccessConfig,
+    FastCacheConfig,
     FastMode,
     IoConfig,
     MissingGenePolicy,
@@ -123,6 +124,56 @@ def test_config_dynamic_routing_and_validation() -> None:
         IoConfig.make(backend="bad")
     with pytest.raises(ValueError, match="backend"):
         DataBankConfig.make(backend="bad")
+
+
+def test_fast_cache_and_scheduled_runtime_config_are_api_fields() -> None:
+    cfg = DataBankConfig.make(
+        fast_config=FastAccessConfig.fast(),
+        fast__cache__payload_capacity_bytes=128,
+        fast__cache__decoded_capacity_bytes=256,
+        fast__cache__shards=16,
+    )
+    assert isinstance(cfg.fast_config.cache, FastCacheConfig)
+    assert cfg.fast_config.cache.payload_capacity_bytes == 128
+    assert cfg.fast_config.cache.decoded_capacity_bytes == 256
+    assert cfg.fast_config.cache.shards == 16
+    cfg.validate()
+
+    roundtrip = ScDataBank(cfg).config
+    assert roundtrip.fast_config.cache.payload_capacity_bytes == 128
+    assert roundtrip.fast_config.cache.decoded_capacity_bytes == 256
+    assert roundtrip.fast_config.cache.shards == 16
+
+    prefetch_cfg = ScheduledPrefetchConfig(
+        response_limit=2,
+        small_projected_sparse_policy="selected_only",
+    )
+    prefetch_cfg.validate()
+    assert prefetch_cfg.response_limit == 2
+    assert prefetch_cfg.small_projected_sparse_policy == "selected_only"
+
+
+def test_benchmark_config_sets_fast_load_workers() -> None:
+    from test import make_config as make_benchmark_config
+
+    cfg = make_benchmark_config(
+        128,
+        48,
+        1,
+        1,
+        32,
+        True,
+        96,
+        8192,
+        96,
+        48,
+        16 * 1024,
+        0.10,
+        1024 * 1024,
+    )
+
+    assert cfg.fast_config.load.scheduler_workers == 96
+    assert cfg.fast_config.load.io_workers == 48
 
 
 def test_config_accepts_dict_and_nested_dicts() -> None:

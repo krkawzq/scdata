@@ -86,6 +86,7 @@ from ._scdata import (
     _MissingGenePolicy,
     _FastAccessConfig,
     _FastBloscConfig,
+    _FastCacheConfig,
     _FastLoadCoalesceConfig,
     _FastLoadConfig,
     _PrefetchPlan,
@@ -114,6 +115,7 @@ __all__ = [
     "AccessCpuConfig",
     "FillConfig",
     "FastAccessConfig",
+    "FastCacheConfig",
     "FastLoadConfig",
     "FastLoadCoalesceConfig",
     "FastBloscConfig",
@@ -121,12 +123,14 @@ __all__ = [
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
     "ProjectedSparseDataGroupStrategy",
+    "SmallProjectedSparsePolicy",
     "ProfileSnapshot",
 ]
 
 
 ProfileSnapshot = dict[str, Any]
 ProjectedSparseDataGroupStrategy = Literal["selected_only", "read_all"]
+SmallProjectedSparsePolicy = Literal["auto", "selected_only", "read_all"]
 
 
 class FastMode:
@@ -574,6 +578,15 @@ class FastBloscConfig(_Config):
 
 
 @dataclass(slots=True)
+class FastCacheConfig(_Config):
+    """Fast path block cache settings."""
+
+    payload_capacity_bytes: int = 0
+    decoded_capacity_bytes: int = 0
+    shards: int = 8
+
+
+@dataclass(slots=True)
 class FastAccessConfig(_Config):
     """Fast (Blosc-LZ4 native) access path settings.
 
@@ -595,10 +608,12 @@ class FastAccessConfig(_Config):
     memory_budget_bytes: int = 8 * 1024**3
     response_queue_bytes_soft_limit: int = 4 * 1024**3
     response_queue_bytes_hard_limit: int = 6 * 1024**3
+    cache: FastCacheConfig = field(default_factory=FastCacheConfig)
     load: FastLoadConfig = field(default_factory=FastLoadConfig)
     blosc: FastBloscConfig = field(default_factory=FastBloscConfig)
 
     def __post_init__(self) -> None:
+        self.cache = _coerce_config_value(self.cache, FastCacheConfig, "cache")
         self.load = _coerce_config_value(self.load, FastLoadConfig, "load")
         self.blosc = _coerce_config_value(self.blosc, FastBloscConfig, "blosc")
 
@@ -697,6 +712,8 @@ class ScheduledPrefetchConfig(_Config):
     prefetch_step: int = 8
     access: ScheduledAccessConfig = field(default_factory=ScheduledAccessConfig)
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy = "selected_only"
+    small_projected_sparse_policy: SmallProjectedSparsePolicy = "auto"
+    response_limit: int | None = None
     fast_mode: str = FastMode.DISABLED
 
     def __post_init__(self) -> None:
@@ -707,6 +724,29 @@ class ScheduledPrefetchConfig(_Config):
                 "projected_sparse_data_strategy must be 'selected_only' or 'read_all', "
                 f"got {self.projected_sparse_data_strategy!r}"
             )
+        small_policy_allowed = {
+            "auto",
+            "default",
+            "selected_only",
+            "selected",
+            "selected-only",
+            "read_all",
+            "read-all",
+            "all",
+            "off",
+            "on",
+            "true",
+            "false",
+            "never",
+            "always",
+        }
+        if self.small_projected_sparse_policy not in small_policy_allowed:
+            raise ValueError(
+                "small_projected_sparse_policy must be 'auto', 'selected_only', or 'read_all', "
+                f"got {self.small_projected_sparse_policy!r}"
+            )
+        if self.response_limit is not None and self.response_limit <= 0:
+            raise ValueError("response_limit must be greater than 0 when set")
         fast_allowed = {"disabled", "auto", "force", "off", "on", "true", "false", "forced"}
         if self.fast_mode not in fast_allowed:
             raise ValueError(
@@ -737,6 +777,7 @@ _CONFIG_CLASSES: frozenset[type] = frozenset(
         FastLoadCoalesceConfig,
         FastLoadConfig,
         FastBloscConfig,
+        FastCacheConfig,
         FastAccessConfig,
         DataBankConfig,
         ScheduledAccessConfig,
@@ -757,6 +798,7 @@ _RUST_CONFIG_TYPES: dict[type, type] = {
     FastLoadCoalesceConfig: _FastLoadCoalesceConfig,
     FastLoadConfig: _FastLoadConfig,
     FastBloscConfig: _FastBloscConfig,
+    FastCacheConfig: _FastCacheConfig,
     FastAccessConfig: _FastAccessConfig,
     DataBankConfig: _DataBankConfig,
     ScheduledAccessConfig: _ScheduledAccessConfig,
@@ -901,6 +943,12 @@ def _config_from_rust(config: Any) -> Any:
             full_unshuffle_threshold=config.full_unshuffle_threshold,
             max_block_size=config.max_block_size,
         )
+    if isinstance(config, _FastCacheConfig):
+        return FastCacheConfig(
+            payload_capacity_bytes=config.payload_capacity_bytes,
+            decoded_capacity_bytes=config.decoded_capacity_bytes,
+            shards=config.shards,
+        )
     if isinstance(config, _FastAccessConfig):
         return FastAccessConfig(
             enabled=config.enabled,
@@ -910,6 +958,7 @@ def _config_from_rust(config: Any) -> Any:
             memory_budget_bytes=config.memory_budget_bytes,
             response_queue_bytes_soft_limit=config.response_queue_bytes_soft_limit,
             response_queue_bytes_hard_limit=config.response_queue_bytes_hard_limit,
+            cache=_config_from_rust(config.cache),
             load=_config_from_rust(config.load),
             blosc=_config_from_rust(config.blosc),
         )
@@ -927,6 +976,11 @@ def _config_from_rust(config: Any) -> Any:
                 ProjectedSparseDataGroupStrategy,
                 getattr(config, "projected_sparse_data_strategy", "selected_only"),
             ),
+            small_projected_sparse_policy=cast(
+                SmallProjectedSparsePolicy,
+                getattr(config, "small_projected_sparse_policy", "auto"),
+            ),
+            response_limit=getattr(config, "response_limit", None),
             fast_mode=cast(str, getattr(config, "fast_mode", FastMode.DISABLED)),
         )
     raise TypeError(f"not a Rust config object: {type(config).__name__}")

@@ -269,7 +269,7 @@ where
         .cast::<I>();
     let mut run_start = None;
     let mut run_projected_start = None;
-    let sorted_contiguous_end = if super::aot::assume_sorted_csr_indices() {
+    let sorted_contiguous_end = if dataset.assume_sorted_indices {
         contiguous_selected_sources.map(|(_, end)| end)
     } else {
         None

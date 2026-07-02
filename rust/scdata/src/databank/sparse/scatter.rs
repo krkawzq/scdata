@@ -601,6 +601,7 @@ pub(crate) fn try_scatter_sparse_rows_parallel_checked_with_group_indices<T: Dat
     let num_genes = dataset.num_genes;
     let index_dtype = dataset.index_dtype;
     let src_dtype = dataset.data.dtype;
+    let assume_sorted_indices = dataset.assume_sorted_indices;
     let job_count = compute.worker_count().min(output_rows).max(1);
     let rows_per_job = output_rows.div_ceil(job_count);
     let mut jobs = Vec::with_capacity(job_count);
@@ -626,6 +627,7 @@ pub(crate) fn try_scatter_sparse_rows_parallel_checked_with_group_indices<T: Dat
                 index_bytes.as_ref(),
                 src_dtype,
                 projection.as_ref().as_ref(),
+                assume_sorted_indices,
                 skip_unloaded_groups,
                 row_start,
                 row_end,
@@ -643,6 +645,7 @@ pub(crate) fn try_scatter_sparse_rows_parallel_checked_with_group_indices<T: Dat
                 index_bytes.as_ref(),
                 src_dtype,
                 projection.as_ref().as_ref(),
+                assume_sorted_indices,
                 skip_unloaded_groups,
                 row_start,
                 row_end,
@@ -660,6 +663,7 @@ pub(crate) fn try_scatter_sparse_rows_parallel_checked_with_group_indices<T: Dat
                 index_bytes.as_ref(),
                 src_dtype,
                 projection.as_ref().as_ref(),
+                assume_sorted_indices,
                 skip_unloaded_groups,
                 row_start,
                 row_end,
@@ -677,6 +681,7 @@ pub(crate) fn try_scatter_sparse_rows_parallel_checked_with_group_indices<T: Dat
                 index_bytes.as_ref(),
                 src_dtype,
                 projection.as_ref().as_ref(),
+                assume_sorted_indices,
                 skip_unloaded_groups,
                 row_start,
                 row_end,
@@ -938,6 +943,7 @@ pub(crate) fn scatter_sparse_row_range_checked_typed<T, I>(
     index_bytes: &[u8],
     src_dtype: DType,
     projection: Option<&CompiledGeneProjection>,
+    assume_sorted_indices: bool,
     skip_unloaded_groups: bool,
     row_start: usize,
     row_end: usize,
@@ -1014,6 +1020,7 @@ where
             scatter_sparse_values_to_row_checked_typed::<T, I>(
                 num_genes,
                 projection,
+                assume_sorted_indices,
                 piece.projection_filtered,
                 piece.contiguous_output_start,
                 piece.elements,
@@ -1030,6 +1037,7 @@ where
 pub(crate) fn scatter_sparse_values_to_row_checked_typed<T, I>(
     num_genes: usize,
     projection: Option<&CompiledGeneProjection>,
+    assume_sorted_indices: bool,
     projection_filtered: bool,
     contiguous_output_start: Option<usize>,
     elements: usize,
@@ -1071,6 +1079,7 @@ where
             contiguous_selected_source_range: projection.contiguous_selected_source_range(),
             contiguous_selected_source_output_start: projection
                 .contiguous_selected_source_output_start(),
+            assume_sorted_indices,
         };
         if projection_filtered {
             return unsafe {
@@ -1326,6 +1335,7 @@ pub(crate) fn scatter_sparse_data_group_projected_checked_with_projected_indices
         contiguous_selected_source_range: projection.contiguous_selected_source_range(),
         contiguous_selected_source_output_start: projection
             .contiguous_selected_source_output_start(),
+        assume_sorted_indices: dataset.assume_sorted_indices,
     };
 
     match dataset.index_dtype {
@@ -1415,6 +1425,7 @@ pub(crate) fn scatter_sparse_data_groups_projected_checked_with_projected_indice
         contiguous_selected_source_range: projection.contiguous_selected_source_range(),
         contiguous_selected_source_output_start: projection
             .contiguous_selected_source_output_start(),
+        assume_sorted_indices: dataset.assume_sorted_indices,
     };
 
     macro_rules! dispatch {
@@ -1865,6 +1876,7 @@ pub(crate) fn scatter_sparse_data_group_projected_checked_from_decoded_source<T:
         contiguous_selected_source_range: projection.contiguous_selected_source_range(),
         contiguous_selected_source_output_start: projection
             .contiguous_selected_source_output_start(),
+        assume_sorted_indices: dataset.assume_sorted_indices,
     };
 
     match dataset.index_dtype {

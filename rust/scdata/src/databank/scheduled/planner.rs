@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::access::AccessItem;
 
-use super::super::config::ProjectedSparseDataGroupStrategy;
+use super::super::config::{ProjectedSparseDataGroupStrategy, SmallProjectedSparsePolicy};
 use super::super::dataset::{Dataset, Dense1DDataset, Dense2DDataset, SparseCsrDataset};
 use super::super::error::{DataBankError, DataBankResult};
 use super::super::plan::{self};
@@ -25,6 +25,7 @@ pub(crate) fn plan_single_dataset_owned(
     output_rows: Option<Vec<usize>>,
     gene_axis: &GeneAxisPlan,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
 ) -> DataBankResult<(Vec<usize>, SingleDatasetPlan, Vec<AccessItem>)> {
     if let Some(output_rows) = output_rows.as_ref() {
         if cells.len() != output_rows.len() {
@@ -109,6 +110,7 @@ pub(crate) fn plan_single_dataset_owned(
                 && projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::SelectedOnly
                 && !should_read_all_small_projected_sparse_plan(
                     projected_sparse_data_strategy,
+                    small_projected_sparse_policy,
                     has_projection,
                     &plan,
                 ) {
@@ -136,6 +138,7 @@ pub(crate) fn plan_batch_multi(
     batch: MultiBatchCells,
     gene_axes: &MultiGeneAxisPlan,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
 ) -> DataBankResult<(BatchPlan, Vec<AccessItem>)> {
     if datasets.is_empty() {
         return Err(DataBankError::InvalidConfig(
@@ -176,6 +179,7 @@ pub(crate) fn plan_batch_multi(
                 None,
                 gene_axes.axis_for(dataset_idx)?,
                 projected_sparse_data_strategy,
+                small_projected_sparse_policy,
             )?;
             return Ok((
                 BatchPlan::Single {
@@ -189,7 +193,13 @@ pub(crate) fn plan_batch_multi(
     }
 
     let layout = collect_multi_dataset_batch_rows(datasets, &batch, total_cells)?;
-    plan_multi_layout(datasets, layout, gene_axes, projected_sparse_data_strategy)
+    plan_multi_layout(
+        datasets,
+        layout,
+        gene_axes,
+        projected_sparse_data_strategy,
+        small_projected_sparse_policy,
+    )
 }
 
 pub(crate) fn plan_multi_layout(
@@ -197,6 +207,7 @@ pub(crate) fn plan_multi_layout(
     mut layout: MultiBatchLayout,
     gene_axes: &MultiGeneAxisPlan,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
 ) -> DataBankResult<(BatchPlan, Vec<AccessItem>)> {
     let can_use_single_plan = layout.per_dataset.len() == 1
         && output_rows_are_sequential(&layout.per_dataset[0].output_rows);
@@ -209,6 +220,7 @@ pub(crate) fn plan_multi_layout(
             None,
             gene_axes.axis_for(dataset_idx)?,
             projected_sparse_data_strategy,
+            small_projected_sparse_policy,
         )?;
         return Ok((
             BatchPlan::Single {
@@ -233,6 +245,7 @@ pub(crate) fn plan_multi_layout(
             Some(dataset_batch.output_rows),
             &gene_axis,
             projected_sparse_data_strategy,
+            small_projected_sparse_policy,
         )?;
         debug_assert_eq!(planned_cells.len(), active_rows);
         items.append(&mut part_items);

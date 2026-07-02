@@ -380,6 +380,7 @@ fn run_native_scheduled_synthetic(config: NativeSyntheticConfig) -> Result<Value
         },
         projected_sparse_data_strategy: config.projected_sparse_data_strategy,
         native_mode: NativeMode::Force,
+        ..ScheduledPrefetchConfig::default()
     };
 
     if config.warmup_batches > 0 {
@@ -913,6 +914,7 @@ fn scheduled_synthetic_sparse_spec(
         index_dtype: DType::I32,
         num_cells: total_cells,
         num_genes: source_genes,
+        assume_sorted_indices: false,
     })
 }
 

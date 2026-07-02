@@ -91,6 +91,7 @@ try:
         MissingGenePolicy,
         FastAccessConfig,
         FastBloscConfig,
+        FastCacheConfig,
         FastLoadCoalesceConfig,
         FastLoadConfig,
         FastMode,
@@ -98,6 +99,7 @@ try:
         ScheduledAccessConfig,
         ScheduledPrefetchConfig,
         ScDataBank,
+        SmallProjectedSparsePolicy,
         ThreadedConfig,
         UringConfig,
     )
@@ -118,6 +120,7 @@ except ModuleNotFoundError as exc:
     AccessCpuConfig = _missing("AccessCpuConfig")  # type: ignore[assignment, misc]
     FillConfig = _missing("FillConfig")  # type: ignore[assignment, misc]
     FastAccessConfig = _missing("FastAccessConfig")  # type: ignore[assignment, misc]
+    FastCacheConfig = _missing("FastCacheConfig")  # type: ignore[assignment, misc]
     FastLoadConfig = _missing("FastLoadConfig")  # type: ignore[assignment, misc]
     FastLoadCoalesceConfig = _missing("FastLoadCoalesceConfig")  # type: ignore[assignment, misc]
     FastBloscConfig = _missing("FastBloscConfig")  # type: ignore[assignment, misc]
@@ -125,6 +128,7 @@ except ModuleNotFoundError as exc:
     ScheduledAccessConfig = _missing("ScheduledAccessConfig")  # type: ignore[assignment, misc]
     ScheduledPrefetchConfig = _missing("ScheduledPrefetchConfig")  # type: ignore[assignment, misc]
     ProjectedSparseDataGroupStrategy = _missing("ProjectedSparseDataGroupStrategy")  # type: ignore[assignment, misc]
+    SmallProjectedSparsePolicy = _missing("SmallProjectedSparsePolicy")  # type: ignore[assignment, misc]
 
 try:
     from scdata.corpus import Corpus
@@ -152,6 +156,7 @@ __all__ = [
     "AccessCpuConfig",
     "FillConfig",
     "FastAccessConfig",
+    "FastCacheConfig",
     "FastLoadConfig",
     "FastLoadCoalesceConfig",
     "FastBloscConfig",
@@ -159,6 +164,7 @@ __all__ = [
     "ScheduledAccessConfig",
     "ScheduledPrefetchConfig",
     "ProjectedSparseDataGroupStrategy",
+    "SmallProjectedSparsePolicy",
     "Corpus",
     # data (pure Python — usable with or without the Rust extension)
     "CellAccess",

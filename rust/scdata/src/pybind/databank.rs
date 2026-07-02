@@ -95,6 +95,11 @@ impl PyDataBank {
             index_dtype: super::dtype::extract_dtype(&dataset.getattr("index_dtype")?)?,
             num_cells: dataset.getattr("num_cells")?.extract()?,
             num_genes: dataset.getattr("num_genes")?.extract()?,
+            assume_sorted_indices: dataset
+                .getattr("assume_sorted_indices")
+                .ok()
+                .and_then(|value| value.extract::<bool>().ok())
+                .unwrap_or(false),
         };
         Ok(self.inner.register_sparse_csr(spec)?.into())
     }

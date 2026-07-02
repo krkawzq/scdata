@@ -143,13 +143,8 @@ pub(crate) struct NativeBlockPayloadCache {
 }
 
 impl NativeBlockPayloadCache {
-    pub(crate) fn new(capacity_bytes: usize) -> Self {
-        const DEFAULT_SHARDS: usize = 8;
-        let shard_count = std::env::var("SCDATA_NATIVE_BLOCK_CACHE_SHARDS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(DEFAULT_SHARDS);
+    pub(crate) fn new(capacity_bytes: usize, shards: usize) -> Self {
+        let shard_count = shards.max(1);
         let shard_capacity = capacity_bytes.div_ceil(shard_count).max(1);
         let shards = (0..shard_count)
             .map(|_| NativeBlockPayloadCacheShard::new(shard_capacity))
@@ -860,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn block_payload_cache_reuses_exact_request() {
         let io = Arc::new(CountingIoBackend::default());
-        let cache = Arc::new(NativeBlockPayloadCache::new(4096));
+        let cache = Arc::new(NativeBlockPayloadCache::new(4096, 8));
         let loader = NativeLoadModule::with_block_cache(io.clone(), config(), Some(cache));
         let first = loader
             .load(&[request(1, 7, 100, 20)])

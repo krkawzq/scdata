@@ -5,7 +5,7 @@ use crate::access::{AccessHandle, PrefetchCancel, ScheduledAccessConfig};
 
 use super::super::array::{DType, DataValue};
 use super::super::compute::DataBankComputePool;
-use super::super::config::ProjectedSparseDataGroupStrategy;
+use super::super::config::{ProjectedSparseDataGroupStrategy, SmallProjectedSparsePolicy};
 use super::super::dataset::{Dataset, SparseCsrDataset};
 use super::super::error::{DataBankError, DataBankResult};
 use super::super::plan::DenseSegment;
@@ -28,6 +28,7 @@ pub(crate) fn assemble_planned_batch<T>(
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     gene_axes: &MultiGeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -45,6 +46,7 @@ where
             compute,
             access_config,
             projected_sparse_data_strategy,
+            small_projected_sparse_policy,
             cancel,
             profiler,
             strategy,
@@ -62,6 +64,7 @@ where
                 compute,
                 access_config,
                 projected_sparse_data_strategy,
+                small_projected_sparse_policy,
                 gene_axis,
                 cancel,
                 profiler,
@@ -90,6 +93,7 @@ pub(crate) fn assemble_single_planned_batch<T>(
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -125,6 +129,7 @@ where
                     compute,
                     access_config,
                     projected_sparse_data_strategy,
+                    small_projected_sparse_policy,
                     gene_axis,
                     cancel,
                     profiler,
@@ -151,6 +156,7 @@ pub(crate) fn assemble_multi_prefetch_batch<T>(
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
     strategy: &AccessStrategy,
@@ -182,6 +188,7 @@ where
             compute,
             access_config,
             projected_sparse_data_strategy,
+            small_projected_sparse_policy,
             cancel,
             profiler,
             strategy,
@@ -206,6 +213,7 @@ pub(crate) fn scatter_multi_part_into<T>(
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
     strategy: &AccessStrategy,
@@ -285,6 +293,7 @@ where
                 compute,
                 access_config,
                 projected_sparse_data_strategy,
+                small_projected_sparse_policy,
                 &part.gene_axis,
                 cancel,
                 profiler,
@@ -463,6 +472,7 @@ pub(crate) fn assemble_sparse_prefetch_batch<T>(
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -490,6 +500,7 @@ where
         compute,
         access_config,
         projected_sparse_data_strategy,
+        small_projected_sparse_policy,
         gene_axis,
         cancel,
         profiler,
@@ -517,6 +528,7 @@ pub(crate) fn scatter_sparse_prefetch_into<T>(
     compute: &DataBankComputePool,
     access_config: &ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     gene_axis: &GeneAxisPlan,
     cancel: &Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -561,6 +573,7 @@ where
         if projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::ReadAll
             || should_read_all_small_projected_sparse_plan(
                 projected_sparse_data_strategy,
+                small_projected_sparse_policy,
                 true,
                 plan,
             )
@@ -1310,11 +1323,7 @@ fn try_load_selected_sparse_group_bytes_ordered_native(
         ));
     }
     let load_started = profiler.start_sparse_projected_data_load();
-    let loaded = load_native_items_ordered_blocking(
-        native.clone(),
-        items,
-        Arc::clone(cancel),
-    );
+    let loaded = load_native_items_ordered_blocking(native.clone(), items, Arc::clone(cancel));
     profiler.record_sparse_projected_data_load(
         load_started,
         loaded.as_ref().map_or(0, |_| selected_bytes),

@@ -85,6 +85,7 @@ pub(crate) struct SparseProjectionCtx<'a> {
     pub(crate) projection: &'a CompiledGeneProjection,
     pub(crate) contiguous_selected_source_range: Option<(usize, usize)>,
     pub(crate) contiguous_selected_source_output_start: Option<(usize, usize)>,
+    pub(crate) assume_sorted_indices: bool,
 }
 
 impl CsrIndex for u32 {

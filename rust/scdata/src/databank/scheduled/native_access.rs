@@ -31,12 +31,23 @@ impl NativeScheduledContext {
         let executor = Arc::new(NativeScheduledExecutor::new(
             config.load.scheduler_workers.max(1),
         )?);
+        let block_cache = (config.cache.payload_capacity_bytes > 0).then(|| {
+            Arc::new(NativeBlockPayloadCache::new(
+                config.cache.payload_capacity_bytes,
+                config.cache.shards,
+            ))
+        });
+        let decoded_cache = (config.cache.decoded_capacity_bytes > 0).then(|| {
+            Arc::new(NativeBlockDecodedCache::new(
+                config.cache.decoded_capacity_bytes,
+            ))
+        });
         Ok(Self {
             io,
             config,
             index_cache: Arc::new(NativeBlockIndexCache::new()),
-            block_cache: native_block_payload_cache_from_env(),
-            decoded_cache: native_decoded_block_cache_from_env(),
+            block_cache,
+            decoded_cache,
             executor,
         })
     }
@@ -115,22 +126,6 @@ pub(crate) struct ResolvedStrategy {
 impl ResolvedStrategy {
     pub(crate) const GENERIC_LABEL: &'static str = "generic";
     pub(crate) const FAST_LABEL: &'static str = "blosc_lz4_fast";
-}
-
-fn native_block_payload_cache_from_env() -> Option<Arc<NativeBlockPayloadCache>> {
-    let capacity = std::env::var("SCDATA_NATIVE_BLOCK_CACHE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    (capacity > 0).then(|| Arc::new(NativeBlockPayloadCache::new(capacity)))
-}
-
-fn native_decoded_block_cache_from_env() -> Option<Arc<NativeBlockDecodedCache>> {
-    let capacity = std::env::var("SCDATA_NATIVE_DECODED_BLOCK_CACHE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    (capacity > 0).then(|| Arc::new(NativeBlockDecodedCache::new(capacity)))
 }
 
 pub(crate) enum ScheduledBatchAccess {
@@ -885,7 +880,8 @@ mod tests {
     };
     use crate::codecs::{codec_from_json_str, CodecError, DecodeSlice, SharedCodec};
     use crate::databank::config::{
-        NativeAccessConfig, NativeBloscConfig, NativeLoadCoalesceConfig, NativeLoadConfig,
+        NativeAccessConfig, NativeBloscConfig, NativeCacheConfig, NativeLoadCoalesceConfig,
+        NativeLoadConfig,
     };
     use std::io;
     use std::sync::Arc;
@@ -968,7 +964,12 @@ mod tests {
     struct CancelIo;
     impl IoBackend for CancelIo {
         fn submit_read(&self, _file: FileRef, _offset: u64, _len: usize, _priority: u8) -> IoTask {
-            Box::pin(async { Err(io::Error::new(io::ErrorKind::UnexpectedEof, "cancel-only io")) })
+            Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "cancel-only io",
+                ))
+            })
         }
     }
 
@@ -981,7 +982,11 @@ mod tests {
             _expected_size: Option<usize>,
             _slice: Option<DecodeSlice>,
         ) -> DecodeTask {
-            Box::pin(async { Err(CodecError::Unsupported { codec: "cancel-only".to_string() }) })
+            Box::pin(async {
+                Err(CodecError::Unsupported {
+                    codec: "cancel-only".to_string(),
+                })
+            })
         }
     }
 
@@ -998,6 +1003,7 @@ mod tests {
             memory_budget_bytes: 4096,
             response_queue_bytes_soft_limit: 1024,
             response_queue_bytes_hard_limit: 2048,
+            cache: NativeCacheConfig::default(),
             load: NativeLoadConfig {
                 scheduler_workers: 1,
                 io_workers: 1,
@@ -1145,7 +1151,9 @@ mod tests {
 
         assert_eq!(out.len(), 2);
         for (_, result) in &out {
-            let err = result.as_ref().expect_err("Err must propagate to every item");
+            let err = result
+                .as_ref()
+                .expect_err("Err must propagate to every item");
             assert!(err.to_string().contains("boom"), "{err}");
         }
     }
@@ -1159,12 +1167,22 @@ mod tests {
         let (_handle, cancel) = make_cancel();
         let codec = blosc_codec();
         let item = |slice: SliceSpec| {
-            AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec.clone(), Some(8))
-                .with_slice_spec(slice)
+            AccessItem::new(
+                ChunkKey::new(file, 1000, encoded.len()),
+                codec.clone(),
+                Some(8),
+            )
+            .with_slice_spec(slice)
         };
         let batch = vec![
-            (0_usize, item(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"))),
-            (1, item(SliceSpec::from_triples(vec![0, 4, 8]).expect("slice"))),
+            (
+                0_usize,
+                item(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice")),
+            ),
+            (
+                1,
+                item(SliceSpec::from_triples(vec![0, 4, 8]).expect("slice")),
+            ),
         ];
 
         let out = load_native_batch(ctx, batch, cancel).await;

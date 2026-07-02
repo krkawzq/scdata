@@ -10,7 +10,8 @@ use crate::codecs::{ChunkCodec, CodecError, CodecResult, SharedCodec, Uncompress
 use crate::databank::{
     ArrayCodecSpec, ArrayGridSpec, ArrayOrder, ArraySpec, ChunkSourceSpec, ChunkSpec, DType,
     DataBank, DataBankConfig, Dense1DSpec, Dense2DSpec, MissingGenePolicy, PrefetchedBatch,
-    ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig, SparseCsrSpec,
+    ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig, SmallProjectedSparsePolicy,
+    SparseCsrSpec,
 };
 use crate::iopool::{BaseIoConfig, IoConfig, ThreadedConfig};
 #[cfg(feature = "profile")]
@@ -495,6 +496,7 @@ fn csr_batch_scatter_preserves_requested_cell_order_across_grouped_chunks() {
             index_dtype: DType::U32,
             num_cells: 3,
             num_genes: 5,
+            assume_sorted_indices: false,
         })
         .expect("register CSR");
 
@@ -573,6 +575,7 @@ fn memory_csr_direct_handles_mismatched_chunk_boundaries_and_index_width() {
             index_dtype: DType::U64,
             num_cells: 2,
             num_genes: 6,
+            assume_sorted_indices: false,
         })
         .expect("register CSR");
 
@@ -1030,6 +1033,7 @@ fn plan_batch_multi_uses_single_fast_path_for_dataset_zero_sequential_rows() {
         batch,
         &gene_axes,
         ProjectedSparseDataGroupStrategy::SelectedOnly,
+        SmallProjectedSparsePolicy::Auto,
     )
     .expect("plan batch");
 
@@ -1066,6 +1070,7 @@ fn plan_batch_multi_uses_single_fast_path_for_nonzero_single_dataset() {
         batch,
         &gene_axes,
         ProjectedSparseDataGroupStrategy::SelectedOnly,
+        SmallProjectedSparsePolicy::Auto,
     )
     .expect("plan batch");
 
@@ -1275,6 +1280,7 @@ fn scheduled_prefetch_memory_csr_matches_direct_access() {
             index_dtype: DType::U32,
             num_cells: 3,
             num_genes: 5,
+            assume_sorted_indices: false,
         })
         .expect("register CSR");
 
@@ -1796,6 +1802,7 @@ fn register_counted_csr_memory(
         index_dtype: DType::U32,
         num_cells,
         num_genes,
+        assume_sorted_indices: false,
     };
     let id = bank
         .registry
@@ -2108,6 +2115,7 @@ fn register_csr_file(bank: &mut DataBank) -> crate::databank::DatasetId {
         index_dtype: DType::U32,
         num_cells: 3,
         num_genes: 5,
+        assume_sorted_indices: false,
     })
     .expect("register CSR file")
 }
@@ -2181,6 +2189,7 @@ fn register_csr_mixed_file_memory_data(bank: &mut DataBank) -> crate::databank::
         index_dtype: DType::U32,
         num_cells: 3,
         num_genes: 5,
+        assume_sorted_indices: false,
     };
     bank.registry
         .register(Dataset::SparseCsr(dataset))

@@ -6,7 +6,7 @@ use std::thread;
 use crate::access::PrefetchCancel;
 
 use super::super::array::{DType, DataValue};
-use super::super::config::ProjectedSparseDataGroupStrategy;
+use super::super::config::{ProjectedSparseDataGroupStrategy, SmallProjectedSparsePolicy};
 use super::super::dataset::Dataset;
 use super::super::error::DataBankResult;
 use super::super::interner::GeneNameView;
@@ -21,21 +21,18 @@ const PROJECTED_SPARSE_READ_ALL_SMALL_DATA_GROUPS: usize = 8;
 
 pub(crate) fn should_read_all_small_projected_sparse_plan(
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     has_projection: bool,
     plan: &SparseBatchPlan,
 ) -> bool {
+    if small_projected_sparse_policy == SmallProjectedSparsePolicy::SelectedOnly {
+        return false;
+    }
     has_projection
         && projected_sparse_data_strategy == ProjectedSparseDataGroupStrategy::SelectedOnly
-        && read_all_small_projected_sparse_enabled()
         && !plan.data_groups.is_empty()
         && plan.data_groups.len() <= PROJECTED_SPARSE_READ_ALL_SMALL_DATA_GROUPS
         && sparse_plan_output_rows_are_compact(plan)
-}
-
-fn read_all_small_projected_sparse_enabled() -> bool {
-    std::env::var("SCDATA_READ_ALL_SMALL_PROJECTED_SPARSE")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
-        .unwrap_or(true)
 }
 
 fn sparse_plan_output_rows_are_compact(plan: &SparseBatchPlan) -> bool {

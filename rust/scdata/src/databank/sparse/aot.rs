@@ -1,4 +1,4 @@
-use std::{mem, ptr, slice, sync::OnceLock};
+use std::{mem, ptr, slice};
 
 use super::super::array::{Bf16Bits, DType, DataValue, F16Bits};
 use super::super::error::{DataBankError, DataBankResult};
@@ -468,7 +468,7 @@ where
     let out_ptr = out.as_mut_ptr();
     let output_by_source = projection.projection.output_by_source.as_ptr();
 
-    if assume_sorted_csr_indices() {
+    if projection.assume_sorted_indices {
         if let (Some((source_start, source_end)), Some((output_source_start, output_start))) = (
             projection.contiguous_selected_source_range,
             projection.contiguous_selected_source_output_start,
@@ -668,7 +668,7 @@ where
     let out_ptr = out.as_mut_ptr();
     let output_by_source = projection.projection.output_by_source.as_ptr();
 
-    if assume_sorted_csr_indices() {
+    if projection.assume_sorted_indices {
         if let (Some((source_start, source_end)), Some((output_source_start, output_start))) = (
             projection.contiguous_selected_source_range,
             projection.contiguous_selected_source_output_start,
@@ -728,15 +728,6 @@ where
         }
     }
     Ok(())
-}
-
-pub(crate) fn assume_sorted_csr_indices() -> bool {
-    static ASSUME_SORTED: OnceLock<bool> = OnceLock::new();
-    *ASSUME_SORTED.get_or_init(|| {
-        std::env::var("SCDATA_ASSUME_SORTED_CSR_INDICES")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-            .unwrap_or(false)
-    })
 }
 
 unsafe fn scatter_projected_cols_cast<O, S, D>(

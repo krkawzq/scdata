@@ -8,7 +8,7 @@ use crate::profile::ProfileTimer;
 
 use super::super::array::DataValue;
 use super::super::compute::{ComputeJob, DataBankComputePool};
-use super::super::config::ProjectedSparseDataGroupStrategy;
+use super::super::config::{ProjectedSparseDataGroupStrategy, SmallProjectedSparsePolicy};
 use super::super::dataset::Dataset;
 use super::super::error::{DataBankError, DataBankResult};
 
@@ -34,6 +34,8 @@ where
     pub(crate) access_config: ScheduledAccessConfig,
     pub(crate) strategy: AccessStrategy,
     pub(crate) projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    pub(crate) small_projected_sparse_policy: SmallProjectedSparsePolicy,
+    pub(crate) response_limit: Option<usize>,
     pub(crate) gene_axes: Arc<MultiGeneAxisPlan>,
     pub(crate) tx: flume::Sender<DataBankResult<PrefetchedBatch<T>>>,
     pub(crate) cancel: Arc<PrefetchCancelRegistry>,
@@ -61,8 +63,8 @@ impl<T> ProducerState<T>
 where
     T: DataValue,
 {
-    fn new(prefetch_step: usize, worker_count: usize) -> Self {
-        let response_limit = scheduled_response_limit(prefetch_step, worker_count);
+    fn new(prefetch_step: usize, worker_count: usize, response_limit: Option<usize>) -> Self {
+        let response_limit = scheduled_response_limit(prefetch_step, worker_count, response_limit);
         Self {
             next_read_seq: 0,
             next_emit_seq: 0,
@@ -86,11 +88,13 @@ where
     }
 }
 
-fn scheduled_response_limit(prefetch_step: usize, worker_count: usize) -> usize {
+fn scheduled_response_limit(
+    prefetch_step: usize,
+    worker_count: usize,
+    response_limit: Option<usize>,
+) -> usize {
     let default_limit = prefetch_step.min(worker_count.saturating_sub(1).max(1));
-    std::env::var("SCDATA_SCHEDULED_RESPONSE_LIMIT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+    response_limit
         .filter(|&value| value > 0)
         .map(|value| value.min(prefetch_step.max(1)).min(worker_count.max(1)))
         .unwrap_or(default_limit)
@@ -193,7 +197,11 @@ where
         let channel_capacity = self.prefetch_step.max(1);
         let (planned_tx, planned_rx) = flume::bounded(channel_capacity);
         let (done_tx, done_rx) = flume::bounded(channel_capacity);
-        let mut state = ProducerState::<T>::new(self.prefetch_step, self.compute.worker_count());
+        let mut state = ProducerState::<T>::new(
+            self.prefetch_step,
+            self.compute.worker_count(),
+            self.response_limit,
+        );
 
         loop {
             if self.cancel.is_cancelled() {
@@ -261,6 +269,7 @@ where
                 self.access_config,
                 self.strategy.clone(),
                 self.projected_sparse_data_strategy,
+                self.small_projected_sparse_policy,
                 Arc::clone(&self.cancel),
                 planned_tx.clone(),
                 self.profiler.clone(),
@@ -381,6 +390,7 @@ where
                 Arc::clone(&self.compute),
                 self.access_config,
                 self.projected_sparse_data_strategy,
+                self.small_projected_sparse_policy,
                 Arc::clone(&self.gene_axes),
                 Arc::clone(&self.cancel),
                 done_tx.clone(),
@@ -452,6 +462,7 @@ pub(crate) fn make_prefetch_request_job(
     access_config: ScheduledAccessConfig,
     strategy: AccessStrategy,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     registry: Arc<PrefetchCancelRegistry>,
     planned_tx: flume::Sender<PlannedMessage>,
     profiler: ScheduledPrefetchProfiler,
@@ -472,6 +483,7 @@ pub(crate) fn make_prefetch_request_job(
                     batch,
                     gene_axes.as_ref(),
                     projected_sparse_data_strategy,
+                    small_projected_sparse_policy,
                 );
                 profiler.record_request_plan(plan_started);
                 let (mut plan, mut items) = planned?;
@@ -484,6 +496,7 @@ pub(crate) fn make_prefetch_request_job(
                     &strategy,
                     access_config,
                     projected_sparse_data_strategy,
+                    small_projected_sparse_policy,
                     gene_axes.as_ref(),
                     Arc::clone(&cancel),
                     &profiler,
@@ -538,6 +551,7 @@ fn preplan_selected_sparse_request(
     strategy: &AccessStrategy,
     access_config: ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     gene_axes: &MultiGeneAxisPlan,
     cancel: Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -560,6 +574,7 @@ fn preplan_selected_sparse_request(
                 strategy,
                 access_config,
                 projected_sparse_data_strategy,
+                small_projected_sparse_policy,
                 gene_axes.axis_for(*dataset_idx)?,
                 Arc::clone(&cancel),
                 profiler,
@@ -573,6 +588,7 @@ fn preplan_selected_sparse_request(
                     strategy,
                     access_config,
                     projected_sparse_data_strategy,
+                    small_projected_sparse_policy,
                     &part.gene_axis,
                     Arc::clone(&cancel),
                     profiler,
@@ -596,6 +612,7 @@ fn preplan_single_selected_sparse_request(
     strategy: &AccessStrategy,
     access_config: ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     gene_axis: &GeneAxisPlan,
     cancel: Arc<PrefetchCancel>,
     profiler: &ScheduledPrefetchProfiler,
@@ -617,6 +634,7 @@ fn preplan_single_selected_sparse_request(
     if gene_axis.projection().is_none()
         || should_read_all_small_projected_sparse_plan(
             projected_sparse_data_strategy,
+            small_projected_sparse_policy,
             true,
             sparse_plan,
         )
@@ -740,6 +758,7 @@ pub(crate) fn make_prefetch_response_job<T>(
     compute: Arc<DataBankComputePool>,
     access_config: ScheduledAccessConfig,
     projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    small_projected_sparse_policy: SmallProjectedSparsePolicy,
     gene_axes: Arc<MultiGeneAxisPlan>,
     registry: Arc<PrefetchCancelRegistry>,
     done_tx: flume::Sender<DoneMessage<T>>,
@@ -774,6 +793,7 @@ where
                     compute.as_ref(),
                     &access_config,
                     projected_sparse_data_strategy,
+                    small_projected_sparse_policy,
                     gene_axes.as_ref(),
                     &cancel,
                     &profiler,

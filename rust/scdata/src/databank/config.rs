@@ -111,6 +111,7 @@ pub struct NativeAccessConfig {
     pub memory_budget_bytes: usize,
     pub response_queue_bytes_soft_limit: usize,
     pub response_queue_bytes_hard_limit: usize,
+    pub cache: NativeCacheConfig,
     pub load: NativeLoadConfig,
     pub blosc: NativeBloscConfig,
 }
@@ -125,6 +126,7 @@ impl Default for NativeAccessConfig {
             memory_budget_bytes: 8 * 1024 * 1024 * 1024,
             response_queue_bytes_soft_limit: 4 * 1024 * 1024 * 1024,
             response_queue_bytes_hard_limit: 6 * 1024 * 1024 * 1024,
+            cache: NativeCacheConfig::default(),
             load: NativeLoadConfig::default(),
             blosc: NativeBloscConfig::default(),
         }
@@ -152,8 +154,35 @@ impl NativeAccessConfig {
                 "native.response_queue_bytes_hard_limit must be <= memory_budget_bytes".to_string(),
             );
         }
+        self.cache.validate()?;
         self.load.validate()?;
         self.blosc.validate()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeCacheConfig {
+    pub payload_capacity_bytes: usize,
+    pub decoded_capacity_bytes: usize,
+    pub shards: usize,
+}
+
+impl Default for NativeCacheConfig {
+    fn default() -> Self {
+        Self {
+            payload_capacity_bytes: 0,
+            decoded_capacity_bytes: 0,
+            shards: 8,
+        }
+    }
+}
+
+impl NativeCacheConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.shards == 0 {
+            return Err("native.cache.shards must be greater than 0".to_string());
+        }
         Ok(())
     }
 }
@@ -249,6 +278,42 @@ impl NativeBloscConfig {
     }
 }
 
+/// Policy for the selected-only projected sparse path when a batch touches a
+/// small, compact set of CSR data groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SmallProjectedSparsePolicy {
+    /// Keep the current heuristic: read all data for small compact plans.
+    #[default]
+    Auto,
+    /// Never apply the small-plan read-all override.
+    SelectedOnly,
+    /// Apply the small-plan read-all override when its preconditions hold.
+    ReadAll,
+}
+
+impl SmallProjectedSparsePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SelectedOnly => "selected_only",
+            Self::ReadAll => "read_all",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" | "default" => Ok(Self::Auto),
+            "selected_only" | "selected-only" | "selected" | "off" | "false" | "never" => {
+                Ok(Self::SelectedOnly)
+            }
+            "read_all" | "read-all" | "all" | "on" | "true" | "always" => Ok(Self::ReadAll),
+            other => Err(format!(
+                "small_projected_sparse_policy must be 'auto', 'selected_only', or 'read_all', got {other:?}"
+            )),
+        }
+    }
+}
+
 /// Per-call settings for scheduled DataBank cell prefetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledPrefetchConfig {
@@ -258,6 +323,10 @@ pub struct ScheduledPrefetchConfig {
     pub access: ScheduledAccessConfig,
     /// Strategy for projected sparse CSR data groups.
     pub projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
+    /// Selected-only small-plan override policy.
+    pub small_projected_sparse_policy: SmallProjectedSparsePolicy,
+    /// Optional active response job limit. `None` keeps the automatic limit.
+    pub response_limit: Option<usize>,
     /// Native Blosc-LZ4 access routing for this scheduled request.
     pub native_mode: NativeMode,
 }
@@ -268,6 +337,8 @@ impl Default for ScheduledPrefetchConfig {
             prefetch_step: 2,
             access: ScheduledAccessConfig::default(),
             projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy::default(),
+            small_projected_sparse_policy: SmallProjectedSparsePolicy::default(),
+            response_limit: None,
             native_mode: NativeMode::default(),
         }
     }
@@ -277,6 +348,9 @@ impl ScheduledPrefetchConfig {
     pub fn validate(self) -> Result<(), String> {
         if self.prefetch_step == 0 {
             return Err("prefetch_step must be greater than 0".to_string());
+        }
+        if self.response_limit == Some(0) {
+            return Err("response_limit must be greater than 0 when set".to_string());
         }
         Ok(())
     }

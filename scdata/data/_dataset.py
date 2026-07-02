@@ -833,6 +833,9 @@ class SparseDataset:
     #: Filesystem path of the store root holding the ``indices`` / ``data``
     #: payload files.  See :attr:`DenseDataset.store_root`.
     store_root: str = ""
+    #: Whether CSR indices are sorted ascending within every row.  When true,
+    #: the databank can use sorted-row fast paths for projected sparse access.
+    assume_sorted_indices: bool = False
 
     def __post_init__(self) -> None:
         gene_names = _as_gene_names(self.gene_names)
@@ -945,6 +948,7 @@ class SparseDataset:
 
     def __repr__(self) -> str:
         root = f", store_root={self.store_root!r}" if self.store_root else ""
+        sorted_indices = ", assume_sorted_indices=True" if self.assume_sorted_indices else ""
         return (
             "SparseDataset("
             f"shape={self.shape}, "
@@ -953,6 +957,7 @@ class SparseDataset:
             f"index_dtype={self.index_dtype.value!r}, "
             f"num_chunks={self.num_chunks}"
             f"{root}"
+            f"{sorted_indices}"
             ")"
         )
 

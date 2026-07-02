@@ -842,9 +842,12 @@ mod tests {
         let codec = blosc_codec();
         let short = AccessItem::new(ChunkKey::new(file, 2000, 8), codec.clone(), Some(4))
             .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
-        let normal =
-            AccessItem::new(ChunkKey::new(file, 1000, encoded.len()), codec.clone(), Some(8))
-                .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
+        let normal = AccessItem::new(
+            ChunkKey::new(file, 1000, encoded.len()),
+            codec.clone(),
+            Some(8),
+        )
+        .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
         let items = vec![short, normal];
 
         let out = load_access_items_blosc_lz4_native(
@@ -860,7 +863,10 @@ mod tests {
         .expect("decline is Ok(None), not Err");
 
         assert_eq!(out.len(), 2);
-        assert!(out[0].is_none(), "short chunk with slice must decline to None");
+        assert!(
+            out[0].is_none(),
+            "short chunk with slice must decline to None"
+        );
         assert_eq!(out[1].as_deref(), Some(b"abcd".as_slice()));
     }
 

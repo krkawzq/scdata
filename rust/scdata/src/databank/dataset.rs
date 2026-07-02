@@ -159,6 +159,7 @@ pub struct SparseCsrDataset {
     pub index_dtype: DType,
     pub num_cells: usize,
     pub num_genes: usize,
+    pub assume_sorted_indices: bool,
 }
 
 #[derive(Debug)]
@@ -170,6 +171,7 @@ pub struct SparseCsrSpec {
     pub index_dtype: DType,
     pub num_cells: usize,
     pub num_genes: usize,
+    pub assume_sorted_indices: bool,
 }
 
 #[derive(Debug)]
@@ -181,6 +183,7 @@ pub(crate) struct ResolvedSparseCsrSpec {
     pub index_dtype: DType,
     pub num_cells: usize,
     pub num_genes: usize,
+    pub assume_sorted_indices: bool,
 }
 
 impl SparseCsrDataset {
@@ -198,6 +201,7 @@ impl SparseCsrDataset {
                 index_dtype: spec.index_dtype,
                 num_cells: spec.num_cells,
                 num_genes: spec.num_genes,
+                assume_sorted_indices: spec.assume_sorted_indices,
             },
             io_pool,
         )
@@ -335,6 +339,7 @@ pub(crate) fn build_sparse_csr_dataset(
         index_dtype: spec.index_dtype,
         num_cells: spec.num_cells,
         num_genes: spec.num_genes,
+        assume_sorted_indices: spec.assume_sorted_indices,
     })
 }
 

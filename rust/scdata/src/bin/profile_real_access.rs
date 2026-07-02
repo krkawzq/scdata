@@ -145,7 +145,24 @@ def make_bank(memory_gib, threads):
     return ScDataBank(cfg)
 
 
-def make_bank_split(memory_gib, io_workers, decode_workers, access_workers, fill_workers):
+def make_bank_split(
+    memory_gib,
+    io_workers,
+    decode_workers,
+    access_workers,
+    fill_workers,
+    native,
+):
+    (
+        native_enabled,
+        native_fused_workers,
+        native_prefetch_blocks,
+        native_load_scheduler_workers,
+        native_load_io_workers,
+        native_coalesce_max_gap_bytes,
+        native_coalesce_max_waste_ratio,
+        native_coalesce_max_merged_len,
+    ) = native
     from scdata import DataBankConfig, ScDataBank
 
     cfg = DataBankConfig.make(
@@ -156,6 +173,18 @@ def make_bank_split(memory_gib, io_workers, decode_workers, access_workers, fill
         fill__num_workers=int(fill_workers),
         access__cache_capacity_bytes=int(memory_gib) * 1024**3 * 3 // 4,
         access__memory_budget_bytes=int(memory_gib) * 1024**3,
+        access__scheduler_shards=int(access_workers),
+        fast__enabled=bool(native_enabled),
+        fast__fused_workers=int(native_fused_workers),
+        fast__request_prefetch_blocks=int(native_prefetch_blocks),
+        fast__memory_budget_bytes=int(memory_gib) * 1024**3,
+        fast__response_queue_bytes_soft_limit=int(memory_gib) * 1024**3 // 2,
+        fast__response_queue_bytes_hard_limit=int(memory_gib) * 1024**3 * 3 // 4,
+        fast__load__scheduler_workers=int(native_load_scheduler_workers),
+        fast__load__io_workers=int(native_load_io_workers),
+        fast__load__coalesce__max_gap_bytes=int(native_coalesce_max_gap_bytes),
+        fast__load__coalesce__max_waste_ratio=float(native_coalesce_max_waste_ratio),
+        fast__load__coalesce__max_merged_len=int(native_coalesce_max_merged_len),
     )
     return ScDataBank(cfg)
 
@@ -189,7 +218,14 @@ def resolve_dtype(dtype):
     return dtype
 
 
-def make_prefetch_config(prefetch_step, access_prefetch_step, decode_ahead_steps, ready_ahead_steps):
+def make_prefetch_config(
+    prefetch_step,
+    access_prefetch_step,
+    decode_ahead_steps,
+    ready_ahead_steps,
+    projected_sparse_data_strategy,
+    fast_mode,
+):
     from scdata import ScheduledAccessConfig, ScheduledPrefetchConfig
 
     return ScheduledPrefetchConfig(
@@ -199,6 +235,8 @@ def make_prefetch_config(prefetch_step, access_prefetch_step, decode_ahead_steps
             decode_ahead_steps=int(decode_ahead_steps),
             ready_ahead_steps=int(ready_ahead_steps),
         ),
+        projected_sparse_data_strategy=str(projected_sparse_data_strategy),
+        fast_mode=str(fast_mode),
     )
 
 
@@ -562,6 +600,7 @@ impl Clone for RustDatasetSpec {
                 index_dtype: spec.index_dtype,
                 num_cells: spec.num_cells,
                 num_genes: spec.num_genes,
+                assume_sorted_indices: spec.assume_sorted_indices,
             }),
         }
     }
@@ -644,6 +683,18 @@ fn main() -> AppResult<()> {
                         databank_decode_workers(&args),
                         databank_access_workers(&args),
                         databank_fill_workers(&args),
+                        (
+                            args.native_enabled,
+                            args.native_fused_workers,
+                            args.native_prefetch_blocks,
+                            databank_fill_workers(&args)
+                                .max(args.native_fused_workers)
+                                .max(1),
+                            databank_io_workers(&args).max(1),
+                            args.native_coalesce_max_gap_bytes,
+                            args.native_coalesce_max_waste_ratio,
+                            args.native_coalesce_max_merged_len,
+                        ),
                     ),
                 )?;
                 let register_started = Instant::now();
@@ -677,6 +728,18 @@ fn main() -> AppResult<()> {
                             databank_decode_workers(&args),
                             databank_access_workers(&args),
                             databank_fill_workers(&args),
+                            (
+                                args.native_enabled,
+                                args.native_fused_workers,
+                                args.native_prefetch_blocks,
+                                databank_fill_workers(&args)
+                                    .max(args.native_fused_workers)
+                                    .max(1),
+                                databank_io_workers(&args).max(1),
+                                args.native_coalesce_max_gap_bytes,
+                                args.native_coalesce_max_waste_ratio,
+                                args.native_coalesce_max_merged_len,
+                            ),
                         ),
                     )?;
                     let register_started = Instant::now();
@@ -802,6 +865,8 @@ fn run_case(
             case.access_prefetch_step,
             case.decode_ahead_steps,
             case.ready_ahead_steps,
+            args.projected_sparse_data_strategy.as_str(),
+            args.native_mode.as_str(),
         ),
     )?;
     let genes = helper.call_method1(
@@ -885,6 +950,10 @@ fn run_case(
             "native_enabled": args.native_enabled,
             "native_fused_workers": args.native_fused_workers,
             "native_prefetch_blocks": args.native_prefetch_blocks,
+            "native_load_workers": {
+                "scheduler": databank_fill_workers(args).max(args.native_fused_workers).max(1),
+                "io": databank_io_workers(args).max(1),
+            },
             "native_coalesce": {
                 "max_gap_bytes": args.native_coalesce_max_gap_bytes,
                 "max_waste_ratio": args.native_coalesce_max_waste_ratio,
@@ -939,6 +1008,7 @@ fn run_case_rust_core(
         },
         projected_sparse_data_strategy: args.projected_sparse_data_strategy,
         native_mode: args.native_mode,
+        ..ScheduledPrefetchConfig::default()
     };
 
     let mut bank = DataBank::new(rust_databank_config(args))?;
@@ -1011,6 +1081,10 @@ fn run_case_rust_core(
             "native_enabled": args.native_enabled,
             "native_fused_workers": args.native_fused_workers,
             "native_prefetch_blocks": args.native_prefetch_blocks,
+            "native_load_workers": {
+                "scheduler": databank_fill_workers(args).max(args.native_fused_workers).max(1),
+                "io": databank_io_workers(args).max(1),
+            },
             "native_coalesce": {
                 "max_gap_bytes": args.native_coalesce_max_gap_bytes,
                 "max_waste_ratio": args.native_coalesce_max_waste_ratio,
@@ -1466,6 +1540,11 @@ fn build_rust_dataset_spec(ds: &Bound<'_, PyAny>) -> AppResult<RustDatasetSpec> 
                 index_dtype,
                 num_cells: ds.getattr("num_cells")?.extract()?,
                 num_genes: ds.getattr("num_genes")?.extract()?,
+                assume_sorted_indices: ds
+                    .getattr("assume_sorted_indices")
+                    .ok()
+                    .and_then(|value| value.extract::<bool>().ok())
+                    .unwrap_or(false),
             }))
         }
         other => Err(format!("unsupported dataset kind `{other}`").into()),
@@ -2134,6 +2213,10 @@ fn args_json(args: &Args) -> Value {
         "native_enabled": args.native_enabled,
         "native_fused_workers": args.native_fused_workers,
         "native_prefetch_blocks": args.native_prefetch_blocks,
+        "native_load_workers": {
+            "scheduler": databank_fill_workers(args).max(args.native_fused_workers).max(1),
+            "io": databank_io_workers(args).max(1),
+        },
         "native_coalesce": {
             "max_gap_bytes": args.native_coalesce_max_gap_bytes,
             "max_waste_ratio": args.native_coalesce_max_waste_ratio,

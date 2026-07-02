@@ -67,12 +67,13 @@ impl DecodeBackend for CodecDecode {
 fn materialize_decode_slice(decoded: &[u8], slice: &DecodeSlice) -> CodecResult<Vec<u8>> {
     let mut out = vec![0u8; slice.output_len];
     for range in slice.ranges.iter().copied() {
-        let end = range.dst_offset.checked_add(range.len()).ok_or_else(|| {
-            CodecError::Decode {
+        let end = range
+            .dst_offset
+            .checked_add(range.len())
+            .ok_or_else(|| CodecError::Decode {
                 codec: "mock".to_string(),
                 message: "invalid decode slice".to_string(),
-            }
-        })?;
+            })?;
         if range.src_start > range.src_end || range.src_end > decoded.len() || end > out.len() {
             return Err(CodecError::Decode {
                 codec: "mock".to_string(),

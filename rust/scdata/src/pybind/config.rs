@@ -4,8 +4,9 @@ use pyo3::prelude::*;
 use crate::access::{AccessConfig, AccessCpuConfig, ScheduledAccessConfig};
 use crate::codecs::DecodePoolConfig;
 use crate::databank::{
-    DataBankConfig, FillConfig, NativeAccessConfig, NativeBloscConfig, NativeLoadCoalesceConfig,
-    NativeLoadConfig, NativeMode, ProjectedSparseDataGroupStrategy, ScheduledPrefetchConfig,
+    DataBankConfig, FillConfig, NativeAccessConfig, NativeBloscConfig, NativeCacheConfig,
+    NativeLoadCoalesceConfig, NativeLoadConfig, NativeMode, ProjectedSparseDataGroupStrategy,
+    ScheduledPrefetchConfig, SmallProjectedSparsePolicy,
 };
 use crate::iopool::{BaseIoConfig, IoConfig, ThreadedConfig, UringConfig};
 
@@ -20,6 +21,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAccessCpuConfig>()?;
     m.add_class::<PyFillConfig>()?;
     m.add_class::<PyFastAccessConfig>()?;
+    m.add_class::<PyFastCacheConfig>()?;
     m.add_class::<PyFastLoadConfig>()?;
     m.add_class::<PyFastLoadCoalesceConfig>()?;
     m.add_class::<PyFastBloscConfig>()?;
@@ -663,6 +665,18 @@ impl PyFastAccessConfig {
     }
 
     #[getter]
+    fn cache(&self) -> PyFastCacheConfig {
+        PyFastCacheConfig {
+            inner: self.inner.cache.clone(),
+        }
+    }
+
+    #[setter]
+    fn set_cache(&mut self, value: PyFastCacheConfig) {
+        self.inner.cache = value.inner;
+    }
+
+    #[getter]
     fn load(&self) -> PyFastLoadConfig {
         PyFastLoadConfig {
             inner: self.inner.load.clone(),
@@ -684,6 +698,56 @@ impl PyFastAccessConfig {
     #[setter]
     fn set_blosc(&mut self, value: PyFastBloscConfig) {
         self.inner.blosc = value.inner;
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        validate_result(self.inner.validate())
+    }
+}
+
+#[pyclass(name = "_FastCacheConfig", module = "scdata._scdata")]
+#[derive(Clone)]
+pub(crate) struct PyFastCacheConfig {
+    inner: NativeCacheConfig,
+}
+
+#[pymethods]
+impl PyFastCacheConfig {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: NativeCacheConfig::default(),
+        }
+    }
+
+    #[getter]
+    fn payload_capacity_bytes(&self) -> usize {
+        self.inner.payload_capacity_bytes
+    }
+
+    #[setter]
+    fn set_payload_capacity_bytes(&mut self, value: usize) {
+        self.inner.payload_capacity_bytes = value;
+    }
+
+    #[getter]
+    fn decoded_capacity_bytes(&self) -> usize {
+        self.inner.decoded_capacity_bytes
+    }
+
+    #[setter]
+    fn set_decoded_capacity_bytes(&mut self, value: usize) {
+        self.inner.decoded_capacity_bytes = value;
+    }
+
+    #[getter]
+    fn shards(&self) -> usize {
+        self.inner.shards
+    }
+
+    #[setter]
+    fn set_shards(&mut self, value: usize) {
+        self.inner.shards = value;
     }
 
     fn validate(&self) -> PyResult<()> {
@@ -1040,6 +1104,28 @@ impl PyScheduledPrefetchConfig {
         self.inner.projected_sparse_data_strategy =
             ProjectedSparseDataGroupStrategy::parse(value).map_err(PyValueError::new_err)?;
         Ok(())
+    }
+
+    #[getter]
+    fn small_projected_sparse_policy(&self) -> &'static str {
+        self.inner.small_projected_sparse_policy.as_str()
+    }
+
+    #[setter]
+    fn set_small_projected_sparse_policy(&mut self, value: &str) -> PyResult<()> {
+        self.inner.small_projected_sparse_policy =
+            SmallProjectedSparsePolicy::parse(value).map_err(PyValueError::new_err)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn response_limit(&self) -> Option<usize> {
+        self.inner.response_limit
+    }
+
+    #[setter]
+    fn set_response_limit(&mut self, value: Option<usize>) {
+        self.inner.response_limit = value;
     }
 
     #[getter]

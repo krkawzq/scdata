@@ -81,6 +81,8 @@ def make_config(
     fast_enabled: bool,
     fast_fused_workers: int,
     fast_prefetch_blocks: int,
+    fast_load_scheduler_workers: int,
+    fast_load_io_workers: int,
     fast_coalesce_max_gap_bytes: int,
     fast_coalesce_max_waste_ratio: float,
     fast_coalesce_max_merged_len: int,
@@ -100,6 +102,8 @@ def make_config(
         fast__memory_budget_bytes=memory_gib * 1024**3,
         fast__response_queue_bytes_soft_limit=memory_gib * 1024**3 // 2,
         fast__response_queue_bytes_hard_limit=memory_gib * 1024**3 * 3 // 4,
+        fast__load__scheduler_workers=fast_load_scheduler_workers,
+        fast__load__io_workers=fast_load_io_workers,
         fast__load__coalesce__max_gap_bytes=fast_coalesce_max_gap_bytes,
         fast__load__coalesce__max_waste_ratio=fast_coalesce_max_waste_ratio,
         fast__load__coalesce__max_merged_len=fast_coalesce_max_merged_len,
@@ -361,6 +365,8 @@ def run_once(args: argparse.Namespace) -> dict:
         args.fast_enabled,
         args.fast_fused_workers,
         args.fast_prefetch_blocks,
+        args.fast_load_scheduler_workers or max(fill_workers, args.fast_fused_workers, 1),
+        args.fast_load_io_workers or max(io_workers, 1),
         args.fast_coalesce_max_gap_bytes,
         args.fast_coalesce_max_waste_ratio,
         args.fast_coalesce_max_merged_len,
@@ -394,6 +400,10 @@ def run_once(args: argparse.Namespace) -> dict:
         "fast_enabled": args.fast_enabled,
         "fast_fused_workers": args.fast_fused_workers,
         "fast_prefetch_blocks": args.fast_prefetch_blocks,
+        "fast_load_workers": {
+            "scheduler": cfg.fast_config.load.scheduler_workers,
+            "io": cfg.fast_config.load.io_workers,
+        },
         "fast_coalesce": {
             "max_gap_bytes": args.fast_coalesce_max_gap_bytes,
             "max_waste_ratio": args.fast_coalesce_max_waste_ratio,
@@ -446,6 +456,18 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--fast-fused-workers", type=int, default=4)
     parser.add_argument("--fast-prefetch-blocks", type=int, default=4096)
+    parser.add_argument(
+        "--fast-load-scheduler-workers",
+        type=int,
+        default=0,
+        help="0 means max(resolved --fill-workers, --fast-fused-workers)",
+    )
+    parser.add_argument(
+        "--fast-load-io-workers",
+        type=int,
+        default=0,
+        help="0 means resolved --io-workers",
+    )
     parser.add_argument("--fast-coalesce-max-gap-bytes", type=int, default=16 * 1024)
     parser.add_argument("--fast-coalesce-max-waste-ratio", type=float, default=0.10)
     parser.add_argument("--fast-coalesce-max-merged-len", type=int, default=1024 * 1024)
@@ -520,6 +542,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error("--fast-fused-workers must be positive")
     if args.fast_prefetch_blocks < 1:
         parser.error("--fast-prefetch-blocks must be positive")
+    if args.fast_load_scheduler_workers < 0:
+        parser.error("--fast-load-scheduler-workers must be non-negative")
+    if args.fast_load_io_workers < 0:
+        parser.error("--fast-load-io-workers must be non-negative")
     if args.fast_coalesce_max_gap_bytes < 0:
         parser.error("--fast-coalesce-max-gap-bytes must be non-negative")
     if not 0 <= args.fast_coalesce_max_waste_ratio <= 1:

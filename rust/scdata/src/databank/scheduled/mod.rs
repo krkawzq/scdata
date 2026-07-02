@@ -276,6 +276,8 @@ where
         access_config: config.access,
         strategy: resolved.strategy,
         projected_sparse_data_strategy: config.projected_sparse_data_strategy,
+        small_projected_sparse_policy: config.small_projected_sparse_policy,
+        response_limit: config.response_limit,
         gene_axes: Arc::new(gene_axes),
         tx,
         cancel: Arc::clone(&cancel),

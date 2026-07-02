@@ -497,6 +497,34 @@ def test_sparse_dataset_indptr_length_mismatch(csr_array_metas):
         )
 
 
+def test_sparse_dataset_sorted_indices_metadata(csr_array_metas):
+    indices, data = csr_array_metas
+    default = SparseDataset(
+        gene_names=tuple(f"g{i}" for i in range(4)),
+        indptr=(0, 2, 4, 6),
+        indices=indices,
+        data=data,
+        index_dtype=DType.I32,
+        num_cells=3,
+        num_genes=4,
+    )
+    assert default.assume_sorted_indices is False
+    assert "assume_sorted_indices" not in repr(default)
+
+    marked = SparseDataset(
+        gene_names=tuple(f"g{i}" for i in range(4)),
+        indptr=(0, 2, 4, 6),
+        indices=indices,
+        data=data,
+        index_dtype=DType.I32,
+        num_cells=3,
+        num_genes=4,
+        assume_sorted_indices=True,
+    )
+    assert marked.assume_sorted_indices is True
+    assert "assume_sorted_indices=True" in repr(marked)
+
+
 def test_sparse_dataset_indptr_non_monotonic(csr_array_metas):
     indices, data = csr_array_metas
     with pytest.raises(ValueError, match="monotonic"):
