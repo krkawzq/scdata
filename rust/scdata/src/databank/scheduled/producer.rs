@@ -16,7 +16,7 @@ use super::super::gene_axis::*;
 use super::super::sparse::*;
 
 use super::assemble::*;
-use super::native_access::{build_scheduled_batch_access, NativeScheduledContext};
+use super::native_access::{AccessStrategy, NativeScheduledContext};
 use super::planner::*;
 use super::profile::*;
 use super::types::*;
@@ -499,9 +499,12 @@ pub(crate) fn make_prefetch_request_job(
                 }
                 let schedule_started = profiler.start_request_schedule();
                 let native_for_response = native.clone();
-                let scheduled_result = build_scheduled_batch_access(
+                // Transitional: construct the strategy from (native_mode,
+                // native) and delegate to AccessStrategy::build. Step 3
+                // replaces this with a single resolve_strategy() at spawn.
+                let strategy = AccessStrategy::from_mode_and_ctx(native_mode, native)?;
+                let scheduled_result = strategy.build(
                     access.clone(),
-                    native,
                     items,
                     access_config,
                     native_mode,
@@ -636,9 +639,9 @@ fn preplan_single_selected_sparse_request(
     };
 
     let index_items = sparse_plan_index_file_access_items(sparse_plan)?;
-    let mut index_scheduled = build_scheduled_batch_access(
+    let index_strategy = AccessStrategy::from_mode_and_ctx(native_mode, native.clone())?;
+    let mut index_scheduled = index_strategy.build(
         access.clone(),
-        native.clone(),
         index_items,
         access_config,
         native_mode,

@@ -16,9 +16,8 @@ use super::super::sparse::*;
 use super::super::util::*;
 
 use super::native_access::{
-    build_scheduled_batch_access, load_native_items_ordered_async,
-    load_native_items_ordered_blocking, run_native_custom_blocking, NativeScheduledContext,
-    ScheduledBatchAccess,
+    load_native_items_ordered_async, load_native_items_ordered_blocking,
+    run_native_custom_blocking, AccessStrategy, NativeScheduledContext, ScheduledBatchAccess,
 };
 use super::profile::*;
 use super::types::*;
@@ -1389,16 +1388,17 @@ fn schedule_selected_sparse_file_groups(
     if items.is_empty() {
         return Ok(None);
     }
-    build_scheduled_batch_access(
-        access.clone(),
-        native.cloned(),
-        items,
-        *access_config,
-        native_mode,
-        Arc::clone(cancel),
-        true,
-    )
-    .map(Some)
+    let strategy = AccessStrategy::from_mode_and_ctx(native_mode, native.cloned())?;
+    strategy
+        .build(
+            access.clone(),
+            items,
+            *access_config,
+            native_mode,
+            Arc::clone(cancel),
+            true,
+        )
+        .map(Some)
 }
 
 fn load_selected_sparse_group(

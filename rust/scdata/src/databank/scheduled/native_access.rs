@@ -81,6 +81,64 @@ impl AccessStrategy {
             Self::BloscLz4Native(ctx) => Some(ctx),
         }
     }
+
+    /// Build this batch's scheduled access iterator. Replaces the 5-arm
+    /// `build_scheduled_batch_access` match.
+    ///
+    /// `native_mode` is a transitional parameter: the call sites have not yet
+    /// switched to `resolve_strategy`, so they still construct the strategy
+    /// from `(native_mode, native)` and must thread `native_mode` through to
+    /// `NativeScheduledAccess::spawn` (which the worker still uses for its
+    /// per-item fallback decision). Once Step 5 removes the fallback, `spawn`
+    /// drops `native_mode` and so does this method.
+    pub(crate) fn build(
+        &self,
+        access: AccessHandle,
+        items: Vec<AccessItem>,
+        access_config: ScheduledAccessConfig,
+        native_mode: NativeMode,
+        cancel: Arc<PrefetchCancel>,
+        allow_small_command_grouping: bool,
+    ) -> DataBankResult<ScheduledBatchAccess> {
+        match self {
+            Self::Generic => {
+                build_generic_scheduled_access(access, items, access_config, cancel)
+            }
+            Self::BloscLz4Native(ctx) => NativeScheduledAccess::spawn(
+                access,
+                ctx.clone(),
+                items,
+                access_config,
+                native_mode,
+                cancel,
+                allow_small_command_grouping,
+            )
+            .map(ScheduledBatchAccess::Native),
+        }
+    }
+
+    /// Transitional constructor from the legacy `(native_mode, native)` pair.
+    ///
+    /// Replicates the strategy-selection logic of `build_scheduled_batch_access`
+    /// without spawning, producing a resolved `AccessStrategy`. This exists
+    /// only for Step 2, where call sites still hold the legacy pair; Step 3
+    /// replaces them with a single `resolve_strategy()` at spawn time and
+    /// deletes this helper.
+    pub(crate) fn from_mode_and_ctx(
+        native_mode: NativeMode,
+        native: Option<NativeScheduledContext>,
+    ) -> DataBankResult<Self> {
+        match (native_mode, native) {
+            (NativeMode::Disabled, _) => Ok(Self::Generic),
+            (NativeMode::Auto, None) => Ok(Self::Generic),
+            (NativeMode::Auto, Some(ctx)) if !ctx.config.enabled => Ok(Self::Generic),
+            (NativeMode::Auto | NativeMode::Force, Some(ctx)) => Ok(Self::BloscLz4Native(ctx)),
+            (NativeMode::Force, None) => Err(DataBankError::InvalidConfig(
+                "native_mode='force' requested but native access context is unavailable"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 fn native_block_payload_cache_from_env() -> Option<Arc<NativeBlockPayloadCache>> {
@@ -112,41 +170,6 @@ impl Iterator for ScheduledBatchAccess {
             Self::Generic(scheduled) => scheduled.next(),
             Self::Native(scheduled) => scheduled.next(),
         }
-    }
-}
-
-pub(crate) fn build_scheduled_batch_access(
-    access: AccessHandle,
-    native: Option<NativeScheduledContext>,
-    items: Vec<AccessItem>,
-    access_config: ScheduledAccessConfig,
-    native_mode: NativeMode,
-    cancel: Arc<PrefetchCancel>,
-    allow_small_command_grouping: bool,
-) -> DataBankResult<ScheduledBatchAccess> {
-    match (native_mode, native) {
-        (NativeMode::Disabled, _) => {
-            build_generic_scheduled_access(access, items, access_config, cancel)
-        }
-        (NativeMode::Auto, Some(ctx)) if !ctx.config.enabled => {
-            build_generic_scheduled_access(access, items, access_config, cancel)
-        }
-        (NativeMode::Auto | NativeMode::Force, Some(ctx)) => NativeScheduledAccess::spawn(
-            access,
-            ctx,
-            items,
-            access_config,
-            native_mode,
-            cancel,
-            allow_small_command_grouping,
-        )
-        .map(ScheduledBatchAccess::Native),
-        (NativeMode::Auto, None) => {
-            build_generic_scheduled_access(access, items, access_config, cancel)
-        }
-        (NativeMode::Force, None) => Err(DataBankError::InvalidConfig(
-            "native_mode='force' requested but native access context is unavailable".to_string(),
-        )),
     }
 }
 
