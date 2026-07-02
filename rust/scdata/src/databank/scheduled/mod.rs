@@ -24,7 +24,7 @@ pub(crate) use planner::plan_batch_multi;
 pub(crate) use types::{BatchPlan, SingleDatasetPlan};
 pub use types::{PrefetchCells, PrefetchedBatch};
 
-use native_access::NativeScheduledContext;
+use native_access::{AccessStrategy, NativeScheduledContext};
 use producer::*;
 use profile::*;
 use types::*;
@@ -404,5 +404,150 @@ fn ensure_native_mode_available(
         (NativeMode::Force, None) => Err(DataBankError::InvalidConfig(
             "native_mode='force' requested but native access context is unavailable".to_string(),
         )),
+    }
+}
+
+/// Resolve the actual execution strategy once, at spawn time.
+///
+/// `mode` is the caller-requested *policy*; the returned `AccessStrategy` is
+/// the *resolved* strategy the session runs. `precondition` is the dataset-level
+/// blosc contract (`datasets.iter().all(Dataset::is_blosc_codec)`); it is a
+/// single O(datasets) probe at spawn time, not a per-item hot-path check.
+///
+/// Semantics (row = (mode, native_ctx, precondition)):
+///   (Disabled, _,            _)          → Generic
+///   (Auto,    None,          _)          → Generic
+///   (Auto,    Some(ctx) if !ctx.config.enabled, _) → Generic
+///   (Auto,    Some(ctx),     true)       → BloscLz4Native(ctx)
+///   (Auto,    Some(_),       false)      → Generic   // contract unmet → safe strategy-level retreat
+///   (Force,   None,          _)          → Err       // no native context
+///   (Force,   Some(ctx),     true)       → BloscLz4Native(ctx)
+///   (Force,   Some(_),       false)      → Err       // contract unmet → hard fail, no fallback
+///
+/// Once `BloscLz4Native` is resolved, the native worker runs with zero
+/// fallback: a decode failure is a real error. `Auto` + contract violation
+/// retreats to `Generic` at the strategy level (one spawn-time decision), not
+/// per-item. `Force` + contract violation is a hard `InvalidConfig` error
+/// raised at spawn rather than a per-item failure inside the worker.
+pub(crate) fn resolve_strategy(
+    mode: NativeMode,
+    native_ctx: Option<NativeScheduledContext>,
+    precondition: bool,
+) -> DataBankResult<AccessStrategy> {
+    use AccessStrategy::*;
+    match (mode, native_ctx, precondition) {
+        (NativeMode::Disabled, _, _) => Ok(Generic),
+        (NativeMode::Auto, None, _) => Ok(Generic),
+        (NativeMode::Auto, Some(ctx), _) if !ctx.config.enabled => Ok(Generic),
+        (NativeMode::Auto, Some(ctx), true) => Ok(BloscLz4Native(ctx)),
+        (NativeMode::Auto, Some(_), false) => Ok(Generic),
+        (NativeMode::Force, None, _) => Err(DataBankError::InvalidConfig(
+            "native_mode='force' requested but native access context is unavailable".to_string(),
+        )),
+        (NativeMode::Force, Some(ctx), true) => Ok(BloscLz4Native(ctx)),
+        (NativeMode::Force, Some(_), false) => Err(DataBankError::InvalidConfig(
+            "native_mode='force' but dataset is not fully blosc".to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::{FileRef, IoBackend, IoTask};
+    use std::sync::Arc;
+
+    /// `IoBackend` stub that never services a read — `resolve_strategy` only
+    /// inspects `NativeScheduledContext.config.enabled`, never submits IO, so
+    /// the backend is never exercised by these tests.
+    struct StubIo;
+
+    impl IoBackend for StubIo {
+        fn submit_read(&self, _file: FileRef, _offset: u64, _len: usize, _priority: u8) -> IoTask {
+            unimplemented!("resolve_strategy tests never submit reads")
+        }
+    }
+
+    fn native_ctx(enabled: bool) -> NativeScheduledContext {
+        NativeScheduledContext::new(
+            Arc::new(StubIo),
+            NativeAccessConfig {
+                enabled,
+                ..NativeAccessConfig::default()
+            },
+        )
+        .expect("native context")
+    }
+
+    fn assert_generic(strategy: &AccessStrategy) {
+        assert!(
+            matches!(strategy, AccessStrategy::Generic),
+            "expected Generic, got native",
+        );
+        assert!(!strategy.is_native());
+        assert!(strategy.native_ctx().is_none());
+    }
+
+    fn assert_native(strategy: &AccessStrategy) {
+        assert!(
+            matches!(strategy, AccessStrategy::BloscLz4Native(_)),
+            "expected BloscLz4Native, got Generic",
+        );
+        assert!(strategy.is_native());
+        assert!(strategy.native_ctx().is_some());
+    }
+
+    #[test]
+    fn disabled_always_resolves_generic() {
+        // (Disabled, _, _) → Generic regardless of context / precondition.
+        assert_generic(&resolve_strategy(NativeMode::Disabled, None, true).unwrap());
+        assert_generic(&resolve_strategy(NativeMode::Disabled, None, false).unwrap());
+        assert_generic(&resolve_strategy(NativeMode::Disabled, Some(native_ctx(true)), true).unwrap());
+    }
+
+    #[test]
+    fn auto_without_context_resolves_generic() {
+        // (Auto, None, _) → Generic.
+        assert_generic(&resolve_strategy(NativeMode::Auto, None, true).unwrap());
+        assert_generic(&resolve_strategy(NativeMode::Auto, None, false).unwrap());
+    }
+
+    #[test]
+    fn auto_with_disabled_context_resolves_generic() {
+        // (Auto, Some(ctx) if !ctx.config.enabled, _) → Generic even when the
+        // blosc contract holds.
+        assert_generic(&resolve_strategy(NativeMode::Auto, Some(native_ctx(false)), true).unwrap());
+        assert_generic(&resolve_strategy(NativeMode::Auto, Some(native_ctx(false)), false).unwrap());
+    }
+
+    #[test]
+    fn auto_enabled_with_contract_resolves_native() {
+        // (Auto, Some(ctx), true) → BloscLz4Native(ctx).
+        assert_native(&resolve_strategy(NativeMode::Auto, Some(native_ctx(true)), true).unwrap());
+    }
+
+    #[test]
+    fn auto_enabled_without_contract_retreats_to_generic() {
+        // (Auto, Some(_), false) → Generic (strategy-level safe retreat).
+        assert_generic(&resolve_strategy(NativeMode::Auto, Some(native_ctx(true)), false).unwrap());
+    }
+
+    #[test]
+    fn force_without_context_is_hard_error() {
+        // (Force, None, _) → Err.
+        assert!(resolve_strategy(NativeMode::Force, None, true).is_err());
+        assert!(resolve_strategy(NativeMode::Force, None, false).is_err());
+    }
+
+    #[test]
+    fn force_with_contract_resolves_native() {
+        // (Force, Some(ctx), true) → BloscLz4Native(ctx).
+        assert_native(&resolve_strategy(NativeMode::Force, Some(native_ctx(true)), true).unwrap());
+    }
+
+    #[test]
+    fn force_without_contract_is_hard_error() {
+        // (Force, Some(_), false) → Err (hard fail, no fallback).
+        assert!(resolve_strategy(NativeMode::Force, Some(native_ctx(true)), false).is_err());
     }
 }

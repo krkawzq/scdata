@@ -44,6 +44,45 @@ impl NativeScheduledContext {
     }
 }
 
+/// The resolved access strategy for a single prefetch session.
+///
+/// Produced once at spawn time by `resolve_strategy` (see `scheduled/mod.rs`),
+/// then carried by the producer / assemble layers for the whole session. It
+/// replaces the previous `(native_mode, Option<NativeScheduledContext>)` pair
+/// that was threaded through every function: the only question those callers
+/// actually had — "are we on the native execution path?" — is now answered by
+/// [`Self::is_native`].
+///
+/// `NativeMode` stays as the *policy* requested by the caller; `AccessStrategy`
+/// is the *resolved* strategy actually running. Once resolved to
+/// [`Self::BloscLz4Native`], the native worker runs with zero fallback: a decode
+/// failure is a real error, never a silent retreat to the generic path.
+#[derive(Clone)]
+pub(crate) enum AccessStrategy {
+    /// Generic access-scheduler chunk reads + decode pool path.
+    Generic,
+    /// Blosc-LZ4 native direct read + block-level scatter path. Zero fallback.
+    BloscLz4Native(NativeScheduledContext),
+}
+
+impl AccessStrategy {
+    /// Whether this session runs on the native execution path. Replaces the
+    /// scattered `(native_mode, native)` paired queries.
+    pub(crate) fn is_native(&self) -> bool {
+        matches!(self, Self::BloscLz4Native(_))
+    }
+
+    /// Borrow the native context; only valid when [`Self::is_native`] is true.
+    /// Prefer `if let AccessStrategy::BloscLz4Native(ctx) = &strategy { ... }`
+    /// so exhaustiveness guarantees safety, rather than `expect`.
+    pub(crate) fn native_ctx(&self) -> Option<&NativeScheduledContext> {
+        match self {
+            Self::Generic => None,
+            Self::BloscLz4Native(ctx) => Some(ctx),
+        }
+    }
+}
+
 fn native_block_payload_cache_from_env() -> Option<Arc<NativeBlockPayloadCache>> {
     let capacity = std::env::var("SCDATA_NATIVE_BLOCK_CACHE_BYTES")
         .ok()

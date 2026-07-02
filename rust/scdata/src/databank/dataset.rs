@@ -54,6 +54,28 @@ impl Dataset {
             }
         }
     }
+
+    /// Whether every chunk-read path of this dataset is blosc-encoded.
+    ///
+    /// `codec` is shared at the array level (`Array.codec: SharedCodec`), so
+    /// this is O(arrays), not O(chunks). `indptr` is a materialized `Vec<u64>`
+    /// registered up front and never reaches the chunk-read path, so it does
+    /// not participate in the probe.
+    ///
+    /// This is a *cheap blosc-level* probe, not a full `blosc.lz4` guarantee:
+    /// `SharedCodec` only exposes `name()`, and the actual lz4-ness is only
+    /// knowable by parsing the runtime blosc header. The dispatch layer
+    /// therefore selects on blosc only; the native loader verifies lz4
+    /// adaptivity when it parses the block table.
+    pub(crate) fn is_blosc_codec(&self) -> bool {
+        match self {
+            Self::Dense1D(dataset) => dataset.data.codec.name() == "blosc",
+            Self::Dense2D(dataset) => dataset.data.codec.name() == "blosc",
+            Self::SparseCsr(dataset) => {
+                dataset.indices.codec.name() == "blosc" && dataset.data.codec.name() == "blosc"
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
