@@ -43,7 +43,7 @@ from scdata.io import launch
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
 
-    from scdata.data._dataset import DType
+    from scdata.data._dtype import DTypeLike
     from scdata.data._stats import BankConfigSummary
 
 __all__ = ["Corpus"]
@@ -238,7 +238,7 @@ class Corpus:
         drop_last: bool = False,
         sampler: Any = None,
         batch_sampler: Any = None,
-        out_dtype: "DType | str | None" = None,
+        out_dtype: "DTypeLike | None" = None,
         prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
         collate_fn: "Callable[[ScDataBatch], Any] | None" = None,
         collect_stats: bool = True,

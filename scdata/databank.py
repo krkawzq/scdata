@@ -70,7 +70,8 @@ from typing import (
 
 from .data._cell import CellAccess, CellBatch, CellData, _as_cell_index
 from .data._coerce import _as_gene_names
-from .data._dataset import DataError, Dataset, DatasetCollection, DenseDataset, DType, SparseDataset
+from .data._dataset import Dataset, DatasetCollection, DenseDataset, SparseDataset
+from .data._dtype import DataError, DType, DTypeLike, normalize_dtype
 from .data._index import CellIndexPlan
 from .data._prefetch import PrefetchIterator
 from ._scdata import (
@@ -238,16 +239,9 @@ def _coerce_missing_policy(
     )
 
 
-def _coerce_dtype(dtype: DType | str | None) -> DType | None:
+def _coerce_dtype(dtype: DTypeLike | None) -> DType | None:
     """Normalize a public dtype value."""
-    if dtype is None or isinstance(dtype, DType):
-        return dtype
-    text = str(dtype).strip()
-    folded = text.lower()
-    for candidate in DType:
-        if folded == candidate.value or text.upper() == candidate.name:
-            return candidate
-    return DType.parse(dtype)
+    return normalize_dtype(dtype, allow_none=True)
 
 
 _FLOAT_DTYPE_RANK = {
@@ -294,7 +288,7 @@ def _auto_output_dtype(dtypes: Iterable[DType]) -> DType:
 
 
 def _coerce_prefetch_dtype(
-    dtype: DType | Literal["auto"] | str | None, ids: Iterable[DatasetId], bank: "ScDataBank"
+    dtype: DTypeLike | Literal["auto"] | None, ids: Iterable[DatasetId], bank: "ScDataBank"
 ) -> DType:
     if dtype is None or (isinstance(dtype, str) and dtype.strip().lower() == "auto"):
         return _auto_output_dtype(bank.dataset_dtype(id) for id in ids)
@@ -1421,7 +1415,7 @@ class ScDataBank:
         | Literal["zero", "error", "raise", "strict"]
         | str
         | None = None,
-        dtype: DType | Literal["auto"] | str | None = None,
+        dtype: DTypeLike | Literal["auto"] | None = None,
         access_config: ScheduledAccessConfig | Mapping[str, Any] | None = None,
     ) -> CellData:
         """Load cells from one dataset, optionally projected onto a gene subset.
@@ -1472,7 +1466,7 @@ class ScDataBank:
         | Literal["zero", "error", "raise", "strict"]
         | str
         | None = None,
-        dtype: DType | Literal["auto"] | str | None = None,
+        dtype: DTypeLike | Literal["auto"] | None = None,
         access_config: ScheduledAccessConfig | Mapping[str, Any] | None = None,
     ) -> CellData:
         """Load one multi-dataset batch of cells, optionally projected onto ``genes``.
@@ -1575,7 +1569,7 @@ class ScDataBank:
         | Literal["zero", "error", "raise", "strict"]
         | str
         | None = None,
-        dtype: DType | Literal["auto"] | str | None = None,
+        dtype: DTypeLike | Literal["auto"] | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
         """Stream decoded cell batches from one dataset, optionally onto ``genes``.
@@ -1639,7 +1633,7 @@ class ScDataBank:
         | Literal["zero", "error", "raise", "strict"]
         | str
         | None = None,
-        dtype: DType | Literal["auto"] | str | None = None,
+        dtype: DTypeLike | Literal["auto"] | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
         """Stream decoded cell batches mixing cells from several datasets.
@@ -1683,7 +1677,7 @@ class ScDataBank:
         | Literal["zero", "error", "raise", "strict"]
         | str
         | None = None,
-        dtype: DType | Literal["auto"] | str | None = None,
+        dtype: DTypeLike | Literal["auto"] | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]:
         """Stream batches from a numeric :class:`~scdata.data.CellIndexPlan`.

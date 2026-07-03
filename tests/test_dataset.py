@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import scdata.data as data_api
-from scdata.data import CellAccess, CellBatch, CellData, CellIndexPlan
+from scdata.data import CellAccess, CellBatch, CellData, CellIndexPlan, normalize_dtype
 from scdata.data._dataset import (
     ArrayMeta,
     ArrayOrder,
@@ -71,6 +71,29 @@ def test_dtype_parse_structured_record():
 
 
 @pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("f32", DType.F32),
+        ("F32", DType.F32),
+        ("float32", DType.F32),
+        ("uint64", DType.U64),
+        ("bfloat16", DType.BF16),
+        (np.float32, DType.F32),
+        (np.dtype("float64"), DType.F64),
+        (np.array([1, 2], dtype=np.uint16), DType.U16),
+    ],
+)
+def test_dtype_constructor_accepts_user_friendly_inputs(value, expected):
+    assert DType(value) == expected
+
+
+def test_normalize_dtype_optional_none():
+    assert normalize_dtype(None, allow_none=True) is None
+    with pytest.raises(DtypeParseError):
+        normalize_dtype(None)
+
+
+@pytest.mark.parametrize(
     "dtype,expected_size",
     [
         (DType.U8, 1),
@@ -122,6 +145,11 @@ def test_dtype_from_numpy(np_dt, expected):
 def test_dtype_from_numpy_rejects_complex():
     with pytest.raises(DtypeParseError):
         DType.from_numpy(np.complex64)
+
+
+def test_dtype_from_numpy_rejects_big_endian():
+    with pytest.raises(DtypeParseError, match="big-endian"):
+        DType.from_numpy(np.dtype(">f4"))
 
 
 def test_cell_index_plan_from_counts_and_global_indices():
@@ -309,6 +337,25 @@ def test_array_meta_chunk_count_validated():
             dtype=DType.F32,
             chunks=_chunk_locs(1),
         )
+
+
+def test_array_meta_coerces_dtype_like_inputs():
+    file_meta = ArrayMeta.from_chunks(
+        shape=(4,),
+        chunk_shape=(2,),
+        dtype="float32",
+        chunks=_chunk_locs(2),
+    )
+    dir_meta = ArrayMeta.from_directory(
+        shape=(4,),
+        chunk_shape=(2,),
+        dtype=np.array([1, 2], dtype=np.uint16),
+        chunk_paths=("X/c/0", "X/c/1"),
+        chunk_lengths=(8, 8),
+    )
+
+    assert file_meta.dtype == DType.F32
+    assert dir_meta.dtype == DType.U16
 
 
 def test_array_meta_rank_mismatch_rejected():
@@ -523,6 +570,34 @@ def test_sparse_dataset_sorted_indices_metadata(csr_array_metas):
     )
     assert marked.assume_sorted_indices is True
     assert "assume_sorted_indices=True" in repr(marked)
+
+
+def test_sparse_dataset_coerces_index_dtype_like_inputs():
+    indices = ArrayMeta.from_chunks(
+        shape=(6,),
+        chunk_shape=(6,),
+        dtype="int64",
+        chunks=_chunk_locs(1),
+    )
+    data = ArrayMeta.from_chunks(
+        shape=(6,),
+        chunk_shape=(6,),
+        dtype=np.float32,
+        chunks=_chunk_locs(1),
+    )
+    ds = SparseDataset(
+        gene_names=tuple(f"g{i}" for i in range(4)),
+        indptr=(0, 2, 4, 6),
+        indices=indices,
+        data=data,
+        index_dtype=np.int64,
+        num_cells=3,
+        num_genes=4,
+    )
+
+    assert ds.index_dtype == DType.I64
+    assert ds.indices.dtype == DType.I64
+    assert ds.dtype == DType.F32
 
 
 def test_sparse_dataset_indptr_non_monotonic(csr_array_metas):

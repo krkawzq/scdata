@@ -34,6 +34,7 @@ from typing import Any, Iterable, Literal, Sequence, cast
 import numpy as np
 
 from scdata.data._coerce import _as_gene_names, _as_u64_array, _coerce_u64_int
+from scdata.data._dtype import DataError, DType, DTypeLike, DtypeParseError
 
 __all__ = [
     "ArrayOrder",
@@ -49,19 +50,6 @@ __all__ = [
     "DtypeParseError",
     "CodecConfigError",
 ]
-
-
-class DataError(ValueError):
-    """Base for metadata parsing errors raised by :mod:`scdata.data`.
-
-    The io layer catches :class:`DataError` and re-raises it as
-    :class:`~scdata.io.StoreError` so :func:`~scdata.io.launch` exposes a single
-    error type to callers.
-    """
-
-
-class DtypeParseError(DataError):
-    """Raised when a zarr dtype/order string cannot be mapped to a scdata type."""
 
 
 class CodecConfigError(DataError):
@@ -91,165 +79,6 @@ class ArrayOrder(str, Enum):
         if text == "F":
             raise DtypeParseError("F-order arrays are unsupported (scdata stores are C-order)")
         raise DtypeParseError(f"unsupported array order: {value!r}")
-
-
-class DType(Enum):
-    """Element dtype, mirrors the Rust ``DType`` enum (``databank/array.rs``).
-
-    Rust supports a fixed set of numeric dtypes.  NumPy/zarr dtype strings may
-    be endianness-prefixed (``<f4``, ``|u8``, ``>i4``); scdata stores are always
-    little-endian on disk, so ``<``, ``=`` and ``|`` are accepted.  ``>`` is
-    rejected instead of silently byte-swapping metadata the Rust reader cannot
-    decode as written.
-    """
-
-    U8 = "u8"
-    I8 = "i8"
-    U16 = "u16"
-    I16 = "i16"
-    U32 = "u32"
-    I32 = "i32"
-    U64 = "u64"
-    I64 = "i64"
-    F16 = "f16"
-    BF16 = "bf16"
-    F32 = "f32"
-    F64 = "f64"
-
-    @property
-    def item_size(self) -> int:
-        match self:
-            case DType.U8 | DType.I8:
-                return 1
-            case DType.U16 | DType.I16 | DType.F16 | DType.BF16:
-                return 2
-            case DType.U32 | DType.I32 | DType.F32:
-                return 4
-            case DType.U64 | DType.I64 | DType.F64:
-                return 8
-
-    @property
-    def is_csr_index(self) -> bool:
-        """Whether this dtype is valid for CSR ``indices`` (Rust ``is_csr_index``)."""
-        return self in (DType.I32, DType.U32, DType.I64, DType.U64)
-
-    @classmethod
-    def parse(cls, dtype: object) -> "DType":
-        """Parse a NumPy/zarr dtype field into a :class:`DType`.
-
-        Accepts the standard zarr forms:
-
-        * a base type string, e.g. ``"<f4"``, ``"|u8"``, ``">i4"``,
-        * a structured record ``[base, [("f0", "<i4")]]`` — the base element
-          type is used (scdata stores scalars, not structured records, but
-          zarr wraps single-field arrays this way),
-        * a :class:`DType` (passthrough).
-        """
-        if isinstance(dtype, DType):
-            return dtype
-        if dtype is None:
-            raise DtypeParseError("dtype is None")
-
-        base = _extract_base_dtype(dtype)
-        return _decode_base_dtype(base)
-
-    @classmethod
-    def from_numpy(cls, dtype: Any) -> "DType":
-        """Map a numpy dtype object to a :class:`DType`."""
-        np_dtype = np.dtype(dtype)
-        kind = np_dtype.kind
-        size = np_dtype.itemsize
-        match (kind, size):
-            case ("u", 1):
-                return cls.U8
-            case ("i", 1):
-                return cls.I8
-            case ("u", 2):
-                return cls.U16
-            case ("i", 2):
-                return cls.I16
-            case ("u", 4):
-                return cls.U32
-            case ("i", 4):
-                return cls.I32
-            case ("u", 8):
-                return cls.U64
-            case ("i", 8):
-                return cls.I64
-            case ("f", 2):
-                # numpy has no native bf16; a 2-byte float is f16 here.
-                return cls.F16
-            case ("f", 4):
-                return cls.F32
-            case ("f", 8):
-                return cls.F64
-            case _:
-                raise DtypeParseError(f"unsupported numpy dtype: {np_dtype}")
-
-
-def _extract_base_dtype(dtype: object) -> str:
-    """Return the base type string from a zarr dtype field."""
-    if isinstance(dtype, str):
-        return dtype
-    # zarr represents structured arrays as [base_str, [(field, dtype), ...]].
-    if isinstance(dtype, list) and dtype:
-        first = dtype[0]
-        if isinstance(first, str):
-            return first
-    # Some libraries emit a dict with shape/descriptor; fall back to str().
-    text = str(dtype).strip()
-    if not text:
-        raise DtypeParseError(f"empty dtype descriptor: {dtype!r}")
-    return text
-
-
-_BASE_DTYPE_MAP: dict[str, DType] = {
-    "u1": DType.U8,
-    "i1": DType.I8,
-    "u2": DType.U16,
-    "i2": DType.I16,
-    "u4": DType.U32,
-    "i4": DType.I32,
-    "u8": DType.U64,
-    "i8": DType.I64,
-    "f2": DType.F16,
-    "f4": DType.F32,
-    "f8": DType.F64,
-    # numcodecs/bfloat extensions used by some single-cell stores.
-    "bf2": DType.BF16,
-}
-
-
-def _decode_base_dtype(base: str) -> DType:
-    text = base.strip()
-    if not text:
-        raise DtypeParseError("empty base dtype string")
-
-    # Strip endianness prefix.  scdata stores are little-endian on disk; we
-    # accept '<' (little), '=' (native on our write targets), and '|' (not
-    # applicable / byte).  Big-endian input is rejected because Rust decodes
-    # bytes exactly as written.
-    if text[0] in "<>=":
-        prefix = text[0]
-        body = text[1:]
-        if prefix == ">":
-            # Big-endian source is not produced by scdata; refuse rather than
-            # silently byte-swap.
-            raise DtypeParseError(
-                f"big-endian dtype {base!r} is unsupported (scdata stores are little-endian)"
-            )
-    elif text[0] == "|":
-        body = text[1:]
-    else:
-        body = text
-
-    body = body.strip().lower()
-    if not body:
-        raise DtypeParseError(f"missing type code in {base!r}")
-
-    if body not in _BASE_DTYPE_MAP:
-        raise DtypeParseError(f"unsupported dtype {base!r} (body {body!r})")
-    return _BASE_DTYPE_MAP[body]
 
 
 @dataclass(frozen=True)
@@ -339,7 +168,7 @@ class ArrayMeta:
 
     shape: tuple[int, ...]
     chunk_shape: tuple[int, ...]
-    dtype: DType
+    dtype: DTypeLike
     order: ArrayOrder = ArrayOrder.C
     codec: CodecPipeline = field(default_factory=CodecPipeline)
     payload_path: str = ""
@@ -377,6 +206,7 @@ class ArrayMeta:
     )
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "dtype", DType(self.dtype))
         if len(self.shape) != len(self.chunk_shape):
             raise ValueError(
                 f"shape rank {len(self.shape)} != chunk_shape rank {len(self.chunk_shape)}"
@@ -467,7 +297,7 @@ class ArrayMeta:
         *,
         shape: tuple[int, ...],
         chunk_shape: tuple[int, ...],
-        dtype: DType,
+        dtype: DTypeLike,
         chunks: Iterable[ChunkLocation],
         order: ArrayOrder = ArrayOrder.C,
         codec: CodecPipeline | None = None,
@@ -510,7 +340,7 @@ class ArrayMeta:
         *,
         shape: tuple[int, ...],
         chunk_shape: tuple[int, ...],
-        dtype: DType,
+        dtype: DTypeLike,
         chunk_paths: Iterable[str],
         chunk_lengths: Iterable[int],
         order: ArrayOrder = ArrayOrder.C,
@@ -827,7 +657,7 @@ class SparseDataset:
     indptr: np.ndarray | Sequence[int]
     indices: ArrayMeta
     data: ArrayMeta
-    index_dtype: DType
+    index_dtype: DTypeLike
     num_cells: int
     num_genes: int
     #: Filesystem path of the store root holding the ``indices`` / ``data``
@@ -838,6 +668,7 @@ class SparseDataset:
     assume_sorted_indices: bool = False
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "index_dtype", DType(self.index_dtype))
         gene_names = _as_gene_names(self.gene_names)
         object.__setattr__(self, "gene_names", gene_names)
         if self.num_cells <= 0:

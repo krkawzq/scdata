@@ -30,13 +30,12 @@ from scdata.data._dataset import (
     ArrayMeta,
     ArrayOrder,
     CodecPipeline,
-    DataError,
     DenseDataset,
-    DType,
     Dataset,
     DatasetCollection,
     SparseDataset,
 )
+from scdata.data._dtype import DataError, DType
 
 try:
     from scdata._scdata import (
@@ -328,7 +327,7 @@ def _is_json_int(value: object) -> bool:
 
 def _parse_dtype(value: object, context: str) -> DType:
     try:
-        return DType.parse(value)
+        return DType(value)
     except DataError as err:
         raise StoreError(f"{context}: {err}") from err
 
@@ -382,11 +381,8 @@ def _v3_dtype(meta: dict[str, object], context: str) -> DType:
     """Parse a v3 ``data_type`` field into a :class:`DType`.
 
     v3 uses bare type strings (``"float32"``, ``"int64"``) rather than the v2
-    endianness-prefixed form (``"<f4"``).  anndata writes little-endian
-    implicitly via the ``bytes`` codec; scdata stores are little-endian, so we
-    map the bare name through the existing dtype decoder by synthesizing the
-    little-endian form.  String arrays (``data_type: "string"``) are rejected
-    here — they are metadata-only and handled by the gene-name reader.
+    endianness-prefixed form (``"<f4"``).  String arrays are metadata-only and
+    handled by the gene-name reader.
     """
     raw = meta.get("data_type")
     if isinstance(raw, dict):
@@ -396,31 +392,15 @@ def _v3_dtype(meta: dict[str, object], context: str) -> DType:
         name = raw
     if not isinstance(name, str):
         raise StoreError(f"{context}: zarr.json data_type must be a string, got {raw!r}")
-    if name in ("string", "variable_length_utf8"):
+    folded = name.strip().lower()
+    if folded in ("string", "variable_length_utf8"):
         raise StoreError(
             f"{context}: string arrays are metadata-only; route through the gene-name reader"
         )
-    # Map the v3 bare name to the little-endian zarr v2 dtype string the
-    # existing DType.parse understands.
-    v3_to_v2 = {
-        "bool": "|b1",
-        "int8": "|i1",
-        "uint8": "|u1",
-        "int16": "<i2",
-        "uint16": "<u2",
-        "int32": "<i4",
-        "uint32": "<u4",
-        "int64": "<i8",
-        "uint64": "<u8",
-        "float16": "<f2",
-        "float32": "<f4",
-        "float64": "<f8",
-        "bfloat16": "bf2",
-    }
-    dtype_str = v3_to_v2.get(name)
-    if dtype_str is None:
-        raise StoreError(f"{context}: unsupported v3 data_type {name!r}")
-    return _parse_dtype(dtype_str, context)
+    try:
+        return DType(folded)
+    except DataError as err:
+        raise StoreError(f"{context}: unsupported v3 data_type {name!r}: {err}") from err
 
 
 def _v3_codec_pipeline(codecs: object, context: str) -> CodecPipeline:

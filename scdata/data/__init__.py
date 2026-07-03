@@ -23,14 +23,12 @@ from scdata.data._dataset import (
     ChunkLocation,
     CodecPipeline,
     DenseDataset,
-    DType,
     Dataset,
     DatasetCollection,
-    DataError,
-    DtypeParseError,
     CodecConfigError,
     SparseDataset,
 )
+from scdata.data._dtype import DataError, DType, DTypeLike, DtypeParseError, normalize_dtype
 from scdata.data._index import CellIndexDataset, CellIndexPlan
 from scdata.data._prefetch import PrefetchIterator
 from scdata.data._stats import BankConfigSummary, LoaderStats
@@ -42,10 +40,12 @@ __all__ = [
     "CodecPipeline",
     "DenseDataset",
     "DType",
+    "DTypeLike",
     "Dataset",
     "DatasetCollection",
     "DataError",
     "DtypeParseError",
+    "normalize_dtype",
     "CodecConfigError",
     "SparseDataset",
     "CellAccess",

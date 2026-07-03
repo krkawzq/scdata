@@ -12,7 +12,8 @@ from typing import Any, Iterable, Literal
 import numpy as np
 from numpy.typing import NDArray
 
-from scdata.data._dataset import DenseDataset, DType, SparseDataset
+from scdata.data._dataset import DenseDataset, SparseDataset
+from scdata.data._dtype import DType
 
 __version__: str
 

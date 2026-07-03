@@ -40,10 +40,11 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in torch-free envs.
     _TorchDataLoader = _MissingTorchDataLoader
 
 if TYPE_CHECKING:
-    from scdata.data._dataset import DType, DenseDataset, SparseDataset
+    from scdata.data._dataset import DenseDataset, SparseDataset
+    from scdata.data._dtype import DTypeLike
     from scdata.databank import DatasetId, MissingGenePolicy, ScDataBank, ScheduledPrefetchConfig
 else:
-    DType = object
+    DTypeLike = object
     DenseDataset = object
     DatasetId = object
     MissingGenePolicy = object
@@ -62,7 +63,7 @@ class _SupportsPrefetch(Protocol):
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy | str | None = None,
-        dtype: DType | str | None = None,
+        dtype: DTypeLike | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]: ...
 
@@ -73,7 +74,7 @@ class _SupportsPrefetch(Protocol):
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy | str | None = None,
-        dtype: DType | str | None = None,
+        dtype: DTypeLike | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]: ...
 
@@ -84,7 +85,7 @@ class _SupportsPrefetch(Protocol):
         genes: Iterable[str] | None = None,
         *,
         missing: MissingGenePolicy | str | None = None,
-        dtype: DType | str | None = None,
+        dtype: DTypeLike | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
     ) -> Iterator[CellBatch]: ...
 
@@ -465,7 +466,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         | None = None,
         genes: Iterable[str] | None = None,
         missing: "MissingGenePolicy | str | None" = None,
-        out_dtype: "DType | str | None" = None,
+        out_dtype: "DTypeLike | None" = None,
         prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
         collate_fn: Callable[[ScDataBatch], Any] | None = None,
         collect_stats: bool = True,
@@ -531,7 +532,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
             _as_gene_names(genes, "genes") if genes is not None else None
         )
         self.sc_missing: MissingGenePolicy | str | None = missing
-        self.sc_out_dtype: DType | str | None = out_dtype
+        self.sc_out_dtype: DTypeLike | None = out_dtype
         self.sc_prefetch_config: ScheduledPrefetchConfig | Mapping[str, Any] | None = (
             prefetch_config
         )
@@ -793,7 +794,7 @@ class ScDataLoader(_TorchDataLoader):  # type: ignore[misc, valid-type]
         batch_size: int = 1024,
         shuffle: bool = True,
         drop_last: bool = False,
-        out_dtype: "DType | str | None" = None,
+        out_dtype: "DTypeLike | None" = None,
         prefetch_config: "ScheduledPrefetchConfig | Mapping[str, Any] | None" = None,
         collate_fn: Callable[[ScDataBatch], Any] | None = None,
         collect_stats: bool = True,
