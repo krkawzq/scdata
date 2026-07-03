@@ -2,6 +2,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::access::{AccessHandle, PrefetchCancel, ScheduledAccessConfig};
+use crate::env::fastpath;
 
 use super::super::array::{DType, DataValue};
 use super::super::compute::DataBankComputePool;
@@ -652,7 +653,7 @@ where
         selected_bytes,
     );
 
-    if read_all_selected_scatter_enabled() {
+    if fastpath::read_all_selected_scatter_enabled() {
         let scan_started = profiler.start_sparse_projected_index_scan();
         let selected_plan =
             plan_sparse_selected_data_batch(dataset, plan, index_bytes.as_ref(), gene_axis)?;
@@ -890,7 +891,7 @@ where
     }
 
     if !selected_data_scheduled
-        && selected_sparse_fused_scatter_enabled()
+        && fastpath::native_fused_scatter_enabled()
         && can_use_selected_sparse_ordered_native(
             strategy,
             &selected_plan,
@@ -1192,18 +1193,6 @@ fn can_use_selected_sparse_ordered_native(
         })
 }
 
-fn selected_sparse_fused_scatter_enabled() -> bool {
-    std::env::var("SCDATA_NATIVE_FUSED_SCATTER")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-fn read_all_selected_scatter_enabled() -> bool {
-    std::env::var("SCDATA_READALL_SELECTED_SCATTER")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn scatter_selected_sparse_groups_fused_native<T>(
     strategy: &AccessStrategy,
@@ -1379,6 +1368,7 @@ fn schedule_selected_sparse_file_groups(
             items,
             *access_config,
             Arc::clone(cancel),
+            true,
             true,
         )
         .map(Some)

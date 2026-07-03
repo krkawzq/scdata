@@ -1774,6 +1774,7 @@ fn build_real_io_config(config: &NativeRealIoConfig) -> Result<crate::iopool::Io
             crate::iopool::ThreadedConfig {
                 base,
                 num_workers: config.io_workers,
+                steal_interval_us: 0,
                 cpus: None,
             },
         )),

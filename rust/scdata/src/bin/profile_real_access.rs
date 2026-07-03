@@ -10,7 +10,7 @@ use _scdata::databank::{
 };
 #[cfg(feature = "uring")]
 use _scdata::iopool::UringConfig;
-use _scdata::iopool::{IoConfig, ThreadedConfig};
+use _scdata::iopool::{BaseIoConfig, IoConfig, ThreadedConfig};
 use _scdata::profile::{ProfileMetricKind, ProfileSnapshot};
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
@@ -469,6 +469,11 @@ struct Args {
     threads: usize,
     io_backend: IoBackendArg,
     io_workers: usize,
+    io_max_in_flight: usize,
+    io_queue_capacity: usize,
+    io_queue_shards: usize,
+    io_assume_non_overlapping_reads: bool,
+    io_thread_steal_us: usize,
     uring_entries: u32,
     decode_workers: usize,
     access_workers: usize,
@@ -943,6 +948,13 @@ fn run_case(
             "io_backend": args.io_backend.as_str(),
             "uring_entries": args.uring_entries,
             "io_workers": databank_io_workers(args),
+            "io_config": {
+                "max_in_flight": args.io_max_in_flight,
+                "queue_capacity": args.io_queue_capacity,
+                "queue_shards": args.io_queue_shards,
+                "assume_non_overlapping_reads": args.io_assume_non_overlapping_reads,
+                "thread_steal_us": args.io_thread_steal_us,
+            },
             "decode_workers": databank_decode_workers(args),
             "access_workers": databank_access_workers(args),
             "fill_workers": databank_fill_workers(args),
@@ -1079,6 +1091,13 @@ fn run_case_rust_core(
             "io_backend": args.io_backend.as_str(),
             "uring_entries": args.uring_entries,
             "io_workers": databank_io_workers(args),
+            "io_config": {
+                "max_in_flight": args.io_max_in_flight,
+                "queue_capacity": args.io_queue_capacity,
+                "queue_shards": args.io_queue_shards,
+                "assume_non_overlapping_reads": args.io_assume_non_overlapping_reads,
+                "thread_steal_us": args.io_thread_steal_us,
+            },
             "decode_workers": databank_decode_workers(args),
             "access_workers": databank_access_workers(args),
             "fill_workers": databank_fill_workers(args),
@@ -1414,13 +1433,23 @@ fn databank_fill_workers(args: &Args) -> usize {
 
 fn rust_databank_config(args: &Args) -> DataBankConfig {
     let access_memory_bytes = args.memory_gib * 1024 * 1024 * 1024;
+    let io_base = BaseIoConfig {
+        max_in_flight: args.io_max_in_flight,
+        queue_capacity: args.io_queue_capacity,
+        queue_shards: args.io_queue_shards,
+        assume_non_overlapping_reads: args.io_assume_non_overlapping_reads,
+        ..BaseIoConfig::default()
+    };
     let io_config = match args.io_backend {
         IoBackendArg::Threaded => IoConfig::Threaded(ThreadedConfig {
+            base: io_base,
             num_workers: databank_io_workers(args),
+            steal_interval_us: args.io_thread_steal_us,
             ..ThreadedConfig::default()
         }),
         #[cfg(feature = "uring")]
         IoBackendArg::Uring => IoConfig::Uring(UringConfig {
+            base: io_base,
             entries: args.uring_entries,
             drivers: databank_io_workers(args),
             ..UringConfig::default()
@@ -2216,6 +2245,13 @@ fn args_json(args: &Args) -> Value {
         "io_backend": args.io_backend.as_str(),
         "uring_entries": args.uring_entries,
         "io_workers": databank_io_workers(args),
+        "io_config": {
+            "max_in_flight": args.io_max_in_flight,
+            "queue_capacity": args.io_queue_capacity,
+            "queue_shards": args.io_queue_shards,
+            "assume_non_overlapping_reads": args.io_assume_non_overlapping_reads,
+            "thread_steal_us": args.io_thread_steal_us,
+        },
         "decode_workers": databank_decode_workers(args),
         "access_workers": databank_access_workers(args),
         "fill_workers": databank_fill_workers(args),
@@ -2285,6 +2321,11 @@ fn parse_args() -> AppResult<Args> {
         threads: 96,
         io_backend: IoBackendArg::Threaded,
         io_workers: 0,
+        io_max_in_flight: 1024,
+        io_queue_capacity: 4096,
+        io_queue_shards: 1,
+        io_assume_non_overlapping_reads: false,
+        io_thread_steal_us: 0,
         uring_entries: 1024,
         decode_workers: 0,
         access_workers: 0,
@@ -2369,6 +2410,13 @@ fn parse_args() -> AppResult<Args> {
             "--threads" => args.threads = parse_usize(&value, &key)?,
             "--io-backend" => args.io_backend = IoBackendArg::parse(&value)?,
             "--io-workers" => args.io_workers = parse_usize(&value, &key)?,
+            "--io-max-in-flight" => args.io_max_in_flight = parse_usize(&value, &key)?,
+            "--io-queue-capacity" => args.io_queue_capacity = parse_usize(&value, &key)?,
+            "--io-queue-shards" => args.io_queue_shards = parse_usize(&value, &key)?,
+            "--io-assume-non-overlapping-reads" => {
+                args.io_assume_non_overlapping_reads = parse_bool(&value, &key)?
+            }
+            "--io-thread-steal-us" => args.io_thread_steal_us = parse_usize(&value, &key)?,
             "--uring-entries" => args.uring_entries = parse_u32(&value, &key)?,
             "--decode-workers" => args.decode_workers = parse_usize(&value, &key)?,
             "--access-workers" => args.access_workers = parse_usize(&value, &key)?,
@@ -2563,6 +2611,11 @@ Key options:
   --threads N                         Must be divisible by 4. Default: 96.
   --io-backend threaded|uring          Rust-core DataBank IO backend. Default: threaded.
   --io-workers N                      DataBank IO workers. 0 means --threads/4.
+  --io-max-in-flight N                IoPool max dispatched operations. Default: 1024.
+  --io-queue-capacity N               IoPool admitted operation capacity. Default: 4096.
+  --io-queue-shards N                 IoPool internal queue shards. Default: 1.
+  --io-assume-non-overlapping-reads B Enable read-optimized queue path. Default: false.
+  --io-thread-steal-us N              Threaded shard steal sleep in us. 0 disables. Default: 0.
   --uring-entries N                   io_uring SQ/CQ entries when --io-backend=uring. Default: 1024.
   --decode-workers N                  Decode workers. 0 means --threads/4.
   --access-workers N                  Access CPU workers. 0 means --threads/4.

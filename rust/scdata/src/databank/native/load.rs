@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::access::{FileRef, IoBackend, IoTask};
+#[cfg(test)]
+use crate::access::IoTask;
+use crate::access::{FileRef, IoBackend};
 
 use super::super::config::NativeLoadCoalesceConfig;
 

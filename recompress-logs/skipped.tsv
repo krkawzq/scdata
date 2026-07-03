@@ -1,4 +1,0 @@
-status	dataset_id	zip_path	size_bytes	seconds	blosc_arrays	blosc_chunks	message
-skipped	00476f9f-ebc1-4b72-b541-32f912ce36ea	/mnt/shared-storage-user/dnacoding/wangzhongqi/Data/cellxgene/Homo_sapiens/00476f9f-ebc1-4b72-b541-32f912ce36ea/full.zarr.zip	103321683	0.008615169674158096	0	0	already at target blocksize
-skipped	01209dce-3575-4bed-b1df-129f57fbc031	/mnt/shared-storage-user/dnacoding/wangzhongqi/Data/cellxgene/Homo_sapiens/01209dce-3575-4bed-b1df-129f57fbc031/full.zarr.zip	382022869	0.008907914161682129	0	0	already at target blocksize
-skipped	0087cde2-967d-4f7c-8e6e-40e4c9ad1891	/mnt/shared-storage-user/dnacoding/wangzhongqi/Data/cellxgene/Homo_sapiens/0087cde2-967d-4f7c-8e6e-40e4c9ad1891/full.zarr.zip	539486499	0.010240960866212845	0	0	already at target blocksize

@@ -8,6 +8,7 @@ use tokio::task::JoinSet;
 use crate::access::{
     AccessHandle, AccessItem, IoBackend, PrefetchCancel, ScheduledAccess, ScheduledAccessConfig,
 };
+use crate::env::fastpath;
 
 use super::super::config::NativeAccessConfig;
 use super::super::error::{DataBankError, DataBankResult};
@@ -24,6 +25,7 @@ pub(crate) struct NativeScheduledContext {
     pub(crate) block_cache: Option<Arc<NativeBlockPayloadCache>>,
     pub(crate) in_flight_payload_reads: Option<Arc<NativeInFlightPayloadReads>>,
     pub(crate) decoded_cache: Option<Arc<NativeBlockDecodedCache>>,
+    cache_requires_targeted_command: bool,
     executor: Arc<NativeScheduledExecutor>,
 }
 
@@ -32,19 +34,35 @@ impl NativeScheduledContext {
         let executor = Arc::new(NativeScheduledExecutor::new(
             config.load.scheduler_workers.max(1),
         )?);
-        let block_cache = (config.cache.payload_capacity_bytes > 0).then(|| {
+        let explicit_cache =
+            config.cache.payload_capacity_bytes > 0 || config.cache.decoded_capacity_bytes > 0;
+        let (payload_capacity_bytes, decoded_capacity_bytes, cache_requires_targeted_command) =
+            if explicit_cache {
+                (
+                    config.cache.payload_capacity_bytes,
+                    config.cache.decoded_capacity_bytes,
+                    false,
+                )
+            } else if let Some((payload, decoded)) =
+                targeted_selected_sparse_cache_capacities(&config)
+            {
+                (payload, decoded, true)
+            } else {
+                (0, 0, false)
+            };
+        let block_cache = (payload_capacity_bytes > 0).then(|| {
             Arc::new(NativeBlockPayloadCache::new(
-                config.cache.payload_capacity_bytes,
+                payload_capacity_bytes,
                 config.cache.shards,
             ))
         });
-        let decoded_cache = (config.cache.decoded_capacity_bytes > 0).then(|| {
+        let decoded_cache = (decoded_capacity_bytes > 0).then(|| {
             Arc::new(NativeBlockDecodedCache::new(
-                config.cache.decoded_capacity_bytes,
+                decoded_capacity_bytes,
                 config.cache.shards,
             ))
         });
-        let in_flight_payload_reads = native_in_flight_payload_reads_enabled()
+        let in_flight_payload_reads = fastpath::native_in_flight_payload_reads_enabled()
             .then(|| Arc::new(NativeInFlightPayloadReads::new()));
         Ok(Self {
             io,
@@ -53,8 +71,29 @@ impl NativeScheduledContext {
             block_cache,
             in_flight_payload_reads,
             decoded_cache,
+            cache_requires_targeted_command,
             executor,
         })
+    }
+
+    fn block_cache_for_command(
+        &self,
+        use_targeted_cache: bool,
+    ) -> Option<Arc<NativeBlockPayloadCache>> {
+        if self.cache_requires_targeted_command && !use_targeted_cache {
+            return None;
+        }
+        self.block_cache.clone()
+    }
+
+    fn decoded_cache_for_command(
+        &self,
+        use_targeted_cache: bool,
+    ) -> Option<Arc<NativeBlockDecodedCache>> {
+        if self.cache_requires_targeted_command && !use_targeted_cache {
+            return None;
+        }
+        self.decoded_cache.clone()
     }
 }
 
@@ -96,6 +135,7 @@ impl AccessStrategy {
         access_config: ScheduledAccessConfig,
         cancel: Arc<PrefetchCancel>,
         allow_small_command_grouping: bool,
+        use_targeted_cache: bool,
     ) -> DataBankResult<ScheduledBatchAccess> {
         match self {
             Self::Generic => build_generic_scheduled_access(access, items, access_config, cancel),
@@ -105,6 +145,7 @@ impl AccessStrategy {
                 access_config,
                 cancel,
                 allow_small_command_grouping,
+                use_targeted_cache,
             )
             .map(ScheduledBatchAccess::Native),
         }
@@ -156,7 +197,7 @@ pub(crate) async fn load_native_items_ordered_async(
 ) -> DataBankResult<Vec<Vec<u8>>> {
     let total_items = items.len();
     let batch = items.into_iter().enumerate().collect::<Vec<_>>();
-    let results = load_native_batch(native, batch, cancel).await;
+    let results = load_native_batch(native, batch, cancel, false).await;
     let mut ordered = (0..total_items).map(|_| None).collect::<Vec<_>>();
     for (seq, result) in results {
         if seq >= total_items {
@@ -243,6 +284,7 @@ impl NativeScheduledAccess {
         access_config: ScheduledAccessConfig,
         cancel: Arc<PrefetchCancel>,
         allow_small_command_grouping: bool,
+        use_targeted_cache: bool,
     ) -> DataBankResult<Self> {
         let window = native_window(&native.config, access_config);
         let (tx, rx) = flume::bounded(window.max(1));
@@ -252,6 +294,7 @@ impl NativeScheduledAccess {
             items,
             cancel,
             allow_small_command_grouping,
+            use_targeted_cache,
             window,
             tx,
         })?;
@@ -278,6 +321,7 @@ struct NativeScheduledCommand {
     items: Vec<AccessItem>,
     cancel: Arc<PrefetchCancel>,
     allow_small_command_grouping: bool,
+    use_targeted_cache: bool,
     window: usize,
     tx: flume::Sender<io::Result<Vec<u8>>>,
 }
@@ -430,6 +474,7 @@ fn native_scheduled_worker_loop(rx: flume::Receiver<NativeExecutorCommand>) {
                 match rx.try_recv() {
                     Ok(NativeExecutorCommand::Scheduled(next)) => {
                         if should_group_native_commands(&next)
+                            && next.use_targeted_cache == commands[0].use_targeted_cache
                             && total_items + next.items.len() <= max_items
                         {
                             total_items += next.items.len();
@@ -454,6 +499,7 @@ fn native_scheduled_worker_loop(rx: flume::Receiver<NativeExecutorCommand>) {
                 command.native,
                 command.items,
                 command.cancel,
+                command.use_targeted_cache,
                 command.window,
                 command.tx,
             ));
@@ -508,12 +554,12 @@ fn run_native_custom(runtime: &tokio::runtime::Runtime, command: NativeCustomCom
 }
 
 fn should_group_native_commands(command: &NativeScheduledCommand) -> bool {
-    let min_items = if native_group_single_item_commands_enabled() {
+    let min_items = if fastpath::native_group_single_item_commands_enabled() {
         1
     } else {
         2
     };
-    (command.allow_small_command_grouping || native_cross_command_grouping_enabled())
+    (command.allow_small_command_grouping || fastpath::native_command_grouping_enabled())
         && !command.cancel.is_cancelled()
         && !command.items.is_empty()
         && command.items.len() >= min_items
@@ -524,6 +570,7 @@ async fn run_native_scheduled(
     native: NativeScheduledContext,
     items: Vec<AccessItem>,
     cancel: Arc<PrefetchCancel>,
+    use_targeted_cache: bool,
     window: usize,
     tx: flume::Sender<io::Result<Vec<u8>>>,
 ) {
@@ -546,7 +593,7 @@ async fn run_native_scheduled(
                 source_done = true;
                 break;
             };
-            let batch_size = native_item_batch_size(&native);
+            let batch_size = native_item_batch_size_for_command(&native, use_targeted_cache);
             let mut batch = Vec::with_capacity(batch_size);
             batch.push(first);
             while batch.len() < batch_size {
@@ -558,7 +605,9 @@ async fn run_native_scheduled(
             }
             let native = native.clone();
             let cancel = Arc::clone(&cancel);
-            tasks.spawn(async move { load_native_batch(native, batch, cancel).await });
+            tasks.spawn(async move {
+                load_native_batch(native, batch, cancel, use_targeted_cache).await
+            });
         }
 
         // Reclaim every already-finished task without awaiting. On a
@@ -636,6 +685,7 @@ async fn load_native_batch(
     native: NativeScheduledContext,
     batch: Vec<(usize, AccessItem)>,
     cancel: Arc<PrefetchCancel>,
+    use_targeted_cache: bool,
 ) -> Vec<(usize, io::Result<Vec<u8>>)> {
     if cancel.is_cancelled() {
         return batch
@@ -652,9 +702,9 @@ async fn load_native_batch(
         Arc::clone(&native.io),
         native.config.load.coalesce.clone(),
         &native.index_cache,
-        native.block_cache.clone(),
+        native.block_cache_for_command(use_targeted_cache),
         native.in_flight_payload_reads.clone(),
-        native.decoded_cache.clone(),
+        native.decoded_cache_for_command(use_targeted_cache),
         &items,
         0,
     )
@@ -700,6 +750,7 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
         return;
     }
     let native = commands[0].native.clone();
+    let use_targeted_cache = commands[0].use_targeted_cache;
     let mut states = Vec::with_capacity(commands.len());
     let mut slots = Vec::new();
     let mut batch = Vec::new();
@@ -734,7 +785,7 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
     }
 
     if !batch.is_empty() {
-        let results = load_native_batch_uncancelled(native, batch).await;
+        let results = load_native_batch_uncancelled(native, batch, use_targeted_cache).await;
         for (flat_seq, result) in results {
             let Some(&(command_idx, item_idx)) = slots.get(flat_seq) else {
                 continue;
@@ -772,6 +823,7 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
 async fn load_native_batch_uncancelled(
     native: NativeScheduledContext,
     batch: Vec<(usize, AccessItem)>,
+    use_targeted_cache: bool,
 ) -> Vec<(usize, io::Result<Vec<u8>>)> {
     let items = batch
         .iter()
@@ -781,9 +833,9 @@ async fn load_native_batch_uncancelled(
         Arc::clone(&native.io),
         native.config.load.coalesce.clone(),
         &native.index_cache,
-        native.block_cache.clone(),
+        native.block_cache_for_command(use_targeted_cache),
         native.in_flight_payload_reads.clone(),
-        native.decoded_cache.clone(),
+        native.decoded_cache_for_command(use_targeted_cache),
         &items,
         0,
     )
@@ -829,15 +881,18 @@ fn native_window(config: &NativeAccessConfig, access_config: ScheduledAccessConf
         .min(access_window.max(config.fused_workers.max(1)))
 }
 
-fn native_item_batch_size(native: &NativeScheduledContext) -> usize {
-    if let Some(value) = std::env::var("SCDATA_NATIVE_ITEM_BATCH_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-    {
+fn native_item_batch_size_for_command(
+    native: &NativeScheduledContext,
+    use_targeted_cache: bool,
+) -> usize {
+    if let Some(value) = fastpath::native_item_batch_size() {
         return value.clamp(8, 4096);
     }
-    if native.block_cache.is_none() && native.decoded_cache.is_none() {
+    let command_uses_cache = native.block_cache_for_command(use_targeted_cache).is_some()
+        || native
+            .decoded_cache_for_command(use_targeted_cache)
+            .is_some();
+    if !command_uses_cache {
         return native
             .config
             .fused_workers
@@ -855,40 +910,46 @@ fn native_batch_multi_item_min() -> usize {
     8
 }
 
-fn native_small_command_group_max_items(native: &NativeScheduledContext) -> usize {
-    native_item_batch_size(native)
+fn native_small_command_group_max_items(
+    native: &NativeScheduledContext,
+    use_targeted_cache: bool,
+) -> usize {
+    native_item_batch_size_for_command(native, use_targeted_cache)
         .min(16)
         .max(native_batch_multi_item_min())
 }
 
 fn native_command_group_max_items(command: &NativeScheduledCommand) -> usize {
-    if native_cross_command_grouping_enabled() {
-        return std::env::var("SCDATA_NATIVE_COMMAND_GROUP_MAX_ITEMS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 1)
-            .unwrap_or_else(|| native_item_batch_size(&command.native).saturating_mul(4))
+    if fastpath::native_command_grouping_enabled() {
+        return fastpath::native_command_group_max_items()
+            .unwrap_or_else(|| {
+                native_item_batch_size_for_command(&command.native, command.use_targeted_cache)
+                    .saturating_mul(4)
+            })
             .clamp(native_batch_multi_item_min(), 4096);
     }
-    native_small_command_group_max_items(&command.native)
+    native_small_command_group_max_items(&command.native, command.use_targeted_cache)
 }
 
-fn native_cross_command_grouping_enabled() -> bool {
-    std::env::var("SCDATA_NATIVE_COMMAND_GROUPING")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-fn native_group_single_item_commands_enabled() -> bool {
-    std::env::var("SCDATA_NATIVE_GROUP_SINGLE_ITEM_COMMANDS")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-fn native_in_flight_payload_reads_enabled() -> bool {
-    std::env::var("SCDATA_NATIVE_INFLIGHT_PAYLOAD_READS")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
-        .unwrap_or(true)
+fn targeted_selected_sparse_cache_capacities(
+    config: &NativeAccessConfig,
+) -> Option<(usize, usize)> {
+    if !fastpath::native_targeted_selected_sparse_cache_enabled() {
+        return None;
+    }
+    let memory = config.memory_budget_bytes;
+    if memory == 0 {
+        return None;
+    }
+    let payload = fastpath::native_targeted_payload_cache_bytes()
+        .unwrap_or_else(|| (memory / 4).min(32 * 1024 * 1024 * 1024));
+    let decoded = fastpath::native_targeted_decoded_cache_bytes()
+        .unwrap_or_else(|| (memory / 2).min(64 * 1024 * 1024 * 1024));
+    if payload == 0 && decoded == 0 {
+        None
+    } else {
+        Some((payload, decoded))
+    }
 }
 
 #[cfg(test)]
@@ -1149,7 +1210,7 @@ mod tests {
             .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
         let batch = vec![(0_usize, short), (1, normal)];
 
-        let out = load_native_batch(ctx, batch, cancel).await;
+        let out = load_native_batch(ctx, batch, cancel, false).await;
 
         assert_eq!(out.len(), 2);
         let err = out[0].1.as_ref().expect_err("None must become io::Error");
@@ -1171,7 +1232,7 @@ mod tests {
             .with_slice_spec(SliceSpec::from_triples(vec![0, 0, 4]).expect("slice"));
         let batch = vec![(0_usize, item.clone()), (1, item)];
 
-        let out = load_native_batch(ctx, batch, cancel).await;
+        let out = load_native_batch(ctx, batch, cancel, false).await;
 
         assert_eq!(out.len(), 2);
         for (_, result) in &out {
@@ -1209,7 +1270,7 @@ mod tests {
             ),
         ];
 
-        let out = load_native_batch(ctx, batch, cancel).await;
+        let out = load_native_batch(ctx, batch, cancel, false).await;
 
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].1.as_ref().expect("ok").as_slice(), b"abcd");
@@ -1234,7 +1295,7 @@ mod tests {
         };
         let strategy = AccessStrategy::BloscLz4Native(ctx);
         let scheduled = strategy
-            .build(handle, items, access_config, cancel, false)
+            .build(handle, items, access_config, cancel, false, false)
             .expect("native build");
 
         let got = drain_timeout(scheduled, Duration::from_secs(5));

@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
 use std::thread;
+use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
@@ -182,6 +183,10 @@ pub struct ThreadedConfig {
     pub base: BaseIoConfig,
     /// Number of worker threads. Default: 8.
     pub num_workers: usize,
+    /// When greater than zero and multiple queue shards are configured,
+    /// threaded workers periodically scan sibling shards before sleeping on
+    /// their home queue. Default: 0 (disabled).
+    pub steal_interval_us: usize,
     /// Optional CPU affinity allow-list. When `Some`, workers are pinned to
     /// these CPUs round-robin, so `num_workers` may be greater than
     /// `cpus.len()`. When `None`, workers are left unpinned so the scheduler can
@@ -194,6 +199,7 @@ impl Default for ThreadedConfig {
         Self {
             base: BaseIoConfig::default(),
             num_workers: 8,
+            steal_interval_us: 0,
             cpus: None,
         }
     }
@@ -977,6 +983,12 @@ enum PopAttempt {
     ActiveFull,
 }
 
+pub(super) enum QueuePop {
+    Work(IoWork),
+    Timeout,
+    Shutdown,
+}
+
 impl QueueCore {
     #[cfg(test)]
     pub(super) fn new(priority_levels: usize, max_active: usize) -> Self {
@@ -1456,8 +1468,7 @@ impl QueueCore {
         }
     }
 
-    #[cfg(test)]
-    fn try_pop_for_test(&self) -> Option<IoWork> {
+    pub(super) fn try_pop(&self) -> Option<IoWork> {
         let mut inner = self.inner.lock().unwrap();
         match self.pop_ready_with_active_locked(&mut inner) {
             PopAttempt::Work(work) => {
@@ -1465,6 +1476,48 @@ impl QueueCore {
                 Some(self.profile_dispatched(work))
             }
             PopAttempt::NoReady | PopAttempt::ActiveFull => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn try_pop_for_test(&self) -> Option<IoWork> {
+        self.try_pop()
+    }
+
+    pub(super) fn pop_timeout(&self, timeout: Duration) -> QueuePop {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            match self.pop_ready_with_active_locked(&mut inner) {
+                PopAttempt::Work(work) => {
+                    drop(inner);
+                    return QueuePop::Work(self.profile_dispatched(work));
+                }
+                PopAttempt::NoReady => {}
+                PopAttempt::ActiveFull => {
+                    if inner.shutdown {
+                        return QueuePop::Shutdown;
+                    }
+                    drop(inner);
+                    if self
+                        .active_limiter
+                        .wait_for_capacity_until(|| self.is_shutdown())
+                    {
+                        return QueuePop::Shutdown;
+                    }
+                    inner = self.inner.lock().unwrap();
+                    continue;
+                }
+            }
+
+            if inner.shutdown {
+                return QueuePop::Shutdown;
+            }
+
+            let (next, wait) = self.available.wait_timeout(inner, timeout).unwrap();
+            inner = next;
+            if wait.timed_out() {
+                return QueuePop::Timeout;
+            }
         }
     }
 
@@ -2985,6 +3038,7 @@ mod tests {
                 assume_non_overlapping_reads: false,
             },
             num_workers: 2,
+            steal_interval_us: 0,
             cpus: None,
         }))
         .expect("create pool")
@@ -3546,6 +3600,7 @@ mod tests {
                 assume_non_overlapping_reads: false,
             },
             num_workers: 4,
+            steal_interval_us: 0,
             cpus: None,
         });
 
@@ -3577,6 +3632,7 @@ mod tests {
                 assume_non_overlapping_reads: false,
             },
             num_workers: 4,
+            steal_interval_us: 0,
             cpus: None,
         }))
         .expect("create constrained pool");
@@ -3844,6 +3900,7 @@ mod tests {
                 assume_non_overlapping_reads: false,
             },
             num_workers: 4,
+            steal_interval_us: 0,
             cpus: None,
         }))
         .expect("create sharded pool");
@@ -4798,6 +4855,7 @@ mod tests {
         let config = ThreadedConfig {
             base: BaseIoConfig::default(),
             num_workers: 8,
+            steal_interval_us: 0,
             cpus: Some(vec![0, 1]),
         };
         config.validate().expect("workers may exceed cpu count");

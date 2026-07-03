@@ -899,6 +899,7 @@ fn scheduled_prefetch_waits_when_iopool_queue_is_full() {
                 assume_non_overlapping_reads: false,
             },
             num_workers: 1,
+            steal_interval_us: 0,
             cpus: None,
         }),
         ..DataBankConfig::default()

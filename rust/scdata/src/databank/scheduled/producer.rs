@@ -4,6 +4,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crate::access::{AccessHandle, AccessItem, PrefetchCancel, ScheduledAccessConfig};
+use crate::env::fastpath;
 use crate::profile::ProfileTimer;
 
 use super::super::array::DataValue;
@@ -511,12 +512,14 @@ pub(crate) fn make_prefetch_request_job(
                 // span — do not move it into AccessStrategy::build.
                 let schedule_started = profiler.start_request_schedule();
                 let strategy_for_response = strategy.clone();
+                let use_targeted_cache = batch_plan_uses_targeted_selected_sparse_cache(&plan);
                 let scheduled_result = strategy.build(
                     access.clone(),
                     items,
                     access_config,
                     Arc::clone(&cancel),
                     false,
+                    use_targeted_cache,
                 );
                 profiler.record_request_schedule(schedule_started);
                 let scheduled = scheduled_result?;
@@ -558,7 +561,7 @@ fn preplan_selected_sparse_request(
     plan: &mut BatchPlan,
     items: &mut Vec<AccessItem>,
 ) -> DataBankResult<()> {
-    if !preplan_selected_sparse_enabled()
+    if !fastpath::preplan_selected_sparse_enabled()
         || projected_sparse_data_strategy != ProjectedSparseDataGroupStrategy::SelectedOnly
     {
         return Ok(());
@@ -652,6 +655,7 @@ fn preplan_single_selected_sparse_request(
         access_config,
         Arc::clone(&cancel),
         false,
+        false,
     )?;
     let index_bytes =
         load_sparse_prefetch_indices(access, &cancel, profiler, sparse_plan, &mut index_scheduled)?;
@@ -670,7 +674,7 @@ fn preplan_single_selected_sparse_request(
 
     let selected_plan =
         plan_sparse_selected_data_batch(dataset, sparse_plan, index_bytes.as_ref(), gene_axis)?;
-    let defer_selected_data = preplan_selected_sparse_defer_data_enabled()
+    let defer_selected_data = fastpath::preplan_selected_sparse_defer_data_enabled()
         && can_defer_selected_sparse_data_to_response(strategy);
     *sparse_plan = selected_plan;
     *preloaded_index_bytes = Some(Arc::from(index_bytes.into_boxed_slice()));
@@ -728,16 +732,30 @@ fn selected_sparse_data_deferred_to_response(
         && plan.index_pieces.is_empty()
 }
 
-fn preplan_selected_sparse_enabled() -> bool {
-    std::env::var("SCDATA_PREPLAN_SELECTED_SPARSE")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
-        .unwrap_or(true)
+fn batch_plan_uses_targeted_selected_sparse_cache(plan: &BatchPlan) -> bool {
+    match plan {
+        BatchPlan::Single { plan, .. } => single_plan_uses_targeted_selected_sparse_cache(plan),
+        BatchPlan::Multi(multi) => multi
+            .parts
+            .iter()
+            .any(|part| single_plan_uses_targeted_selected_sparse_cache(&part.plan)),
+    }
 }
 
-fn preplan_selected_sparse_defer_data_enabled() -> bool {
-    std::env::var("SCDATA_PREPLAN_SELECTED_SPARSE_DEFER_DATA")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
+fn single_plan_uses_targeted_selected_sparse_cache(plan: &SingleDatasetPlan) -> bool {
+    match plan {
+        SingleDatasetPlan::Sparse {
+            plan,
+            preloaded_index_bytes,
+            selected_data_scheduled,
+            ..
+        } => {
+            preloaded_index_bytes.is_some()
+                && *selected_data_scheduled
+                && !plan.data_groups.is_empty()
+        }
+        SingleDatasetPlan::Dense { .. } => false,
+    }
 }
 
 /// Whether selected sparse data can be deferred to the response phase.

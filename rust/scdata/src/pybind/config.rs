@@ -224,6 +224,16 @@ impl PyThreadedConfig {
     }
 
     #[getter]
+    fn steal_interval_us(&self) -> usize {
+        self.inner.steal_interval_us
+    }
+
+    #[setter]
+    fn set_steal_interval_us(&mut self, value: usize) {
+        self.inner.steal_interval_us = value;
+    }
+
+    #[getter]
     fn cpus(&self) -> Option<Vec<usize>> {
         self.inner.cpus.clone()
     }

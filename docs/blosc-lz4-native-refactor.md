@@ -3131,3 +3131,175 @@ in-flight-on:
   定位的结构性问题: random 的 touched block / IO call 放大，以及 sequential 的 output
   materialization / ordered drain。这个 completion ordering fix 不改变这些上限，但为后续
   targeted in-flight / window-local sharing 打开了默认安全路径。
+
+### 19.26 64K blocksize recompression retest
+
+用户将 32 个真实数据集重新压缩，Blosc native blocksize 从旧的 `256 KiB` 降到
+`64 KiB`。本轮在同一 worker `ms-0701-210140-1018388-nknq4` 上重新评测 full-catalog
+cache-off random 和 sequential。测试仍覆盖 32 datasets、`4,268,896` cells、all batches；
+cache 诊断路径保持关闭:
+
+- `--native-cache-payload-bytes 0`
+- `--native-cache-decoded-bytes 0`
+- unset `SCDATA_NATIVE_BLOCK_CACHE_BYTES`
+- unset `SCDATA_NATIVE_DECODED_BLOCK_CACHE_BYTES`
+
+真实 GPFS no-profile full all:
+
+| run | order | dtype | measured / seen | batch/s | output GB/s | setup s | avg cores | util | checksum |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `outputs/native-runs/retest64k-random-cacheoff-allbatches-20260703-151216.jsonl` | random | stored -> u32 | `33287 / 33351` | 626.33 | 1.314 | 14.670 | 22.32 | 23.25% | 2381 |
+| `outputs/native-runs/retest64k-sequential-u16-cacheoff-allbatches-r2-20260703-151618.jsonl` | sequential | u16 | `33287 / 33351` | 18294.18 | 19.183 | 0.237 | 56.10 | 58.44% | 2514 |
+
+sequential 第一次 no-profile run
+`outputs/native-runs/retest64k-sequential-u16-cacheoff-allbatches-20260703-151404.jsonl`
+为 `15956.92 batch/s`，随后 profile full all 与重复 no-profile 分别为 `18355.53` 和
+`18294.18 batch/s`，因此第一次结果按短时 GPFS/调度抖动处理。
+
+profile 诊断:
+
+| run | order | measured batches | batch/s | read MiB | read MiB/batch | IO calls | ops/batch | note |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `outputs/native-runs/profile64k-random-cacheoff-m8192-20260703-151439.jsonl` | random | 8192 | 448.98 | 131628.34 | 16.07 | 2079848 | 253.89 | profile overhead included |
+| `outputs/native-runs/profile64k-sequential-u16-cacheoff-allbatches-20260703-151552.jsonl` | sequential | 33287 | 18355.53 | 15969.83 | 0.480 | 89749 | 2.70 | profile overhead small |
+
+和旧 profile 证据对比:
+
+- random old 256K-ish state: `~30.27 MiB/batch`, `~255.05 ops/batch`。
+- random 64K state: `16.07 MiB/batch`, `253.89 ops/batch`。
+- sequential old best profile: `~0.67 MiB/batch`, `~2.78 ops/batch`。
+- sequential 64K state: `0.480 MiB/batch`, `2.70 ops/batch`。
+
+结论:
+
+- 64K blocksize 确实把 random cache-off 物理读字节约减半，但没有降低每 batch 的
+  IO call 数。full random 从旧 `~588-591 batch/s` 提升到 `626.33 batch/s`，只提升
+  `~6%`，说明当前 random 仍被 `~254 ops/batch` 的小 IO / queue wait / dataset part
+  调度延迟限制，而不是单纯 payload 字节数。
+- sequential 受益更直接，重复 no-profile 达到 `18294.18 batch/s`，高于旧
+  `17633-17736 batch/s` guardrail，但仍未达到用户当前要求的 `20000 batch/s`。
+- 这次复测更新了后续优化的基准: random 目标 `2000 batch/s` 不能只靠 blocksize 缩小，
+  必须继续减少 random full 的 touched block / IO calls，或做 window-local block/decoded
+  reuse；sequential 距离 `20000` 还差约 `9%`，更可能通过降低 output materialization /
+  ordered drain 开销补齐。
+
+### 19.27 Off-cache random optimization direction
+
+从本节开始，主优化目标重新收敛到完全随机、cache-off 的生产口径。payload / decoded block
+cache 已经证明可以提升随机吞吐，但 cache 命中强依赖数据分布、访问随机性、cache size 与
+total working set 比例，因此不能作为 random off-cache 目标达成证据。cache 路径后续只保留为
+诊断工具，用来确认重复 block reuse 的理论上限，不作为主线验收。
+
+当前瓶颈判断:
+
+- random cache-off 仍然是 IO-bound，但瓶颈已经从 payload 带宽转移到小随机 IO 的
+  KOPS / latency / 调度开销。64K blocksize 将 read bytes/batch 从 `~30.27 MiB` 降到
+  `16.07 MiB`，但 IO ops/batch 仍为 `253.89`，full random 只从 `~590` 提到
+  `626.33 batch/s`。
+- 当前 GPFS 后端本身未证明达到 KOPS 极限；更可能是 scdata IO 模块在单位线程可产出的
+  IO 操作数上不够高效，包括 threaded 阻塞 IO、队列/锁争用、completion 排队和跨阶段
+  backpressure。
+- 因为 random 平均 CPU 只用到约 `22-34` cores，系统不是 CPU 算满，而是在 IO submit /
+  completion / response ordered drain 之间出现等待气泡。
+
+后续 off-cache random 优化方向:
+
+1. 提高单位线程 IO ops 产出。优化 iopool 的 submit/completion 热路径，减少互相持锁、
+   阻塞线程和队列唤醒开销；threaded 后端必须能以更少线程提交更多小随机读。`io_uring`
+   可以继续作为实验后端，但不能依赖它作为唯一方案，因为它依赖 OS/kernel 配置，也可能受到
+   uring 上限影响。
+2. 降低 IO 模块线程资源占用。IO 层用更少线程打出更高 KOPS 后，释放出的 CPU/core budget
+   应转给 request / response / assemble 任务，避免随机路径在 IO 等待缓解后又被 response
+   scatter、output materialization 或 ordered drain 接住。
+3. 打通 IO 与处理流水。减少 request、native load、response assemble 之间的气泡，尤其是
+   多 dataset part、小 range、ordered completion 下的并发阻塞；优先尝试无锁或少锁数据结构、
+   sharded queues、批量 completion drain、减少跨线程往返和不必要的 wakeup。
+4. 继续减少 off-cache IO ops/batch。虽然本节重点是提高 KOPS，但与 touched block / request
+   graph 优化正交；任何能在不依赖 cache 的情况下减少 `~254 ops/batch` 的改动仍然优先。
+
+验收和回退规则:
+
+- 主验收必须使用 cache-off 参数:
+  `--native-cache-payload-bytes 0`、`--native-cache-decoded-bytes 0`，并 unset
+  `SCDATA_NATIVE_BLOCK_CACHE_BYTES` / `SCDATA_NATIVE_DECODED_BLOCK_CACHE_BYTES`。
+- 每个优化必须在同一 worker、同一 32-dataset full-catalog random 口径下实测；
+  profile 结果要同时报告 `read MiB/batch`、`IO ops/batch`、`batch/s`、CPU cores 和 setup。
+- 负优化必须回退；如果改动对不同后端或数据分布有不确定性，只能默认关闭并作为显式开关。
+- sequential guardrail 必须同时保留。random IO 优化不能显著降低 sequential 当前
+  `~18.3k batch/s` off-cache 水平。
+
+### 19.28 IoPool read-fastpath and queue-shard A/B
+
+本轮围绕 19.27 的 KOPS 判断做第一组 off-cache 实测。代码改动:
+
+- `profile_real_access` 增加可追溯 iopool 参数:
+  `--io-max-in-flight`、`--io-queue-capacity`、`--io-queue-shards`、
+  `--io-assume-non-overlapping-reads`。
+- `SCDATA_NATIVE_TARGETED_SELECTED_SPARSE_CACHE` 改为默认关闭；只有显式设置
+  `1/true/yes/on` 时才启用 targeted cache，避免 `--native-cache-* 0` 的 off-cache
+  评测被 cache 路径污染。
+
+验证:
+
+```bash
+cargo fmt --manifest-path rust/scdata/Cargo.toml
+cargo check --manifest-path rust/scdata/Cargo.toml --no-default-features --features profile --bin profile_real_access --offline
+cargo build --manifest-path rust/scdata/Cargo.toml --release --no-default-features --features profile --bin profile_real_access --offline
+cargo test --manifest-path rust/scdata/Cargo.toml --lib iopool --no-default-features --features pybind-bench --offline
+cargo test --manifest-path rust/scdata/Cargo.toml --lib scheduled --no-default-features --features pybind-bench --offline
+```
+
+结果:
+
+- iopool unit tests: `42 passed`
+- scheduled unit tests: `45 passed`
+
+所有 worker 测试均为 32 datasets、`4,268,896` cells、`genes=4096`、batch128、
+cache-off:
+
+- `--native-cache-payload-bytes 0`
+- `--native-cache-decoded-bytes 0`
+- `SCDATA_NATIVE_TARGETED_SELECTED_SPARSE_CACHE=0`
+- unset `SCDATA_NATIVE_BLOCK_CACHE_BYTES`
+- unset `SCDATA_NATIVE_DECODED_BLOCK_CACHE_BYTES`
+
+8192-batch random short sweep:
+
+| run dir | config | batch/s | output GB/s | setup s | avg cores | checksum |
+|---|---|---:|---:|---:|---:|---:|
+| `outputs/native-runs/iopool64k-random-sweep-20260703-161614/baseline.jsonl` | current: shard1, ordered reads | 484.45 | 1.016 | 17.355 | 20.60 | 719 |
+| `outputs/native-runs/iopool64k-random-sweep-20260703-161614/fastread-shard1.jsonl` | fast-read, shard1 | 627.21 | 1.315 | 14.092 | 43.34 | 719 |
+| `outputs/native-runs/iopool64k-random-sweep-20260703-161614/fastread-shard8.jsonl` | fast-read, shard8 | 1087.47 | 2.281 | 9.839 | 48.48 | 719 |
+| `outputs/native-runs/iopool64k-random-sweep-20260703-161614/fastread-shard16.jsonl` | fast-read, shard16 | 1040.29 | 2.182 | 10.818 | 44.07 | 719 |
+
+Full-catalog random/sequential guardrail:
+
+| run | order | config | measured / seen | batch/s | output GB/s | setup s | avg cores | checksum |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| `outputs/native-runs/iopool64k-fastread-shard8-full-20260703-161911/random-full.jsonl` | random | fast-read, shard8, io48 | `33287 / 33351` | 1321.05 | 2.770 | 8.132 | 47.92 | 2381 |
+| `outputs/native-runs/iopool64k-fastread-shard8-full-20260703-161911/sequential-full.jsonl` | sequential | fast-read, shard8, io48 | `33287 / 33351` | 14293.55 | 14.988 | 0.237 | 37.19 | 2514 |
+
+第二轮 random tuning:
+
+| run dir | config | batch/s | note |
+|---|---|---:|---|
+| `outputs/native-runs/iopool64k-random-fastread-sweep2-20260703-162049/i64-if1024-q4096-s8.jsonl` | io64, in-flight1024, shard8 | 1069.10 | more IO threads did not improve |
+| `outputs/native-runs/iopool64k-random-fastread-sweep2-20260703-162049/i64-if2048-q8192-s8.jsonl` | io64, in-flight2048, shard8 | 1047.65 | deeper queue did not improve |
+| `outputs/native-runs/iopool64k-random-fastread-sweep2-20260703-162049/i80-if2048-q8192-s8.jsonl` | io80, in-flight2048, shard8 | 1055.35 | more IO threads still flat |
+| `outputs/native-runs/iopool64k-random-fastread-sweep2-20260703-162049/i64-if2048-q8192-s4.jsonl` | io64, shard4 | 988.60 | fewer shards increases lock contention |
+| `outputs/native-runs/iopool64k-random-fastread-sweep2-20260703-162049/i64-if2048-q8192-s12.jsonl` | io64, shard12 | 1040.13 | above shard8 does not help |
+
+结论:
+
+- 这组实测确认 random off-cache 的主瓶颈确实在 iopool KOPS / ordering / lock
+  coordination。只打开 read-fastpath 就把短测从 `484.45` 提到 `627.21`；再加 8 shards
+  提到 `1087.47`。full-catalog random 从 64K cache-off baseline `626.33` 提到
+  `1321.05 batch/s`，为当前最强 no-cache 结果。
+- 该优化不是最终解。`1321.05` 仍低于 `2000 batch/s`，说明剩余缺口不靠继续增加
+  blocking IO threads 或队列深度解决；`io64/io80` 和 `max_in_flight=2048` 都是负向或持平。
+- fast-read + shards 不能作为全局默认，因为 sequential full all 从 `18294.18` 降到
+  `14293.55 batch/s`。原因是当前 threaded backend 将 worker 固定分配到 queue shard；
+  sequential 主要访问单一文件/少数 shard，会被每 shard worker 数限制。
+- 后续正确方向是实现 read-only/adaptive iopool: random 多文件时使用 fast-read + shards；
+  sequential 单文件/少文件时保持 shard1，或在线程池层增加 work stealing / shared wait，
+  避免 sharding 后单 shard 被固定 worker 数限速。

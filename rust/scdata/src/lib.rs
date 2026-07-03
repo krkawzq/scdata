@@ -1,6 +1,8 @@
 #[cfg(feature = "python-extension")]
 use pyo3::prelude::*;
 
+mod env;
+
 pub mod access;
 pub mod codecs;
 pub mod databank;
