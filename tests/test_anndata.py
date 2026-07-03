@@ -28,6 +28,15 @@ def _write_json(path: Path, obj) -> None:
     path.write_text(json.dumps(obj), encoding="utf-8")
 
 
+def _blosc_blocksize(path: Path) -> int:
+    """Return the ``blocksize`` written into a node's Blosc codec config."""
+    meta = _read_json(path / "zarr.json")
+    for codec in meta["codecs"]:
+        if codec.get("name") == "blosc":
+            return int(codec["configuration"]["blocksize"])
+    raise AssertionError(f"no blosc codec in {path}/zarr.json")
+
+
 @pytest.fixture
 def dense_adata():
     return ad.AnnData(
@@ -137,7 +146,7 @@ def test_write_zarr_sparse_rectilinear_registers_with_databank(
         chunk_size=(4,),
         align_cells=True,
         store="dir",
-        blocksize=0,
+        blocksize=None,
     )
 
     ds = launch(root)
@@ -153,7 +162,7 @@ def test_write_zarr_sparse_rectilinear_registers_with_databank(
             "cname": "lz4",
             "clevel": 5,
             "shuffle": "shuffle",
-            "blocksize": 0,
+            "blocksize": 64 * 1024,
         },
     }
     assert ds.data.codec.compressor == {
@@ -161,7 +170,7 @@ def test_write_zarr_sparse_rectilinear_registers_with_databank(
         "cname": "lz4",
         "clevel": 5,
         "shuffle": 1,
-        "blocksize": 0,
+        "blocksize": 64 * 1024,
         "typesize": 4,
     }
     assert tuple(np.asarray(ds.indptr).tolist()) == tuple(matrix.indptr.tolist())
@@ -179,6 +188,84 @@ def test_write_zarr_rejects_unknown_compressor(tmp_path: Path, sparse_adata) -> 
             align_cells=True,
             store="dir",
             compressor="blocs.lz4.level5",
+        )
+
+
+def test_write_zarr_blocksize_default_is_64kib(tmp_path: Path, dense_adata) -> None:
+    """``None`` and ``0`` both select the scdata default (64 KiB), not Blosc auto."""
+    for bs in (None, 0):
+        root = write_zarr(
+            dense_adata,
+            tmp_path / f"dense_{bs}.zarr",
+            format="dense2d",
+            chunk_size=(2, 2),
+            store="dir",
+            blocksize=bs,
+        )
+        assert _blosc_blocksize(root / "X") == 64 * 1024
+
+
+def test_write_zarr_blocksize_positive_passes_through(tmp_path: Path, dense_adata) -> None:
+    """A positive ``blocksize`` overrides the default verbatim, even below 64 KiB.
+
+    Values under 64 KiB are not rejected here; numcodecs raises them to 64 KiB
+    at encode time.  The Blosc block size also propagates to CSR ``indptr`` /
+    ``indices`` / ``data`` when ``format="sparse"``.
+    """
+    root = write_zarr(
+        dense_adata,
+        tmp_path / "dense_128k.zarr",
+        format="dense2d",
+        chunk_size=(2, 2),
+        store="dir",
+        blocksize=128 * 1024,
+    )
+    assert _blosc_blocksize(root / "X") == 128 * 1024
+
+    root_small = write_zarr(
+        dense_adata,
+        tmp_path / "dense_1k.zarr",
+        format="dense2d",
+        chunk_size=(2, 2),
+        store="dir",
+        blocksize=1024,
+    )
+    assert _blosc_blocksize(root_small / "X") == 1024
+
+
+def test_write_zarr_blocksize_overrides_mapping_and_rejects_negative(
+    tmp_path: Path, sparse_adata
+) -> None:
+    """The public ``blocksize`` is the single source — a blocksize embedded in a
+    ``compressor`` mapping is ignored.  Negative values raise ``StoreError``.
+    """
+    adata, _ = sparse_adata
+    compressor = {"id": "blosc", "configuration": {"blocksize": 32768, "cname": "lz4"}}
+
+    root = write_zarr(
+        adata,
+        tmp_path / "override.zarr",
+        format="sparse",
+        chunk_size=(4,),
+        align_cells=True,
+        store="dir",
+        compressor=compressor,
+        blocksize=128 * 1024,
+    )
+    # Mapping's 32768 is ignored; the public argument wins on every CSR array.
+    assert _blosc_blocksize(root / "X" / "indptr") == 128 * 1024
+    assert _blosc_blocksize(root / "X" / "indices") == 128 * 1024
+    assert _blosc_blocksize(root / "X" / "data") == 128 * 1024
+
+    with pytest.raises(StoreError, match="blocksize must be non-negative"):
+        write_zarr(
+            adata,
+            tmp_path / "negative.zarr",
+            format="sparse",
+            chunk_size=(4,),
+            align_cells=True,
+            store="dir",
+            blocksize=-1,
         )
 
 

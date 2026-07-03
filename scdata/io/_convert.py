@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
 
 from scdata.io._anndata import (
-    _DEFAULT_BLOCKSIZE,
     _DEFAULT_CHUNK_ELEMENTS,
     _DEFAULT_COMPRESSOR,
     _Compressor,
@@ -99,9 +98,10 @@ class AnnDataZarrZipConverter:
     storage while making both registerable by scdata.
 
     Chunks are compressed by default using ``"blosc.lz4.level5"``.  Pass
-    ``compressor=None`` to write uncompressed chunks.  ``blocksize`` defaults
-    to 64 KiB on every compressed array; set it to ``0`` to leave the block
-    size to Blosc, or to a positive number of bytes to override.
+    ``compressor=None`` to write uncompressed chunks.  ``blocksize`` is the
+    Blosc block size in bytes — the single block-size knob, applied only when
+    the compressor is Blosc and silently ignored otherwise.  ``None`` and ``0``
+    select the scdata default (64 KiB); a positive value is used verbatim.
     """
 
     smart: bool = True
@@ -110,7 +110,7 @@ class AnnDataZarrZipConverter:
     align_cells: bool = True
     layer_format: _LayerFormat = "preserve"
     compressor: _Compressor = _DEFAULT_COMPRESSOR
-    blocksize: int = _DEFAULT_BLOCKSIZE
+    blocksize: int | None = None
     output_dir: str | os.PathLike[str] | None = None
     overwrite: bool = True
     read_kwargs: Mapping[str, Any] = field(default_factory=dict)

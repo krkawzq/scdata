@@ -57,10 +57,11 @@ _SCDATA_SHAPE_2D = "scdata-shape-2d"
 # Default chunk element count when ``chunk_size`` is an int.
 _DEFAULT_CHUNK_ELEMENTS = 1_000_000
 _DEFAULT_COMPRESSOR = "blosc.lz4.level5"
-# Default Blosc block size in bytes. 64 KiB bounds read amplification for
-# random partial access on the native fast path while keeping compression
-# ratio near Blosc's auto-selected value. ``0`` (Blosc auto) remains the
-# per-call escape hatch.
+# Default Blosc block size in bytes (64 KiB).  Bounds read amplification for
+# random partial access on the native fast path while keeping the compression
+# ratio near Blosc's auto-selected value.  Selected when the public
+# ``blocksize`` argument is ``None`` or ``0``.  numcodecs raises any value
+# below 64 KiB to 64 KiB internally, so this is the smallest effective value.
 _DEFAULT_BLOCKSIZE = 64 * 1024
 
 
@@ -121,11 +122,15 @@ def write_zarr(
     blocksize:
         Blosc block size in bytes, applied to every Blosc-compressed array
         (``X``, ``layers``, ``raw.X``, and CSR ``indptr`` / ``indices`` /
-        ``data``).  Defaults to ``64 * 1024`` (64 KiB), which bounds read
-        amplification for random partial access on the native fast path.
-        ``0`` lets Blosc pick the block size; a positive value overrides any
-        blocksize embedded in ``compressor``.  Ignored when ``compressor`` is
-        ``None``.
+        ``data``).  This is the single block-size knob: any ``blocksize``
+        embedded in ``compressor`` (e.g. a mapping) is overridden by it.
+        Only takes effect when ``compressor`` resolves to Blosc; for any
+        other compressor it is silently ignored.  Defaults to ``64 * 1024``
+        (64 KiB), which bounds read amplification for random partial access
+        on the native fast path.  Pass ``0`` to let numcodecs/Blosc pick the
+        block size automatically; a positive value is used verbatim.
+        numcodecs raises any value below 64 KiB to 64 KiB, so smaller values
+        are not an error — no lower bound is enforced here.
     """
     import zarr
     from anndata._io.specs import write_elem
@@ -227,7 +232,7 @@ def _write_x(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
-    blocksize: int = 0,
+    blocksize: int | None = None,
 ) -> None:
     """Write the X array/group in the requested layout."""
     _write_matrix(
@@ -252,7 +257,7 @@ def _write_layers(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
-    blocksize: int = 0,
+    blocksize: int | None = None,
 ) -> None:
     """Write all AnnData layers using the same scdata matrix layouts as X."""
     if not adata.layers:
@@ -284,7 +289,7 @@ def _write_raw(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
-    blocksize: int = 0,
+    blocksize: int | None = None,
 ) -> None:
     """Write ``adata.raw`` so ``raw.X`` uses the same scdata layout as ``X``.
 
@@ -331,7 +336,7 @@ def _write_matrix(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
-    blocksize: int = 0,
+    blocksize: int | None = None,
 ) -> None:
     """Write one dense or CSR matrix under ``g[name]`` in a scdata layout."""
     from scipy import sparse as _sparse
@@ -447,7 +452,7 @@ def _create_dense_array(
     *,
     attrs: dict[str, Any],
     compressor: _Compressor,
-    blocksize: int = 0,
+    blocksize: int | None = None,
 ) -> None:
     """Create a v3 dense array with the scdata default codec pipeline."""
     from zarr.codecs import BytesCodec
@@ -476,7 +481,7 @@ def _write_csr_group(
     chunk_size: int | list[int] | tuple[int, ...],
     align_cells: bool,
     compressor: _Compressor,
-    blocksize: int = 0,
+    blocksize: int | None = None,
 ) -> None:
     """Write a CSR matrix as an anndata-compatible v3 group.
 
@@ -608,7 +613,7 @@ def _write_rectilinear_array(
     dtype: Any,
     *,
     compressor: _Compressor,
-    blocksize: int = 0,
+    blocksize: int | None = None,
 ) -> None:
     """Write a 1D array with a rectilinear (variable-length) chunk grid.
 
@@ -805,11 +810,11 @@ def _v3_bytes_codecs(np_dtype: np.dtype) -> list[dict[str, Any]]:
 
 
 def _v3_codecs(
-    np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int = 0
+    np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int | None = None
 ) -> list[dict[str, Any]]:
     """Return the v3 serializer plus optional BytesBytes compressor codecs."""
     codecs = _v3_bytes_codecs(np_dtype)
-    cfg = _compressor_config(compressor, np_dtype, blocksize_override=blocksize)
+    cfg = _compressor_config(compressor, np_dtype, blocksize=blocksize)
     if cfg is None:
         return codecs
     if cfg["id"] == "blosc":
@@ -830,10 +835,10 @@ def _v3_codecs(
 
 
 def _zarr_compressors(
-    np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int = 0
+    np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int | None = None
 ) -> tuple[Any, ...]:
     """Return zarr v3 BytesBytes codec objects for dense arrays."""
-    cfg = _compressor_config(compressor, np_dtype, blocksize_override=blocksize)
+    cfg = _compressor_config(compressor, np_dtype, blocksize=blocksize)
     if cfg is None:
         return ()
     if cfg["id"] == "blosc":
@@ -852,10 +857,10 @@ def _zarr_compressors(
 
 
 def _encode_chunk_bytes(
-    raw: bytes, np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int = 0
+    raw: bytes, np_dtype: np.dtype, compressor: _Compressor, *, blocksize: int | None = None
 ) -> bytes:
     """Apply the write compressor to one manually-written chunk."""
-    cfg = _compressor_config(compressor, np_dtype, blocksize_override=blocksize)
+    cfg = _compressor_config(compressor, np_dtype, blocksize=blocksize)
     if cfg is None:
         return raw
     if cfg["id"] == "blosc":
@@ -873,18 +878,42 @@ def _encode_chunk_bytes(
     raise StoreError(f"unsupported compressor id: {cfg['id']!r}")
 
 
+def _resolve_blocksize(blocksize: int | None) -> int:
+    """Resolve the public ``blocksize`` argument for the numcodecs Blosc config.
+
+    ``None`` and ``0`` mean "let numcodecs/Blosc pick the block size" — they
+    are passed through as ``0`` so Blosc selects automatically (its documented
+    behavior).  Any positive value is used verbatim.  numcodecs raises values
+    below 64 KiB to 64 KiB internally, so no lower bound is enforced here —
+    only negatives are rejected.
+
+    The scdata default block size (``_DEFAULT_BLOCKSIZE``) is applied by
+    :func:`write_zarr`'s parameter default, not here: callers who explicitly
+    pass ``0`` or ``None`` are asking for Blosc's automatic choice, not for
+    scdata's default.
+    """
+    if blocksize is None or blocksize == 0:
+        return 0
+    value = int(blocksize)
+    if value < 0:
+        raise StoreError(f"blosc blocksize must be non-negative, got {blocksize}")
+    return value
+
+
 def _compressor_config(
     compressor: _Compressor,
     np_dtype: np.dtype,
     *,
-    blocksize_override: int = 0,
+    blocksize: int | None = None,
 ) -> dict[str, Any] | None:
     """Normalize public compressor input to a numcodecs-compatible config.
 
-    When ``blocksize_override`` is positive and the resolved compressor is
-    Blosc, it overrides any blocksize embedded in ``compressor`` (whether from
-    a mapping or the default).  A zero override leaves the compressor's own
-    blocksize untouched, preserving the previous behavior.
+    ``blocksize`` is the single explicit block-size knob.  It is applied only
+    when the resolved compressor is Blosc; for any other compressor it is
+    silently ignored.  ``None`` and ``0`` pass through to Blosc as ``0``
+    (Blosc picks the block size automatically); a positive value is used
+    verbatim.  Any ``blocksize`` embedded in ``compressor`` (e.g. a mapping)
+    is overridden — there is only one blocksize source.
     """
     if compressor is None:
         return None
@@ -897,12 +926,8 @@ def _compressor_config(
             "compressor must be None, a string such as 'blosc.lz4.level5', "
             f"or a mapping, got {type(compressor).__name__}"
         )
-    if (
-        cfg is not None
-        and cfg.get("id") == "blosc"
-        and int(blocksize_override) > 0
-    ):
-        cfg["blocksize"] = int(blocksize_override)
+    if cfg is not None and cfg.get("id") == "blosc":
+        cfg["blocksize"] = _resolve_blocksize(blocksize)
     return cfg
 
 
@@ -948,12 +973,13 @@ def _compressor_config_from_mapping(
     cfg = value.get("configuration")
     options = dict(cfg) if isinstance(cfg, Mapping) else dict(value)
     if codec_id == "blosc":
+        # ``blocksize`` in the mapping is intentionally ignored: the public
+        # ``blocksize`` argument is the single source (see _compressor_config).
         return _blosc_config(
             np_dtype=np_dtype,
             cname=str(options.get("cname", "lz4")),
             clevel=int(options.get("clevel", options.get("level", 5))),
             shuffle=options.get("shuffle", 1),
-            blocksize=int(options.get("blocksize", 0)),
             typesize=int(options.get("typesize", np_dtype.itemsize)),
         )
     raise StoreError(f"unsupported compressor id: {codec_id!r}")
@@ -965,22 +991,21 @@ def _blosc_config(
     cname: str = "lz4",
     clevel: int = 5,
     shuffle: int | str | None = 1,
-    blocksize: int = 0,
     typesize: int | None = None,
 ) -> dict[str, Any]:
     if not 0 <= int(clevel) <= 9:
         raise StoreError(f"blosc clevel must be between 0 and 9, got {clevel}")
-    if int(blocksize) < 0:
-        raise StoreError(f"blosc blocksize must be non-negative, got {blocksize}")
     parsed_typesize = int(np_dtype.itemsize if typesize is None else typesize)
     if parsed_typesize <= 0:
         raise StoreError(f"blosc typesize must be positive, got {parsed_typesize}")
+    # ``blocksize`` is a placeholder here; _compressor_config overwrites it
+    # from the public ``blocksize`` argument before the config is used.
     return {
         "id": "blosc",
         "cname": str(cname),
         "clevel": int(clevel),
         "shuffle": _blosc_shuffle_int(shuffle),
-        "blocksize": int(blocksize),
+        "blocksize": 0,
         "typesize": parsed_typesize,
     }
 
@@ -1071,7 +1096,11 @@ def _write_v3_node(g: Any, name: str, meta: dict[str, Any], *, is_group: bool) -
     """
     store = g.store
     key = _group_store_key(g, f"{name}/zarr.json")
-    _store_set_bytes(store, key, (json.dumps(meta) + "\n").encode("utf-8"))
+    # Match zarr's own serialization (core/metadata/v3.py: to_buffer_dict uses
+    # ``json.dumps(d, allow_nan=True, indent=config.get("json_indent"))`` with no
+    # trailing newline, json_indent defaults to 2) so hand-written rectilinear
+    # array nodes are byte-for-byte consistent with zarr-written group/dense nodes.
+    _store_set_bytes(store, key, json.dumps(meta, allow_nan=True, indent=2).encode("utf-8"))
 
 
 def _group_store_key(g: Any, key: str) -> str:
@@ -1087,7 +1116,7 @@ def _validate_write_options(
     chunk_size: int | list[int] | tuple[int, ...],
     store: str,
     compressor: _Compressor,
-    blocksize: int = 0,
+    blocksize: int | None = None,
 ) -> None:
     """Validate cheap write options before touching the output path."""
     if store not in ("zip", "dir"):
@@ -1096,7 +1125,7 @@ def _validate_write_options(
         raise StoreError(f"unsupported X format: {format!r}")
     if layer_format not in ("preserve", "auto", "dense2d", "dense1d", "sparse"):
         raise StoreError(f"unsupported layer_format {layer_format!r}")
-    if int(blocksize) < 0:
+    if blocksize is not None and int(blocksize) < 0:
         raise StoreError(f"blosc blocksize must be non-negative, got {blocksize}")
     _validate_chunk_size_values(chunk_size)
     _compressor_config(compressor, np.dtype("float32"))

@@ -624,6 +624,7 @@ async fn process_synthetic_batch(
             &cache,
             None,
             None,
+            None,
             &item,
             0,
         )
@@ -1712,6 +1713,7 @@ async fn process_real_io_batch(
             io.clone(),
             coalesce.clone(),
             &cache,
+            None,
             None,
             None,
             &item,

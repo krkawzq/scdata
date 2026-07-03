@@ -13,7 +13,7 @@ use super::super::config::NativeAccessConfig;
 use super::super::error::{DataBankError, DataBankResult};
 use super::super::native::{
     load_access_items_blosc_lz4_native, NativeBlockDecodedCache, NativeBlockIndexCache,
-    NativeBlockPayloadCache,
+    NativeBlockPayloadCache, NativeInFlightPayloadReads,
 };
 
 #[derive(Clone)]
@@ -22,6 +22,7 @@ pub(crate) struct NativeScheduledContext {
     pub(crate) config: NativeAccessConfig,
     pub(crate) index_cache: Arc<NativeBlockIndexCache>,
     pub(crate) block_cache: Option<Arc<NativeBlockPayloadCache>>,
+    pub(crate) in_flight_payload_reads: Option<Arc<NativeInFlightPayloadReads>>,
     pub(crate) decoded_cache: Option<Arc<NativeBlockDecodedCache>>,
     executor: Arc<NativeScheduledExecutor>,
 }
@@ -40,13 +41,17 @@ impl NativeScheduledContext {
         let decoded_cache = (config.cache.decoded_capacity_bytes > 0).then(|| {
             Arc::new(NativeBlockDecodedCache::new(
                 config.cache.decoded_capacity_bytes,
+                config.cache.shards,
             ))
         });
+        let in_flight_payload_reads = native_in_flight_payload_reads_enabled()
+            .then(|| Arc::new(NativeInFlightPayloadReads::new()));
         Ok(Self {
             io,
             config,
             index_cache: Arc::new(NativeBlockIndexCache::new()),
             block_cache,
+            in_flight_payload_reads,
             decoded_cache,
             executor,
         })
@@ -503,10 +508,15 @@ fn run_native_custom(runtime: &tokio::runtime::Runtime, command: NativeCustomCom
 }
 
 fn should_group_native_commands(command: &NativeScheduledCommand) -> bool {
+    let min_items = if native_group_single_item_commands_enabled() {
+        1
+    } else {
+        2
+    };
     (command.allow_small_command_grouping || native_cross_command_grouping_enabled())
         && !command.cancel.is_cancelled()
         && !command.items.is_empty()
-        && command.items.len() > 1
+        && command.items.len() >= min_items
         && command.items.len() < native_command_group_max_items(command)
 }
 
@@ -643,6 +653,7 @@ async fn load_native_batch(
         native.config.load.coalesce.clone(),
         &native.index_cache,
         native.block_cache.clone(),
+        native.in_flight_payload_reads.clone(),
         native.decoded_cache.clone(),
         &items,
         0,
@@ -771,6 +782,7 @@ async fn load_native_batch_uncancelled(
         native.config.load.coalesce.clone(),
         &native.index_cache,
         native.block_cache.clone(),
+        native.in_flight_payload_reads.clone(),
         native.decoded_cache.clone(),
         &items,
         0,
@@ -865,6 +877,18 @@ fn native_cross_command_grouping_enabled() -> bool {
     std::env::var("SCDATA_NATIVE_COMMAND_GROUPING")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+fn native_group_single_item_commands_enabled() -> bool {
+    std::env::var("SCDATA_NATIVE_GROUP_SINGLE_ITEM_COMMANDS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn native_in_flight_payload_reads_enabled() -> bool {
+    std::env::var("SCDATA_NATIVE_INFLIGHT_PAYLOAD_READS")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]

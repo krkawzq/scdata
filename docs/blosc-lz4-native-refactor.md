@@ -2128,6 +2128,48 @@ profile-only virtual `IoBackend` 注入 `DataBank`，然后走
 4. LoadModule 已经能 coalesce byte ranges，但还没有 native 专属 metrics；现在只能从 iopool
    总 metrics 反推。必须补 `native_load_requested_bytes`、`native_load_read_bytes`、
    `native_load_waste_ratio` 和 block decode/scatter 计数，才能可靠设置生产默认 coalescing。
+
+### 19.10 In-flight payload sharing 诊断
+
+为验证 random full catalog 的重复 block read 是否主要发生在当前并发窗口内，新增了一个
+短生命周期 exact-range in-flight 共享结构:
+
+- 位置: `NativeLoadModule` / `NativeScheduledContext`。
+- 开关: `SCDATA_NATIVE_INFLIGHT_PAYLOAD_READS=1` 显式启用，默认关闭。
+- 语义: 只共享当前正在读取的 `(file, offset, len)` payload completion；owner 读完后立即从全局
+  map 移除，不形成 raw/compressed payload cache。
+
+本轮同时给 `profile_real_access` 增加了显式诊断参数:
+
+- `--native-cache-payload-bytes`
+- `--native-cache-decoded-bytes`
+- `--native-cache-shards`
+
+这些参数只用于量化 cache 上限收益；最终目标仍是不依赖 payload/decoded cache。
+
+短测结果:
+
+| run | setting | batches | batch/s | iopool read bytes | iopool calls | 结论 |
+|---|---|---:|---:|---:|---:|---|
+| `outputs/native-runs/release-real-random32-inflight-off-m65536-20260703.jsonl` | in-flight off | 448 measured | 450.9 | 14.438 GB | 108,462 | 稳定基线 |
+| `outputs/native-runs/release-real-random32-inflight-on-m65536-20260703-r2.jsonl` | in-flight on | 448 measured | 452.6 | 14.169 GB | 106,250 | 仅约 2% IO 降幅，吞吐基本不变 |
+
+full all-batches 结果:
+
+- `SCDATA_NATIVE_INFLIGHT_PAYLOAD_READS=1` 在 full random all-batches 中仍触发过
+  completion/payload 错配，例如 `native loaded block has 180577 bytes, expected 180510`。
+- 因此该路径不能作为默认优化或验收证据；当前默认保持关闭。
+- default-off full all-batches run:
+  `outputs/native-runs/release-real-random32-default-allbatches-20260703.jsonl`
+  完成，`493.3 batch/s`，低于历史约 `590 batch/s` 和目标 `2000 batch/s`。该结果也再次说明
+  random 目标不能靠小窗口 exact in-flight sharing 达成。
+
+下一步不能继续押注这个小 in-flight 方向。random 目标需要更大的请求图:
+
+- batch/window 级以上的 block request graph；
+- 按 block 聚合 consumer 后 decode-once/multi-output scatter；
+- 在不持久化 payload 的前提下，把同一测试窗口内的重复 block read 收敛到一次 IO；
+- 同时保持 output batch order 和 warmup/measured 计时口径不把工作隐藏到 setup。
 5. completion queue/memory budget 仍需生产化 backpressure；benchmark mode 可以放宽，
    production 默认必须受 native memory budget 限制，并记录 soft-limit wait/blocked metrics。
 6. `genes=4096` 真实 GPFS random sparse 在当前预检中是 `416.7 batch/s`，实际 IO 带宽约
@@ -2988,3 +3030,104 @@ profile 证据:
 - 要达到 `32000 batch/s`，下一步需要改变 sequential 的输出/访问结构，例如 window-level
   multi-batch CSR replay、输出 buffer reuse/zero-page 策略、或把多个 sequential batches
   合并成更粗粒度的 native CSR scatter，再按 batch 切分结果；继续扫现有参数收益有限。
+
+### 19.25 In-flight completion ordering fix
+
+本轮修复 `SCDATA_NATIVE_INFLIGHT_PAYLOAD_READS` 长 stream 下的 Blosc block 串位问题。旧
+错误形态:
+
+```text
+_scdata.DataBankError: IO error: codec error: failed to decode blosc:
+native loaded block has 82952 bytes, expected 71681
+```
+
+旧日志中 `expected=71681` 与 `loaded=82952` 能反查到 batch 16 相邻两条 native block
+request。这说明 zarr zip 内 block table 和 payload offset 本身是自洽的；错误来自 native
+reader 把相邻 request 的 completion 交叉消费，不是 `zarr_write` 格式转换问题。
+
+产生机制:
+
+- batch native planner 会按 request 顺序记录 `read_jobs`，后续 scatter 用
+  `read_jobs.iter().zip(completions)` 消费 completion。
+- in-flight exact payload sharing 打开后，一个 batch 可能同时包含 waiter request 和新的
+  miss request。
+- 旧 native load path 先返回 owner/miss completion，再把 waiter completion append 到末尾。
+  如果调用方请求顺序是 `[waiter, miss]`，返回就变成 `[miss, waiter]`。
+- 上层按位置 zip 后，request A 的 Blosc block 长度会拿到 request B 的 payload，所以报出
+  `native loaded block has <B bytes>, expected <A bytes>`。
+
+修复点:
+
+- `NativeLoadModule::{load, load_unsorted}` 现在统一承诺: 返回 completion 顺序必须等于传入
+  request 顺序。cache hit、coalesced miss、in-flight waiter 混合时都会按 request id 复原。
+- completion 合并从 `HashMap` 改成 compact request-id `Vec<Option<_>>`，保持 O(1) 索引，
+  降低热路径开销，并显式拒绝 duplicate / missing / out-of-range completion。
+- coalesced child 拆分时也检测重复 child id，避免重复 request 被静默覆盖。
+- `NativeInFlightPayloadReads` 默认开启；`SCDATA_NATIVE_INFLIGHT_PAYLOAD_READS=0/false/no/off`
+  只作为显式 opt-out。修复不是通过关闭 in-flight 规避。
+- in-flight table 从单个全局 `Mutex<HashMap>` 改为 64 shard，降低 96/128 native worker
+  并发 register/complete 时的热点锁。
+- batch/item 层不再对 in-flight 做二次 completion remap，排序契约下沉到 native load 层，
+  避免重复 O(n) 重排。
+
+本地验证:
+
+```bash
+cargo fmt --manifest-path rust/scdata/Cargo.toml --check
+cargo test --manifest-path rust/scdata/Cargo.toml --lib native:: --no-default-features --features pybind-bench --offline
+cargo test --manifest-path rust/scdata/Cargo.toml --lib scheduled --no-default-features --features pybind-bench --offline
+uv run pytest tests/test_anndata.py -q
+uv run maturin develop --release --offline
+cargo build --manifest-path rust/scdata/Cargo.toml --release --no-default-features --features profile --bin profile_real_access --offline
+```
+
+结果:
+
+- native unit tests: `29 passed`
+- scheduled unit tests: `45 passed`
+- Python anndata tests: `29 passed`
+- release extension: `scdata/_scdata.abi3.so`, `2026-07-03 14:08:53 +0800`
+- release profiler: `target/release/profile_real_access`, `2026-07-03 14:10:07 +0800`
+
+worker full scheduled stream 复现，默认 in-flight-on，未设置
+`SCDATA_NATIVE_INFLIGHT_PAYLOAD_READS`:
+
+```bash
+cd /mnt/shared-storage-user/dnacoding/wangzhongqi/Code/Project/scJEPA
+python scripts/cellxgene/sample_hvg.py \
+  --overwrite \
+  --output-dir outputs/repro_scdata_inflight_default_on_20260703_1412 \
+  --scdata-path /home/wangzhongqi/Code/Project/scdata
+```
+
+结果:
+
+- sampled cells: `200,000`
+- batches: `1,563 / 1,563`
+- stream seconds: `75.237`
+- cell/s: `2658.25`
+- GB written/s: `0.66`
+- elapsed seconds: `335.134`
+- 旧 batch 8-16 左右的 Blosc length mismatch 没有复现。
+
+真实 GPFS no-profile guardrail，worker `ms-0701-210140-1018388-nknq4`，cache off，默认
+in-flight-on:
+
+| run | order | dtype | measured / seen | batch/s | output GB/s | setup s | avg cores | util | checksum |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `outputs/native-runs/release-real-random32-singleton-selected-default-allbatches-20260702-133345.jsonl` | random | stored -> u32 | `33287 / 33351` | 590.65 | 1.239 | 15.175 | 31.06 | 32.35% | 2381 |
+| `outputs/native-runs/release-real-random32-inflight-defaulton-shard64-allbatches-20260703-1419.jsonl` | random | stored -> u32 | `33287 / 33351` | 587.66 | 1.232 | 14.564 | 31.30 | 32.61% | 2381 |
+| `outputs/native-runs/release-real-sequential-u16-seqparams-fw32-nw128-allbatches-20260702-145101.jsonl` | sequential | u16 | `33287 / 33351` | 17735.84 | 18.597 | 0.265 | 58.56 | 61.0% | 2514 |
+| `outputs/native-runs/release-real-sequential-u16-inflight-defaulton-shard64-allbatches-20260703-1422.jsonl` | sequential | u16 | `33287 / 33351` | 17633.45 | 18.490 | 0.260 | 56.22 | 58.56% | 2514 |
+
+结论:
+
+- 本 bug 已修在 Rust native load / in-flight completion ordering 层，不是通过关闭
+  scheduled stream、关闭 native path 或关闭 in-flight 规避。
+- 默认 in-flight-on 后，`sample_hvg` 完整 stream 已通过，并且 stream 时间从上一轮
+  `77.318s` 降到 `75.237s`，没有性能回退。
+- `profile_real_access` 的 random/sequential guardrail 与旧最佳同档；差异在 GPFS 抖动范围内。
+- 剩余 full-catalog random `1600 batch/s` 与 sequential `32000 batch/s` 缺口仍是前面章节
+  定位的结构性问题: random 的 touched block / IO call 放大，以及 sequential 的 output
+  materialization / ordered drain。这个 completion ordering fix 不改变这些上限，但为后续
+  targeted in-flight / window-local sharing 打开了默认安全路径。

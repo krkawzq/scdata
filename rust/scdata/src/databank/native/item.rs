@@ -13,7 +13,9 @@ use super::executor::{
     scatter_loaded_blosc_block_cached, scatter_loaded_blosc_block_multi_output_cached,
     NativeBlockDecodedCache, NativeBlockOutputConsumer, NativeBlockScratch,
 };
-use super::load::{NativeBlockPayloadCache, NativeLoadCompletion, NativeLoadModule};
+use super::load::{
+    NativeBlockPayloadCache, NativeInFlightPayloadReads, NativeLoadCompletion, NativeLoadModule,
+};
 use super::metadata::{index_from_plan, NativeBlockIndexCache, NativeBloscBlockIndex};
 use super::planner::{plan_blosc_slice_reads, NativeSliceBlockPlan};
 
@@ -36,6 +38,7 @@ pub(crate) async fn load_access_item_blosc_lz4_native(
     coalesce: NativeLoadCoalesceConfig,
     index_cache: &NativeBlockIndexCache,
     block_cache: Option<Arc<NativeBlockPayloadCache>>,
+    in_flight: Option<Arc<NativeInFlightPayloadReads>>,
     decoded_cache: Option<Arc<NativeBlockDecodedCache>>,
     item: &AccessItem,
     priority: u8,
@@ -45,7 +48,7 @@ pub(crate) async fn load_access_item_blosc_lz4_native(
     // `codec.name() != "blosc"` guard is gone. `None` still covers the
     // remaining decline paths (short chunk, non-lz4 header, unsupported block
     // table); `load_native_batch` turns those into `io::Error` fail-fast.
-    let loader = NativeLoadModule::with_block_cache(io, coalesce, block_cache);
+    let loader = NativeLoadModule::with_caches(io, coalesce, block_cache, in_flight);
     if item.slice == SliceSpec::Full {
         return load_full_blosc_item(&loader, item, priority)
             .await
@@ -122,6 +125,7 @@ pub(crate) async fn load_access_items_blosc_lz4_native(
     coalesce: NativeLoadCoalesceConfig,
     index_cache: &NativeBlockIndexCache,
     block_cache: Option<Arc<NativeBlockPayloadCache>>,
+    in_flight: Option<Arc<NativeInFlightPayloadReads>>,
     decoded_cache: Option<Arc<NativeBlockDecodedCache>>,
     items: &[AccessItem],
     priority: u8,
@@ -135,6 +139,7 @@ pub(crate) async fn load_access_items_blosc_lz4_native(
                     coalesce.clone(),
                     index_cache,
                     block_cache.clone(),
+                    in_flight.clone(),
                     decoded_cache.clone(),
                     item,
                     priority,
@@ -146,7 +151,12 @@ pub(crate) async fn load_access_items_blosc_lz4_native(
     }
 
     let batch_coalesce = cross_item_coalesce_config(coalesce.clone());
-    let loader = NativeLoadModule::with_block_cache(Arc::clone(&io), coalesce, block_cache.clone());
+    let loader = NativeLoadModule::with_caches(
+        Arc::clone(&io),
+        coalesce,
+        block_cache.clone(),
+        in_flight.clone(),
+    );
     let mut results = (0..items.len()).map(|_| None).collect::<Vec<_>>();
     let mut planned_outputs = (0..items.len()).map(|_| None).collect::<Vec<_>>();
     let mut block_jobs = Vec::new();
@@ -240,7 +250,7 @@ pub(crate) async fn load_access_items_blosc_lz4_native(
         return Ok(results);
     }
 
-    let batch_loader = NativeLoadModule::with_block_cache(io, batch_coalesce, block_cache);
+    let batch_loader = NativeLoadModule::with_caches(io, batch_coalesce, block_cache, in_flight);
     let completions = batch_loader.load_unsorted(&requests).await?;
     if completions.len() != requests.len() {
         return Err(AccessError::Io(io::Error::new(
@@ -557,6 +567,7 @@ mod tests {
             &index_cache(),
             None,
             None,
+            None,
             &item,
             0,
         )
@@ -586,6 +597,7 @@ mod tests {
             io,
             coalesce_config(),
             &index_cache(),
+            None,
             None,
             None,
             &item,
@@ -621,6 +633,7 @@ mod tests {
             &cache,
             None,
             None,
+            None,
             &item(SliceSpec::from_triples(vec![0, 0, 2]).expect("slice")),
             0,
         )
@@ -633,6 +646,7 @@ mod tests {
             io.clone(),
             coalesce_config(),
             &cache,
+            None,
             None,
             None,
             &item(SliceSpec::from_triples(vec![0, 4, 6]).expect("slice")),
@@ -742,6 +756,7 @@ mod tests {
             &index_cache(),
             None,
             None,
+            None,
             &items,
             0,
         )
@@ -783,6 +798,7 @@ mod tests {
             &index_cache(),
             None,
             None,
+            None,
             &items,
             0,
         )
@@ -817,6 +833,7 @@ mod tests {
             io,
             coalesce_config(),
             &index_cache(),
+            None,
             None,
             None,
             &items,
@@ -856,6 +873,7 @@ mod tests {
             &index_cache(),
             None,
             None,
+            None,
             &items,
             0,
         )
@@ -889,6 +907,7 @@ mod tests {
             &index_cache(),
             None,
             None,
+            None,
             &items,
             0,
         )
@@ -915,6 +934,7 @@ mod tests {
             io,
             coalesce_config(),
             &index_cache(),
+            None,
             None,
             None,
             &items,

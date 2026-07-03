@@ -108,10 +108,10 @@ pub(crate) struct NativeBlockDecodedCache {
 }
 
 impl NativeBlockDecodedCache {
-    pub(crate) fn new(capacity_bytes: usize) -> Self {
-        const SHARDS: usize = 8;
-        let shard_capacity = capacity_bytes.div_ceil(SHARDS).max(1);
-        let shards = (0..SHARDS)
+    pub(crate) fn new(capacity_bytes: usize, shards: usize) -> Self {
+        let shard_count = shards.max(1);
+        let shard_capacity = capacity_bytes.div_ceil(shard_count).max(1);
+        let shards = (0..shard_count)
             .map(|_| NativeBlockDecodedCacheShard::new(shard_capacity))
             .collect();
         Self { shards }
@@ -210,9 +210,17 @@ pub(crate) fn scatter_loaded_blosc_block_cached(
     let block = &index.blocks[block_idx];
     if loaded_block.len() != block.compressed_len {
         return Err(decode_error(format!(
-            "native loaded block has {} bytes, expected {}",
+            "native loaded block has {} bytes, expected {}; key={:?}; block_idx={}; logical_block_idx={}; payload_relative_offset={}; decoded_offset={}; decoded_len={}; compressed_size={}; decoded_size={}",
             loaded_block.len(),
-            block.compressed_len
+            block.compressed_len,
+            key,
+            block_idx,
+            block.block_idx,
+            block.payload_relative_offset,
+            block.decoded_offset,
+            block.decoded_len,
+            index.compressed_size,
+            index.decoded_size
         )));
     }
 
@@ -342,9 +350,17 @@ pub(crate) fn scatter_loaded_blosc_block_multi_output_cached(
     let block = &index.blocks[block_idx];
     if loaded_block.len() != block.compressed_len {
         return Err(decode_error(format!(
-            "native loaded block has {} bytes, expected {}",
+            "native loaded block has {} bytes, expected {}; key={:?}; block_idx={}; logical_block_idx={}; payload_relative_offset={}; decoded_offset={}; decoded_len={}; compressed_size={}; decoded_size={}",
             loaded_block.len(),
-            block.compressed_len
+            block.compressed_len,
+            key,
+            block_idx,
+            block.block_idx,
+            block.payload_relative_offset,
+            block.decoded_offset,
+            block.decoded_len,
+            index.compressed_size,
+            index.decoded_size
         )));
     }
 
@@ -1115,7 +1131,7 @@ mod tests {
             offset: 1024,
             len: loaded.len(),
         };
-        let cache = NativeBlockDecodedCache::new(1024 * 1024);
+        let cache = NativeBlockDecodedCache::new(1024 * 1024, 8);
         let mut scratch = NativeBlockScratch::default();
         let mut first = vec![0u8; 64];
         let mut second = vec![0u8; 64];

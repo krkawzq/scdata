@@ -480,6 +480,9 @@ struct Args {
     native_enabled: bool,
     native_fused_workers: usize,
     native_prefetch_blocks: usize,
+    native_cache_payload_bytes: usize,
+    native_cache_decoded_bytes: usize,
+    native_cache_shards: usize,
     native_coalesce_max_gap_bytes: usize,
     native_coalesce_max_waste_ratio: f32,
     native_coalesce_max_merged_len: usize,
@@ -950,6 +953,11 @@ fn run_case(
             "native_enabled": args.native_enabled,
             "native_fused_workers": args.native_fused_workers,
             "native_prefetch_blocks": args.native_prefetch_blocks,
+            "native_cache": {
+                "payload_bytes": args.native_cache_payload_bytes,
+                "decoded_bytes": args.native_cache_decoded_bytes,
+                "shards": args.native_cache_shards,
+            },
             "native_load_workers": {
                 "scheduler": databank_fill_workers(args).max(args.native_fused_workers).max(1),
                 "io": databank_io_workers(args).max(1),
@@ -1445,6 +1453,11 @@ fn rust_databank_config(args: &Args) -> DataBankConfig {
             memory_budget_bytes: access_memory_bytes,
             response_queue_bytes_soft_limit: access_memory_bytes / 2,
             response_queue_bytes_hard_limit: access_memory_bytes * 3 / 4,
+            cache: _scdata::databank::NativeCacheConfig {
+                payload_capacity_bytes: args.native_cache_payload_bytes,
+                decoded_capacity_bytes: args.native_cache_decoded_bytes,
+                shards: args.native_cache_shards,
+            },
             load: _scdata::databank::NativeLoadConfig {
                 scheduler_workers: databank_fill_workers(args)
                     .max(args.native_fused_workers)
@@ -2213,6 +2226,11 @@ fn args_json(args: &Args) -> Value {
         "native_enabled": args.native_enabled,
         "native_fused_workers": args.native_fused_workers,
         "native_prefetch_blocks": args.native_prefetch_blocks,
+        "native_cache": {
+            "payload_bytes": args.native_cache_payload_bytes,
+            "decoded_bytes": args.native_cache_decoded_bytes,
+            "shards": args.native_cache_shards,
+        },
         "native_load_workers": {
             "scheduler": databank_fill_workers(args).max(args.native_fused_workers).max(1),
             "io": databank_io_workers(args).max(1),
@@ -2278,6 +2296,9 @@ fn parse_args() -> AppResult<Args> {
         native_enabled: false,
         native_fused_workers: 4,
         native_prefetch_blocks: 4096,
+        native_cache_payload_bytes: 0,
+        native_cache_decoded_bytes: 0,
+        native_cache_shards: 8,
         native_coalesce_max_gap_bytes: 16 * 1024,
         native_coalesce_max_waste_ratio: 0.10,
         native_coalesce_max_merged_len: 1024 * 1024,
@@ -2362,6 +2383,13 @@ fn parse_args() -> AppResult<Args> {
             "--native-enabled" => args.native_enabled = parse_bool(&value, &key)?,
             "--native-fused-workers" => args.native_fused_workers = parse_usize(&value, &key)?,
             "--native-prefetch-blocks" => args.native_prefetch_blocks = parse_usize(&value, &key)?,
+            "--native-cache-payload-bytes" => {
+                args.native_cache_payload_bytes = parse_usize(&value, &key)?
+            }
+            "--native-cache-decoded-bytes" => {
+                args.native_cache_decoded_bytes = parse_usize(&value, &key)?
+            }
+            "--native-cache-shards" => args.native_cache_shards = parse_usize(&value, &key)?,
             "--native-coalesce-max-gap-bytes" => {
                 args.native_coalesce_max_gap_bytes = parse_usize(&value, &key)?
             }
@@ -2413,6 +2441,7 @@ fn validate_args(args: &Args) -> AppResult<()> {
         || args.ready_ahead_steps.contains(&0)
         || args.native_fused_workers == 0
         || args.native_prefetch_blocks == 0
+        || args.native_cache_shards == 0
         || args.native_coalesce_max_merged_len == 0
     {
         return Err("batch/prefetch/decode/ready values must be positive".into());
@@ -2546,6 +2575,9 @@ Key options:
   --native-enabled true|false         Enable native path for auto mode. Default: false.
   --native-fused-workers N            Native fused worker hint. Default: 4.
   --native-prefetch-blocks N          Native block prefetch window. Default: 4096.
+  --native-cache-payload-bytes N      Diagnostic compressed block cache capacity. Default: 0.
+  --native-cache-decoded-bytes N      Diagnostic decoded block cache capacity. Default: 0.
+  --native-cache-shards N             Diagnostic native cache shard count. Default: 8.
   --native-coalesce-max-gap-bytes N    Native range coalesce max gap. Default: 16384.
   --native-coalesce-max-waste-ratio X  Native range coalesce max waste ratio. Default: 0.10.
   --native-coalesce-max-merged-len N   Native range coalesce max merged length. Default: 1048576.

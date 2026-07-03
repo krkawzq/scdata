@@ -18,7 +18,8 @@ pub(crate) use executor::{
 pub(crate) use item::{load_access_item_blosc_lz4_native, load_access_items_blosc_lz4_native};
 pub(crate) use load::{
     coalesce_load_requests, CoalescedChild, CoalescedRead, NativeBlockCacheKey,
-    NativeBlockPayloadCache, NativeLoadCompletion, NativeLoadModule, NativeLoadRequest,
+    NativeBlockPayloadCache, NativeInFlightPayloadReads, NativeLoadCompletion, NativeLoadModule,
+    NativeLoadRequest,
 };
 pub(crate) use metadata::{
     build_blosc_lz4_block_index, build_blosc_lz4_block_index_from_header_table, index_from_plan,
