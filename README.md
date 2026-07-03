@@ -1,13 +1,12 @@
 # scdata
 
 <p align="center">
-  <strong>High-performance storage, compression, and loading for single-cell data.</strong>
+  <strong>Read single-cell data off disk as fast as if it were in memory.</strong>
 </p>
 
 <p align="center">
   <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-≥3.10-blue?logo=python&logoColor=white"></a>
   <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/Rust-core-dea584?logo=rust&logoColor=white"></a>
-  <a href="https://pyo3.rs/"><img alt="PyO3" src="https://img.shields.io/badge/PyO3-bindings-d11141"></a>
   <a href="https://github.com/zarr-developers/zarr-specs"><img alt="Zarr v3" src="https://img.shields.io/badge/Zarr-v3-purple"></a>
   <img alt="status" src="https://img.shields.io/badge/status-WIP-orange">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green"></a>
@@ -15,207 +14,124 @@
 
 ---
 
-`scdata` solves one engineering problem: **random access of a huge number of
-small vectors out of massive compressed file stores.**
+`scdata` is an IO toolkit built for one workload: **random access of single
+cells out of massive, fully-compressed datasets.**
 
-Single-cell data is exactly this shape — every cell is a small gene-expression
-vector (a few thousand floats), datasets hold millions of cells, and training
-samples them at random. Stock `anndata` / `zarr` reads are built for sequential
-scans, not for millions of tiny random reads against a compressed archive.
-`scdata` is a Python package backed by a Rust core that rebuilds the entire read
-path — IO, decompression, scheduling, and single-cell layout — for this
-workload, with a target of **~20 GiB/s decode bandwidth** and **~32k cells/s**
-end-to-end access on GPFS.
+A single cell is just a small gene-expression vector (a few thousand floats),
+yet training samples millions of them at random. Stock readers are built for
+sequential scans — they pull and decompress whole chunks just to hand you a
+few cells. `scdata` rebuilds the read path around the cell: data is stored as
+CSR + Blosc/LZ4 (and other codecs) inside a portable `zarr.zip`, and on read
+only the **64 KiB compressed blocks** a cell actually touches are fetched and
+decompressed — never the whole chunk. The result is disk-resident data that
+responds like an in-memory array, at a target of tens of thousands of
+cells/s end-to-end.
 
 ## ✨ Features
 
-### ⚡ IO — batched random reads against huge files
-
-- **io_uring backend.** SQE/CQE batches amortize per-read syscall cost;
-  `IOSQE_ASYNC` plus kernel io-wq give true async reads; fixed-file registration
-  skips per-IO fd lookup. A threaded `pread` backend falls back off-Linux.
-- **Byte-range planning.** A cell's vector (a few KB) is sliced out of a large
-  chunk (tens of MB) — only the needed byte range is read, never the whole chunk.
-  Dense rows, 1D spans, and variable-length CSR rows all plan into minimal ranges.
-- **Two-level dedup.** Concurrent requests for the same chunk share one IO (keyed
-  by `ChunkKey`); the same chunk+codec shares one decode (keyed by `DecodeKey`).
-  A million-cell sample never re-reads or re-decodes a chunk it already has.
-- **Sharded `QueueCore`.** Priority queues, per-file ordering, and read
-  coalescing live behind a sharded queue keyed by byte range, so dedup holds
-  while lock contention stays low.
-
-### 🧠 Scheduling — a lock-free, memory-bounded pipeline
-
-- **Sharded scheduler.** Each shard is a single current-thread tokio runtime with
-  `Rc<RefCell>` state — fully lock-free within a shard, parallel across shards,
-  routed by a splitmix64 hash of the chunk key.
-- **IO → decode → scatter, pipelined.** The three stages run on independent
-  thread pools; different chunks run fully in parallel, while the same chunk's
-  IO and decode stay ordered.
-- **Dual-form LRU cache (raw + decoded).** A hit skips IO; a decoded hit skips
-  IO *and* decode. Pinned entries cannot be evicted while a caller holds them.
-- **Unified memory budget.** Cache, in-flight, and staging bytes share one
-  budget; over-budget triggers three-stage eviction (cache → staging → blocking
-  backpressure) instead of OOM.
-- **Three-stage scheduled prefetch.** Independent look-ahead depths for IO →
-  decode → ready, drained through a ring buffer; dropping the consumer cancels
-  in-flight work rather than leaking it.
-
-### 🧬 Single-cell native layout
-
-- **Three matrix kinds.** `Dense1D`, `Dense2D`, and `SparseCsr`, all registered
-  under one `DatasetId`; `launch_all` / `register_all` expose `X` and every
-  `layers/<name>` matrix as independent datasets.
-- **Rectilinear cell-aligned CSR.** Chunk boundaries align to cell boundaries, so
-  a random cell's sparse row lands in a single chunk — minimizing random IO on
-  variable-length rows, the decisive cost for sparse single-cell access.
-- **Gene interning.** Identical gene names across datasets share one `Arc<str>`;
-  a `repr(C)` pointer/len view exposes them to Python with zero allocation.
-- **Parallel scatter/fill.** A compute pool assembles decoded bytes into the
-  output matrix (with CSR deserialization), triggered above a row/byte threshold.
-
-### Rust core architecture
-
-```
-                         pybind.rs
-                     (PyO3 reflection layer)
-                              │
-                              ▼
-                     ┌──────────────────┐
-                     │     DataBank     │
-                     │  facade: regis-  │
-                     │  tration, gene   │
-                     │  interner, ac-   │
-                     │  cess entry pts  │
-                     └────────┬─────────┘
-              ┌───────────────┼───────────────┐
-              │               │               │
-   ┌──────────▼───────┐ ┌─────▼──────────┐ ┌──▼────────────────┐
-   │  DatasetRegistry │ │ AccessScheduler│ │ DataBankCompute   │
-   │                  │ │ (sharded,      │ │   Pool            │
-   │ Dense1D/Dense2D/ │ │  lock-free)    │ │ (scatter / fill)  │
-   │ SparseCsr        │ │                │ │                   │
-   │                  │ │ each shard =   │ │ • dense row       │
-   │ • Array / Chunk  │ │  single cur-   │ │   scatter         │
-   │ • byte-range     │ │  rent_thread   │ │ • CSR deserialize │
-   │   chunk locations│ │  tokio rt +    │ │ • gene projection │
-   │   (FileOffset /  │ │  Rc<RefCell>   │ │                   │
-   │    Dir / Memory) │ │                │ │ triggered above   │
-   │                  │ │ routed by      │ │ rows/bytes        │
-   │ • ArrayGrid      │ │ chunk hash     │ │ threshold         │
-   │   Regular /      │ │                │ └───────────────────┘
-   │   Rectilinear    │ └───────┬────────┘
-   └──────────────────┘         │
-                       ┌────────┴────────┐
-                       │  per-shard      │
-                       │                 │
-                       │ • LRU cache     │ ┌──────────────────┐
-                       │   (raw +        │▶│  MemoryBudget    │
-                       │    decoded,     │ │                  │
-                       │    pinned)      │ │ cache + inflight │
-                       │                 │ │ + staging        │
-                       │ • inflight      │ │                  │
-                       │   dedup         │ │ 3-stage eviction │
-                       │   (IO + decode) │ │ → backpressure   │
-                       │                 │ └──────────────────┘
-                       │ • 3-stage       │
-                       │   scheduled     │
-                       │   prefetch      │
-                       │   (ring buffer) │
-                       └────────┬────────┘
-                                │
-                     ┌──────────┴──────────┐
-                     │  IoBackend /        │
-                     │  DecodeBackend      │  (trait adapters —
-                     │  (boxed async       │   access core
-                     │   futures)          │   stays backend-                     
-                     └──────────┬──────────┘   agnostic)
-                                │
-             ┌──────────────────┴──────────────────────┐
-             ▼                                         ▼
-   ┌──────────────────────┐                ┌──────────────────────┐
-   │  IoPool              │                │  DecodePool          │
-   │                      │  encoded bytes │                      │
-   │  io_uring backend:   │◀──────────────▶│  dedicated OS        │
-   │  SQE/CQE batches,    │  (Arc<[u8]>)   │  threads             │
-   │  IOSQE_ASYNC +       │                │                      │
-   │  kernel io-wq,       │                │  zstd / lz4 / blosc  │
-   │  fixed files         │                │  / gzip / bz2 / xz   │
-   │                      │                │  / crc32 / identity  │
-   │  threaded pread      │                │                      │
-   │  fallback            │                │  bounded channel +   │
-   │                      │                │  backpressure        │
-   │  sharded QueueCore:  │                │                      │
-   │  priority queues,    │                │  zero-alloc decode:  │
-   │  read coalescing,    │                │  set_len, buffer     │
-   │  per-file ordering   │                │  reuse, spare ping-  │
-   └──────────┬───────────┘                │  pong, codec cache   │
-              │                            └──────────────────────┘
-              ▼  positioned reads by (file, offset, len)
-        disk / zarr v3 store / ZIP_STORED archive
-```
-
-The `DataBank` facade owns a `DatasetRegistry`, a sharded `AccessScheduler`, and
-a `DataBankComputePool`. A cell request is **planned** into byte ranges against
-registered chunks, the scheduler **reads** each chunk via `IoBackend`, **decodes**
-it via `DecodeBackend`, and the compute pool **scatters** the decoded bytes into
-the output matrix. All four — IO, decode, scheduling, scatter — are independent
-pools running concurrently, with cache hits, dedup, and the memory budget keeping
-random access of small vectors from ever stalling on a single chunk.
+- **Fast as memory.** Random cell access from compressed on-disk stores at
+  near in-memory latency — pipelined IO → decode → scatter with caching,
+  dedup, and a unified memory budget.
+- **Fully compressed.** Sparse matrices stay CSR; chunks are compressed with
+  Blosc/LZ4 (zstd, lz4, gzip, … also supported). Stored as a single
+  `zarr.zip` archive that stock `anndata.read_zarr` can still open.
+- **On-demand 64 KiB blocks.** Reads and decompression are pushed down to the
+  Blosc compressed block — only the blocks covering the requested cells are
+  touched, so a random batch never pays for a whole chunk.
+- **Rust core, Python API.** IO (`io_uring` / threaded `pread`), codecs, and
+  scheduling live in a Rust extension; you drive it from a small Python API.
 
 ## 📦 Installation
 
-`scdata` builds its Rust extension via [`maturin`](https://www.maturin.rs/). From the
-repository root:
+`scdata` builds its Rust extension with [`maturin`](https://www.maturin.rs/):
 
 ```sh
 uv sync --extra dev
-uv run maturin develop --uv
-```
-
-Editable install alternative:
-
-```sh
+uv run maturin develop --uv          # editable build
+# or
 uv pip install -e .
 ```
 
-**Requirements:** Python ≥ 3.10, numpy ≥ 2.2, numcodecs ≥ 0.13. `anndata` / `zarr` are
-only needed for interop and round-trip validation (`pip install -e ".[anndata]"`).
+**Requirements:** Python ≥ 3.10, numpy ≥ 2.2, numcodecs ≥ 0.13. Install
+`anndata` / `zarr` only for conversion and round-trip validation
+(`uv pip install -e ".[anndata]"`).
 
-## 🛠️ Development
+## 🚀 Usage
 
-### Common commands
+### 1. Convert AnnData → compressed `zarr.zip`
 
-```sh
-# Python
-uv run pytest -q                              # test suite
-uv run ruff check scdata tests                # lint
+Any input `anndata` can read (`.h5ad`, `.zarr`, `.loom`, `.csv`, `.mtx`, …)
+becomes a scdata store: sparse `X` written as CSR, chunks compressed with
+Blosc-LZ4, default 64 KiB block size.
 
-# Rust
-cargo check  --manifest-path rust/scdata/Cargo.toml
-cargo test   --manifest-path rust/scdata/Cargo.toml
-cargo bench  --manifest-path rust/scdata/Cargo.toml   # modules / stress / iopool / fullchain
+```python
+from scdata import AnnDataZarrZipConverter
+
+# writes dataset.zarr.zip next to the source (same stem, .zarr.zip suffix)
+AnnDataZarrZipConverter()("path/to/dataset.h5ad")
 ```
 
-### Repository layout
+### 2. Random cell access, on demand
 
+```python
+from pathlib import Path
+from scdata import ScDataBank, DataBankConfig, launch_all
+
+bank = ScDataBank(DataBankConfig.make(backend="threaded"))
+ds = launch_all(Path("dataset.zarr.zip"))["X"]   # or "raw/X", "layers/counts"
+id = bank.register(ds)
+
+genes = bank.dataset_genes(id)[:4096]
+cell = bank.load(id, cells=[0, 1, 2, 3], genes=genes, missing="zero")
+print(cell.data.shape)                            # (4, 4096)
+
+bank.close()
 ```
-scdata/                Python package
-├── io/                zarr v3 read/write, anndata interop, launch
-├── data/              Dataset / CellData / ScDataLoader / Prefetch  (pure Python)
-├── databank.py        ScDataBank + config dataclasses  (Rust wrapper layer)
-└── _scdata.abi3.so    built Rust extension
-rust/scdata/src/       Rust core
-├── databank/          registration, access facade, batch, scheduling plan
-├── access/            sharded scheduler, LRU cache, CPU pool, memory budget
-├── codecs/            zstd/lz4/blosc pipeline, decode pool, registry
-├── iopool/            io_uring / threaded IO backends
-└── pybind.rs          PyO3 bindings (the only Python-reflection layer)
-docs/                  benchmark report
-examples/              usage notebooks
-tests/                 pytest suite
-scripts/               compression / numcodecs export benchmarks
+
+### 3. Stream training batches (random order, many datasets)
+
+Build a `CellIndexPlan` describing which cell comes from which dataset, and
+stream dense batches ready for the GPU. `fast_mode="force"` turns on the
+native 64 KiB-block fast path.
+
+```python
+import numpy as np
+from pathlib import Path
+from scdata import (
+    ScDataBank, DataBankConfig, launch_all,
+    CellIndexPlan, ScheduledAccessConfig, ScheduledPrefetchConfig,
+)
+
+paths = [Path(f"ds{i}.zarr.zip") for i in range(8)]
+bank = ScDataBank(DataBankConfig.make(backend="threaded", io__threaded__num_workers=16))
+ids = [bank.register(launch_all(p)["X"]) for p in paths]
+genes = bank.dataset_genes(ids[0])[:4096]
+
+# a shuffled plan: (dataset_index, cell_index) for every cell, in batches of 128
+counts = [bank.dataset_num_cells(i) for i in ids]
+offsets = np.concatenate(([0], np.cumsum(counts)))
+order = np.arange(offsets[-1])
+np.random.default_rng(0).shuffle(order)
+ds_idx = np.searchsorted(offsets[1:], order, side="right").astype(np.uint16)
+cell_idx = (order - offsets[ds_idx]).astype(np.uint32)
+plan = CellIndexPlan(ds_idx, cell_idx, 128)
+
+config = ScheduledPrefetchConfig(
+    prefetch_step=512,
+    access=ScheduledAccessConfig(
+        prefetch_step=512, decode_ahead_steps=512, ready_ahead_steps=512,
+    ),
+    fast_mode="force",
+)
+
+for batch in bank.prefetch_indexed(ids, plan, genes=genes, missing="zero", config=config):
+    x = batch.data        # (128, 4096) dense ndarray
+    # ...feed to your model
+
+bank.close()
 ```
+
+See `examples/` for runnable random- and sequential-access benchmarks.
 
 ## 📄 License
 
