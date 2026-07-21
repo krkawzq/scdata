@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Single-cell data storage, compression, and loading toolkit with a Rust core"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "numcodecs>=0.13.1",
     "numpy>=2.2.6",
@@ -25,16 +25,17 @@ classifiers = [
 # anndata/zarr bridge: only needed for anndata interop tests and round-trip
 # validation. The core io/data modules use neither at runtime.
 anndata = [
-    "anndata>=0.11.4",
-    "zarr>=2.18.3",
+    "anndata==0.13.2",
+    "zarr>=3.1.6,<3.3",
 ]
 dev = [
     "maturin>=1.8,<2",
     "pytest>=8.0",
     "ruff>=0.12",
     "h5py>=3.11.0",
-    "anndata>=0.11.4",
-    "zarr>=2.18.3",
+    "anndata==0.13.2",
+    "zarr>=3.1.6,<3.3",
+    "tqdm>=4.66",
 ]
 
 [tool.maturin]
@@ -45,4 +46,4 @@ python-source = "."
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"

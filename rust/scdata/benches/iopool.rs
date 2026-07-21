@@ -211,6 +211,7 @@ fn threaded_config(args: &Args) -> IoConfig {
     IoConfig::Threaded(ThreadedConfig {
         base: base_config(args),
         num_workers: args.workers,
+        steal_interval_us: 0,
         cpus: None,
     })
 }

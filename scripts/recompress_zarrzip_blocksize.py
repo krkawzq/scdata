@@ -21,9 +21,9 @@ chunk bytes change.  Every other store entry (``obs`` / ``var`` zstd arrays,
 
 Correctness contract
 --------------------
-For any array whose ``codecs`` list contains a ``blosc`` entry, the re-compressed
-output is byte-identical to what :func:`scdata.io.write_zarr` would produce when
-called with the same Blosc parameters and the same target ``blocksize`` —
+For a supported scdata v3 numeric pipeline (``bytes`` serializer followed by one
+``blosc`` codec), output is byte-identical to what :func:`scdata.io.write_zarr`
+would produce with the same Blosc parameters and target ``blocksize`` —
 ``numcodecs.Blosc.encode`` is deterministic given (decoded bytes, cname, clevel,
 shuffle, typesize, blocksize), and we copy those five parameters straight from
 the source ``zarr.json``.  This equivalence has been verified empirically
@@ -39,7 +39,7 @@ Usage
 -----
     uv run python scripts/recompress_zarrzip_blocksize.py INPUT.zarr.zip \\
         --blocksize 65536 [--output OUTPUT.zarr.zip] [--overwrite] \\
-        [--verify] [--jobs N]
+        [--verify]
 
 With ``--verify`` the converted store is opened with :func:`scdata.io.launch`
 and every re-compressed chunk is decoded back and compared byte-for-byte against
@@ -51,12 +51,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import struct
 import sys
 import tempfile
 import time
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -147,27 +146,122 @@ class BloscParams:
 # ---------------------------------------------------------------------------
 
 
-def _find_blosc_codec(meta: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
-    """Return (index, configuration) of the blosc codec in ``meta["codecs"]``.
+def _unsupported_pipeline(array_path: str, detail: str) -> ValueError:
+    return ValueError(
+        f"{array_path}: unsupported Blosc codec pipeline ({detail}); expected "
+        "[bytes serializer, single blosc compressor] from a scdata zarr v3 store"
+    )
 
-    Returns None if the array has no blosc compressor (e.g. zstd-only, or a
-    pure ``bytes`` serializer).  A v3 codecs list is [serializer, *compressors];
-    there is at most one blosc entry in scdata-written stores.
+
+def _recompressible_blosc_codec(
+    meta: dict[str, Any], array_path: str
+) -> tuple[int, dict[str, Any]] | None:
+    """Return the sole Blosc codec only for the scdata v3 pipeline we can prove.
+
+    Non-Blosc arrays are copied without interpretation.  A Blosc array is safe
+    to rewrite only when it is the numeric scdata form emitted by ``write_zarr``:
+    ``bytes`` (little-endian or omitted config for one-byte dtypes) followed by
+    exactly one ``blosc`` compressor.  In particular, do not mistake a Blosc
+    nested in sharding or an additional codec for raw bytes that numcodecs can
+    re-encode independently.
     """
     codecs = meta.get("codecs")
     if not isinstance(codecs, list):
         return None
-    for i, entry in enumerate(codecs):
-        if isinstance(entry, dict) and entry.get("name") == "blosc":
-            cfg = entry.get("configuration")
-            if not isinstance(cfg, dict):
-                raise ValueError("blosc codec entry missing 'configuration' object")
-            return i, cfg
-    return None
+
+    names = [entry.get("name") if isinstance(entry, dict) else None for entry in codecs]
+    if any(name in {"sharding_indexed", "sharding"} for name in names):
+        raise _unsupported_pipeline(array_path, "sharding codec")
+    if "blosc" not in names:
+        return None
+    if meta.get("zarr_format") != 3:
+        raise _unsupported_pipeline(array_path, "zarr_format is not 3")
+    chunk_key_encoding = meta.get("chunk_key_encoding")
+    if (
+        not isinstance(chunk_key_encoding, dict)
+        or chunk_key_encoding.get("name") != "default"
+        or not isinstance(chunk_key_encoding.get("configuration"), dict)
+        or chunk_key_encoding["configuration"].get("separator") != "/"
+    ):
+        raise _unsupported_pipeline(array_path, "non-default chunk key encoding")
+    if len(codecs) != 2 or names != ["bytes", "blosc"]:
+        raise _unsupported_pipeline(array_path, f"codec names are {names!r}")
+
+    serializer = codecs[0]
+    blosc = codecs[1]
+    assert isinstance(serializer, dict) and isinstance(blosc, dict)  # implied by names
+    serializer_cfg = serializer.get("configuration", {})
+    if serializer_cfg is None:
+        serializer_cfg = {}
+    if (
+        not isinstance(serializer_cfg, dict)
+        or set(serializer_cfg) - {"endian"}
+        or serializer_cfg.get("endian", "little") != "little"
+    ):
+        raise _unsupported_pipeline(array_path, "non-scdata bytes serializer configuration")
+
+    cfg = blosc.get("configuration")
+    if not isinstance(cfg, dict):
+        raise _unsupported_pipeline(array_path, "blosc configuration is not an object")
+    return 1, cfg
 
 
 def _is_array_meta(meta: dict[str, Any]) -> bool:
     return isinstance(meta, dict) and meta.get("node_type") == "array"
+
+
+@dataclass(frozen=True)
+class StoreLayout:
+    """Validated ZIP entry names and Blosc-array metadata for a zarr store."""
+
+    names: frozenset[str]
+    blosc_blocksizes: dict[str, int]
+
+
+def inspect_store(path: Path) -> StoreLayout:
+    """Read every ZIP entry and collect every supported Blosc array declaration.
+
+    ``ZipFile.testzip`` consumes each complete entry, so this validates central
+    directory consistency and every entry's CRC before callers use the result to
+    skip a conversion.  Duplicate paths are rejected because a set comparison
+    otherwise could call a partial archive complete.
+    """
+    with zipfile.ZipFile(path, mode="r") as zin:
+        infos = zin.infolist()
+        names = [info.filename for info in infos]
+        if len(names) != len(set(names)):
+            raise ValueError(f"{path}: ZIP contains duplicate entry names")
+        for info in infos:
+            if not info.is_dir() and info.compress_type != zipfile.ZIP_STORED:
+                raise ValueError(
+                    f"{path}: ZIP entry {info.filename!r} is not ZIP_STORED"
+                )
+        bad_entry = zin.testzip()
+        if bad_entry is not None:
+            raise zipfile.BadZipFile(f"{path}: CRC failed for ZIP entry {bad_entry!r}")
+
+        blocksizes: dict[str, int] = {}
+        for key in names:
+            if not key.endswith("zarr.json"):
+                continue
+            meta = json.loads(zin.read(key))
+            if not _is_array_meta(meta):
+                continue
+            found = _recompressible_blosc_codec(meta, key)
+            if found is not None:
+                _, cfg = found
+                blocksizes[key] = int(cfg.get("blocksize", 0))
+    return StoreLayout(names=frozenset(names), blosc_blocksizes=blocksizes)
+
+
+def blosc_array_blocksizes(path: Path) -> dict[str, int]:
+    """Return every supported Blosc array's declared blocksize in ``path``.
+
+    Inspection also validates every ZIP entry and rejects unsupported Blosc
+    pipelines.  Batch conversion relies on this before declaring a destination
+    complete enough to skip.
+    """
+    return inspect_store(path).blosc_blocksizes
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +274,22 @@ def _array_prefix(zarr_json_key: str) -> str:
     # zarr.json is always the last path segment; chunks live as siblings under
     # the same array directory, keyed "<prefix>c/<coords>".
     return zarr_json_key[: -len("zarr.json")]
+
+
+def _chunk_array_prefix(key: str) -> str | None:
+    """Return the array prefix for a scdata v3 default chunk key in O(1).
+
+    scdata writes ``chunk_key_encoding={name: default, separator: /}``, so a
+    chunk belongs to ``<array-prefix>c/<coords>``.  Splitting at the final
+    marker handles an array directory literally named ``c`` and avoids scanning
+    every array prefix for every chunk.
+    """
+    prefix, marker, _ = key.rpartition("/c/")
+    if marker:
+        return f"{prefix}/"
+    if key.startswith("c/"):
+        return ""
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -196,14 +306,6 @@ class ConvertStats:
     recompressed_bytes_in: int = 0
     recompressed_bytes_out: int = 0
     decode_errors: int = 0
-
-
-def _blosc_header(blocksize_or_nbytes: bytes) -> tuple[int, int, int]:
-    """Read (nbytes, blocksize, ctbytes) from the first 16 bytes of a blosc chunk."""
-    nbytes = struct.unpack_from("<I", blocksize_or_nbytes, 4)[0]
-    blocksize = struct.unpack_from("<I", blocksize_or_nbytes, 8)[0]
-    ctbytes = struct.unpack_from("<I", blocksize_or_nbytes, 12)[0]
-    return nbytes, blocksize, ctbytes
 
 
 def _recompress_chunk(
@@ -297,10 +399,10 @@ def convert_store(
                     zout.writestr(key, raw_bytes)
                     stats.copied_entries += 1
                     continue
-                found = _find_blosc_codec(meta)
+                found = _recompressible_blosc_codec(meta, key)
                 if found is None:
-                    # non-blosc array (zstd / uncompressed / string): copy the
-                    # original bytes verbatim.
+                    # Non-Blosc arrays (zstd / uncompressed / string) are not
+                    # interpreted and remain byte-identical.
                     zout.writestr(key, raw_bytes)
                     stats.copied_entries += 1
                     continue
@@ -325,22 +427,18 @@ def convert_store(
                 stats.blosc_arrays += 1
 
             # 2. Stream chunk files.  For arrays marked for re-compress, decode
-            #    + re-encode; for every other entry, byte-copy.
-            #    We process keys in sorted order for cache-friendly reads.
+            #    + re-encode; for every other entry, byte-copy.  Deriving the
+            #    array prefix from the scdata v3 ``.../c/<coords>`` chunk key is
+            #    O(1), unlike testing every array prefix for every chunk.
             non_meta_keys = [n for n in names if not n.endswith("zarr.json")]
             for key in non_meta_keys:
-                # Is this chunk under an array we're re-compressing?
-                prefix_match = None
-                for prefix in recompress_prefixes:
-                    if key.startswith(prefix):
-                        prefix_match = prefix
-                        break
-                if prefix_match is None:
-                    # not a blosc-array chunk (or a skipped blosc array): copy.
+                prefix = _chunk_array_prefix(key)
+                params = recompress_prefixes.get(prefix) if prefix is not None else None
+                if params is None:
+                    # Not a changed Blosc chunk (or a skipped array): byte-copy.
                     zout.writestr(key, zin.read(key))
                     stats.copied_entries += 1
                     continue
-                params = recompress_prefixes[prefix_match]
                 src_bytes = zin.read(key)
                 if len(src_bytes) == 0:
                     # zero-length chunk (absent/fill-value): copy as-is, the
@@ -392,53 +490,60 @@ def _verify_store(
     recompress_prefixes: dict[str, BloscParams],
     target_blocksize: int,
 ) -> None:
-    """Open the converted store with scdata.io.launch and sanity-check it.
+    """Validate staged output before it can replace its destination.
 
-    ``launch`` parses every zarr.json, reads var/_index (decodes its chunks) and
-    CSR indptr (decodes its chunks), so a broken blosc config or a corrupt
-    indptr/var chunk would raise here.  We additionally re-decode every
-    re-compressed chunk of indptr (which launch decodes anyway) plus a sample of
-    data/indices chunks and compare against the source decode — the per-chunk
-    byte roundtrip in ``_recompress_chunk`` already covers every chunk, but this
-    is a second independent check through scdata's reader.
+    Every changed chunk is independently decoded from both archives and compared
+    byte-for-byte.  ``ZipFile.testzip`` reads every output entry completely,
+    forcing ZIP CRC validation even for unchanged metadata/string entries.
     """
-    from scdata.io import launch
-
-    ds = launch(converted)
-    # launch already validated shapes + decoded indptr + var/_index.
-    _ = ds.num_cells, ds.num_genes
-
-    # Cross-check: re-decode a sample of re-compressed chunks via the source
-    # reader and confirm the blosc header blocksize is self-consistent.  The
-    # authoritative equivalence (converted == write_zarr output) was already
-    # established per-chunk in _recompress_chunk(verify=True).
     with zipfile.ZipFile(source, mode="r") as zin, zipfile.ZipFile(
         converted, mode="r"
     ) as zout:
-        checked = 0
+        source_names = zin.namelist()
+        converted_names = zout.namelist()
+        if len(converted_names) != len(set(converted_names)):
+            raise RuntimeError("verify: converted ZIP contains duplicate entry names")
+        if set(source_names) != set(converted_names):
+            missing = sorted(set(source_names) - set(converted_names))
+            extra = sorted(set(converted_names) - set(source_names))
+            raise RuntimeError(
+                f"verify: converted ZIP entry set differs (missing={missing[:3]!r}, "
+                f"extra={extra[:3]!r})"
+            )
+        bad_entry = zout.testzip()
+        if bad_entry is not None:
+            raise zipfile.BadZipFile(
+                f"verify: converted ZIP CRC failed for entry {bad_entry!r}"
+            )
+
         for prefix, params in recompress_prefixes.items():
-            # check up to 3 chunks per array (indptr usually has 1; data has many).
-            sample = []
-            for name in zin.namelist():
-                if name.startswith(prefix) and not name.endswith("zarr.json"):
-                    sample.append(name)
-            sample.sort()
-            for key in sample[:3]:
-                src_chunk = zin.read(key)
-                new_chunk = zout.read(key)
-                if len(src_chunk) == 0:
-                    continue
-                src_dec = bytes(params.decoder().decode(src_chunk))
-                new_dec = bytes(params.decoder().decode(new_chunk))
-                if src_dec != new_dec:
-                    raise RuntimeError(
-                        f"verify: chunk {key} decode mismatch after re-compress"
-                    )
-                checked += 1
-        # at least the indptr of every re-compressed CSR array was decoded by
-        # launch above; make sure we also touched at least one chunk here.
-        if checked == 0 and recompress_prefixes:
-            raise RuntimeError("verify: no re-compressed chunk was sampled")
+            meta_key = f"{prefix}zarr.json"
+            meta = json.loads(zout.read(meta_key))
+            found = _recompressible_blosc_codec(meta, meta_key)
+            if found is None or int(found[1].get("blocksize", 0)) != target_blocksize:
+                raise RuntimeError(
+                    f"verify: {meta_key} does not declare blocksize={target_blocksize}"
+                )
+
+        for key in source_names:
+            prefix = _chunk_array_prefix(key)
+            params = recompress_prefixes.get(prefix) if prefix is not None else None
+            if params is None:
+                continue
+            src_chunk = zin.read(key)
+            if not src_chunk:
+                continue
+            new_chunk = zout.read(key)
+            src_decoded = bytes(params.decoder().decode(src_chunk))
+            new_decoded = bytes(params.decoder().decode(new_chunk))
+            if src_decoded != new_decoded:
+                raise RuntimeError(f"verify: chunk {key} decode mismatch after re-compress")
+
+    # Exercise scdata's reader only after the byte-level archive checks pass.
+    from scdata.io import launch
+
+    ds = launch(converted)
+    _ = ds.num_cells, ds.num_genes
 
 
 # ---------------------------------------------------------------------------
@@ -471,8 +576,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--verify",
         action="store_true",
         help=(
-            "After conversion, open with scdata.io.launch and byte-compare a "
-            "sample of re-compressed chunks against the source."
+            "Before publishing, CRC-check every ZIP entry, byte-compare every "
+            "changed chunk, then open the staged store with scdata.io.launch."
         ),
     )
     p.add_argument(
@@ -515,26 +620,28 @@ def main(argv: list[str] | None = None) -> int:
 def _dry_run(src: Path, target_blocksize: int) -> int:
     with zipfile.ZipFile(src, mode="r") as zin:
         names = zin.namelist()
-        arrays = 0
-        chunks = 0
+        recompress_prefixes: set[str] = set()
         already = 0
         for key in (n for n in names if n.endswith("zarr.json")):
             meta = json.loads(zin.read(key))
             if not _is_array_meta(meta):
                 continue
-            found = _find_blosc_codec(meta)
+            found = _recompressible_blosc_codec(meta, key)
             if found is None:
                 continue
             _, cfg = found
             if not _needs_recompress(cfg, target_blocksize):
                 already += 1
                 continue
-            arrays += 1
-            prefix = _array_prefix(key)
-            chunks += sum(1 for n in names if n.startswith(prefix) and not n.endswith("zarr.json"))
+            recompress_prefixes.add(_array_prefix(key))
+        chunks = sum(
+            _chunk_array_prefix(key) in recompress_prefixes
+            for key in names
+            if not key.endswith("zarr.json")
+        )
     print(
         f"dry-run: {src.name}\n"
-        f"  blosc arrays to re-compress: {arrays}\n"
+        f"  blosc arrays to re-compress: {len(recompress_prefixes)}\n"
         f"  blosc chunks to re-compress: {chunks}\n"
         f"  blosc arrays already at blocksize={target_blocksize}: {already}"
     )

@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from scdata import ScDataBank
 from scdata.data import ArrayOrder, DenseDataset, DType, SparseDataset
 from scdata.io import write_zarr
 from scdata.io._launch import StoreError, launch, launch_all
@@ -104,6 +105,50 @@ def test_write_zarr_invalid_options_preserve_existing_directory(tmp_path: Path) 
     with pytest.raises(StoreError, match="chunk_size"):
         write_zarr(adata, root, format="dense1d", chunk_size=0, store="dir")
     assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_write_zarr_preflights_invalid_anndata_before_replacing_target(tmp_path: Path) -> None:
+    """Content validation must run before the target directory is touched."""
+    none_x = ad.AnnData(
+        X=None,
+        shape=(2, 2),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1"]),
+    )
+    empty = ad.AnnData(
+        X=np.empty((0, 2), dtype=np.float32),
+        obs=pd.DataFrame(index=[]),
+        var=pd.DataFrame(index=["g0", "g1"]),
+    )
+    duplicate, _ = _dense_adata()
+    duplicate.var_names = ["g0", "g0", "g2", "g3"]
+    bool_x, _ = _dense_adata()
+    bool_x.X = np.ones(bool_x.shape, dtype=bool)
+    bool_layer, _ = _dense_adata()
+    bool_layer.layers["mask"] = np.ones(bool_layer.shape, dtype=bool)
+    bool_raw, _ = _dense_adata()
+    bool_raw.raw = ad.AnnData(
+        X=np.ones((3, 2), dtype=bool),
+        var=pd.DataFrame(index=["r0", "r1"]),
+    )
+
+    for name, bad, match in (
+        ("none", none_x, "X is None"),
+        ("empty", empty, "non-empty"),
+        ("duplicate", duplicate, "var_names must be unique"),
+        ("bool_x", bool_x, "bool dtype"),
+        ("bool_layer", bool_layer, "bool dtype"),
+        ("bool_raw", bool_raw, "bool dtype"),
+    ):
+        target = tmp_path / f"preflight_{name}.zarr"
+        target.mkdir()
+        marker = target / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+
+        with pytest.raises(StoreError, match=match):
+            write_zarr(bad, target, store="dir")
+
+        assert marker.read_text(encoding="utf-8") == "keep"
 
 
 def test_dense1d_layer_and_launch_all(tmp_path: Path) -> None:
@@ -229,13 +274,59 @@ def test_nonexistent_path(tmp_path: Path) -> None:
 
 def test_shape_entries_must_be_json_integers(tmp_path: Path) -> None:
     adata, _ = _dense_adata()
-    root = write_zarr(adata, tmp_path / "float_shape.zarr", store="dir")
+    root = write_zarr(adata, tmp_path / "float_shape.zarr", format="dense2d", store="dir")
     meta = _read_json(root / "X" / "zarr.json")
     meta["shape"] = [3.5, 4]
     _write_json(root / "X" / "zarr.json", meta)
 
     with pytest.raises(StoreError, match="JSON integers"):
         launch(root)
+
+
+def test_missing_string_chunk_fills_its_original_positions(tmp_path: Path) -> None:
+    """A missing var-index chunk must not shift later gene names left."""
+    from numcodecs import VLenUTF8
+
+    adata, _ = _dense_adata((2, 4), np.float32)
+    root = write_zarr(adata, tmp_path / "missing_names.zarr", format="dense2d", store="dir")
+    index = root / "var" / "_index"
+    meta = _read_json(index / "zarr.json")
+    meta["chunk_grid"]["configuration"]["chunk_shape"] = [2]
+    meta["codecs"] = [{"name": "vlen-utf8", "configuration": {}}]
+    meta["fill_value"] = "missing"
+    _write_json(index / "zarr.json", meta)
+    codec = VLenUTF8()
+    (index / "c" / "0").write_bytes(codec.encode(np.asarray(["g0", "g1"], dtype=object)))
+    (index / "c" / "1").write_bytes(codec.encode(np.asarray(["g2", "g3"], dtype=object)))
+    (index / "c" / "0").unlink()
+
+    from scdata.io import read_var_names
+
+    assert read_var_names(root) == ("missing", "missing", "g2", "g3")
+
+
+def test_missing_indptr_chunk_fills_its_original_positions(tmp_path: Path) -> None:
+    """Missing indptr chunks bypass native packed decoding and fill in place."""
+    adata, matrix = _sparse_adata()
+    root = write_zarr(
+        adata,
+        tmp_path / "missing_indptr.zarr",
+        format="sparse",
+        compressor=None,
+        store="dir",
+    )
+    indptr = root / "X" / "indptr"
+    meta = _read_json(indptr / "zarr.json")
+    meta["chunk_grid"]["configuration"]["chunk_shape"] = [2]
+    _write_json(indptr / "zarr.json", meta)
+    raw = np.asarray(matrix.indptr, dtype="<i4")
+    (indptr / "c" / "0").write_bytes(raw[:2].tobytes())
+    (indptr / "c" / "1").write_bytes(raw[2:].tobytes())
+    (indptr / "c" / "0").unlink()
+
+    ds = launch(root)
+
+    assert tuple(np.asarray(ds.indptr).tolist()) == (0, 0, 4, 6)
 
 
 def test_absent_chunk_with_nonzero_fill_value_rejected(tmp_path: Path) -> None:
@@ -254,7 +345,7 @@ def test_absent_chunk_with_nonzero_fill_value_rejected(tmp_path: Path) -> None:
 
 def test_unsupported_dtype_is_store_error(tmp_path: Path) -> None:
     adata, _ = _dense_adata()
-    root = write_zarr(adata, tmp_path / "bad_dtype.zarr", store="dir")
+    root = write_zarr(adata, tmp_path / "bad_dtype.zarr", format="dense2d", store="dir")
     meta = _read_json(root / "X" / "zarr.json")
     meta["data_type"] = "complex128"
     _write_json(root / "X" / "zarr.json", meta)
@@ -263,9 +354,20 @@ def test_unsupported_dtype_is_store_error(tmp_path: Path) -> None:
         launch(root)
 
 
+def test_big_endian_bytes_codec_rejected(tmp_path: Path) -> None:
+    adata, _ = _dense_adata()
+    root = write_zarr(adata, tmp_path / "big_endian_bytes.zarr", format="dense2d", store="dir")
+    meta = _read_json(root / "X" / "zarr.json")
+    meta["codecs"][0]["configuration"] = {"endian": "big"}
+    _write_json(root / "X" / "zarr.json", meta)
+
+    with pytest.raises(StoreError, match="bytes endian"):
+        launch(root)
+
+
 def test_f_order_rejected(tmp_path: Path) -> None:
     adata, _ = _dense_adata()
-    root = write_zarr(adata, tmp_path / "forder.zarr", store="dir")
+    root = write_zarr(adata, tmp_path / "forder.zarr", format="dense2d", store="dir")
     meta = _read_json(root / "X" / "zarr.json")
     meta["order"] = "F"
     _write_json(root / "X" / "zarr.json", meta)
@@ -305,6 +407,42 @@ def test_rectilinear_unknown_chunk_key_encoding_rejected(tmp_path: Path) -> None
 
     with pytest.raises(StoreError, match="chunk_key_encoding"):
         launch(root)
+
+
+def test_rectilinear_rle_value_count_clips_trailing_overshoot(tmp_path: Path) -> None:
+    """RLE is [value, count]; only overlapping keys survive an overshooting tail."""
+    adata, matrix = _sparse_adata()
+    root = write_zarr(
+        adata,
+        tmp_path / "rect_rle.zarr",
+        format="sparse",
+        chunk_size=(4,),
+        align_cells=True,
+        compressor=None,
+        store="dir",
+    )
+    for name, values in (("indices", matrix.indices), ("data", matrix.data)):
+        node = root / "X" / name
+        meta = _read_json(node / "zarr.json")
+        meta["chunk_grid"]["configuration"]["chunk_shapes"] = [[[4, 2]]]
+        _write_json(node / "zarr.json", meta)
+        # Zarr's last chunk is codec-shaped as four elements even though only
+        # its first two elements are inside the six-element logical array.
+        padded = np.pad(np.asarray(values[4:]), (0, 2))
+        (node / "c" / "1").write_bytes(np.asarray(padded, dtype=values.dtype).tobytes())
+
+    ds = launch(root)
+    assert ds.data.chunk_boundaries == ((0, 4, 6),)
+    assert ds.data.chunk_codec_boundaries == ((0, 4, 8),)
+    assert ds.data.chunk_paths == ("X/data/c/0", "X/data/c/1")
+
+    bank = ScDataBank()
+    did = bank.register(ds)
+    try:
+        loaded = np.asarray(bank.load(did, [0, 1, 2])).reshape(3, 4)
+    finally:
+        bank.unregister(did)
+    assert np.array_equal(loaded, matrix.toarray())
 
 
 def test_rectilinear_bool_edge_rejected(tmp_path: Path) -> None:

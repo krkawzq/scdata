@@ -474,6 +474,7 @@ fn native_scheduled_worker_loop(rx: flume::Receiver<NativeExecutorCommand>) {
                 match rx.try_recv() {
                     Ok(NativeExecutorCommand::Scheduled(next)) => {
                         if should_group_native_commands(&next)
+                            && Arc::ptr_eq(&next.cancel, &commands[0].cancel)
                             && next.use_targeted_cache == commands[0].use_targeted_cache
                             && total_items + next.items.len() <= max_items
                         {
@@ -566,6 +567,22 @@ fn should_group_native_commands(command: &NativeScheduledCommand) -> bool {
         && command.items.len() < native_command_group_max_items(command)
 }
 
+async fn send_native_scheduled_result(
+    tx: &flume::Sender<io::Result<Vec<u8>>>,
+    result: io::Result<Vec<u8>>,
+    cancel: &Arc<PrefetchCancel>,
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if cancel.is_cancelled() || *cancel_rx.borrow() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        _ = cancel_rx.changed() => false,
+        sent = tx.send_async(result) => sent.is_ok(),
+    }
+}
+
 async fn run_native_scheduled(
     native: NativeScheduledContext,
     items: Vec<AccessItem>,
@@ -583,6 +600,7 @@ async fn run_native_scheduled(
     let total_items = items.len();
     let mut source = items.into_iter().enumerate();
     let mut tasks = JoinSet::new();
+    let mut cancel_rx = cancel.cancel_receiver();
     let mut completed: Vec<Option<io::Result<Vec<u8>>>> = (0..total_items).map(|_| None).collect();
     let mut next_emit = 0usize;
     let mut source_done = false;
@@ -626,9 +644,15 @@ async fn run_native_scheduled(
                     }
                 }
                 Err(err) => {
-                    let _ = tx.send(Err(io::Error::other(format!(
-                        "native scheduled worker failed: {err}"
-                    ))));
+                    let _ = send_native_scheduled_result(
+                        &tx,
+                        Err(io::Error::other(format!(
+                            "native scheduled worker failed: {err}"
+                        ))),
+                        &cancel,
+                        &mut cancel_rx,
+                    )
+                    .await;
                     cancel.cancel_in_flight();
                     return;
                 }
@@ -640,8 +664,9 @@ async fn run_native_scheduled(
                 break;
             };
             let should_stop = result.is_err();
-            if tx.send(result).is_err() {
+            if !send_native_scheduled_result(&tx, result, &cancel, &mut cancel_rx).await {
                 cancel.cancel_in_flight();
+                tasks.abort_all();
                 return;
             }
             next_emit += 1;
@@ -654,31 +679,54 @@ async fn run_native_scheduled(
         if source_done && tasks.is_empty() {
             return;
         }
-        if cancel.is_cancelled() {
-            let _ = tx.send(Err(io::Error::other("scheduled item cancelled")));
+        if cancel.is_cancelled() || *cancel_rx.borrow() {
+            tasks.abort_all();
             return;
         }
 
-        let Some(joined) = tasks.join_next().await else {
-            return;
-        };
-        match joined {
-            Ok(results) => {
-                for (seq, result) in results {
-                    if seq < total_items {
-                        completed[seq] = Some(result);
+        tokio::select! {
+            _ = cancel_rx.changed() => {
+                if cancel.is_cancelled() || *cancel_rx.borrow() {
+                    tasks.abort_all();
+                    return;
+                }
+            }
+            joined = tasks.join_next() => {
+                let Some(joined) = joined else {
+                    return;
+                };
+                match joined {
+                    Ok(results) => {
+                        for (seq, result) in results {
+                            if seq < total_items {
+                                completed[seq] = Some(result);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = send_native_scheduled_result(
+                            &tx,
+                            Err(io::Error::other(format!(
+                                "native scheduled worker failed: {err}"
+                            ))),
+                            &cancel,
+                            &mut cancel_rx,
+                        )
+                        .await;
+                        cancel.cancel_in_flight();
+                        return;
                     }
                 }
             }
-            Err(err) => {
-                let _ = tx.send(Err(io::Error::other(format!(
-                    "native scheduled worker failed: {err}"
-                ))));
-                cancel.cancel_in_flight();
-                return;
-            }
         }
     }
+}
+
+fn cancelled_native_batch(batch: Vec<(usize, AccessItem)>) -> Vec<(usize, io::Result<Vec<u8>>)> {
+    batch
+        .into_iter()
+        .map(|(seq, _)| (seq, Err(io::Error::other("scheduled item cancelled"))))
+        .collect()
 }
 
 async fn load_native_batch(
@@ -688,27 +736,32 @@ async fn load_native_batch(
     use_targeted_cache: bool,
 ) -> Vec<(usize, io::Result<Vec<u8>>)> {
     if cancel.is_cancelled() {
-        return batch
-            .into_iter()
-            .map(|(seq, _)| (seq, Err(io::Error::other("scheduled item cancelled"))))
-            .collect();
+        return cancelled_native_batch(batch);
     }
 
     let items = batch
         .iter()
         .map(|(_, item)| item.clone())
         .collect::<Vec<_>>();
-    let native_result = load_access_items_blosc_lz4_native(
-        Arc::clone(&native.io),
-        native.config.load.coalesce.clone(),
-        &native.index_cache,
-        native.block_cache_for_command(use_targeted_cache),
-        native.in_flight_payload_reads.clone(),
-        native.decoded_cache_for_command(use_targeted_cache),
-        &items,
-        0,
-    )
-    .await;
+    let mut cancel_rx = cancel.cancel_receiver();
+    if *cancel_rx.borrow() {
+        return cancelled_native_batch(batch);
+    }
+    let native_result = tokio::select! {
+        _ = cancel_rx.changed() => {
+            return cancelled_native_batch(batch);
+        }
+        result = load_access_items_blosc_lz4_native(
+            Arc::clone(&native.io),
+            native.config.load.coalesce.clone(),
+            &native.index_cache,
+            native.block_cache_for_command(use_targeted_cache),
+            native.in_flight_payload_reads.clone(),
+            native.decoded_cache_for_command(use_targeted_cache),
+            &items,
+            0,
+        ) => result,
+    };
 
     // Zero fallback: the strategy resolved to native at spawn time, so a native
     // decode failure is a real error. `None` (the loader declined this item —
@@ -785,7 +838,15 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
     }
 
     if !batch.is_empty() {
-        let results = load_native_batch_uncancelled(native, batch, use_targeted_cache).await;
+        // Commands are only grouped when they share this cancellation scope, so
+        // aborting the combined native read cannot cancel another session.
+        let results = load_native_batch(
+            native,
+            batch,
+            Arc::clone(&states[0].cancel),
+            use_targeted_cache,
+        )
+        .await;
         for (flat_seq, result) in results {
             let Some(&(command_idx, item_idx)) = slots.get(flat_seq) else {
                 continue;
@@ -800,6 +861,7 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
     }
 
     for (command_idx, state) in states.into_iter().enumerate() {
+        let mut cancel_rx = state.cancel.cancel_receiver();
         for slot in completed[command_idx].iter_mut().take(state.item_count) {
             let result = slot.take().unwrap_or_else(|| {
                 Err(io::Error::new(
@@ -808,7 +870,8 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
                 ))
             });
             let should_stop = result.is_err();
-            if state.tx.send(result).is_err() {
+            if !send_native_scheduled_result(&state.tx, result, &state.cancel, &mut cancel_rx).await
+            {
                 state.cancel.cancel_in_flight();
                 break;
             }
@@ -816,55 +879,6 @@ async fn run_native_scheduled_small_commands(commands: Vec<NativeScheduledComman
                 state.cancel.cancel_in_flight();
                 break;
             }
-        }
-    }
-}
-
-async fn load_native_batch_uncancelled(
-    native: NativeScheduledContext,
-    batch: Vec<(usize, AccessItem)>,
-    use_targeted_cache: bool,
-) -> Vec<(usize, io::Result<Vec<u8>>)> {
-    let items = batch
-        .iter()
-        .map(|(_, item)| item.clone())
-        .collect::<Vec<_>>();
-    let native_result = load_access_items_blosc_lz4_native(
-        Arc::clone(&native.io),
-        native.config.load.coalesce.clone(),
-        &native.index_cache,
-        native.block_cache_for_command(use_targeted_cache),
-        native.in_flight_payload_reads.clone(),
-        native.decoded_cache_for_command(use_targeted_cache),
-        &items,
-        0,
-    )
-    .await;
-
-    // Zero fallback, same as `load_native_batch`: `None` and `Err` both surface
-    // as `io::Error`. This variant is the small-command-grouping path and does
-    // not consult the cancel flag before loading (cancellation is checked per
-    // command in `run_native_scheduled_small_commands`).
-    match native_result {
-        Ok(results) => {
-            let mut out = Vec::with_capacity(batch.len());
-            for ((seq, _), result) in batch.into_iter().zip(results) {
-                let result = match result {
-                    Some(bytes) => Ok(bytes),
-                    None => Err(io::Error::other(
-                        "native loader returned no result for blosc item",
-                    )),
-                };
-                out.push((seq, result));
-            }
-            out
-        }
-        Err(err) => {
-            let message = err.to_string();
-            batch
-                .into_iter()
-                .map(|(seq, _)| (seq, Err(io::Error::other(message.clone()))))
-                .collect()
         }
     }
 }
@@ -956,7 +970,9 @@ fn targeted_selected_sparse_cache_capacities(
 mod tests {
     use super::{
         load_native_batch, load_native_items_ordered_async, load_native_items_ordered_blocking,
-        AccessStrategy, NativeScheduledContext, ScheduledBatchAccess,
+        run_native_scheduled_small_commands, AccessStrategy, NativeCustomCommand,
+        NativeOrderedCommand, NativeScheduledAccess, NativeScheduledCommand,
+        NativeScheduledContext, ScheduledBatchAccess,
     };
     use crate::access::{
         AccessConfig, AccessCpuConfig, AccessHandle, AccessItem, AccessProfile, AccessScheduler,
@@ -1031,6 +1047,31 @@ mod tests {
             let end = start + len;
             let data: Arc<[u8]> = Arc::from(self.bytes[start..end].to_vec().into_boxed_slice());
             Box::pin(async move { Ok(data) })
+        }
+    }
+
+    /// `IoBackend` that remains pending forever after reporting each read.
+    /// Cancellation must drop these futures rather than waiting for I/O.
+    struct NeverIo {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    impl IoBackend for NeverIo {
+        fn submit_read(&self, _file: FileRef, _offset: u64, _len: usize, _priority: u8) -> IoTask {
+            let _ = self.started.send(());
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Blocking test variant of `NeverIo` with a synchronous start signal.
+    struct NeverIoWithStdSignal {
+        started: std::sync::mpsc::Sender<()>,
+    }
+
+    impl IoBackend for NeverIoWithStdSignal {
+        fn submit_read(&self, _file: FileRef, _offset: u64, _len: usize, _priority: u8) -> IoTask {
+            let _ = self.started.send(());
+            Box::pin(std::future::pending())
         }
     }
 
@@ -1280,6 +1321,151 @@ mod tests {
     // ----- scheduled iterator + dispatch -------------------------------------
 
     #[test]
+    fn native_scheduled_cancel_drops_never_completing_io() {
+        let (_io, items, _expected) = distinct_chunks(16);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut config = native_config();
+        config.cache.payload_capacity_bytes = 4096;
+        let ctx = NativeScheduledContext::new(
+            Arc::new(NeverIoWithStdSignal {
+                started: started_tx,
+            }),
+            config,
+        )
+        .expect("native context");
+        let (handle, cancel) = make_cancel();
+        let strategy = AccessStrategy::BloscLz4Native(ctx);
+        let scheduled = strategy
+            .build(
+                handle,
+                items,
+                ScheduledAccessConfig {
+                    prefetch_step: 16,
+                    decode_ahead_steps: 16,
+                    ready_ahead_steps: 16,
+                },
+                Arc::clone(&cancel),
+                false,
+                false,
+            )
+            .expect("native scheduled access");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = scheduled.into_iter().next();
+            let _ = done_tx.send(result);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("native read started");
+        cancel.cancel_in_flight();
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("native scheduled iterator did not unblock on cancellation");
+        assert!(
+            result.is_none() || result.is_some_and(|item| item.is_err()),
+            "cancelled native scheduled access must not produce data"
+        );
+    }
+
+    #[test]
+    fn full_native_output_queue_cancellation_unblocks_ordered_and_custom_commands() {
+        let (io, mut items, _expected) = distinct_chunks(6);
+        let mut config = native_config();
+        config.request_prefetch_blocks = 1;
+        let ctx = NativeScheduledContext::new(io, config).expect("native context");
+        let (_handle, cancel) = make_cancel();
+        let ordered_item = items.pop().expect("ordered item");
+        let scheduled = NativeScheduledAccess::spawn(
+            ctx.clone(),
+            items,
+            ScheduledAccessConfig {
+                prefetch_step: 1,
+                decode_ahead_steps: 1,
+                ready_ahead_steps: 1,
+            },
+            Arc::clone(&cancel),
+            false,
+            false,
+        )
+        .expect("scheduled access");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while scheduled.rx.as_ref().expect("receiver").len() < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scheduled output queue did not fill"
+            );
+            std::thread::yield_now();
+        }
+        // Give the single native executor worker time to enter the second send
+        // after the capacity-one queue has filled.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let (ordered_reply, ordered_rx) = std::sync::mpsc::sync_channel(1);
+        ctx.executor
+            .submit_ordered(NativeOrderedCommand {
+                native: ctx.clone(),
+                items: vec![ordered_item],
+                cancel: Arc::clone(&cancel),
+                reply: ordered_reply,
+            })
+            .expect("submit ordered command");
+        let (custom_reply, custom_rx) = std::sync::mpsc::sync_channel(1);
+        ctx.executor
+            .submit_custom(NativeCustomCommand {
+                cancel: Arc::clone(&cancel),
+                job: Box::new(|_| Ok(())),
+                reply: custom_reply,
+            })
+            .expect("submit custom command");
+
+        cancel.cancel_in_flight();
+        let ordered = ordered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ordered command did not unblock after cancellation");
+        assert!(ordered.is_err(), "cancelled ordered command must fail");
+        custom_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("custom command did not unblock after cancellation")
+            .expect("custom command");
+        drop(scheduled);
+    }
+
+    #[test]
+    fn grouped_native_output_queue_cancellation_unblocks_sender() {
+        let (io, items, _expected) = distinct_chunks(4);
+        let ctx = make_ctx(io);
+        let (_handle, cancel) = make_cancel();
+        let mut items = items.into_iter();
+        let mut commands = Vec::new();
+        let mut _receivers = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = flume::bounded(1);
+            _receivers.push(rx);
+            commands.push(NativeScheduledCommand {
+                native: ctx.clone(),
+                items: vec![items.next().expect("first"), items.next().expect("second")],
+                cancel: Arc::clone(&cancel),
+                allow_small_command_grouping: true,
+                use_targeted_cache: false,
+                window: 1,
+                tx,
+            });
+        }
+        let cancel_for_thread = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            cancel_for_thread.cancel_in_flight();
+        });
+
+        run_async_timeout(
+            run_native_scheduled_small_commands(commands),
+            Duration::from_secs(2),
+            "grouped native full output queue cancellation",
+        );
+    }
+
+    #[test]
     fn access_strategy_build_native_dispatches_ordered_output() {
         // `AccessStrategy::BloscLz4Native(ctx).build(...)` must dispatch to the
         // native scheduled iterator (`ScheduledBatchAccess::Native`) and emit
@@ -1303,6 +1489,48 @@ mod tests {
         for (got, expected) in got.iter().zip(&expected) {
             assert_eq!(got.as_slice(), expected.as_slice());
         }
+    }
+
+    #[test]
+    fn cancellation_broadcast_aborts_two_never_completing_native_loads() {
+        let (_io, mut items, _expected) = distinct_chunks(2);
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = make_ctx(Arc::new(NeverIo {
+            started: started_tx,
+        }));
+        let (_handle, cancel) = make_cancel();
+        let first_item = items.remove(0);
+        let second_item = items.remove(0);
+
+        run_async_timeout(
+            async move {
+                let first = tokio::spawn(load_native_batch(
+                    ctx.clone(),
+                    vec![(0, first_item)],
+                    Arc::clone(&cancel),
+                    false,
+                ));
+                let second = tokio::spawn(load_native_batch(
+                    ctx,
+                    vec![(0, second_item)],
+                    Arc::clone(&cancel),
+                    false,
+                ));
+                started_rx.recv().await.expect("first native read started");
+                started_rx.recv().await.expect("second native read started");
+                cancel.cancel_in_flight();
+
+                for result in [
+                    first.await.expect("first task"),
+                    second.await.expect("second task"),
+                ] {
+                    let err = result[0].1.as_ref().expect_err("cancelled native load");
+                    assert!(err.to_string().contains("cancelled"), "{err}");
+                }
+            },
+            Duration::from_secs(2),
+            "two native cancellation waiters",
+        );
     }
 
     #[test]

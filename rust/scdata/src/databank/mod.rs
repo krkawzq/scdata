@@ -22,7 +22,7 @@ mod scheduled;
 mod sparse;
 mod util;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 pub use array::{
     ArrayCodecSpec, ArrayGridSpec, ArrayOrder, ArraySpec, Bf16Bits, ChunkSourceSpec, ChunkSpec,
@@ -51,13 +51,93 @@ use interner::GeneInterner;
 use profile::{DataBankAccessKind, DataBankProfile, DataBankRegisterKind, DataBankScheduledKind};
 use registry::DatasetRegistry;
 
+/// File-backed datasets removed from the registry while a prefetcher still
+/// holds their `Arc`.  The prefetcher owns an `Arc` to this tracker and invokes
+/// `cleanup` after it has cancelled, joined, and dropped its dataset arcs, so
+/// retirement does not require another unrelated DataBank operation.
+pub(crate) struct RetiredDatasets {
+    datasets: Mutex<Vec<Arc<Dataset>>>,
+    io_pool: Weak<IoPool>,
+}
+
+/// Keeps a retired-dataset cleanup callback alive with an asynchronous
+/// prefetch job.  The final queued job may be the last owner of a retired
+/// dataset after `PrefetchCells::close` has returned; its drop must therefore
+/// retry cleanup instead of depending on a later, unrelated DataBank call.
+#[derive(Clone)]
+pub(crate) struct RetiredCleanupGuard {
+    retired: Arc<RetiredDatasets>,
+}
+
+impl RetiredCleanupGuard {
+    pub(crate) fn new(retired: Arc<RetiredDatasets>) -> Self {
+        Self { retired }
+    }
+}
+
+impl Drop for RetiredCleanupGuard {
+    fn drop(&mut self) {
+        // Destructors cannot surface a file-release error.  Keep the retired
+        // entry for the next explicit DataBank cleanup attempt in that case.
+        let _ = self.retired.cleanup();
+    }
+}
+
+impl RetiredDatasets {
+    fn new(io_pool: &Arc<IoPool>) -> Self {
+        Self {
+            datasets: Mutex::new(Vec::new()),
+            io_pool: Arc::downgrade(io_pool),
+        }
+    }
+
+    fn retire(&self, dataset: Arc<Dataset>) {
+        self.datasets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(dataset);
+    }
+
+    fn cleanup(&self) -> (usize, usize, DataBankResult<()>) {
+        let Some(io_pool) = self.io_pool.upgrade() else {
+            // The bank has already dropped its pool, which has closed the file
+            // table.  Drop the retired arcs rather than keeping their metadata
+            // alive through a late iterator close.
+            self.datasets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            return (0, 0, Ok(()));
+        };
+        let mut datasets = self
+            .datasets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inspected = datasets.len();
+        let mut first_error = None;
+        let mut retained = Vec::with_capacity(inspected);
+        for dataset in std::mem::take(&mut *datasets) {
+            if Arc::strong_count(&dataset) == 1 {
+                if let Err(err) = dataset.unregister_files(io_pool.as_ref()) {
+                    first_error.get_or_insert(err);
+                }
+            } else {
+                retained.push(dataset);
+            }
+        }
+        let retained_len = retained.len();
+        *datasets = retained;
+        (inspected, retained_len, first_error.map_or(Ok(()), Err))
+    }
+}
+
 pub struct DataBank {
     io_pool: Arc<IoPool>,
     _decode_pool: Arc<DecodePool>,
     access: AccessHandle,
     compute: Arc<DataBankComputePool>,
     registry: DatasetRegistry,
-    retired: Vec<Arc<Dataset>>,
+    retired: Arc<RetiredDatasets>,
     interner: GeneInterner,
     config: DataBankConfig,
     profiler: DataBankProfile,
@@ -87,13 +167,14 @@ impl DataBank {
             Box::new(IoPoolBackend::new(Arc::clone(&io_pool))),
             Box::new(DecodePoolBackend::new(Arc::clone(&decode_pool))),
         )?;
+        let retired = Arc::new(RetiredDatasets::new(&io_pool));
         Ok(Self {
             io_pool,
             _decode_pool: decode_pool,
             access,
             compute,
             registry: DatasetRegistry::new(),
-            retired: Vec::new(),
+            retired,
             interner: GeneInterner::new(),
             config,
             profiler,
@@ -686,6 +767,7 @@ impl DataBank {
         let result = batch::prefetch_cells_scheduled(
             &self.access,
             Arc::clone(&self.compute),
+            Arc::clone(&self.retired),
             dataset,
             batch_source.into_iter(),
             config,
@@ -728,6 +810,7 @@ impl DataBank {
         let result = batch::prefetch_cells_scheduled_by_gene_names(
             &self.access,
             Arc::clone(&self.compute),
+            Arc::clone(&self.retired),
             dataset,
             batch_source.into_iter(),
             gene_names,
@@ -773,6 +856,7 @@ impl DataBank {
         let result = batch::prefetch_cells_scheduled_multi(
             &self.access,
             Arc::clone(&self.compute),
+            Arc::clone(&self.retired),
             datasets,
             batch_source.into_iter(),
             config,
@@ -819,6 +903,7 @@ impl DataBank {
         let result = batch::prefetch_cells_scheduled_multi_by_gene_names(
             &self.access,
             Arc::clone(&self.compute),
+            Arc::clone(&self.retired),
             datasets,
             batch_source.into_iter(),
             gene_names,
@@ -884,30 +969,14 @@ impl DataBank {
         if Arc::strong_count(&dataset) == 1 {
             dataset.unregister_files(self.io_pool.as_ref())
         } else {
-            self.retired.push(dataset);
+            self.retired.retire(dataset);
             Ok(())
         }
     }
 
     fn cleanup_retired(&mut self) -> DataBankResult<()> {
         let started = self.profiler.lifecycle_timer();
-        let inspected = self.retired.len();
-        let mut first_error = None;
-        let mut retained = Vec::with_capacity(self.retired.len());
-
-        for dataset in self.retired.drain(..) {
-            if Arc::strong_count(&dataset) == 1 {
-                if let Err(err) = dataset.unregister_files(self.io_pool.as_ref()) {
-                    first_error.get_or_insert(err);
-                }
-            } else {
-                retained.push(dataset);
-            }
-        }
-
-        self.retired = retained;
-        let retained = self.retired.len();
-        let result = first_error.map_or(Ok(()), Err);
+        let (inspected, retained, result) = self.retired.cleanup();
         self.profiler
             .record_cleanup(started, inspected, retained, result.is_err());
         result

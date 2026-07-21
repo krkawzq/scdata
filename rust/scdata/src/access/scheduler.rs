@@ -10,7 +10,7 @@ use std::thread;
 
 use flume::TrySendError;
 use tokio::runtime::Builder;
-use tokio::sync::{futures::OwnedNotified, oneshot, Notify};
+use tokio::sync::{futures::OwnedNotified, oneshot, watch, Notify};
 use tokio::task::{AbortHandle, JoinError, JoinSet, LocalSet};
 
 #[cfg(test)]
@@ -453,6 +453,10 @@ impl AccessHandle {
 #[derive(Debug)]
 pub struct PrefetchCancel {
     flag: AtomicBool,
+    /// Broadcast cancellation state for async users of this handle (notably
+    /// native scheduled loaders). Each task subscribes independently, and a
+    /// late subscriber immediately observes an already-cancelled state.
+    cancel_tx: watch::Sender<bool>,
     in_flight: Mutex<Option<(u64, ChunkKey)>>,
     handle: AccessHandle,
 }
@@ -460,8 +464,10 @@ pub struct PrefetchCancel {
 impl PrefetchCancel {
     /// Create a handle bound to `handle` for issuing scheduler cancels.
     pub fn new(handle: AccessHandle) -> Arc<Self> {
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
         Arc::new(Self {
             flag: AtomicBool::new(false),
+            cancel_tx,
             in_flight: Mutex::new(None),
             handle,
         })
@@ -470,6 +476,11 @@ impl PrefetchCancel {
     /// Whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
+    }
+
+    /// Subscribe to broadcast cancellation state for an async wait.
+    pub fn cancel_receiver(&self) -> watch::Receiver<bool> {
+        self.cancel_tx.subscribe()
     }
 
     /// Mark the entry currently blocked in `blocking_recv`, so a concurrent
@@ -488,6 +499,7 @@ impl PrefetchCancel {
     /// Returns the cancelled key, if any.
     pub fn cancel_in_flight(&self) -> Option<ChunkKey> {
         self.flag.store(true, Ordering::Release);
+        self.cancel_tx.send_replace(true);
         // A poisoned lock only happens if the producer panicked while holding
         // it (the critical section is a single assignment, so this is unlikely);
         // recover the inner value rather than panicking the consumer's drop too.

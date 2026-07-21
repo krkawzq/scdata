@@ -25,6 +25,7 @@ from numpy.typing import NDArray
 from scdata.data._coerce import _as_gene_names, _coerce_index_int
 from scdata.data._cell import CellAccess, CellBatch, _as_cell_index
 from scdata.data._index import CellIndexDataset, CellIndexPlan
+from scdata.data._prefetch import PrefetchIterator
 from scdata.data._stats import BankConfigSummary, LoaderStats, _StatsCollector
 
 try:
@@ -65,7 +66,7 @@ class _SupportsPrefetch(Protocol):
         missing: MissingGenePolicy | str | None = None,
         dtype: DTypeLike | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
-    ) -> Iterator[CellBatch]: ...
+    ) -> PrefetchIterator: ...
 
     def prefetch_multi(
         self,
@@ -76,7 +77,7 @@ class _SupportsPrefetch(Protocol):
         missing: MissingGenePolicy | str | None = None,
         dtype: DTypeLike | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
-    ) -> Iterator[CellBatch]: ...
+    ) -> PrefetchIterator: ...
 
     def prefetch_indexed(
         self,
@@ -87,7 +88,7 @@ class _SupportsPrefetch(Protocol):
         missing: MissingGenePolicy | str | None = None,
         dtype: DTypeLike | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
-    ) -> Iterator[CellBatch]: ...
+    ) -> PrefetchIterator: ...
 
 
 class _BatchPartPlan(TypedDict):

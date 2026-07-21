@@ -514,6 +514,7 @@ fn databank_config(args: &Args) -> DataBankConfig {
                 assume_non_overlapping_reads: true,
             },
             num_workers: args.workers,
+            steal_interval_us: 0,
             cpus: None,
         }),
         decode_config: DecodePoolConfig {

@@ -363,7 +363,29 @@ def build_tasks(
         if len(by_target.get(str(target), ())) > 1:
             target = default_target_zip(source_dir, input_root, output_root, drop_matrix_dir=False)
         tasks.append(ConvertTask(str(source_dir), str(target)))
+    _validate_unique_tasks(tasks)
     return tasks
+
+
+def _validate_unique_tasks(tasks: list[ConvertTask]) -> None:
+    """Reject duplicate sources or final targets before workers share staging paths."""
+    sources: dict[Path, int] = {}
+    targets: dict[Path, int] = {}
+    for index, task in enumerate(tasks):
+        source = Path(task.source_dir).resolve()
+        target = Path(task.target_zip).resolve()
+        if source in sources:
+            raise ValueError(
+                f"duplicate source directory in selected tasks: {source} "
+                f"(entries {sources[source] + 1} and {index + 1})"
+            )
+        if target in targets:
+            raise ValueError(
+                f"duplicate output target in selected tasks: {target} "
+                f"(entries {targets[target] + 1} and {index + 1})"
+            )
+        sources[source] = index
+        targets[target] = index
 
 
 def default_target_zip(
@@ -448,15 +470,17 @@ def convert_one_task(
             compressor=compressor,
         )
         zip_directory_stored(work_zarr, tmp_zip)
-        os.replace(tmp_zip, target_zip)
-
         if verify:
-            ds = launch(target_zip)
+            # Match the cellxgene converter: validate the staged archive before
+            # publishing so a failed verification cannot replace an existing,
+            # valid target with a bad ZIP that a future run would merely skip.
+            ds = launch(tmp_zip)
             if ds.num_cells != n_obs or ds.num_genes != n_vars:
                 raise RuntimeError(
                     f"launch shape mismatch: got {(ds.num_cells, ds.num_genes)}, "
                     f"expected {(n_obs, n_vars)}"
                 )
+        os.replace(tmp_zip, target_zip)
 
         output_bytes = target_zip.stat().st_size
         if not keep_zarr:
@@ -504,7 +528,9 @@ def read_10x_directory(
     from scipy.io import mmread
 
     matrix_path = require_existing(source_dir, "matrix.mtx")
-    features_path = require_existing(source_dir, "features.tsv")
+    # Older 10x Cell Ranger outputs name the feature table ``genes.tsv``.
+    # Prefer the current ``features.tsv`` spelling, but support the legacy form.
+    features_path = require_existing_any(source_dir, "features.tsv", "genes.tsv")
     barcodes_path = require_existing(source_dir, "barcodes.tsv")
 
     with open_text_or_gzip(matrix_path, binary=True) as fh:
@@ -626,11 +652,17 @@ def integer_value_range(data: Any, *, source: Path, np: Any) -> tuple[int, int]:
 
 
 def require_existing(source_dir: Path, stem: str) -> Path:
-    candidates = (source_dir / f"{stem}.gz", source_dir / stem)
-    for path in candidates:
-        if path.is_file():
-            return path
-    raise FileNotFoundError(f"missing {stem}(.gz) in {source_dir}")
+    return require_existing_any(source_dir, stem)
+
+
+def require_existing_any(source_dir: Path, *stems: str) -> Path:
+    """Find the first present plain or gzip-compressed 10x input file."""
+    for stem in stems:
+        for path in (source_dir / f"{stem}.gz", source_dir / stem):
+            if path.is_file():
+                return path
+    alternatives = " or ".join(f"{stem}(.gz)" for stem in stems)
+    raise FileNotFoundError(f"missing {alternatives} in {source_dir}")
 
 
 def open_text_or_gzip(path: Path, *, binary: bool = False) -> Any:

@@ -3944,6 +3944,7 @@ mod tests {
                     assume_non_overlapping_reads: false,
                 },
                 num_workers: 1,
+                steal_interval_us: 0,
                 cpus: None,
             }),
             profiler.clone(),
@@ -4257,6 +4258,7 @@ mod tests {
                     assume_non_overlapping_reads: false,
                 },
                 num_workers: 1,
+                steal_interval_us: 0,
                 cpus: None,
             }))
             .expect("create env-profiled pool");

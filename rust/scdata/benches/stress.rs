@@ -97,6 +97,7 @@ fn stress_iopool(config: BenchConfig, threads: &[usize]) {
                     assume_non_overlapping_reads: true,
                 },
                 num_workers: 4,
+                steal_interval_us: 0,
                 cpus: None,
             }),
             runtime.clone(),

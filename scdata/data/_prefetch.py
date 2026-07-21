@@ -30,7 +30,7 @@ class PrefetchIterator:
     ``None``).
     """
 
-    __slots__ = ("_inner", "_gene_names", "_resolved_strategy", "_fallback_reason")
+    __slots__ = ("_inner", "_gene_names", "_resolved_strategy", "_fallback_reason", "_closed")
 
     def __init__(
         self,
@@ -42,22 +42,69 @@ class PrefetchIterator:
         # Bind the iterator protocol once; ``inner`` may be a Rust pyclass that
         # is itself an iterator (``__iter__`` returns self) or any Python
         # iterable.
-        self._inner: Iterator[tuple[NDArray[np.intp], NDArray[np.generic], int]] = iter(inner)
+        self._inner: Iterator[tuple[NDArray[np.intp], NDArray[np.generic], int]] | None = (
+            iter(inner)
+        )
         self._gene_names = _as_gene_names(gene_names) if gene_names is not None else None
         self._resolved_strategy = resolved_strategy
         self._fallback_reason = fallback_reason
+        self._closed = False
 
     def __iter__(self) -> "PrefetchIterator":
         return self
 
     def __next__(self) -> CellBatch:
-        cells, data, num_genes = next(self._inner)
-        return CellBatch.from_array(
-            cells=cells,
-            data=data,
-            num_genes=num_genes,
-            gene_names=self._gene_names,
-        )
+        inner = self._inner
+        if self._closed or inner is None:
+            raise StopIteration
+        try:
+            cells, data, num_genes = next(inner)
+            return CellBatch.from_array(
+                cells=cells,
+                data=data,
+                num_genes=num_genes,
+                gene_names=self._gene_names,
+            )
+        except StopIteration:
+            self.close()
+            raise
+        except BaseException:
+            # Do not mask the producer's root error (or an output conversion
+            # error) with a cleanup failure.  Explicit ``close()`` still
+            # reports a close failure to its direct caller.
+            self._close(suppress_errors=True)
+            raise
+
+    def _close(self, *, suppress_errors: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        inner, self._inner = self._inner, None
+        close = getattr(inner, "close", None)
+        if not callable(close):
+            return
+        if suppress_errors:
+            try:
+                close()
+            except BaseException:
+                pass
+        else:
+            close()
+
+    def close(self) -> None:
+        """Cancel outstanding prefetch work and release its retained resources.
+
+        The method is idempotent.  For the Rust producer it invokes its explicit
+        cancellation-and-join path; for a compatible Python source it forwards
+        a conventional ``close()`` method when present.
+        """
+        self._close(suppress_errors=False)
+
+    def __enter__(self) -> "PrefetchIterator":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     @property
     def resolved_strategy(self) -> str | None:

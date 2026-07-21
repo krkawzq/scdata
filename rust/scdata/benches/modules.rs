@@ -468,6 +468,7 @@ fn threaded_io_config(workers: usize, max_in_flight: usize, shards: usize) -> Io
             assume_non_overlapping_reads: true,
         },
         num_workers: workers,
+        steal_interval_us: 0,
         cpus: None,
     })
 }

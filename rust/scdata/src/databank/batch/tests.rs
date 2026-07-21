@@ -5,8 +5,13 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use super::super::array::{Array, ArrayGrid, Chunk, ChunkSource, EdgeChunkLayout, RegisteredFile};
 use super::super::dataset::{Dataset, Dense2DDataset, SparseCsrDataset};
-use crate::access::{ScheduledAccessConfig, SliceSpec};
-use crate::codecs::{ChunkCodec, CodecError, CodecResult, SharedCodec, UncompressedCodec};
+use crate::access::{
+    AccessConfig, AccessScheduler, DecodeBackend, DecodeTask, FileRef, IoBackend, IoTask,
+    ScheduledAccessConfig, SliceSpec,
+};
+use crate::codecs::{
+    ChunkCodec, CodecError, CodecResult, DecodeSlice, SharedCodec, UncompressedCodec,
+};
 use crate::databank::{
     ArrayCodecSpec, ArrayGridSpec, ArrayOrder, ArraySpec, ChunkSourceSpec, ChunkSpec, DType,
     DataBank, DataBankConfig, Dense1DSpec, Dense2DSpec, MissingGenePolicy, PrefetchedBatch,
@@ -1121,35 +1126,285 @@ fn scheduled_multi_prefetch_rejects_float_to_int_output() {
 }
 
 #[test]
-fn unregister_defers_file_release_for_retained_prefetch_dataset() {
+fn dropping_retained_prefetch_releases_files_without_another_bank_operation() {
     let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
     let id = register_dense_2d_file(&mut bank, 4, 4, 2);
-    let dataset = bank.registry.get_arc(id).expect("dataset arc");
-    let batches: Vec<Vec<usize>> = vec![vec![0, 1], vec![2, 3]];
-    let expected: Vec<Vec<u32>> = batches
-        .iter()
-        .map(|cells| expected_dense_rows(cells, 4))
-        .collect();
+    let file_id = match bank.registry.get(id).expect("dataset") {
+        Dataset::Dense2D(dataset) => match &dataset.data.chunks[0].source {
+            ChunkSource::File { file, .. } => file.id,
+            _ => panic!("expected file-backed dense dataset"),
+        },
+        _ => panic!("expected dense dataset"),
+    };
+    let mut prefetch = bank
+        .prefetch_cells_scheduled::<u32, _>(
+            id,
+            vec![vec![0, 1], vec![2, 3]],
+            ScheduledPrefetchConfig::default(),
+        )
+        .expect("prefetch dataset");
 
     bank.unregister(id)
         .expect("unregister should retire retained dataset");
-    let prefetch = super::prefetch_cells_scheduled::<u32, _>(
-        &bank.access,
-        Arc::clone(&bank.compute),
-        Arc::clone(&dataset),
-        batches.into_iter(),
-        ScheduledPrefetchConfig::default(),
-        bank.config.native_config.clone(),
-        bank.native_scheduled_io(),
-    )
-    .expect("prefetch retained dataset");
-    let collected: Vec<Vec<u32>> = prefetch
-        .map(|batch| batch.expect("prefetch batch").buffer)
-        .collect();
-    assert_eq!(collected, expected);
+    assert_eq!(
+        prefetch
+            .next()
+            .expect("prefetch batch")
+            .expect("prefetch output")
+            .buffer,
+        expected_dense_rows(&[0, 1], 4),
+    );
 
-    drop(dataset);
-    bank.cleanup_retired().expect("cleanup retired dataset");
+    // `close` must be safe before completion and must release the retired
+    // dataset after its producer and retained dataset arcs have gone away.
+    prefetch.close();
+    prefetch.close();
+    assert!(prefetch.next().is_none());
+    assert!(
+        bank.io_pool.unregister_file(file_id).is_err(),
+        "the iterator drop must unregister the retired file without requiring another bank call",
+    );
+}
+
+#[test]
+fn projected_sparse_preplan_close_cancels_early_registered_handle() {
+    let mut bank = DataBank::new(parallel_config()).expect("databank");
+    let id = register_csr_file(&mut bank);
+    let dataset = bank.registry.get_arc(id).expect("sparse dataset");
+    let gene_axis =
+        super::GeneAxisPlan::requested(dataset.as_ref(), &["g1"], MissingGenePolicy::Zero)
+            .expect("projected gene axis");
+
+    let (read_started_tx, read_started_rx) = mpsc::channel();
+    let (read_gate_tx, read_gate_rx) = tokio::sync::oneshot::channel();
+    let access = AccessScheduler::spawn(
+        AccessConfig::default(),
+        Box::new(GatedIo {
+            started: read_started_tx,
+            gate: Mutex::new(Some(read_gate_rx)),
+            // The read is cancelled before decode in the success path; its
+            // bytes only make the recovery path well-typed if the assertion
+            // fails and the gate is released for teardown.
+            payload: arc_u32_bytes(&[0, 0, 0, 0]),
+        }),
+        Box::new(PassthroughDecode),
+    )
+    .expect("gated access scheduler");
+    let retired = Arc::new(super::super::RetiredDatasets::new(&bank.io_pool));
+    let config = ScheduledPrefetchConfig {
+        prefetch_step: 1,
+        projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy::SelectedOnly,
+        small_projected_sparse_policy: SmallProjectedSparsePolicy::SelectedOnly,
+        ..ScheduledPrefetchConfig::default()
+    };
+    let prefetch = super::super::scheduled::spawn_prefetch_cells::<u32, _>(
+        access,
+        Arc::clone(&bank.compute),
+        retired,
+        dataset,
+        vec![vec![0usize]].into_iter(),
+        gene_axis,
+        config,
+        None,
+    )
+    .expect("projected sparse prefetch");
+
+    read_started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("preplan blocked in scheduled index read");
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let mut prefetch = prefetch;
+        prefetch.close();
+        closed_tx.send(()).expect("prefetch closed");
+    });
+    if closed_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .is_err()
+    {
+        // Keep the regression failure bounded: the old implementation did not
+        // register this handle until after preplanning, so releasing the gate
+        // lets its deliberately stuck close thread unwind before panicking.
+        let _ = read_gate_tx.send(());
+        closer.join().expect("recovered close thread");
+        panic!("close did not cancel the projected sparse preplan");
+    }
+    closer.join().expect("close thread");
+}
+
+#[test]
+fn close_does_not_join_a_blocking_batch_source() {
+    struct BlockingSource {
+        entered: bool,
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        exited: mpsc::Sender<()>,
+    }
+
+    impl Iterator for BlockingSource {
+        type Item = Vec<usize>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.entered {
+                return None;
+            }
+            self.entered = true;
+            self.started.send(()).expect("source started");
+            self.release.recv().expect("release source");
+            self.exited.send(()).expect("source exited");
+            None
+        }
+    }
+
+    let mut bank = DataBank::new(DataBankConfig::default()).expect("databank");
+    let id = register_dense_2d_memory(&mut bank, 1, 1, 1, 1);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (exited_tx, exited_rx) = mpsc::channel();
+    let prefetch = bank
+        .prefetch_cells_scheduled::<u32, _>(
+            id,
+            BlockingSource {
+                entered: false,
+                started: started_tx,
+                release: release_rx,
+                exited: exited_tx,
+            },
+            ScheduledPrefetchConfig::default(),
+        )
+        .expect("scheduled prefetch");
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("source entered blocking next");
+
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let mut prefetch = prefetch;
+        prefetch.close();
+        closed_tx.send(()).expect("prefetch closed");
+    });
+    closed_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("close must not join a blocking source");
+    closer.join().expect("close thread");
+    release_tx.send(()).expect("release source");
+    exited_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("source exits after its pending next returns");
+}
+
+#[test]
+fn scheduled_prefetch_close_returns_with_capacity_one_compute_backpressure() {
+    let mut config = DataBankConfig::default();
+    config.fill_config.parallel = true;
+    config.fill_config.num_workers = 1;
+    config.fill_config.queue_capacity = 1;
+    let mut bank = DataBank::new(config).expect("databank");
+    let id = register_dense_2d_file(&mut bank, 2, 2, 1);
+
+    let (worker_started_tx, worker_started_rx) = mpsc::channel();
+    let (worker_release_tx, worker_release_rx) = mpsc::channel();
+    bank.compute
+        .submit_response(Box::new(move || {
+            worker_started_tx.send(()).expect("worker started");
+            worker_release_rx.recv().expect("worker release");
+            Ok(())
+        }))
+        .expect("block compute worker");
+    worker_started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("compute worker entered blocker");
+    // The sole request slot is now intentionally full.
+    bank.compute
+        .submit_request(Box::new(|| Ok(())))
+        .expect("fill compute request queue");
+
+    let (source_seen_tx, source_seen_rx) = mpsc::channel();
+    let mut emitted = false;
+    let source = std::iter::from_fn(move || {
+        if emitted {
+            None
+        } else {
+            emitted = true;
+            source_seen_tx.send(()).expect("source entered");
+            Some(vec![0usize])
+        }
+    });
+    let prefetch = bank
+        .prefetch_cells_scheduled::<u32, _>(id, source, ScheduledPrefetchConfig::default())
+        .expect("scheduled prefetch");
+    source_seen_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("source forwarded first batch");
+
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let closer = std::thread::spawn(move || {
+        let mut prefetch = prefetch;
+        prefetch.close();
+        closed_tx.send(()).expect("prefetch closed");
+    });
+    closed_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("close must not wait for a full compute queue");
+    closer.join().expect("close thread");
+    worker_release_tx.send(()).expect("release compute worker");
+}
+
+#[test]
+fn queued_compute_drop_retries_retired_file_cleanup() {
+    let mut config = DataBankConfig::default();
+    config.fill_config.parallel = true;
+    config.fill_config.num_workers = 1;
+    config.fill_config.queue_capacity = 1;
+    let mut bank = DataBank::new(config).expect("databank");
+    let id = register_dense_2d_file(&mut bank, 2, 2, 1);
+    let file_id = match bank.registry.get(id).expect("dataset") {
+        Dataset::Dense2D(dataset) => match &dataset.data.chunks[0].source {
+            ChunkSource::File { file, .. } => file.id,
+            _ => panic!("expected file-backed dense dataset"),
+        },
+        _ => panic!("expected dense dataset"),
+    };
+
+    let (worker_started_tx, worker_started_rx) = mpsc::channel();
+    let (worker_release_tx, worker_release_rx) = mpsc::channel();
+    bank.compute
+        .submit_response(Box::new(move || {
+            worker_started_tx.send(()).expect("worker started");
+            worker_release_rx.recv().expect("worker release");
+            Ok(())
+        }))
+        .expect("block compute worker");
+    worker_started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("compute worker entered blocker");
+
+    let dataset = bank.registry.get_arc(id).expect("retained dataset");
+    let cleanup = super::super::RetiredCleanupGuard::new(Arc::clone(&bank.retired));
+    bank.unregister(id)
+        .expect("unregister should retire queued dataset");
+
+    let (released_tx, released_rx) = mpsc::channel();
+    bank.compute
+        .submit_request(Box::new(move || {
+            // This queued closure owns the final non-retired dataset Arc. Drop
+            // it before signalling so the cleanup guard's callback is observed
+            // deterministically by the assertion below.
+            drop(dataset);
+            drop(cleanup);
+            released_tx.send(()).expect("released dataset");
+            Ok(())
+        }))
+        .expect("queue cleanup closure");
+
+    worker_release_tx.send(()).expect("release compute worker");
+    released_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("queued closure released dataset");
+    assert!(
+        bank.io_pool.unregister_file(file_id).is_err(),
+        "the cleanup callback must unregister the retired file when the queued closure drops it"
+    );
 }
 
 #[test]
@@ -1666,7 +1921,45 @@ fn scheduled_prefetch_exposes_first_ordered_error_only() {
         err,
         crate::databank::DataBankError::CellIndexOutOfRange { cell: 99, .. }
     ));
+    // Receiving an ordered terminal error closes automatically; explicit close
+    // remains idempotent and must preserve the terminal sequence.
+    iter.close();
+    iter.close();
     assert!(iter.next().is_none());
+}
+
+struct GatedIo {
+    started: mpsc::Sender<()>,
+    gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    payload: Arc<[u8]>,
+}
+
+impl IoBackend for GatedIo {
+    fn submit_read(&self, _file: FileRef, _offset: u64, _len: usize, _priority: u8) -> IoTask {
+        self.started.send(()).expect("gated read started");
+        let gate = self.gate.lock().expect("gated read lock").take();
+        let payload = Arc::clone(&self.payload);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            Ok(payload)
+        })
+    }
+}
+
+struct PassthroughDecode;
+
+impl DecodeBackend for PassthroughDecode {
+    fn submit_decode(
+        &self,
+        _codec: SharedCodec,
+        encoded: Arc<[u8]>,
+        _expected_size: Option<usize>,
+        _slice: Option<DecodeSlice>,
+    ) -> DecodeTask {
+        Box::pin(async move { Ok(encoded.to_vec()) })
+    }
 }
 
 #[derive(Clone)]

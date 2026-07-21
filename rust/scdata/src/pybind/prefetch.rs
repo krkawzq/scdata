@@ -385,6 +385,13 @@ impl PyPrefetchCells {
         slf
     }
 
+    /// Cancel outstanding work and join the native producer.  This is exposed
+    /// so the Python wrapper can release file-backed prefetch resources
+    /// deterministically instead of relying on CPython object destruction.
+    fn close(&mut self) {
+        drop(self.inner.take());
+    }
+
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         let Some(iter) = self.inner.as_mut() else {
             return Ok(None);

@@ -11,7 +11,13 @@ import pytest
 
 from scdata import ScDataBank
 from scdata.data import DenseDataset, SparseDataset
-from scdata.io import AnnDataZarrZipConverter, launch, launch_all, read_zarr, write_zarr
+from scdata.io import (
+    AnnDataZarrZipConverter,
+    launch,
+    launch_all,
+    read_zarr,
+    write_zarr,
+)
 from scdata.io._launch import StoreError
 
 ad = pytest.importorskip("anndata")
@@ -94,6 +100,63 @@ def test_write_zarr_dense2d_dir_registers_with_databank(tmp_path: Path, dense_ad
     assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
 
 
+@pytest.mark.parametrize(
+    ("raw", "names", "match"),
+    [
+        (False, ["g0", "", "g2", "g3"], "var_names\\[1\\].*non-empty"),
+        (False, ["g0", pd.NA, "g2", "g3"], "var_names\\[1\\].*NA"),
+        (False, ["g0", 1, "g2", "g3"], "var_names\\[1\\].*text"),
+        (True, ["r0", "r0", "r2"], "raw.var_names must be unique"),
+        (True, ["r0", "", "r2"], "raw.var_names\\[1\\].*non-empty"),
+        (True, ["r0", pd.NA, "r2"], "raw.var_names\\[1\\].*NA"),
+    ],
+)
+def test_write_zarr_preflights_primary_and_raw_var_name_contract(
+    tmp_path: Path, dense_adata, raw: bool, names: list[object], match: str
+) -> None:
+    """Gene identifiers must be text, non-empty, non-NA, and validated before output."""
+    if raw:
+        dense_adata.raw = ad.AnnData(
+            X=np.ones((3, 3), dtype=np.float32),
+            var=pd.DataFrame(index=pd.Index(names, dtype=object)),
+        )
+    else:
+        dense_adata.var.index = pd.Index(names, dtype=object)
+
+    target = tmp_path / "invalid_names.zarr"
+    target.mkdir()
+    marker = target / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    with pytest.raises(StoreError, match=match):
+        write_zarr(dense_adata, target, store="dir")
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("before", [False, True])
+def test_ann_data_bridge_restores_rectilinear_config(
+    tmp_path: Path, sparse_adata, before: bool
+) -> None:
+    """Both write_zarr and read_zarr restore the caller's zarr config value."""
+    import zarr
+
+    adata, matrix = sparse_adata
+    shard_before = ad.settings.auto_shard_zarr_v3
+    with zarr.config.set({"array.rectilinear_chunks": before}):
+        root = write_zarr(
+            adata,
+            tmp_path / f"rectilinear_{before}.zarr",
+            format="sparse",
+            chunk_size=(4,),
+            store="dir",
+        )
+        assert zarr.config.get("array.rectilinear_chunks") is before
+        assert ad.settings.auto_shard_zarr_v3 is shard_before
+        loaded = read_zarr(root)
+        assert zarr.config.get("array.rectilinear_chunks") is before
+        assert ad.settings.auto_shard_zarr_v3 is shard_before
+    assert np.array_equal(loaded.X.toarray(), matrix.toarray())
+
+
 def test_write_zarr_dense_big_endian_normalizes_for_rust(tmp_path: Path) -> None:
     data = np.arange(12, dtype=">f4").reshape(3, 4)
     adata = ad.AnnData(
@@ -131,8 +194,28 @@ def test_write_zarr_dense1d_zip_registers_with_databank(tmp_path: Path, dense_ad
     assert set(ds.data.chunk_file_paths) == {str(root)}
     with zipfile.ZipFile(root) as zf:
         names = zf.namelist()
+        assert all(info.compress_type == zipfile.ZIP_STORED for info in zf.infolist())
     assert len(names) == len(set(names))
+    assert not list(tmp_path.glob(".dense1d.zarr.zip.*.tmp"))
     assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_write_zarr_zip_stages_through_directory_not_memory_store(
+    tmp_path: Path, dense_adata, monkeypatch
+) -> None:
+    import zarr.storage
+
+    class ForbiddenMemoryStore:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("zip writes must not buffer the complete store in memory")
+
+    monkeypatch.setattr(zarr.storage, "MemoryStore", ForbiddenMemoryStore)
+    root = write_zarr(dense_adata, tmp_path / "streamed.zarr.zip", store="zip")
+
+    assert root.is_file()
+    loaded = read_zarr(root).X
+    actual = loaded.toarray() if sp.issparse(loaded) else np.asarray(loaded)
+    assert np.array_equal(actual, np.asarray(dense_adata.X))
 
 
 def test_write_zarr_sparse_rectilinear_registers_with_databank(
@@ -175,6 +258,44 @@ def test_write_zarr_sparse_rectilinear_registers_with_databank(
     }
     assert tuple(np.asarray(ds.indptr).tolist()) == tuple(matrix.indptr.tolist())
     assert np.array_equal(_registered_matrix(ds), matrix.toarray())
+
+
+def test_write_zarr_canonicalizes_csr_without_mutating_input(tmp_path: Path) -> None:
+    """Duplicate coordinates are summed and an empty suffix emits no zero run."""
+    matrix = sp.csr_matrix(
+        (
+            np.array([1, 2, 3], dtype=np.float32),
+            np.array([2, 0, 2], dtype=np.int32),
+            np.array([0, 3, 3], dtype=np.int32),
+        ),
+        shape=(2, 3),
+    )
+    original = (matrix.data.copy(), matrix.indices.copy(), matrix.indptr.copy())
+    adata = ad.AnnData(
+        X=matrix,
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+
+    root = write_zarr(
+        adata,
+        tmp_path / "canonical_csr.zarr",
+        format="sparse",
+        chunk_size=(3,),
+        align_cells=True,
+        store="dir",
+    )
+    ds = launch(root)
+    loaded = read_zarr(root)
+    runs = _read_json(root / "X" / "data" / "zarr.json")["chunk_grid"]["configuration"]["chunk_shapes"][0]
+
+    assert np.array_equal(matrix.data, original[0])
+    assert np.array_equal(matrix.indices, original[1])
+    assert np.array_equal(matrix.indptr, original[2])
+    assert runs == [2]
+    expected = np.array([[2, 0, 4], [0, 0, 0]], dtype=np.float32)
+    assert np.array_equal(loaded.X.toarray(), expected)
+    assert np.array_equal(_registered_matrix(ds), expected)
 
 
 def test_write_zarr_rejects_unknown_compressor(tmp_path: Path, sparse_adata) -> None:
@@ -362,6 +483,39 @@ def test_launch_lz4_v3_codec_registers_with_databank(tmp_path: Path, dense_adata
     assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
 
 
+@pytest.mark.parametrize("codec_name", ["bz2", "lzma"])
+def test_launch_numcodecs_alias_bz2_lzma_registers_with_databank(
+    tmp_path: Path, dense_adata, codec_name: str
+) -> None:
+    from numcodecs import BZ2, LZMA
+
+    codec = BZ2(level=1) if codec_name == "bz2" else LZMA(preset=1)
+    root = write_zarr(
+        dense_adata,
+        tmp_path / f"{codec_name}_dense.zarr",
+        format="dense2d",
+        chunk_size=(3, 4),
+        compressor=None,
+        store="dir",
+    )
+    raw = np.ascontiguousarray(np.asarray(dense_adata.X)).tobytes()
+    (root / "X" / "c" / "0" / "0").write_bytes(codec.encode(raw))
+    config = codec.get_config()
+    config.pop("id")
+    meta = _read_json(root / "X" / "zarr.json")
+    meta["codecs"] = [
+        {"name": "bytes", "configuration": {"endian": "little"}},
+        {"name": f"numcodecs.{codec_name}", "configuration": config},
+    ]
+    _write_json(root / "X" / "zarr.json", meta)
+
+    ds = launch(root)
+
+    assert ds.data.codec.compressor is not None
+    assert ds.data.codec.compressor["id"] == codec_name
+    assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
 def test_launch_multiple_v3_codecs_preserves_decode_order(tmp_path: Path, dense_adata) -> None:
     from numcodecs import GZip, Zlib, Zstd
 
@@ -541,6 +695,23 @@ def test_converter_reads_zarr_directory_without_suffix(tmp_path: Path, dense_ada
     ds = launch(root)
     assert isinstance(ds, DenseDataset)
     assert np.array_equal(_registered_matrix(ds), np.asarray(dense_adata.X))
+
+
+def test_write_zarr_disables_annotation_sharding_for_direct_launch(
+    tmp_path: Path, dense_adata
+) -> None:
+    """AnnData annotations written by scdata stay inside the launch contract."""
+    dense_adata.var.index = pd.CategoricalIndex(["g2", "g0", "g3", "g1"])
+    root = write_zarr(dense_adata, tmp_path / "categorical_var.zarr", store="dir")
+    var_nodes = [_read_json(node) for node in (root / "var").rglob("zarr.json")]
+
+    assert not any(
+        codec.get("name") == "sharding_indexed"
+        for node in var_nodes
+        for codec in node.get("codecs", [])
+    )
+    ds = launch(root)
+    assert ds.gene_names == ("g2", "g0", "g3", "g1")
 
 
 def test_converter_explicit_dense2d_and_output_dir(tmp_path: Path, dense_adata) -> None:

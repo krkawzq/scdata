@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from scdata import (
+    CellAccess,
     DataBankConfig,
     FastAccessConfig,
     FastCacheConfig,
@@ -19,7 +20,9 @@ from scdata import (
     ScDataBank,
 )
 from scdata._scdata import DataBankError
+from scdata.databank import _auto_output_dtype
 from scdata.data import CellIndexPlan, DatasetCollection, DenseDataset, DType, SparseDataset
+from scdata.data._prefetch import PrefetchIterator
 from scdata.io import launch, launch_all, write_zarr
 
 ad = pytest.importorskip("anndata")
@@ -154,7 +157,7 @@ def test_fast_cache_and_scheduled_runtime_config_are_api_fields() -> None:
 
 
 def test_benchmark_config_sets_fast_load_workers() -> None:
-    from test import make_config as make_benchmark_config
+    from scripts.bench_access import make_config as make_benchmark_config
 
     cfg = make_benchmark_config(
         128,
@@ -211,12 +214,17 @@ def test_config_accepts_dict_and_nested_dicts() -> None:
     direct = DataBankConfig(
         io_config={
             "backend": "threaded",
-            "threaded": {"num_workers": 9, "base": {"queue_capacity": 33}},
+            "threaded": {
+                "num_workers": 9,
+                "steal_interval_us": 13,
+                "base": {"queue_capacity": 33},
+            },
         },
         access_config={"cpu": {"queue_capacity": 7}},
     )
     assert isinstance(direct.io_config, IoConfig)
     assert direct.io_config.threaded_config.num_workers == 9
+    assert direct.io_config.threaded_config.steal_interval_us == 13
     assert direct.io_config.threaded_config.base.queue_capacity == 33
     assert direct.access_config.cpu.queue_capacity == 7
 
@@ -224,6 +232,15 @@ def test_config_accepts_dict_and_nested_dicts() -> None:
     assert io.backend == "uring"
     assert io.uring_config.entries == 256
     assert io.uring_config.base.priority_levels == 5
+
+    threaded = DataBankConfig.make(
+        backend="threaded",
+        io__threaded__steal_interval_us=17,
+    )
+    assert threaded.io_config.threaded_config.steal_interval_us == 17
+    threaded_roundtrip = ScDataBank(threaded)
+    assert threaded_roundtrip.config.io_config.threaded_config.steal_interval_us == 17
+    threaded_roundtrip.close()
 
     bank = ScDataBank(
         {"access": {"cache_capacity_bytes": 16 * 1024**2, "memory_budget_bytes": 32 * 1024**2}}
@@ -377,6 +394,153 @@ def test_access_dtype_round_trip(tmp_path: Path) -> None:
         bank.unregister(did)
 
 
+@pytest.mark.parametrize(
+    ("input_dtypes", "expected"),
+    [
+        ((DType.U8, DType.U16), DType.U16),
+        ((DType.I8, DType.I32), DType.I32),
+        ((DType.U8, DType.I8), DType.I16),
+        ((DType.U8, DType.I16), DType.I16),
+        ((DType.U16, DType.I16), DType.I32),
+        ((DType.U32, DType.I32), DType.I64),
+        ((DType.U32, DType.I64), DType.I64),
+        ((DType.F16, DType.BF16), DType.F32),
+        ((DType.F16, DType.I16), DType.F32),
+        ((DType.F32, DType.U16), DType.F32),
+        ((DType.F32, DType.U32), DType.F64),
+    ],
+)
+def test_auto_output_dtype_promotes_without_narrowing(
+    input_dtypes: tuple[DType, ...], expected: DType
+) -> None:
+    assert _auto_output_dtype(input_dtypes) == expected
+
+
+def test_auto_output_dtype_rejects_u64_signed_integer_mix() -> None:
+    with pytest.raises(ValueError, match="lossless common integer"):
+        _auto_output_dtype((DType.U64, DType.I8))
+    with pytest.raises(ValueError, match="lossless common integer"):
+        _auto_output_dtype((DType.I64, DType.U64))
+
+
+def test_prefetch_cell_access_gene_names_define_or_override_schema(tmp_path: Path) -> None:
+    root, ds, expected, _ = _dense_store(
+        tmp_path, "pf_cell_access_genes", (4, 4), np.float32, ["g0", "g1", "g2", "g3"]
+    )
+    bank = ScDataBank()
+    did = bank.register_dense(ds, str(root))
+    try:
+        subset = ("g2", "g0")
+        inferred = list(
+            bank.prefetch(
+                did,
+                [CellAccess([0, 2], subset), CellAccess([1], subset)],
+            )
+        )
+        assert [batch.var_names for batch in inferred] == [subset, subset]
+        assert np.array_equal(inferred[0].to_numpy(), expected[[0, 2]][:, [2, 0]])
+        assert np.array_equal(inferred[1].to_numpy(), expected[[1]][:, [2, 0]])
+
+        all_genes = next(iter(bank.prefetch(did, [CellAccess([3])])))
+        assert all_genes.var_names == ("g0", "g1", "g2", "g3")
+        assert np.array_equal(all_genes.to_numpy(), expected[[3]])
+
+        explicit = next(
+            iter(
+                bank.prefetch(
+                    did,
+                    [CellAccess([0], ["g2"]), CellAccess([1], ["g0"])],
+                    genes=["g1"],
+                )
+            )
+        )
+        assert explicit.var_names == ("g1",)
+        assert np.array_equal(explicit.to_numpy(), expected[[0]][:, [1]])
+
+        with pytest.raises(ValueError, match="CellAccess.gene_names"):
+            bank.prefetch(did, [CellAccess([0]), CellAccess([1], ["g0"])])
+        with pytest.raises(ValueError, match="CellAccess.gene_names"):
+            bank.prefetch(did, [CellAccess([0], ["g0", "g1"]), CellAccess([1], ["g1", "g0"])])
+    finally:
+        bank.unregister(did)
+
+
+def test_prefetch_multi_and_load_multi_resolve_cell_access_gene_names(tmp_path: Path) -> None:
+    root0, ds0, expected0, _ = _dense_store(
+        tmp_path, "pf_multi_cell_access_0", (4, 3), np.uint8, ["g0", "g1", "g2"]
+    )
+    root1, ds1, expected1, _ = _dense_store(
+        tmp_path, "pf_multi_cell_access_1", (4, 3), np.int8, ["g0", "g1", "g2"]
+    )
+    bank = ScDataBank()
+    ids = [bank.register_dense(ds0, str(root0)), bank.register_dense(ds1, str(root1))]
+    try:
+        subset = ("g2", "g0")
+        prefetched = list(
+            bank.prefetch_multi(
+                ids,
+                [
+                    [(0, CellAccess([0], subset)), (1, CellAccess([1], subset))],
+                    [(1, CellAccess([2], subset))],
+                ],
+            )
+        )
+        assert [batch.var_names for batch in prefetched] == [subset, subset]
+        assert prefetched[0].data.dtype == np.dtype("int16")
+        assert np.array_equal(
+            prefetched[0].to_numpy(),
+            np.vstack([expected0[[0]][:, [2, 0]], expected1[[1]][:, [2, 0]]]),
+        )
+
+        explicit = next(
+            iter(
+                bank.prefetch_multi(
+                    ids,
+                    [[(0, CellAccess([1], ["g2"])), (1, CellAccess([0], ["g0"]))]],
+                    genes=["g1"],
+                )
+            )
+        )
+        assert explicit.var_names == ("g1",)
+        assert np.array_equal(
+            explicit.to_numpy(),
+            np.vstack([expected0[[1]][:, [1]], expected1[[0]][:, [1]]]),
+        )
+
+        loaded = bank.load_multi(
+            ids,
+            [(0, CellAccess([2], subset)), (1, CellAccess([3], subset))],
+        )
+        assert loaded.var_names == subset
+        assert loaded.data.dtype == np.dtype("int16")
+        assert np.array_equal(
+            loaded.to_numpy(),
+            np.vstack([expected0[[2]][:, [2, 0]], expected1[[3]][:, [2, 0]]]),
+        )
+
+        loaded_explicit = bank.load_multi(
+            ids,
+            [(0, CellAccess([0], ["g2"])), (1, CellAccess([1], ["g0"]))],
+            genes=["g1"],
+        )
+        assert loaded_explicit.var_names == ("g1",)
+        assert np.array_equal(
+            loaded_explicit.to_numpy(),
+            np.vstack([expected0[[0]][:, [1]], expected1[[1]][:, [1]]]),
+        )
+
+        with pytest.raises(ValueError, match="CellAccess.gene_names"):
+            bank.prefetch_multi(ids, [[(0, CellAccess([0])), (1, CellAccess([0], ["g0"]))]])
+        with pytest.raises(ValueError, match="CellAccess.gene_names"):
+            bank.load_multi(
+                ids,
+                [(0, CellAccess([0], ["g0", "g1"])), (1, CellAccess([0], ["g1", "g0"]))],
+            )
+    finally:
+        for did in ids:
+            bank.unregister(did)
+
+
 def test_load_by_genes(tmp_path: Path) -> None:
     root, ds, expected, _ = _dense_store(
         tmp_path, "gn", (5, 6), np.float32, [f"g{i}" for i in range(6)]
@@ -482,6 +646,139 @@ def test_prefetch(tmp_path: Path) -> None:
         assert np.array_equal(data.reshape(len(cells), 6), rows)
     assert seen == 5
     bank.unregister(did)
+
+
+def test_prefetch_iterator_closes_on_exhaustion_error_and_explicit_close() -> None:
+    class TrackingSource:
+        def __init__(self, entries: list[object]) -> None:
+            self._entries = iter(entries)
+            self.close_calls = 0
+
+        def __iter__(self) -> "TrackingSource":
+            return self
+
+        def __next__(self) -> tuple[np.ndarray, np.ndarray, int]:
+            entry = next(self._entries)
+            if isinstance(entry, BaseException):
+                raise entry
+            return entry  # type: ignore[return-value]
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    entry = (np.array([0], dtype=np.intp), np.array([1], dtype=np.int32), 1)
+
+    exhausted_source = TrackingSource([entry])
+    exhausted = PrefetchIterator(exhausted_source)
+    assert next(exhausted).cells.tolist() == [0]
+    with pytest.raises(StopIteration):
+        next(exhausted)
+    exhausted.close()
+    assert exhausted_source.close_calls == 1
+
+    partial_source = TrackingSource([entry, entry])
+    partial = PrefetchIterator(partial_source)
+    assert next(partial).cells.tolist() == [0]
+    partial.close()
+    partial.close()
+    with pytest.raises(StopIteration):
+        next(partial)
+    assert partial_source.close_calls == 1
+
+    error_source = TrackingSource([RuntimeError("producer failed")])
+    errored = PrefetchIterator(error_source)
+    with pytest.raises(RuntimeError, match="producer failed"):
+        next(errored)
+    with pytest.raises(StopIteration):
+        next(errored)
+    assert error_source.close_calls == 1
+
+    context_source = TrackingSource([entry])
+    with PrefetchIterator(context_source) as contextual:
+        assert next(contextual).cells.tolist() == [0]
+    assert context_source.close_calls == 1
+
+
+def test_prefetch_close_preserves_ordered_error_and_is_idempotent(tmp_path: Path) -> None:
+    root, ds, expected, _ = _dense_store(
+        tmp_path, "prefetch_close", (3, 2), np.float32, ["g0", "g1"]
+    )
+    bank = ScDataBank()
+    did = bank.register_dense(ds, str(root))
+    try:
+        iterator = bank.prefetch(did, [[0], [99], [1]])
+        assert np.array_equal(next(iterator).to_numpy(), expected[[0]])
+        with pytest.raises(DataBankError, match="cell index"):
+            next(iterator)
+        iterator.close()
+        iterator.close()
+        with pytest.raises(StopIteration):
+            next(iterator)
+
+        with bank.prefetch(did, [[2]]) as contextual:
+            assert np.array_equal(next(contextual).to_numpy(), expected[[2]])
+        with pytest.raises(StopIteration):
+            next(contextual)
+    finally:
+        bank.unregister(did)
+
+
+@pytest.mark.parametrize(
+    ("dtypes", "expected"),
+    [
+        ((DType.U64,), DType.U64),
+        ((DType.U32, DType.I32), DType.I64),
+        ((DType.F16, DType.BF16), DType.F32),
+        ((DType.F16, DType.U8), DType.F16),
+        ((DType.BF16, DType.U16), DType.F32),
+        ((DType.F16, DType.U32), DType.F64),
+    ],
+)
+def test_auto_output_dtype_never_narrows_lossless_cases(
+    dtypes: tuple[DType, ...], expected: DType
+) -> None:
+    assert _auto_output_dtype(dtypes) is expected
+
+
+@pytest.mark.parametrize(
+    "dtypes",
+    [
+        (DType.U64, DType.I64),
+        (DType.U64, DType.F64),
+        (DType.F32, DType.U64),
+    ],
+)
+def test_auto_output_dtype_rejects_unrepresentable_u64_mixes(dtypes: tuple[DType, ...]) -> None:
+    with pytest.raises(ValueError, match="lossless"):
+        _auto_output_dtype(dtypes)
+
+
+def test_prefetch_validates_non_consuming_errors_before_eager_batches(tmp_path: Path) -> None:
+    root, ds, _, _ = _dense_store(
+        tmp_path, "prefetch_exception_order", (2, 2), np.float32, ["g0", "g1"]
+    )
+    bank = ScDataBank()
+    did = bank.register_dense(ds, str(root))
+
+    def exploding_batches() -> Any:
+        raise AssertionError("batch generator must not be consumed")
+        yield [0]
+
+    try:
+        with pytest.raises(ValueError, match="prefetch_step"):
+            bank.prefetch(
+                did,
+                exploding_batches(),
+                config=ScheduledPrefetchConfig(prefetch_step=0),
+            )
+
+        bank.unregister(did)
+        with pytest.raises(DataBankError, match="unloaded"):
+            bank.prefetch(did, exploding_batches())
+    finally:
+        # The id was already removed in the exception-order branch.
+        if not bank.is_closed:
+            bank.close()
 
 
 def test_prefetch_accepts_cells_attribute_without_python_numpy_materialization(

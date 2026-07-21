@@ -103,21 +103,38 @@ fn cast_identity_is_byte_copy() {
 }
 
 #[test]
-fn dtype_can_cast_to_policy() {
-    // float→int forbidden
-    assert!(!DType::F32.can_cast_to(DType::I32));
-    assert!(!DType::F16.can_cast_to(DType::U8));
-    assert!(!DType::BF16.can_cast_to(DType::I64));
-    // everything else allowed, including downcasts
-    assert!(DType::F64.can_cast_to(DType::F32));
-    assert!(DType::F32.can_cast_to(DType::F16));
-    assert!(DType::F32.can_cast_to(DType::BF16));
-    assert!(DType::F16.can_cast_to(DType::BF16));
-    assert!(DType::U32.can_cast_to(DType::U8));
-    assert!(DType::I64.can_cast_to(DType::I16));
-    assert!(DType::U8.can_cast_to(DType::F32));
-    assert!(DType::I32.can_cast_to(DType::F64));
-    assert!(DType::U8.can_cast_to(DType::U8));
+fn dtype_can_cast_to_policy_is_complete_and_matches_the_cast_engine() {
+    let all = [
+        DType::U8,
+        DType::I8,
+        DType::U16,
+        DType::I16,
+        DType::U32,
+        DType::I32,
+        DType::U64,
+        DType::I64,
+        DType::F16,
+        DType::BF16,
+        DType::F32,
+        DType::F64,
+    ];
+    for src in all {
+        for dst in all {
+            assert_eq!(
+                src.can_cast_to(dst),
+                !(src.is_float() && dst.is_int()),
+                "unexpected cast policy for {src:?} -> {dst:?}",
+            );
+        }
+    }
+
+    // Explicit integer narrowing is intentionally Rust-`as` conversion.
+    let mut signed = [0i64; 1];
+    i64::cast_slice_from(&u64::MAX.to_ne_bytes(), DType::U64, &mut signed).unwrap();
+    assert_eq!(signed, [-1]);
+    let mut unsigned = [0u64; 1];
+    u64::cast_slice_from(&(-1i64).to_ne_bytes(), DType::I64, &mut unsigned).unwrap();
+    assert_eq!(unsigned, [u64::MAX]);
 }
 
 fn temp_file(bytes: &[u8]) -> PathBuf {
@@ -169,6 +186,96 @@ fn build_array_unregisters_files_when_late_chunk_validation_fails() {
         io_pool.unregister_file(0).is_err(),
         "partially registered file should have been unregistered"
     );
+}
+
+#[test]
+fn rectilinear_codec_tail_decodes_padded_extent_but_ranges_stay_logical() {
+    let default_grid = ArrayGrid::from_spec(
+        &[6],
+        ArrayGridSpec::Rectilinear {
+            logical_axes: vec![vec![0, 4, 6]],
+            codec_axes: None,
+        },
+    )
+    .expect("default rectilinear grid");
+    assert_eq!(
+        default_grid
+            .decoded_extent_for_chunk(&[6], 1)
+            .expect("default decoded extent"),
+        vec![2]
+    );
+
+    let io_pool = IoPool::new(IoConfig::default()).expect("io pool");
+    let first_chunk: Vec<u8> = (0_u32..4).flat_map(u32::to_ne_bytes).collect();
+    let padded_last_chunk: Vec<u8> = (4_u32..8).flat_map(u32::to_ne_bytes).collect();
+    let spec = ArraySpec {
+        shape: vec![6],
+        dtype: DType::U32,
+        order: ArrayOrder::C,
+        codec: ArrayCodecSpec::Uncompressed,
+        grid: ArrayGridSpec::Rectilinear {
+            logical_axes: vec![vec![0, 4, 6]],
+            codec_axes: Some(vec![vec![0, 4, 8]]),
+        },
+        chunks: vec![
+            ChunkSpec {
+                source: ChunkSourceSpec::Memory {
+                    bytes: Arc::from(first_chunk.into_boxed_slice()),
+                },
+                decoded_bytes: 16,
+            },
+            ChunkSpec {
+                source: ChunkSourceSpec::Memory {
+                    bytes: Arc::from(padded_last_chunk.clone().into_boxed_slice()),
+                },
+                decoded_bytes: 16,
+            },
+        ],
+    };
+
+    let array = build_array_from_spec(spec, &io_pool).expect("array accepts codec extent");
+    assert_eq!(
+        array
+            .grid
+            .decoded_extent_for_chunk(&array.shape, 1)
+            .expect("codec extent"),
+        vec![4]
+    );
+    assert_eq!(
+        array.chunks[1].decoded_bytes,
+        4 * std::mem::size_of::<u32>()
+    );
+    let ChunkRef::Memory {
+        bytes,
+        codec,
+        expected_size,
+        decoded,
+    } = chunk_ref(&array, 1).expect("last chunk ref")
+    else {
+        panic!("expected memory chunk");
+    };
+    assert!(!decoded);
+    assert_eq!(expected_size, array.chunks[1].decoded_bytes);
+    assert_eq!(
+        codec
+            .decode(&bytes, Some(expected_size))
+            .expect("decode padded tail"),
+        padded_last_chunk
+    );
+
+    let mut pieces = Vec::new();
+    array
+        .grid
+        .for_each_1d_range(&array.shape, array.dtype, &array.chunks, 4, 6, |piece| {
+            pieces.push(piece);
+            Ok(())
+        })
+        .expect("logical tail range");
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(pieces[0].chunk_index, 1);
+    assert_eq!(pieces[0].byte_start, 0);
+    assert_eq!(pieces[0].byte_end, 2 * std::mem::size_of::<u32>());
+    assert_eq!(pieces[0].elements, 2);
 }
 
 #[test]

@@ -26,7 +26,8 @@ pub(crate) fn build_array_spec(
     }
     let dtype = super::dtype::extract_dtype(&data.getattr("dtype")?)?;
     let codec = build_codec(py, &data.getattr("codec")?)?;
-    let grid = build_grid_spec(data, &shape, chunk_shape)?;
+    let codec_axes = optional_chunk_codec_boundaries(data)?;
+    let grid = build_grid_spec(data, &shape, chunk_shape, codec_axes)?;
     let decoded_bytes = chunk_decoded_bytes(&shape, dtype, &grid)?;
     let chunks = build_chunks(data, store_path, &decoded_bytes)?;
 
@@ -79,11 +80,21 @@ fn build_grid_spec(
     data: &Bound<'_, PyAny>,
     shape: &[usize],
     chunk_shape: Vec<usize>,
+    codec_axes: Option<Vec<Vec<usize>>>,
 ) -> PyResult<ArrayGridSpec> {
-    let axes = optional_chunk_boundaries(data)?;
-    if let Some(axes) = axes {
-        validate_rectilinear_axes(shape, &axes)?;
-        return Ok(ArrayGridSpec::Rectilinear { axes });
+    let logical_axes = optional_chunk_boundaries(data)?;
+    if let Some(logical_axes) = logical_axes {
+        validate_rectilinear_axes(shape, &logical_axes)?;
+        validate_chunk_codec_boundaries(&logical_axes, codec_axes.as_deref())?;
+        return Ok(ArrayGridSpec::Rectilinear {
+            logical_axes,
+            codec_axes,
+        });
+    }
+    if codec_axes.is_some() {
+        return Err(PyValueError::new_err(
+            "chunk_codec_boundaries require a rectilinear chunk grid",
+        ));
     }
     validate_regular_grid(shape, &chunk_shape)?;
     Ok(ArrayGridSpec::Regular {
@@ -94,6 +105,20 @@ fn build_grid_spec(
 
 fn optional_chunk_boundaries(data: &Bound<'_, PyAny>) -> PyResult<Option<Vec<Vec<usize>>>> {
     match data.getattr("chunk_boundaries") {
+        Ok(value) => {
+            let axes: Vec<Vec<usize>> = value.extract()?;
+            if axes.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(axes))
+            }
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn optional_chunk_codec_boundaries(data: &Bound<'_, PyAny>) -> PyResult<Option<Vec<Vec<usize>>>> {
+    match data.getattr("chunk_codec_boundaries") {
         Ok(value) => {
             let axes: Vec<Vec<usize>> = value.extract()?;
             if axes.is_empty() {
@@ -355,6 +380,42 @@ fn validate_rectilinear_axes(shape: &[usize], axes: &[Vec<usize>]) -> PyResult<(
     Ok(())
 }
 
+fn validate_chunk_codec_boundaries(
+    logical_axes: &[Vec<usize>],
+    codec_axes: Option<&[Vec<usize>]>,
+) -> PyResult<()> {
+    let Some(codec_axes) = codec_axes else {
+        return Ok(());
+    };
+    if codec_axes.len() != logical_axes.len() {
+        return Err(PyValueError::new_err(
+            "chunk_codec_boundaries rank must match chunk_boundaries rank",
+        ));
+    }
+    for (axis, (logical, physical)) in logical_axes.iter().zip(codec_axes).enumerate() {
+        if physical.len() != logical.len() {
+            return Err(PyValueError::new_err(format!(
+                "chunk_codec_boundaries[{axis}] length must match chunk_boundaries[{axis}]"
+            )));
+        }
+        if physical.first().copied() != Some(0)
+            || physical.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(PyValueError::new_err(format!(
+                "chunk_codec_boundaries[{axis}] must start at 0 and be strictly increasing"
+            )));
+        }
+        if physical[..physical.len() - 1] != logical[..logical.len() - 1]
+            || physical[physical.len() - 1] < logical[logical.len() - 1]
+        {
+            return Err(PyValueError::new_err(format!(
+                "chunk_codec_boundaries[{axis}] may only extend the final logical edge"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn chunk_decoded_bytes(
     shape: &[usize],
     dtype: DType,
@@ -372,7 +433,12 @@ fn chunk_decoded_bytes(
             ArrayGridSpec::Regular { chunk_shape, edge } => {
                 regular_chunk_elements(shape, chunk_shape, *edge, &coords)?
             }
-            ArrayGridSpec::Rectilinear { axes } => rectilinear_chunk_elements(axes, &coords)?,
+            ArrayGridSpec::Rectilinear {
+                logical_axes,
+                codec_axes,
+            } => {
+                rectilinear_chunk_elements(codec_axes.as_deref().unwrap_or(logical_axes), &coords)?
+            }
         };
         out.push(elements.checked_mul(dtype.item_size()).ok_or_else(|| {
             PyValueError::new_err(format!("chunk {chunk_index} decoded byte size overflow"))
@@ -388,7 +454,9 @@ fn grid_shape(shape: &[usize], grid: &ArrayGridSpec) -> PyResult<Vec<usize>> {
             .zip(chunk_shape)
             .map(|(&dim, &chunk)| div_ceil(dim, chunk))
             .collect()),
-        ArrayGridSpec::Rectilinear { axes } => Ok(axes.iter().map(|axis| axis.len() - 1).collect()),
+        ArrayGridSpec::Rectilinear { logical_axes, .. } => {
+            Ok(logical_axes.iter().map(|axis| axis.len() - 1).collect())
+        }
     }
 }
 
