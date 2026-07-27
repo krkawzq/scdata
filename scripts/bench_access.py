@@ -30,9 +30,19 @@ Beyond raw throughput, the tool records:
 * per-run ``profile_snapshot`` from the Rust core (``--profile``);
 * the fast path's ``resolved_strategy`` / ``fallback_reason`` for scheduled
   runs (so you can see whether ``blosc_lz4_fast`` actually engaged);
+* first measured-batch latency and measured per-batch p50 / p95 wall latency
+  (seconds; warmup batches are excluded);
+* process-wide peak RSS after each sample as ``process_peak_rss_kib``.  On
+  Linux this is ``resource.getrusage(...).ru_maxrss`` in KiB: a process
+  high-water mark, not a resettable per-sample delta;
 * mean / stdev / min / max across ``--repeat`` runs (steady-state behavior);
 * a machine-info block (hostname, CPU count, scdata version, ...) for
   reproducible comparison.
+
+If warmup consumes every batch, a sample has zero measured batches.  Its
+``first_measured_batch_seconds`` and latency percentiles are ``null`` in JSON;
+throughput remains zero.  Aggregates ignore these ``null`` latency values, and
+are themselves ``null`` only when every sample for a mode has zero batches.
 
 Subcommands:
 
@@ -68,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import socket
@@ -81,10 +92,16 @@ from typing import Any, Iterable, Iterator
 
 import numpy as np
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is unavailable on Windows.
+    resource = None
+
 from scdata import (
     CellIndexPlan,
     DType,
     DataBankConfig,
+    Dataset,
     ScDataBank,
     ScheduledAccessConfig,
     ScheduledPrefetchConfig,
@@ -96,8 +113,15 @@ try:
     from tqdm.auto import tqdm
 except ModuleNotFoundError:  # tqdm is optional; fall back to a no-op wrapper.
 
-    def tqdm(iterable: Any, **_: Any) -> Any:
-        return iterable
+    class _NoopProgress:
+        def update(self, _: int = 1) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def tqdm(iterable: Any | None = None, **_: Any) -> Any:
+        return iterable if iterable is not None else _NoopProgress()
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +153,7 @@ DEFAULT_READY_AHEAD_STEPS = 16
 class CatalogEntry:
     path: Path
     matrix: str
-    dataset: object
+    dataset: Dataset
     dtype: str
     n_obs: int
     n_vars: int
@@ -196,7 +220,7 @@ def make_config(
     )
 
 
-def pick_rowcount(path: Path) -> tuple[str | None, object | None]:
+def pick_rowcount(path: Path) -> tuple[str | None, Dataset | None]:
     datasets = launch_all(path)
     keys = ["X"]
     if "raw/X" in datasets:
@@ -225,7 +249,7 @@ def build_catalog(
     for path in tqdm(paths, desc="scan", unit="dataset", disable=quiet):
         try:
             key, ds = pick_rowcount(path)
-            if ds is None:
+            if key is None or ds is None:
                 skipped.append((path, "no u16/u32 matrix"))
                 continue
             catalog.append(
@@ -333,15 +357,67 @@ def resolve_genes(bank: ScDataBank, ids: list, args: argparse.Namespace):
     return genes
 
 
-def resolve_dtype(args: argparse.Namespace) -> str | None:
-    if args.dtype in ("stored", "native", "auto", "none"):
+def resolve_dtype(
+    args: argparse.Namespace, catalog: Iterable[CatalogEntry] | None = None
+) -> str | None:
+    """Resolve one comparable output dtype for every benchmark access path.
+
+    The catalog only admits ``u16``/``u32`` row-count matrices.  When an alias
+    such as ``stored`` is used, a mixed catalog is therefore promoted to
+    ``u32`` for both scheduled and unscheduled runs instead of letting the two
+    paths silently benchmark different output widths.
+    """
+    if args.dtype not in ("stored", "native", "auto", "none"):
+        return DType(args.dtype).value
+    if catalog is None:
         return None
-    return args.dtype
+    stored = {DType(entry.dtype) for entry in catalog}
+    if not stored:
+        raise ValueError("cannot resolve benchmark dtype from an empty catalog")
+    if not stored.issubset(ROWCOUNT_DTYPES):
+        raise ValueError(f"unsupported benchmark stored dtypes: {sorted(d.value for d in stored)}")
+    return (DType.U32 if DType.U32 in stored else DType.U16).value
 
 
 # ---------------------------------------------------------------------------
 # Benchmarks
 # ---------------------------------------------------------------------------
+
+
+def percentile(values: list[float], q: float) -> float | None:
+    """Return percentile ``q`` using linear interpolation, or ``None`` if empty."""
+    if not 0 <= q <= 100:
+        raise ValueError("percentile must be in [0, 100]")
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q / 100
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def latency_metrics(batch_latencies: list[float]) -> dict[str, float | None]:
+    """Summarize measured batch wall times without retaining them in result JSON."""
+    return {
+        "first_measured_batch_seconds": batch_latencies[0] if batch_latencies else None,
+        "batch_latency_p50_seconds": percentile(batch_latencies, 50),
+        "batch_latency_p95_seconds": percentile(batch_latencies, 95),
+    }
+
+
+def process_peak_rss_kib() -> int | None:
+    """Return Linux process peak RSS in KiB, or ``None`` where unsupported.
+
+    Linux reports ``ru_maxrss`` in KiB.  It is a process-wide high-water mark,
+    so values do not reset between modes or repeats in the same process.
+    """
+    if resource is None or not sys.platform.startswith("linux"):
+        return None
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
 
 def _sample(
@@ -354,8 +430,11 @@ def _sample(
     checksum: int,
     seconds: float,
     warmup_batches: int,
+    output_dtype: str | None,
     resolved_strategy: str | None,
     fallback_reason: str | None,
+    batch_latencies: list[float],
+    peak_rss_kib: int | None,
 ) -> dict:
     return {
         "mode": mode,
@@ -368,8 +447,11 @@ def _sample(
         "bytes": bytes_read,
         "checksum": checksum,
         "warmup_batches": warmup_batches,
+        "output_dtype": output_dtype,
         "resolved_strategy": resolved_strategy,
         "fallback_reason": fallback_reason,
+        **latency_metrics(batch_latencies),
+        "process_peak_rss_kib": peak_rss_kib,
     }
 
 
@@ -380,38 +462,60 @@ def bench_unscheduled_once(
     offsets: np.ndarray,
     args: argparse.Namespace,
     warmup: int,
+    dtype: str | None = None,
 ) -> dict:
     genes = resolve_genes(bank, ids, args)
-    dtype = resolve_dtype(args)
+    if dtype is None:
+        dtype = resolve_dtype(args)
     missing = "zero" if genes is not None else None
     total_batches = (len(order) + args.batch_size - 1) // args.batch_size
     iterator = iter_batches(order, offsets, args.batch_size)
 
     cells = batches = parts_seen = bytes_read = checksum = 0
+    # Consuming only the batch plan is not a warmup: execute the same load calls
+    # as the measured path so caches, worker pools, and file handles are primed.
     for _ in range(warmup):
         try:
-            next(iterator)
+            warmup_parts = next(iterator)
         except StopIteration:
             break
-    started = time.perf_counter()
-    remaining = max(0, total_batches - warmup)
-    for parts in tqdm(
-        iterator, total=remaining, desc="unscheduled", unit="batch", disable=args.quiet
-    ):
-        batches += 1
-        parts_seen += len(parts)
-        for dataset_idx, local_cells in parts:
-            out = bank.load(
+        for dataset_idx, local_cells in warmup_parts:
+            bank.load(
                 ids[dataset_idx],
                 local_cells,
                 genes=genes,
                 missing=missing,
                 dtype=dtype,
             )
-            cells += len(local_cells)
-            bytes_read += out.data.nbytes
-            if out.data.size:
-                checksum = (checksum + int(out.data[0])) & 0xFFFFFFFF
+    batch_latencies: list[float] = []
+    started = time.perf_counter()
+    remaining = max(0, total_batches - warmup)
+    progress = tqdm(total=remaining, desc="unscheduled", unit="batch", disable=args.quiet)
+    try:
+        while True:
+            batch_started = time.perf_counter()
+            try:
+                parts = next(iterator)
+            except StopIteration:
+                break
+            batches += 1
+            parts_seen += len(parts)
+            for dataset_idx, local_cells in parts:
+                out = bank.load(
+                    ids[dataset_idx],
+                    local_cells,
+                    genes=genes,
+                    missing=missing,
+                    dtype=dtype,
+                )
+                cells += len(local_cells)
+                bytes_read += out.data.nbytes
+                if out.data.size:
+                    checksum = (checksum + int(out.data[0])) & 0xFFFFFFFF
+            batch_latencies.append(time.perf_counter() - batch_started)
+            progress.update(1)
+    finally:
+        progress.close()
     seconds = time.perf_counter() - started
     return _sample(
         mode="unscheduled",
@@ -422,8 +526,11 @@ def bench_unscheduled_once(
         checksum=checksum,
         seconds=seconds,
         warmup_batches=warmup,
+        output_dtype=dtype,
         resolved_strategy=None,
         fallback_reason=None,
+        batch_latencies=batch_latencies,
+        peak_rss_kib=process_peak_rss_kib(),
     )
 
 
@@ -435,11 +542,13 @@ def bench_scheduled_once(
     offsets: np.ndarray,
     args: argparse.Namespace,
     warmup: int,
+    dtype: str | None = None,
 ) -> dict:
     if args.gene_mode == "native" and len({entry.n_vars for entry in catalog}) != 1:
         raise SystemExit("scheduled native mode requires identical n_vars; use --gene-mode first")
     genes = resolve_genes(bank, ids, args)
-    dtype = resolve_dtype(args)
+    if dtype is None:
+        dtype = resolve_dtype(args, catalog)
     missing = "zero" if genes is not None else None
     config = ScheduledPrefetchConfig(
         prefetch_step=args.prefetch_step,
@@ -471,14 +580,26 @@ def bench_scheduled_once(
             next(stream)
         except StopIteration:
             break
+    batch_latencies: list[float] = []
     started = time.perf_counter()
     remaining = max(0, total_batches - warmup)
-    for batch in tqdm(stream, total=remaining, desc="scheduled", unit="batch", disable=args.quiet):
-        batches += 1
-        cells += len(batch.cells)
-        bytes_read += batch.data.nbytes
-        if batch.data.size:
-            checksum = (checksum + int(batch.data[0])) & 0xFFFFFFFF
+    progress = tqdm(total=remaining, desc="scheduled", unit="batch", disable=args.quiet)
+    try:
+        while True:
+            batch_started = time.perf_counter()
+            try:
+                batch = next(stream)
+            except StopIteration:
+                break
+            batches += 1
+            cells += len(batch.cells)
+            bytes_read += batch.data.nbytes
+            if batch.data.size:
+                checksum = (checksum + int(batch.data[0])) & 0xFFFFFFFF
+            batch_latencies.append(time.perf_counter() - batch_started)
+            progress.update(1)
+    finally:
+        progress.close()
     seconds = time.perf_counter() - started
     return _sample(
         mode="scheduled",
@@ -489,8 +610,11 @@ def bench_scheduled_once(
         checksum=checksum,
         seconds=seconds,
         warmup_batches=warmup,
+        output_dtype=dtype,
         resolved_strategy=resolved_strategy,
         fallback_reason=fallback_reason,
+        batch_latencies=batch_latencies,
+        peak_rss_kib=process_peak_rss_kib(),
     )
 
 
@@ -517,11 +641,18 @@ def dumps(obj: Any) -> str:
 
 
 def machine_info() -> dict:
+    affinity_cpu_count: int | None = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            affinity_cpu_count = len(os.sched_getaffinity(0))
+        except OSError:
+            pass
     return {
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
         "python": sys.version.split()[0],
         "cpu_count": os.cpu_count(),
+        "affinity_cpu_count": affinity_cpu_count,
         "scdata_version": scdata_version,
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
@@ -536,6 +667,14 @@ def _stats(values: list[float]) -> dict:
     }
 
 
+def _optional_stats(values: list[float | int | None]) -> dict:
+    """Aggregate nullable sample metrics while preserving no-measurement state."""
+    present = [float(value) for value in values if value is not None]
+    if not present:
+        return {"mean": None, "stdev": None, "min": None, "max": None}
+    return _stats(present)
+
+
 def aggregate_summary(runs: list[dict]) -> dict:
     by_mode: dict[str, list[dict]] = {}
     for run in runs:
@@ -548,6 +687,18 @@ def aggregate_summary(runs: list[dict]) -> dict:
             "cells_per_s": _stats([s["cells_per_s"] for s in samples]),
             "gb_per_s": _stats([s["gb_per_s"] for s in samples]),
             "seconds": _stats([s["seconds"] for s in samples]),
+            "first_measured_batch_seconds": _optional_stats(
+                [s.get("first_measured_batch_seconds") for s in samples]
+            ),
+            "batch_latency_p50_seconds": _optional_stats(
+                [s.get("batch_latency_p50_seconds") for s in samples]
+            ),
+            "batch_latency_p95_seconds": _optional_stats(
+                [s.get("batch_latency_p95_seconds") for s in samples]
+            ),
+            "process_peak_rss_kib": _optional_stats(
+                [s.get("process_peak_rss_kib") for s in samples]
+            ),
             "resolved_strategy": samples[0]["resolved_strategy"],
             "fallback_reason": samples[0]["fallback_reason"],
         }
@@ -586,6 +737,7 @@ def run_bench(args: argparse.Namespace) -> dict:
         args.fast_coalesce_max_merged_len,
     )
 
+    output_dtype = resolve_dtype(args, catalog)
     runs: list[dict] = []
     for repeat in range(args.repeat):
         bank = ScDataBank(cfg)
@@ -596,12 +748,16 @@ def run_bench(args: argparse.Namespace) -> dict:
 
             results: list[dict] = []
             if args.mode in ("unscheduled", "both"):
-                sample = bench_unscheduled_once(bank, ids, order, offsets, args, args.warmup)
+                sample = bench_unscheduled_once(
+                    bank, ids, order, offsets, args, args.warmup, output_dtype
+                )
                 if args.profile:
                     sample["profile"] = bank.profile_snapshot_and_reset()
                 results.append(sample)
             if args.mode in ("scheduled", "both"):
-                sample = bench_scheduled_once(bank, ids, catalog, order, offsets, args, args.warmup)
+                sample = bench_scheduled_once(
+                    bank, ids, catalog, order, offsets, args, args.warmup, output_dtype
+                )
                 if args.profile:
                     sample["profile"] = bank.profile_snapshot_and_reset()
                 results.append(sample)
@@ -631,6 +787,7 @@ def run_bench(args: argparse.Namespace) -> dict:
             "batch_size": args.batch_size,
             "seed": args.seed,
             "dtype": args.dtype,
+            "output_dtype": output_dtype,
             "gene_mode": args.gene_mode,
             "genes": args.genes,
             "projected_sparse_data_strategy": args.projected_sparse_data_strategy,
@@ -693,7 +850,8 @@ def print_summary(result: dict, *, file=None) -> None:
     print("", file=file)
     print("=" * 72, file=file)
     print(
-        f"scdata bench | {meta['hostname']} | {meta['cpu_count']} CPUs | "
+        f"scdata bench | {meta['hostname']} | {meta['cpu_count']} logical CPUs"
+        f" / {meta.get('affinity_cpu_count') or '?'} available | "
         f"scdata {meta['scdata_version']}",
         file=file,
     )
@@ -723,6 +881,18 @@ def print_summary(result: dict, *, file=None) -> None:
             f"{mode:<12} {cps['mean']:>14,.0f} {gbs['mean']:>10.2f} {sec['mean']:>10.3f} {strat:<16}",
             file=file,
         )
+        first = stats.get("first_measured_batch_seconds", {}).get("mean")
+        p50 = stats.get("batch_latency_p50_seconds", {}).get("mean")
+        p95 = stats.get("batch_latency_p95_seconds", {}).get("mean")
+        peak_rss = stats.get("process_peak_rss_kib", {}).get("mean")
+        if first is not None and p50 is not None and p95 is not None:
+            print(
+                f"{'':<12} batch latency mean first/p50/p95 = "
+                f"{first * 1e3:.3f}/{p50 * 1e3:.3f}/{p95 * 1e3:.3f} ms",
+                file=file,
+            )
+        if peak_rss is not None:
+            print(f"{'':<12} process peak RSS mean = {peak_rss / 1024:.1f} MiB", file=file)
         if stats.get("runs", 0) > 1:
             print(
                 f"{'':<12} {cps['min']:>14,.0f}..{cps['max']:>14,.0f} (stdev {cps['stdev']:.0f})",
@@ -842,7 +1012,10 @@ def add_bench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dtype",
         default="stored",
-        help="output dtype; 'stored'/'auto'/'none' keep the stored dtype",
+        help=(
+            "output dtype; aliases 'stored'/'native'/'auto'/'none' use one common "
+            "lossless dtype across the selected catalog (u32 for mixed u16/u32)"
+        ),
     )
     parser.add_argument("--gene-mode", choices=("first", "native"), default="first")
     parser.add_argument(

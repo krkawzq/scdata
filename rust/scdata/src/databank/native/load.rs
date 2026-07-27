@@ -462,7 +462,7 @@ impl NativeLoadModule {
         &self,
         original_order: &[NativeLoadRequest],
         cached: Vec<NativeLoadCompletion>,
-        registered: RegisteredNativeLoads,
+        mut registered: RegisteredNativeLoads,
         reads: Vec<CoalescedRead>,
     ) -> io::Result<Vec<NativeLoadCompletion>> {
         let loaded = if registered.misses.is_empty() {
@@ -474,16 +474,20 @@ impl NativeLoadModule {
             {
                 Ok(loaded) => {
                     self.complete_inflight_success(&registered.owners, &loaded);
+                    registered.disarm_owners();
                     loaded
                 }
                 Err(err) => {
                     self.complete_inflight_error(&registered.owners, &err);
+                    registered.disarm_owners();
                     return Err(err);
                 }
             }
         };
         let had_waiters = !registered.waiters.is_empty();
-        let waited = self.await_inflight_waiters(registered.waiters).await?;
+        let waited = self
+            .await_inflight_waiters(std::mem::take(&mut registered.waiters))
+            .await?;
         let loaded = loaded.into_iter().chain(waited).collect();
         if had_waiters {
             return merge_completions_by_request_id(original_order, cached, loaded);
@@ -497,6 +501,8 @@ impl NativeLoadModule {
                 misses: requests.to_vec(),
                 owners: Vec::new(),
                 waiters: Vec::new(),
+                owner_in_flight: None,
+                owners_armed: false,
             };
         };
         let mut misses = Vec::new();
@@ -517,6 +523,8 @@ impl NativeLoadModule {
             misses,
             owners,
             waiters,
+            owner_in_flight: Some(Arc::clone(in_flight)),
+            owners_armed: true,
         }
     }
 
@@ -800,6 +808,36 @@ struct RegisteredNativeLoads {
     misses: Vec<NativeLoadRequest>,
     owners: Vec<NativeOwnedInFlightPayload>,
     waiters: Vec<NativeWaitingInFlightPayload>,
+    /// Holds the owner registrations live until their normal completion is
+    /// published. If the async load future is aborted, Drop publishes an
+    /// interrupted result and removes every map entry so a later identical
+    /// request can become an owner instead of waiting forever.
+    owner_in_flight: Option<Arc<NativeInFlightPayloadReads>>,
+    owners_armed: bool,
+}
+
+impl RegisteredNativeLoads {
+    fn disarm_owners(&mut self) {
+        self.owners_armed = false;
+    }
+}
+
+impl Drop for RegisteredNativeLoads {
+    fn drop(&mut self) {
+        if !self.owners_armed {
+            return;
+        }
+        let Some(in_flight) = &self.owner_in_flight else {
+            return;
+        };
+        let interrupted = NativeSharedLoadError::from_error(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "native in-flight payload owner interrupted",
+        ));
+        for owner in &self.owners {
+            in_flight.complete(owner.request, &owner.entry, Err(interrupted.clone()));
+        }
+    }
 }
 
 fn build_request_by_id(
@@ -1310,6 +1348,83 @@ mod tests {
         assert_eq!(second[1].request_id, 3);
         assert_eq!(&second[0].bytes[second[0].range.clone()], &bytes(100, 20));
         assert_eq!(&second[1].bytes[second[1].range.clone()], &bytes(124, 20));
+    }
+
+    #[test]
+    fn aborted_owner_releases_inflight_key_for_a_new_read() {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let io = Arc::new(FirstPendingThenReadyIo {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            started: started_tx,
+        });
+        let in_flight = Arc::new(NativeInFlightPayloadReads::new());
+        let loader = NativeLoadModule::with_caches(io.clone(), config(), None, Some(in_flight));
+
+        run_async_timeout(
+            async move {
+                let owner_loader = loader.clone();
+                let owner =
+                    tokio::spawn(async move { owner_loader.load(&[request(1, 7, 100, 20)]).await });
+                started_rx.recv().await.expect("owner read started");
+                owner.abort();
+                assert!(owner
+                    .await
+                    .expect_err("owner task should be aborted")
+                    .is_cancelled());
+
+                let retry = loader
+                    .load(&[request(2, 7, 100, 20)])
+                    .await
+                    .expect("retry must become a new owner rather than wait forever");
+                assert_eq!(retry.len(), 1);
+                assert_eq!(retry[0].request_id, 2);
+                assert_eq!(io.reads(), 2);
+            },
+            std::time::Duration::from_secs(2),
+            "native in-flight owner cleanup",
+        );
+    }
+
+    struct FirstPendingThenReadyIo {
+        reads: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    impl FirstPendingThenReadyIo {
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl IoBackend for FirstPendingThenReadyIo {
+        fn submit_read(&self, _file: FileRef, offset: u64, len: usize, _priority: u8) -> IoTask {
+            let read_idx = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.started.send(());
+            if read_idx == 0 {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(async move { Ok(Arc::from(bytes(offset, len).into_boxed_slice())) })
+            }
+        }
+    }
+
+    fn run_async_timeout<F, T>(future: F, timeout: std::time::Duration, label: &str) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let label = label.to_string();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("native load test runtime");
+            let result = runtime.block_on(future);
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(timeout)
+            .unwrap_or_else(|_| panic!("{label} did not complete in time"))
     }
 
     struct MockIoBackend;

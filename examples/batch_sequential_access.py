@@ -201,7 +201,6 @@ def main() -> None:
         )
 
         seen_batches = batches = cells = bytes_out = checksum = 0
-        start = None
         print("[6/7] streaming batches", flush=True)
         stream = prefetch_indexed_fast(bank, ids, plan, genes, config)
         pending_progress = 0
@@ -209,16 +208,26 @@ def main() -> None:
             total=plan.num_batches,
             **progress_kwargs("sequential batches", "batch"),
         ) as progress:
+            # ``next`` actually loads the response.  Warm it up before starting
+            # the clock, then start the clock *before* the first measured next.
+            for _ in range(WARMUP_BATCHES):
+                try:
+                    next(stream)
+                except StopIteration:
+                    break
+                seen_batches += 1
+                pending_progress += 1
+            if pending_progress:
+                progress.update(pending_progress)
+                pending_progress = 0
+
+            start = time.perf_counter()
             for batch_cells, batch_data, _num_genes in stream:
                 seen_batches += 1
                 pending_progress += 1
                 if pending_progress >= STREAM_PROGRESS_UPDATE_EVERY:
                     progress.update(pending_progress)
                     pending_progress = 0
-                if seen_batches <= WARMUP_BATCHES:
-                    continue
-                if start is None:
-                    start = time.perf_counter()
                 batches += 1
                 cells += len(batch_cells)
                 bytes_out += batch_data.nbytes
@@ -226,7 +235,7 @@ def main() -> None:
                     checksum = (checksum + data_checksum(batch_data)) & ((1 << 64) - 1)
             if pending_progress:
                 progress.update(pending_progress)
-        seconds = time.perf_counter() - start if start is not None else 0.0
+        seconds = time.perf_counter() - start
     finally:
         bank.close()
 

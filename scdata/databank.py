@@ -59,7 +59,6 @@ from os import PathLike, fspath
 from typing import (
     Any,
     Iterable,
-    Iterator,
     Literal,
     Mapping,
     TypeVar,
@@ -268,23 +267,73 @@ def _is_float_dtype(dtype: DType) -> bool:
 
 
 def _auto_output_dtype(dtypes: Iterable[DType]) -> DType:
+    """Return a common output dtype without introducing a narrowing cast.
+
+    This is deliberately stricter than Rust's explicit-cast policy.  The Rust
+    engine permits integer and floating narrowing when the caller requested it,
+    whereas ``dtype='auto'`` must not silently select a type that loses an
+    input range or precision.
+    """
     values = tuple(dtypes)
     if not values:
         raise ValueError("cannot infer output dtype from an empty dataset list")
+
     floats = [dtype for dtype in values if _is_float_dtype(dtype)]
+    integers = [dtype for dtype in values if dtype in _INT_DTYPE_RANK]
+    if len(floats) + len(integers) != len(values):
+        raise ValueError(f"cannot infer output dtype from unsupported dtypes: {values!r}")
+
     if floats:
         if DType.F64 in floats:
-            return DType.F64
-        if DType.F32 in floats:
-            return DType.F32
-        if DType.F16 in floats and DType.BF16 in floats:
-            return DType.F32
-        return floats[0]
+            float_dtype = DType.F64
+        elif DType.F32 in floats or (DType.F16 in floats and DType.BF16 in floats):
+            float_dtype = DType.F32
+        else:
+            float_dtype = floats[0]
 
-    max_size = max(_INT_DTYPE_RANK[dtype][0] for dtype in values)
-    same_width = [dtype for dtype in values if _INT_DTYPE_RANK[dtype][0] == max_size]
-    signed = [dtype for dtype in same_width if _INT_DTYPE_RANK[dtype][1]]
-    return signed[0] if signed else same_width[0]
+        if not integers:
+            return float_dtype
+
+        required_precision = max(
+            size * 8 - (1 if signed else 0)
+            for size, signed in (_INT_DTYPE_RANK[dtype] for dtype in integers)
+        )
+        float_precisions = {
+            DType.BF16: 8,
+            DType.F16: 11,
+            DType.F32: 24,
+            DType.F64: 53,
+        }
+        candidates = {
+            DType.BF16: (DType.BF16, DType.F32, DType.F64),
+            DType.F16: (DType.F16, DType.F32, DType.F64),
+            DType.F32: (DType.F32, DType.F64),
+            DType.F64: (DType.F64,),
+        }[float_dtype]
+        for candidate in candidates:
+            if float_precisions[candidate] >= required_precision:
+                return candidate
+        raise ValueError(
+            "cannot infer a lossless common floating-point output dtype for "
+            f"integer/float dtypes: {values!r}; choose an explicit output dtype"
+        )
+
+    signed_sizes = [_INT_DTYPE_RANK[dtype][0] for dtype in integers if _INT_DTYPE_RANK[dtype][1]]
+    unsigned_sizes = [
+        _INT_DTYPE_RANK[dtype][0] for dtype in integers if not _INT_DTYPE_RANK[dtype][1]
+    ]
+    if not signed_sizes or not unsigned_sizes:
+        max_size = max(_INT_DTYPE_RANK[dtype][0] for dtype in integers)
+        return next(dtype for dtype in integers if _INT_DTYPE_RANK[dtype][0] == max_size)
+
+    required_signed_size = max(max(signed_sizes), max(unsigned_sizes) * 2)
+    for dtype in (DType.I8, DType.I16, DType.I32, DType.I64):
+        if _INT_DTYPE_RANK[dtype][0] >= required_signed_size:
+            return dtype
+    raise ValueError(
+        "cannot infer a lossless common integer output dtype for mixed signed/unsigned "
+        f"dtypes: {values!r}; choose an explicit floating-point dtype"
+    )
 
 
 def _coerce_prefetch_dtype(
@@ -397,6 +446,7 @@ class ThreadedConfig(_Config):
     """Thread-pool pread/pwrite backend settings."""
 
     num_workers: int = 24
+    steal_interval_us: int = 0
     cpus: list[int] | None = None
     base: BaseIoConfig = field(default_factory=BaseIoConfig)
 
@@ -883,6 +933,7 @@ def _config_from_rust(config: Any) -> Any:
     if isinstance(config, _ThreadedConfig):
         return ThreadedConfig(
             num_workers=config.num_workers,
+            steal_interval_us=config.steal_interval_us,
             cpus=config.cpus,
             base=_config_from_rust(config.base),
         )
@@ -1168,6 +1219,15 @@ def _coerce_prefetch_config(
     )
 
 
+def _prepare_prefetch_config(
+    config: ScheduledPrefetchConfig | Mapping[str, Any] | None,
+) -> Any:
+    """Convert and validate prefetch configuration before consuming batches."""
+    rust_config = _config_to_rust(_coerce_prefetch_config(config))
+    rust_config.validate()
+    return rust_config
+
+
 def _coerce_access_config(
     config: ScheduledAccessConfig | Mapping[str, Any] | None,
 ) -> ScheduledAccessConfig:
@@ -1182,6 +1242,78 @@ def _coerce_access_config(
         f"access_config must be ScheduledAccessConfig, a mapping, or None; "
         f"got {type(config).__name__}"
     )
+
+
+_PREFETCH_GENE_NAMES_UNSET = object()
+
+
+def _resolve_prefetch_gene_names(
+    genes: Iterable[str] | None,
+    requests: Iterable[object],
+) -> tuple[str, ...] | None:
+    """Resolve a prefetch-wide gene schema from explicit or per-request names.
+
+    Rust prefetch plans have exactly one output schema.  A top-level ``genes``
+    argument therefore wins over every :class:`CellAccess` request.  Without
+    one, every request must either use all genes or specify the same ordered
+    subset; ordinary and duck-typed ``.cells`` requests mean all genes.
+    """
+    if genes is not None:
+        return _as_gene_names(genes, "genes")
+
+    expected: tuple[str, ...] | None | object = _PREFETCH_GENE_NAMES_UNSET
+    for request in requests:
+        requested = request.gene_names if isinstance(request, CellAccess) else None
+        if expected is _PREFETCH_GENE_NAMES_UNSET:
+            expected = requested
+        elif requested != expected:
+            raise ValueError(
+                "CellAccess.gene_names must be identical for every prefetch request "
+                "when genes is not explicitly provided"
+            )
+    if expected is _PREFETCH_GENE_NAMES_UNSET or expected is None:
+        return None
+    assert isinstance(expected, tuple)
+    return expected
+
+
+def _materialize_single_prefetch_batches(
+    batches: Iterable[CellAccess | Iterable[int]],
+    genes: Iterable[str] | None,
+) -> tuple[
+    tuple[CellAccess | Iterable[int], ...],
+    tuple[str, ...] | None,
+]:
+    """Materialize an eager single-dataset plan and resolve its gene schema."""
+    materialized = tuple(batches)
+    return materialized, _resolve_prefetch_gene_names(genes, materialized)
+
+
+def _materialize_multi_prefetch_batches(
+    batches: Iterable[Iterable[tuple[int, CellAccess | Iterable[int]]]],
+    genes: Iterable[str] | None,
+) -> tuple[
+    tuple[tuple[Any, ...], ...],
+    tuple[str, ...] | None,
+]:
+    """Materialize an eager multi-dataset plan while retaining request objects.
+
+    ``_PrefetchPlan.multi`` consumes arbitrary two-item part iterables eagerly.
+    Normalizing only non-list/tuple parts here lets us inspect their cells
+    request once, while keeping the request itself (including duck-typed
+    ``.cells`` objects) untouched for Rust's existing parser.
+    """
+    materialized: list[tuple[Any, ...]] = []
+    requests: list[object] = []
+    for batch in batches:
+        parts: list[Any] = []
+        for part in batch:
+            normalized = part if isinstance(part, (tuple, list)) else tuple(part)
+            parts.append(normalized)
+            if len(normalized) == 2:
+                requests.append(normalized[1])
+        materialized.append(tuple(parts))
+    return tuple(materialized), _resolve_prefetch_gene_names(genes, requests)
 
 
 # ===========================================================================
@@ -1571,7 +1703,7 @@ class ScDataBank:
         | None = None,
         dtype: DTypeLike | Literal["auto"] | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
-    ) -> Iterator[CellBatch]:
+    ) -> PrefetchIterator:
         """Stream decoded cell batches from one dataset, optionally onto ``genes``.
 
         For cross-dataset batches where one batch may mix cells from several
@@ -1588,9 +1720,17 @@ class ScDataBank:
             dtype_value = stored_dtype
         else:
             dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
+        # Gene names deliberately remain eagerly materialized because the
+        # output schema must be known before the iterator is returned. Batch
+        # generators, in contrast, are materialized only after every
+        # non-consuming precondition below has succeeded.
         names = _as_gene_names(genes, "genes") if genes is not None else None
         rust_missing = _coerce_missing_policy(missing)
-        config = _coerce_prefetch_config(config)
+        rust_config = _prepare_prefetch_config(config)
+        core = self._core()
+        # Resolve per-request CellAccess gene names only after every validation
+        # that does not consume the user batch iterable has succeeded.
+        batches, names = _materialize_single_prefetch_batches(batches, names)
 
         if dtype_value == stored_dtype:
             if names is None:
@@ -1607,8 +1747,7 @@ class ScDataBank:
         # request so the Rust projection path can cast on output.
         plan = _PrefetchPlan.single(batches)
         rust_missing_value = rust_missing._rust if rust_missing is not None else None
-        rust_config = _config_to_rust(config)
-        inner = self._core().prefetch_cells(
+        inner = core.prefetch_cells(
             [id._rust],
             plan,
             dtype_value,
@@ -1635,7 +1774,7 @@ class ScDataBank:
         | None = None,
         dtype: DTypeLike | Literal["auto"] | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
-    ) -> Iterator[CellBatch]:
+    ) -> PrefetchIterator:
         """Stream decoded cell batches mixing cells from several datasets.
 
         ``ids`` is a sequence of :class:`DatasetId`.  ``batches`` yields one
@@ -1645,14 +1784,23 @@ class ScDataBank:
         datasets; an explicit ``dtype`` casts every batch to it.
         """
         ids = self._coerce_prefetch_ids(ids)
-        dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
+        # Validate every id even for an explicit output dtype, before the eager
+        # Python plan consumes a user batch generator.
+        stored_dtypes = tuple(self.dataset_dtype(dataset_id) for dataset_id in ids)
+        if dtype is None or (isinstance(dtype, str) and dtype.strip().lower() == "auto"):
+            dtype_value = _auto_output_dtype(stored_dtypes)
+        else:
+            dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
         names = _as_gene_names(genes, "genes") if genes is not None else None
         rust_missing = _coerce_missing_policy(missing)
-        config = _coerce_prefetch_config(config)
+        rust_config = _prepare_prefetch_config(config)
+        core = self._core()
+        # Preserve CellAccess.gene_names semantics without consuming batches
+        # until all independent validation above has completed.
+        batches, names = _materialize_multi_prefetch_batches(batches, names)
         plan = _PrefetchPlan.multi(batches)
         rust_missing_value = rust_missing._rust if rust_missing is not None else None
-        rust_config = _config_to_rust(config)
-        inner = self._core().prefetch_cells(
+        inner = core.prefetch_cells(
             [dataset_id._rust for dataset_id in ids],
             plan,
             dtype_value,
@@ -1679,7 +1827,7 @@ class ScDataBank:
         | None = None,
         dtype: DTypeLike | Literal["auto"] | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
-    ) -> Iterator[CellBatch]:
+    ) -> PrefetchIterator:
         """Stream batches from a numeric :class:`~scdata.data.CellIndexPlan`.
 
         ``plan.dataset_index`` selects entries from ``ids`` and
@@ -1690,14 +1838,18 @@ class ScDataBank:
         if not isinstance(plan, CellIndexPlan):
             raise TypeError(f"plan must be a CellIndexPlan, got {type(plan).__name__}")
         ids = self._coerce_prefetch_ids(ids)
-        dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
+        stored_dtypes = tuple(self.dataset_dtype(dataset_id) for dataset_id in ids)
+        if dtype is None or (isinstance(dtype, str) and dtype.strip().lower() == "auto"):
+            dtype_value = _auto_output_dtype(stored_dtypes)
+        else:
+            dtype_value = _coerce_prefetch_dtype(dtype, ids, self)
         names = _as_gene_names(genes, "genes") if genes is not None else None
         rust_missing = _coerce_missing_policy(missing)
-        config = _coerce_prefetch_config(config)
+        rust_config = _prepare_prefetch_config(config)
+        core = self._core()
         rust_plan = _PrefetchPlan.indexed(plan.dataset_index, plan.cell_index, plan.batch_size)
         rust_missing_value = rust_missing._rust if rust_missing is not None else None
-        rust_config = _config_to_rust(config)
-        inner = self._core().prefetch_cells(
+        inner = core.prefetch_cells(
             [dataset_id._rust for dataset_id in ids],
             rust_plan,
             dtype_value,
@@ -1732,11 +1884,12 @@ class ScDataBank:
         batches: Iterable[CellAccess | Iterable[int]],
         *,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
-    ) -> Iterator[CellBatch]:
-        config = _coerce_prefetch_config(config)
-        rust_config = _config_to_rust(config)
+    ) -> PrefetchIterator:
+        # Verify the core and configuration before eagerly flattening `batches`.
+        core = self._core()
+        rust_config = _prepare_prefetch_config(config)
         plan = _PrefetchPlan.single(batches)
-        inner = self._core().prefetch_cells_raw(id._rust, plan, rust_config)
+        inner = core.prefetch_cells_raw(id._rust, plan, rust_config)
         return PrefetchIterator(
             inner,
             gene_names=tuple(inner.gene_names),
@@ -1752,13 +1905,13 @@ class ScDataBank:
         *,
         missing: MissingGenePolicy | None = None,
         config: ScheduledPrefetchConfig | Mapping[str, Any] | None = None,
-    ) -> Iterator[CellBatch]:
+    ) -> PrefetchIterator:
         names = tuple(_as_gene_names(genes, "genes"))
         rust_missing = missing._rust if missing is not None else None
-        config = _coerce_prefetch_config(config)
-        rust_config = _config_to_rust(config)
+        core = self._core()
+        rust_config = _prepare_prefetch_config(config)
         plan = _PrefetchPlan.single(batches)
-        inner = self._core().prefetch_cells_by_gene_names_raw(
+        inner = core.prefetch_cells_by_gene_names_raw(
             id._rust,
             plan,
             list(names),

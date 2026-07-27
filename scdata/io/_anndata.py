@@ -2,8 +2,10 @@
 
 scdata stores are plain zarr v3 trees (one ``zarr.json`` per node, standard
 per-chunk files), produced by :func:`write_zarr` and read back by
-:func:`read_zarr`.  Staying inside the zarr v3 standard means a store written
-for the Rust databank is also readable by stock ``anndata.read_zarr`` — with
+:func:`read_zarr`.  A directory store in the ordinary ``dense2d`` or
+regular-grid CSR layout is readable by stock ``anndata.read_zarr``.  A
+``.zarr.zip`` filename is *not* directly accepted by stock AnnData; use a
+``zarr.storage.ZipStore`` or :func:`read_zarr`.  scdata additionally supports
 two deliberate, spec-legal extensions:
 
 * ``dense1d`` X — a flattened 1D ``[cells * genes]`` array chunked so a cell
@@ -12,8 +14,8 @@ two deliberate, spec-legal extensions:
 * cell-aligned CSR — ``data`` / ``indices`` use a zarr v3 **rectilinear**
   chunk grid whose edges are CSR row boundaries, so each cell's nonzero run
   lives in one chunk.  Rectilinear is standard v3 (the metadata stores the
-  full per-chunk edge list) but experimental in zarr, so read/write set
-  ``zarr.config['array.rectilinear_chunks'] = True``.
+  full per-chunk edge list) but experimental in zarr, so read/write enable
+  ``array.rectilinear_chunks`` only for the duration of their call.
 
 Three X layouts are supported at write time: ``dense2d`` (standard 2D,
 anndata-readable), ``dense1d`` (flattened, cell-aligned), ``sparse`` (CSR,
@@ -32,6 +34,7 @@ import os
 import warnings
 import zipfile
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
 
@@ -66,10 +69,67 @@ _DEFAULT_BLOCKSIZE = 64 * 1024
 
 
 # ---------------------------------------------------------------------------
+# Scoped zarr configuration
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _write_config():
+    """Temporarily enable supported grids and disable AnnData auto-sharding.
+
+    AnnData 0.13.2 defaults ``auto_shard_zarr_v3`` to true.  Its element
+    writers would otherwise shard annotation arrays such as ``var/_index``,
+    which falls outside scdata's direct-launch physical-chunk contract even
+    when X itself was written in a supported layout.
+    """
+    import anndata as ad
+    import zarr
+
+    # Both settings APIs are scoped and restore the caller's exact value.
+    with (
+        zarr.config.set({"array.rectilinear_chunks": True}),
+        ad.settings.override(auto_shard_zarr_v3=False),
+    ):
+        yield
+
+
+@contextmanager
+def _rectilinear_config():
+    """Temporarily enable zarr's experimental rectilinear-grid support."""
+    import zarr
+
+    with zarr.config.set({"array.rectilinear_chunks": True}):
+        yield
+
+
+def _with_write_config(func: Any) -> Any:
+    """Run one public writer with restored Zarr and AnnData settings."""
+
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with _write_config():
+            return func(*args, **kwargs)
+
+    return wrapped
+
+
+def _with_rectilinear_config(func: Any) -> Any:
+    """Run one public reader with a restored zarr config."""
+
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with _rectilinear_config():
+            return func(*args, **kwargs)
+
+    return wrapped
+
+
+# ---------------------------------------------------------------------------
 # public write
 # ---------------------------------------------------------------------------
 
 
+@_with_write_config
 def write_zarr(
     adata: "AnnData",
     path: str | os.PathLike[str],
@@ -80,7 +140,7 @@ def write_zarr(
     align_cells: bool = True,
     store: _Store = "zip",
     compressor: _Compressor = _DEFAULT_COMPRESSOR,
-    blocksize: int = _DEFAULT_BLOCKSIZE,
+    blocksize: int | None = _DEFAULT_BLOCKSIZE,
 ) -> Path:
     """Write an :class:`anndata.AnnData` as a scdata zarr v3 store.
 
@@ -127,16 +187,13 @@ def write_zarr(
         Only takes effect when ``compressor`` resolves to Blosc; for any
         other compressor it is silently ignored.  Defaults to ``64 * 1024``
         (64 KiB), which bounds read amplification for random partial access
-        on the native fast path.  Pass ``0`` to let numcodecs/Blosc pick the
-        block size automatically; a positive value is used verbatim.
-        numcodecs raises any value below 64 KiB to 64 KiB, so smaller values
-        are not an error — no lower bound is enforced here.
+        on the native fast path.  Pass ``0`` or ``None`` to select that scdata
+        default (64 KiB); a positive value is used verbatim.  numcodecs raises
+        any value below 64 KiB to 64 KiB, so smaller values are not an error —
+        no lower bound is enforced here.
     """
     import zarr
     from anndata._io.specs import write_elem
-    from zarr.storage import MemoryStore
-
-    _enable_rectilinear()
 
     root = Path(os.fspath(path))
     _validate_write_options(
@@ -147,13 +204,11 @@ def write_zarr(
         compressor=compressor,
         blocksize=blocksize,
     )
-    tmp_root: Path | None = None
+    _preflight_write_adata(adata)
     if store == "zip":
         _prepare_zip_target(root)
-        zstore = MemoryStore()
-    else:
-        tmp_root = _make_temp_dir(root)
-        zstore = _make_zarr_store(tmp_root, store)
+    tmp_root: Path | None = _make_temp_dir(root)
+    zstore = _make_zarr_store(tmp_root)
 
     try:
         g = zarr.open_group(zstore, mode="w", zarr_format=3)
@@ -204,17 +259,17 @@ def write_zarr(
                 blocksize=blocksize,
             )
 
+        assert tmp_root is not None
         if store == "zip":
-            _zip_store(zstore, root)
+            _zip_directory(tmp_root, root)
         else:
-            assert tmp_root is not None
             _replace_directory(tmp_root, root)
             tmp_root = None
     finally:
         close = getattr(zstore, "close", None)
         if close is not None:
             close()
-        if store == "dir" and tmp_root is not None:
+        if tmp_root is not None:
             _remove_path(tmp_root)
     return root
 
@@ -259,12 +314,25 @@ def _write_layers(
     compressor: _Compressor,
     blocksize: int | None = None,
 ) -> None:
-    """Write all AnnData layers using the same scdata matrix layouts as X."""
+    """Write all AnnData layers using the same scdata matrix layouts as X.
+
+    ``adata.X`` is mirrored under the ``None`` key in ``adata.layers`` (anndata
+    0.13+ — see :class:`anndata._core.aligned_mapping.LayersBase`, whose
+    ``key=None`` slot "mirrors ``AnnData.X`` and is reported by
+    ``layers.keys()``").  That slot is not a real layer: writing it would both
+    duplicate ``X`` on disk and trip the non-empty-string name check below.
+    Skip the ``None`` key so only named layers reach the ``layers`` group —
+    matching stock anndata's on-disk semantics where ``layers`` never contains
+    ``X``.  A named layer whose value happens to alias ``adata.X`` (e.g.
+    ``adata.layers["counts"] = adata.X``) is still a real layer and is written.
+    """
     if not adata.layers:
         return
     layers = g.require_group("layers")
     layers.attrs.update({"encoding-type": "dict", "encoding-version": "0.1.0"})
     for raw_name, matrix in dict(adata.layers).items():
+        if raw_name is None:
+            continue
         name = _validate_layer_name(raw_name)
         fmt = _resolve_layer_format(matrix, layer_format, align_cells=align_cells)
         _write_matrix(
@@ -374,13 +442,27 @@ def _write_matrix(
             blocksize=blocksize,
         )
     elif format == "sparse":
+        source_index_dtype: np.dtype[Any] | None = None
         if _sparse.isspmatrix_csr(matrix):
-            csr = matrix
+            source_index_dtype = np.dtype(matrix.indices.dtype)
+            csr = matrix.copy()
         elif _sparse.issparse(matrix):
             csr = matrix.tocsr()
         else:
             # Dense input — ``format="sparse"`` promises a CSR conversion.
             csr = _sparse.csr_matrix(np.asarray(matrix))
+        # Do not mutate a caller-owned CSR, but always write canonical CSR.
+        # Duplicate coordinates otherwise yield an indptr/data layout whose
+        # values differ from the logical AnnData matrix, and unsorted indices
+        # unnecessarily penalize downstream sparse access.
+        csr.sum_duplicates()
+        csr.sort_indices()
+        # SciPy can downcast a copied small CSR during canonicalization.  The
+        # source CSR's explicit index width is part of the caller's format
+        # choice, so preserve it in the on-disk metadata.
+        if source_index_dtype is not None and csr.indices.dtype != source_index_dtype:
+            csr.indices = csr.indices.astype(source_index_dtype, copy=False)
+            csr.indptr = csr.indptr.astype(source_index_dtype, copy=False)
         _write_csr_group(
             g,
             name,
@@ -425,6 +507,78 @@ def _validate_matrix_shape(matrix: Any, n_obs: int, n_var: int, context: str) ->
     expected = (int(n_obs), int(n_var))
     if shape != expected:
         raise StoreError(f"matrix {context!r} has shape {shape}, expected {expected}")
+
+
+def _preflight_write_adata(adata: "AnnData") -> None:
+    """Reject unsupported AnnData content before creating or replacing output."""
+    if adata.X is None:
+        raise StoreError("AnnData.X is None")
+    if adata.n_obs <= 0 or adata.n_vars <= 0:
+        raise StoreError(
+            f"AnnData dimensions must be non-empty, got ({adata.n_obs}, {adata.n_vars})"
+        )
+    _validate_var_names(adata.var_names, "var_names")
+    _validate_writable_matrix(adata.X, adata.n_obs, adata.n_vars, "X")
+
+    for raw_name, matrix in dict(adata.layers).items():
+        if raw_name is None:
+            continue
+        name = _validate_layer_name(raw_name)
+        _validate_writable_matrix(matrix, adata.n_obs, adata.n_vars, f"layer {name!r}")
+
+    raw = adata.raw
+    if raw is None:
+        return
+    if raw.X is None:
+        raise StoreError("AnnData.raw.X is None")
+    if raw.n_obs != adata.n_obs:
+        raise StoreError(f"AnnData.raw has {raw.n_obs} cells, expected {adata.n_obs}")
+    if raw.n_obs <= 0 or raw.n_vars <= 0:
+        raise StoreError(f"AnnData.raw dimensions must be non-empty, got ({raw.n_obs}, {raw.n_vars})")
+    _validate_var_names(raw.var_names, "raw.var_names")
+    _validate_writable_matrix(raw.X, raw.n_obs, raw.n_vars, "raw.X")
+
+
+def _validate_var_names(names: Any, context: str) -> None:
+    """Require a unique, non-empty, non-NA text var index before output exists.
+
+    This preflight intentionally owns only the identifier contract required by
+    scdata's gene lookup.  Dataframes and every other AnnData annotation remain
+    delegated to AnnData's element writers below.
+    """
+    import pandas as pd
+
+    seen: set[str] = set()
+    for position, value in enumerate(names):
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and bool(missing):
+            raise StoreError(f"{context}[{position}] must not be NA")
+        if not isinstance(value, str):
+            raise StoreError(f"{context}[{position}] must be text, got {type(value).__name__}")
+        if not value.strip():
+            raise StoreError(f"{context}[{position}] must be non-empty")
+        if value in seen:
+            raise StoreError(f"{context} must be unique, duplicate: {value!r}")
+        seen.add(value)
+
+
+def _validate_writable_matrix(matrix: Any, n_obs: int, n_var: int, context: str) -> None:
+    """Validate every matrix's shape and numeric dtype before output is touched."""
+    if matrix is None:
+        raise StoreError(f"matrix {context!r} is None")
+    _validate_matrix_shape(matrix, n_obs, n_var, context)
+    try:
+        dtype = np.dtype(getattr(matrix, "dtype", np.asarray(matrix).dtype))
+    except (TypeError, ValueError) as err:
+        raise StoreError(f"matrix {context!r} has invalid dtype") from err
+    if dtype.kind == "b":
+        raise StoreError(f"matrix {context!r} has unsupported bool dtype")
+    if dtype.kind not in ("f", "i", "u"):
+        raise StoreError(f"matrix {context!r} has unsupported dtype {dtype}")
+    try:
+        _v3_dtype_name(_little_endian_dtype(dtype))
+    except (KeyError, TypeError) as err:
+        raise StoreError(f"matrix {context!r} has unsupported dtype {dtype}") from err
 
 
 def _resolve_layer_format(
@@ -505,11 +659,16 @@ def _write_csr_group(
     indices = np.asarray(csr.indices)
     data = np.asarray(csr.data)
 
+    # Use multiple chunks for large indptr to avoid blosc's 2 GiB single-buffer
+    # limit.  50 M elements × 8 bytes (int64) = 400 MiB per chunk, well under
+    # the limit.  Reading is unaffected — zarr transparently handles multi-chunk
+    # 1D arrays.
+    indptr_chunk = min(indptr.shape[0], 50_000_000)
     _create_dense_array(
         sub,
         "indptr",
         indptr,
-        (indptr.shape[0],),
+        (indptr_chunk,),
         attrs={
             "encoding-type": "array",
             "encoding-version": "0.2.0",
@@ -598,7 +757,11 @@ def _aligned_cell_boundaries(indptr: np.ndarray, target: int) -> list[int]:
             cell += 1
         if cell == start_cell:  # one cell already exceeds target — take it alone
             cell = start_cell + 1
-        boundaries.append(int(indptr[cell]))
+        boundary = int(indptr[cell])
+        # A suffix of empty cells repeats the preceding CSR offset.  It needs
+        # no chunk; emitting it would declare a zero-length rectilinear run.
+        if boundary > boundaries[-1]:
+            boundaries.append(boundary)
         start_cell = cell
     if boundaries[-1] != int(indptr[-1]):
         boundaries.append(int(indptr[-1]))
@@ -763,13 +926,6 @@ def _little_endian_dtype(dtype: Any) -> np.dtype:
 # ---------------------------------------------------------------------------
 
 
-def _enable_rectilinear() -> None:
-    """Enable zarr's experimental rectilinear chunk grids (write + read)."""
-    import zarr
-
-    zarr.config.set({"array.rectilinear_chunks": True})
-
-
 @contextmanager
 def _suppress_known_zarr_write_warnings():
     """Suppress zarr migration notices that callers cannot act on per write."""
@@ -881,19 +1037,17 @@ def _encode_chunk_bytes(
 def _resolve_blocksize(blocksize: int | None) -> int:
     """Resolve the public ``blocksize`` argument for the numcodecs Blosc config.
 
-    ``None`` and ``0`` mean "let numcodecs/Blosc pick the block size" — they
-    are passed through as ``0`` so Blosc selects automatically (its documented
-    behavior).  Any positive value is used verbatim.  numcodecs raises values
-    below 64 KiB to 64 KiB internally, so no lower bound is enforced here —
-    only negatives are rejected.
-
-    The scdata default block size (``_DEFAULT_BLOCKSIZE``) is applied by
-    :func:`write_zarr`'s parameter default, not here: callers who explicitly
-    pass ``0`` or ``None`` are asking for Blosc's automatic choice, not for
-    scdata's default.
+    ``None`` and ``0`` both select the scdata default block size
+    (``_DEFAULT_BLOCKSIZE``, 64 KiB) rather than Blosc's automatic choice, so
+    every scdata-written store bounds read amplification for random partial
+    access on the native fast path — including stores produced by
+    :class:`~scdata.io.AnnDataZarrZipConverter`, whose ``blocksize`` argument
+    defaults to ``None``.  Any positive value is used verbatim; numcodecs
+    raises values below 64 KiB to 64 KiB internally, so no lower bound is
+    enforced here — only negatives are rejected.
     """
     if blocksize is None or blocksize == 0:
-        return 0
+        return _DEFAULT_BLOCKSIZE
     value = int(blocksize)
     if value < 0:
         raise StoreError(f"blosc blocksize must be non-negative, got {blocksize}")
@@ -910,10 +1064,10 @@ def _compressor_config(
 
     ``blocksize`` is the single explicit block-size knob.  It is applied only
     when the resolved compressor is Blosc; for any other compressor it is
-    silently ignored.  ``None`` and ``0`` pass through to Blosc as ``0``
-    (Blosc picks the block size automatically); a positive value is used
-    verbatim.  Any ``blocksize`` embedded in ``compressor`` (e.g. a mapping)
-    is overridden — there is only one blocksize source.
+    silently ignored.  ``None`` and ``0`` select the scdata default
+    (``_DEFAULT_BLOCKSIZE``, 64 KiB); a positive value is used verbatim.
+    Any ``blocksize`` embedded in ``compressor`` (e.g. a mapping) is
+    overridden — there is only one blocksize source.
     """
     if compressor is None:
         return None
@@ -1145,12 +1299,9 @@ def _validate_chunk_size_values(chunk_size: int | list[int] | tuple[int, ...]) -
             raise StoreError(f"chunk_size entries must be positive, got {parsed}")
 
 
-def _make_zarr_store(root: Path, store: _Store) -> Any:
-    if store == "zip":
-        raise StoreError("internal error: zip writes must use a memory store")
-    if store == "dir":
-        return str(root)
-    raise StoreError(f"unsupported store kind: {store!r}")
+def _make_zarr_store(root: Path) -> str:
+    """Return the directory store used while staging either output kind."""
+    return str(root)
 
 
 def _prepare_zip_target(root: Path) -> None:
@@ -1168,8 +1319,8 @@ def _make_temp_dir(target: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent))
 
 
-def _zip_store(store: Any, target: Path) -> None:
-    """Pack an in-memory zarr store as a ZIP_STORED archive."""
+def _zip_directory(source: Path, target: Path) -> None:
+    """Stream a staged directory store into a sibling ``ZIP_STORED`` archive."""
     import tempfile
 
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
@@ -1177,8 +1328,8 @@ def _zip_store(store: Any, target: Path) -> None:
     tmp = Path(tmp_name)
     try:
         with zipfile.ZipFile(tmp, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for key in sorted(_store_list(store)):
-                zf.writestr(key, _store_get_bytes(store, key))
+            for path in sorted(candidate for candidate in source.rglob("*") if candidate.is_file()):
+                zf.write(path, path.relative_to(source).as_posix(), compress_type=zipfile.ZIP_STORED)
         os.replace(tmp, target)
     finally:
         try:
@@ -1230,6 +1381,7 @@ def _remove_path(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@_with_rectilinear_config
 def read_zarr(
     path: str | os.PathLike[str],
     *,
@@ -1276,7 +1428,6 @@ def read_zarr(
     from anndata.compat import _clean_uns
     from anndata.experimental import read_dispatched
 
-    _enable_rectilinear()
     f = _open_store_for_read(path)
 
     try:

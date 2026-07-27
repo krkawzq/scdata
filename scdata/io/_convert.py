@@ -7,13 +7,14 @@ import gzip
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 from scdata.io._anndata import (
     _DEFAULT_CHUNK_ELEMENTS,
     _DEFAULT_COMPRESSOR,
     _Compressor,
     _LayerFormat,
+    read_zarr,
     write_zarr,
 )
 from scdata.io._launch import StoreError
@@ -86,7 +87,7 @@ class AnnDataZarrZipConverter:
     """Callable converter from AnnData-readable inputs to scdata ``.zarr.zip``.
 
     Reading is delegated to the public/compat readers exposed by
-    ``anndata.io`` in anndata 0.12.x:
+    ``anndata.io`` (anndata ≥ 0.12, pin ``==0.13.2`` in optional deps):
     ``read_h5ad``, ``read_zarr``, ``read_loom``, ``read_hdf``,
     ``read_excel``, ``read_umi_tools``, ``read_csv``, ``read_text``, and
     ``read_mtx``.  Writing is delegated to :func:`scdata.io.write_zarr`.
@@ -208,7 +209,7 @@ class AnnDataZarrZipConverter:
         if read_format == "h5ad":
             return io.read_h5ad(source, **kwargs)
         if read_format == "zarr":
-            return _read_zarr_with_anndata(source, kwargs)
+            return read_zarr(source, **kwargs)
         if read_format == "loom":
             return io.read_loom(source, **kwargs)
         if read_format == "hdf":
@@ -291,20 +292,6 @@ def _same_existing_path(left: Path, right: Path) -> bool:
         return left.exists() and right.exists() and left.resolve() == right.resolve()
     except OSError:
         return False
-
-
-def _read_zarr_with_anndata(source: Path, kwargs: dict[str, Any]) -> "AnnData":
-    import anndata as ad
-
-    if source.is_file():
-        from zarr.storage import ZipStore
-
-        store = ZipStore(str(source), mode="r")
-        try:
-            return ad.io.read_zarr(cast(Any, store), **kwargs)
-        finally:
-            store.close()
-    return ad.io.read_zarr(source, **kwargs)
 
 
 def _infer_hdf_key(source: Path) -> str:

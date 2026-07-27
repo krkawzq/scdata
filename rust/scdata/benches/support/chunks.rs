@@ -121,6 +121,7 @@ pub fn sparse_csr_u32_f32_spec(
         index_dtype: DType::U32,
         num_cells: cells,
         num_genes: genes,
+        assume_sorted_indices: false,
     }
 }
 
@@ -178,7 +179,10 @@ pub fn rectilinear_memory_array_spec(
         dtype,
         order: ArrayOrder::C,
         codec,
-        grid: ArrayGridSpec::Rectilinear { axes },
+        grid: ArrayGridSpec::Rectilinear {
+            logical_axes: axes,
+            codec_axes: None,
+        },
         chunks,
     }
 }

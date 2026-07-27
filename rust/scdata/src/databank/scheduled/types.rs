@@ -11,6 +11,7 @@ use super::super::dataset::Dataset;
 use super::super::error::DataBankResult;
 use super::super::interner::GeneNameView;
 use super::super::plan::DenseSegment;
+use super::super::RetiredDatasets;
 
 use super::super::dense::*;
 use super::super::gene_axis::*;
@@ -147,13 +148,21 @@ where
 ///
 /// Results are cached in the completed queue, so no external output buffer is
 /// accepted.
+///
+/// `next()` retains normal blocking iterator semantics and may wait for the
+/// batch source to yield. `close()` is different: source advancement runs on a
+/// detached forwarder, because arbitrary Rust `Iterator::next()` calls cannot
+/// be interrupted safely. Thus `close()` never joins a source blocked forever;
+/// when that call eventually returns, the forwarder observes cancellation and
+/// exits without submitting another batch.
 pub struct PrefetchCells<T>
 where
     T: DataValue,
 {
     pub(crate) rx: Option<flume::Receiver<DataBankResult<PrefetchedBatch<T>>>>,
     pub(crate) output_names: Vec<GeneNameView>,
-    pub(crate) _datasets: Arc<[Arc<Dataset>]>,
+    pub(crate) _datasets: Option<Arc<[Arc<Dataset>]>>,
+    pub(crate) retired: Arc<RetiredDatasets>,
     pub(crate) prefetch_step: usize,
     pub(crate) resolved_strategy: &'static str,
     pub(crate) fallback_reason: Option<&'static str>,
@@ -188,6 +197,20 @@ where
     pub fn fallback_reason(&self) -> Option<&'static str> {
         self.fallback_reason
     }
+
+    /// Cancel outstanding work, join the producer, and release retained
+    /// datasets.  Safe to call repeatedly and also used by `Drop`.
+    pub fn close(&mut self) {
+        self.cancel.cancel_all();
+        self.rx.take();
+        if let Some(handle) = self.producer.take() {
+            let _ = handle.join();
+        }
+        drop(self._datasets.take());
+        // A file-release failure cannot be reported from `Drop`; the normal
+        // DataBank cleanup path preserves its existing error reporting.
+        let _ = self.retired.cleanup();
+    }
 }
 
 impl<T> Iterator for PrefetchCells<T>
@@ -197,13 +220,19 @@ where
     type Item = DataBankResult<PrefetchedBatch<T>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let rx = self.rx.as_ref()?;
-        match rx.recv() {
-            Ok(batch) => Some(batch),
-            Err(_) => {
-                if let Some(handle) = self.producer.take() {
-                    let _ = handle.join();
+        let received = self.rx.as_ref()?.recv();
+        match received {
+            Ok(batch) => {
+                if batch.is_err() {
+                    // Errors are terminal by producer contract.  Release the
+                    // queue, worker, and retained datasets before surfacing
+                    // the original error to the consumer.
+                    self.close();
                 }
+                Some(batch)
+            }
+            Err(_) => {
+                self.close();
                 None
             }
         }
@@ -215,11 +244,7 @@ where
     T: DataValue,
 {
     fn drop(&mut self) {
-        self.cancel.cancel_all();
-        self.rx.take();
-        if let Some(handle) = self.producer.take() {
-            let _ = handle.join();
-        }
+        self.close();
     }
 }
 
@@ -230,6 +255,9 @@ pub(crate) struct PlannedBatch {
     pub(crate) scheduled: ScheduledBatchAccess,
     pub(crate) strategy: AccessStrategy,
     pub(crate) cancel: Arc<PrefetchCancel>,
+    /// Registration is created before preplanning and is moved to the response
+    /// closure on success. Its Drop unregisters all non-success paths.
+    pub(crate) registration: super::producer::ActiveBatchGuard,
 }
 
 pub(crate) struct PlannedMessage {
@@ -249,18 +277,29 @@ where
 pub(crate) struct PrefetchCancelRegistry {
     cancelled: AtomicBool,
     active: Mutex<BTreeMap<BatchSeq, Arc<PrefetchCancel>>>,
+    /// Wakes the producer when it is waiting only for a slow or permanently
+    /// blocking external batch source.
+    cancel_tx: flume::Sender<()>,
+    cancel_rx: flume::Receiver<()>,
 }
 
 impl PrefetchCancelRegistry {
     pub(crate) fn new() -> Arc<Self> {
+        let (cancel_tx, cancel_rx) = flume::bounded(1);
         Arc::new(Self {
             cancelled: AtomicBool::new(false),
             active: Mutex::new(BTreeMap::new()),
+            cancel_tx,
+            cancel_rx,
         })
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cancel_receiver(&self) -> flume::Receiver<()> {
+        self.cancel_rx.clone()
     }
 
     pub(crate) fn register(&self, seq: BatchSeq, cancel: Arc<PrefetchCancel>) {
@@ -285,6 +324,7 @@ impl PrefetchCancelRegistry {
 
     pub(crate) fn cancel_all(&self) {
         self.cancelled.store(true, Ordering::Release);
+        let _ = self.cancel_tx.try_send(());
         let mut active = self
             .active
             .lock()

@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::thread;
+use std::time::Duration;
 
 use super::config::FillConfig;
 use super::error::{DataBankError, DataBankResult};
@@ -166,15 +167,54 @@ impl DataBankComputePool {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_request(&self, job: ComputeJob) -> DataBankResult<()> {
-        self.submit(job, WorkClass::Request)
+        self.submit_with_cancel(job, WorkClass::Request, || false)
     }
 
+    /// Submit a producer request without making cancellation wait for a full
+    /// compute queue.  A timed send yields the retained closure back on each
+    /// timeout, allowing the coordinator to observe its session cancellation
+    /// without polling in a busy loop.
+    pub(crate) fn submit_request_cancellable<F>(
+        &self,
+        job: ComputeJob,
+        is_cancelled: F,
+    ) -> DataBankResult<()>
+    where
+        F: Fn() -> bool,
+    {
+        self.submit_with_cancel(job, WorkClass::Request, is_cancelled)
+    }
+
+    #[cfg(test)]
     pub(crate) fn submit_response(&self, job: ComputeJob) -> DataBankResult<()> {
-        self.submit(job, WorkClass::Response)
+        self.submit_with_cancel(job, WorkClass::Response, || false)
     }
 
-    fn submit(&self, job: ComputeJob, class: WorkClass) -> DataBankResult<()> {
+    pub(crate) fn submit_response_cancellable<F>(
+        &self,
+        job: ComputeJob,
+        is_cancelled: F,
+    ) -> DataBankResult<()>
+    where
+        F: Fn() -> bool,
+    {
+        self.submit_with_cancel(job, WorkClass::Response, is_cancelled)
+    }
+
+    fn submit_with_cancel<F>(
+        &self,
+        job: ComputeJob,
+        class: WorkClass,
+        is_cancelled: F,
+    ) -> DataBankResult<()>
+    where
+        F: Fn() -> bool,
+    {
+        if is_cancelled() {
+            return Err(DataBankError::PrefetchCancelled);
+        }
         if in_databank_worker() {
             return job();
         }
@@ -188,10 +228,24 @@ impl DataBankComputePool {
         }
         .ok_or(DataBankError::ComputeShutdown)?;
 
-        tx.send(ComputeWork { job, reply: None })
-            .map_err(|_| DataBankError::ComputeShutdown)?;
-        wake_workers(wake_tx);
-        Ok(())
+        let mut work = ComputeWork { job, reply: None };
+        loop {
+            if is_cancelled() {
+                return Err(DataBankError::PrefetchCancelled);
+            }
+            match tx.send_timeout(work, Duration::from_millis(20)) {
+                Ok(()) => {
+                    wake_workers(wake_tx);
+                    return Ok(());
+                }
+                Err(flume::SendTimeoutError::Timeout(next_work)) => {
+                    work = next_work;
+                }
+                Err(flume::SendTimeoutError::Disconnected(_)) => {
+                    return Err(DataBankError::ComputeShutdown);
+                }
+            }
+        }
     }
 }
 
@@ -300,6 +354,7 @@ fn pin_current_thread(cpu: usize) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -340,6 +395,56 @@ mod tests {
                 .expect("request completed");
         }
         assert_eq!(*order.lock().expect("order"), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cancellable_submit_exits_under_capacity_one_backpressure() {
+        let mut config = test_config(1);
+        config.queue_capacity = 1;
+        let pool = Arc::new(DataBankComputePool::new(config).expect("pool"));
+        let (worker_started_tx, worker_started_rx) = mpsc::channel();
+        let (worker_release_tx, worker_release_rx) = mpsc::channel();
+        pool.submit_response(Box::new(move || {
+            worker_started_tx.send(()).expect("worker started");
+            worker_release_rx.recv().expect("worker release");
+            Ok(())
+        }))
+        .expect("block worker");
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker entered blocker");
+
+        // Fill the capacity-one request queue while the sole worker is held.
+        pool.submit_request(Box::new(|| Ok(())))
+            .expect("fill request queue");
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let announced = Arc::new(AtomicBool::new(false));
+        let (submit_entered_tx, submit_entered_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let submit_pool = Arc::clone(&pool);
+        let submit_cancelled = Arc::clone(&cancelled);
+        let submit_announced = Arc::clone(&announced);
+        let submitter = thread::spawn(move || {
+            let result = submit_pool.submit_request_cancellable(Box::new(|| Ok(())), move || {
+                if !submit_announced.swap(true, Ordering::SeqCst) {
+                    submit_entered_tx.send(()).expect("submit entered");
+                }
+                submit_cancelled.load(Ordering::SeqCst)
+            });
+            result_tx.send(result).expect("submit result");
+        });
+        submit_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellable submit observed full queue");
+
+        cancelled.store(true, Ordering::SeqCst);
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled submit returned");
+        assert!(matches!(result, Err(DataBankError::PrefetchCancelled)));
+        submitter.join().expect("submitter thread");
+        worker_release_tx.send(()).expect("release worker");
     }
 
     #[test]

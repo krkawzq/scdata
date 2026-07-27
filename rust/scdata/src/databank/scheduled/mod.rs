@@ -24,6 +24,7 @@ pub(crate) use planner::plan_batch_multi;
 pub(crate) use types::{BatchPlan, SingleDatasetPlan};
 pub use types::{PrefetchCells, PrefetchedBatch};
 
+use super::{RetiredCleanupGuard, RetiredDatasets};
 use native_access::{AccessStrategy, NativeScheduledContext, ResolvedStrategy};
 use producer::*;
 use profile::*;
@@ -41,6 +42,7 @@ use types::*;
 pub fn prefetch_cells_scheduled<T, I>(
     access: &AccessHandle,
     compute: Arc<DataBankComputePool>,
+    retired: Arc<RetiredDatasets>,
     dataset: Arc<Dataset>,
     batch_source: I,
     config: ScheduledPrefetchConfig,
@@ -66,6 +68,7 @@ where
     spawn_prefetch_cells(
         access.clone(),
         compute,
+        retired,
         dataset,
         batch_source,
         GeneAxisPlan::dataset_order(),
@@ -78,6 +81,7 @@ where
 pub fn prefetch_cells_scheduled_multi<T, I>(
     access: &AccessHandle,
     compute: Arc<DataBankComputePool>,
+    retired: Arc<RetiredDatasets>,
     datasets: Arc<[Arc<Dataset>]>,
     batch_source: I,
     config: ScheduledPrefetchConfig,
@@ -96,6 +100,7 @@ where
     spawn_prefetch_cells_multi(
         access.clone(),
         compute,
+        retired,
         datasets,
         batch_source,
         gene_axes,
@@ -108,6 +113,7 @@ where
 pub fn prefetch_cells_scheduled_by_gene_names<T, I, G>(
     access: &AccessHandle,
     compute: Arc<DataBankComputePool>,
+    retired: Arc<RetiredDatasets>,
     dataset: Arc<Dataset>,
     batch_source: I,
     gene_names: &[G],
@@ -137,6 +143,7 @@ where
     spawn_prefetch_cells(
         access.clone(),
         compute,
+        retired,
         dataset,
         batch_source,
         gene_axis,
@@ -149,6 +156,7 @@ where
 pub fn prefetch_cells_scheduled_multi_by_gene_names<T, I, G>(
     access: &AccessHandle,
     compute: Arc<DataBankComputePool>,
+    retired: Arc<RetiredDatasets>,
     datasets: Arc<[Arc<Dataset>]>,
     batch_source: I,
     gene_names: &[G],
@@ -170,6 +178,7 @@ where
     spawn_prefetch_cells_multi(
         access.clone(),
         compute,
+        retired,
         datasets,
         batch_source,
         gene_axes,
@@ -215,6 +224,7 @@ pub(crate) fn validate_multi_cast<T: DataValue>(datasets: &[Arc<Dataset>]) -> Da
 pub(crate) fn spawn_prefetch_cells<T, I>(
     access: AccessHandle,
     compute: Arc<DataBankComputePool>,
+    retired: Arc<RetiredDatasets>,
     dataset: Arc<Dataset>,
     batch_source: I,
     gene_axis: GeneAxisPlan,
@@ -231,6 +241,7 @@ where
     spawn_prefetch_cells_multi(
         access,
         compute,
+        retired,
         datasets,
         batch_source.map(|cells| MultiBatchCells::from_single(cells.as_ref().to_vec())),
         gene_axes,
@@ -242,6 +253,7 @@ where
 pub(crate) fn spawn_prefetch_cells_multi<T, I>(
     access: AccessHandle,
     compute: Arc<DataBankComputePool>,
+    retired: Arc<RetiredDatasets>,
     datasets: Arc<[Arc<Dataset>]>,
     batch_source: I,
     gene_axes: MultiGeneAxisPlan,
@@ -268,11 +280,18 @@ where
     let (tx, rx) = flume::bounded(prefetch_step);
     let cancel = PrefetchCancelRegistry::new();
     let profiler = ScheduledPrefetchProfiler::from_env();
+    let source_rx = spawn_batch_source_forwarder(
+        batch_source,
+        Arc::clone(&cancel),
+        profiler.clone(),
+        prefetch_step,
+    )?;
     let producer = PrefetchProducer {
         access,
         compute,
         datasets,
-        batch_source,
+        source_rx,
+        cleanup: RetiredCleanupGuard::new(Arc::clone(&retired)),
         access_config: config.access,
         strategy: resolved.strategy,
         projected_sparse_data_strategy: config.projected_sparse_data_strategy,
@@ -284,13 +303,21 @@ where
         prefetch_step,
         profiler,
     };
-    let handle = thread::Builder::new()
+    let handle = match thread::Builder::new()
         .name("databank-prefetch-producer".to_string())
-        .spawn(move || producer.run())?;
+        .spawn(move || producer.run())
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            cancel.cancel_all();
+            return Err(err.into());
+        }
+    };
     Ok(PrefetchCells {
         rx: Some(rx),
         output_names,
-        _datasets: retained_datasets,
+        _datasets: Some(retained_datasets),
+        retired,
         prefetch_step,
         resolved_strategy: resolved_label,
         fallback_reason: resolved_reason,

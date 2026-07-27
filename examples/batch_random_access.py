@@ -56,6 +56,7 @@ GENES = 4096
 SEED = 0
 MEMORY_GIB = 128
 STREAM_PROGRESS_UPDATE_EVERY = 1024
+WARMUP_BATCHES = 64
 
 
 def progress_kwargs(desc: str, unit: str) -> dict[str, object]:
@@ -168,7 +169,6 @@ def main() -> None:
 
         batches = cells = bytes_out = checksum = 0
         print("[6/7] streaming batches", flush=True)
-        start = time.perf_counter()
         stream = bank.prefetch_indexed(
             ids,
             plan,
@@ -179,6 +179,19 @@ def main() -> None:
         )
         pending_progress = 0
         with tqdm(total=plan.num_batches, **progress_kwargs("random batches", "batch")) as progress:
+            # Match the sequential benchmark: consume actual prefetch responses,
+            # rather than just constructing a plan, before timing throughput.
+            for _ in range(WARMUP_BATCHES):
+                try:
+                    next(stream)
+                except StopIteration:
+                    break
+                pending_progress += 1
+            if pending_progress:
+                progress.update(pending_progress)
+                pending_progress = 0
+
+            start = time.perf_counter()
             for batch in stream:
                 pending_progress += 1
                 if pending_progress >= STREAM_PROGRESS_UPDATE_EVERY:
@@ -201,6 +214,7 @@ def main() -> None:
         print("order: random")
         print(f"cells: {cells:,}")
         print(f"batches: {batches:,}")
+        print(f"warmup batches: {WARMUP_BATCHES}")
         print(f"seconds: {seconds:.3f}")
         print(f"cell/s: {rate(cells, seconds):.2f}")
         print(f"batch/s: {rate(batches, seconds):.2f}")

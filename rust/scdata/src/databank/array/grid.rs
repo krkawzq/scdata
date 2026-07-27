@@ -19,8 +19,10 @@ pub enum ArrayGrid {
 
 #[derive(Debug, Clone)]
 pub struct RectilinearAxis {
-    /// Monotonic boundaries, length = chunks_on_axis + 1.
-    pub boundaries: Vec<usize>,
+    /// Logical boundaries used to map array coordinates to chunks.
+    pub logical_boundaries: Vec<usize>,
+    /// Codec boundaries used to determine decoded chunk extents.
+    pub codec_boundaries: Vec<usize>,
 }
 
 impl ArrayGrid {
@@ -38,20 +40,44 @@ impl ArrayGrid {
                     edge,
                 })
             }
-            ArrayGridSpec::Rectilinear { axes } => {
-                if axes.len() != shape.len() {
+            ArrayGridSpec::Rectilinear {
+                logical_axes,
+                codec_axes,
+            } => {
+                if logical_axes.len() != shape.len() {
                     return Err(DataBankError::InvalidArrayMeta(format!(
-                        "rectilinear axis count {} does not match shape rank {}",
-                        axes.len(),
+                        "rectilinear logical axis count {} does not match shape rank {}",
+                        logical_axes.len(),
                         shape.len()
                     )));
                 }
-                let mut parsed_axes = Vec::with_capacity(axes.len());
-                let mut grid_shape = Vec::with_capacity(axes.len());
-                for (axis_index, (boundaries, &dim)) in axes.into_iter().zip(shape).enumerate() {
-                    validate_rectilinear_boundaries(axis_index, &boundaries, dim)?;
-                    grid_shape.push(boundaries.len() - 1);
-                    parsed_axes.push(RectilinearAxis { boundaries });
+                let codec_axes = codec_axes.unwrap_or_else(|| logical_axes.clone());
+                if codec_axes.len() != logical_axes.len() {
+                    return Err(DataBankError::InvalidArrayMeta(format!(
+                        "rectilinear codec axis count {} does not match logical axis count {}",
+                        codec_axes.len(),
+                        logical_axes.len()
+                    )));
+                }
+                let mut parsed_axes = Vec::with_capacity(logical_axes.len());
+                let mut grid_shape = Vec::with_capacity(logical_axes.len());
+                for (axis_index, ((logical_boundaries, codec_boundaries), &dim)) in logical_axes
+                    .into_iter()
+                    .zip(codec_axes)
+                    .zip(shape)
+                    .enumerate()
+                {
+                    validate_rectilinear_boundaries(axis_index, &logical_boundaries, dim)?;
+                    validate_rectilinear_codec_boundaries(
+                        axis_index,
+                        &logical_boundaries,
+                        &codec_boundaries,
+                    )?;
+                    grid_shape.push(logical_boundaries.len() - 1);
+                    parsed_axes.push(RectilinearAxis {
+                        logical_boundaries,
+                        codec_boundaries,
+                    });
                 }
                 Ok(Self::Rectilinear {
                     axes: parsed_axes,
@@ -105,9 +131,9 @@ impl ArrayGrid {
                 .iter()
                 .zip(coords.iter())
                 .map(|(axis, &coord)| {
-                    axis.boundaries
+                    axis.codec_boundaries
                         .get(coord + 1)
-                        .zip(axis.boundaries.get(coord))
+                        .zip(axis.codec_boundaries.get(coord))
                         .map(|(&end, &start)| end - start)
                         .ok_or_else(|| invalid_chunk_index(chunk_index))
                 })
@@ -230,8 +256,8 @@ impl ArrayGrid {
         let mut chunk_index = rectilinear_chunk_for_pos(axis, start)?;
         let mut pos = start;
         while pos < end {
-            let chunk_start = axis.boundaries[chunk_index];
-            let chunk_end = axis.boundaries[chunk_index + 1];
+            let chunk_start = axis.logical_boundaries[chunk_index];
+            let chunk_end = axis.logical_boundaries[chunk_index + 1];
             let in_chunk = pos - chunk_start;
             let elements = (end.min(chunk_end)) - pos;
             let byte_start = in_chunk.checked_mul(item_size).ok_or_else(|| {
@@ -409,6 +435,36 @@ fn validate_rectilinear_boundaries(
     Ok(())
 }
 
+fn validate_rectilinear_codec_boundaries(
+    axis_index: usize,
+    logical_boundaries: &[usize],
+    codec_boundaries: &[usize],
+) -> DataBankResult<()> {
+    if codec_boundaries.len() != logical_boundaries.len() {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "rectilinear codec axis {axis_index} boundary count {} does not match logical boundary count {}",
+            codec_boundaries.len(),
+            logical_boundaries.len()
+        )));
+    }
+    if codec_boundaries.first().copied() != Some(0)
+        || codec_boundaries.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "rectilinear codec axis {axis_index} must start at 0 and be strictly increasing"
+        )));
+    }
+    let final_index = codec_boundaries.len() - 1;
+    if codec_boundaries[..final_index] != logical_boundaries[..final_index]
+        || codec_boundaries[final_index] < logical_boundaries[final_index]
+    {
+        return Err(DataBankError::InvalidArrayMeta(format!(
+            "rectilinear codec axis {axis_index} may only extend the final logical boundary"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_1d_range(
     shape: &[usize],
     start: usize,
@@ -494,13 +550,15 @@ fn unravel_chunk_index(chunk_index: usize, grid_shape: &[usize]) -> DataBankResu
 }
 
 fn rectilinear_chunk_for_pos(axis: &RectilinearAxis, pos: usize) -> DataBankResult<usize> {
-    let final_boundary = *axis.boundaries.last().unwrap_or(&0);
+    let final_boundary = *axis.logical_boundaries.last().unwrap_or(&0);
     if pos >= final_boundary {
         return Err(DataBankError::InvalidArrayMeta(format!(
             "position {pos} is out of rectilinear axis range {final_boundary}"
         )));
     }
-    let upper = axis.boundaries.partition_point(|&boundary| boundary <= pos);
+    let upper = axis
+        .logical_boundaries
+        .partition_point(|&boundary| boundary <= pos);
     Ok(upper.saturating_sub(1))
 }
 

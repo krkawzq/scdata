@@ -27,7 +27,11 @@ pub enum ArrayGridSpec {
         edge: EdgeChunkLayout,
     },
     Rectilinear {
-        axes: Vec<Vec<usize>>,
+        /// Logical chunk boundaries used to locate elements and plan reads.
+        logical_axes: Vec<Vec<usize>>,
+        /// Optional codec extents for chunks whose final logical edge is padded.
+        /// When absent, decoded extents equal the logical extents.
+        codec_axes: Option<Vec<Vec<usize>>>,
     },
 }
 

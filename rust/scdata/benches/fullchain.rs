@@ -166,6 +166,7 @@ fn run_codec_case(
             index_dtype: DType::U32,
             num_cells: config.cells,
             num_genes: config.genes,
+            assume_sorted_indices: false,
         })
         .map_err(|err| err.to_string())?
     } else {
@@ -319,6 +320,7 @@ fn databank_config() -> DataBankConfig {
                 assume_non_overlapping_reads: true,
             },
             num_workers: 4,
+            steal_interval_us: 0,
             cpus: None,
         }),
         decode_config: DecodePoolConfig {

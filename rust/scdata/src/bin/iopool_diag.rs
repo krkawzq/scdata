@@ -168,6 +168,7 @@ fn make_config(args: &Args, backend: &str, workers: usize) -> Result<IoConfig, S
         "threaded" => Ok(IoConfig::Threaded(ThreadedConfig {
             base,
             num_workers: workers,
+            steal_interval_us: 0,
             cpus: None,
         })),
         "uring" => {
@@ -402,6 +403,7 @@ fn run_multi_pool(
             "threaded" => IoConfig::Threaded(ThreadedConfig {
                 base,
                 num_workers: 1,
+                steal_interval_us: 0,
                 cpus: None,
             }),
             "uring" => IoConfig::Uring(UringConfig {

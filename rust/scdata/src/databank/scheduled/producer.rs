@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use crate::access::{AccessHandle, AccessItem, PrefetchCancel, ScheduledAccessConfig};
 use crate::env::fastpath;
@@ -12,6 +16,7 @@ use super::super::compute::{ComputeJob, DataBankComputePool};
 use super::super::config::{ProjectedSparseDataGroupStrategy, SmallProjectedSparsePolicy};
 use super::super::dataset::Dataset;
 use super::super::error::{DataBankError, DataBankResult};
+use super::super::RetiredCleanupGuard;
 
 use super::super::gene_axis::*;
 use super::super::sparse::*;
@@ -22,16 +27,18 @@ use super::planner::*;
 use super::profile::*;
 use super::types::*;
 
-pub(crate) struct PrefetchProducer<T, I>
+pub(crate) struct PrefetchProducer<T>
 where
     T: DataValue,
-    I: Iterator,
-    I::Item: Into<MultiBatchCells>,
 {
     pub(crate) access: AccessHandle,
     pub(crate) compute: Arc<DataBankComputePool>,
     pub(crate) datasets: Arc<[Arc<Dataset>]>,
-    pub(crate) batch_source: I,
+    /// Values are forwarded by a dedicated source thread.  The producer never
+    /// owns the user iterator, so close can join it even if `Iterator::next()`
+    /// is permanently blocked in user code.
+    pub(crate) source_rx: flume::Receiver<DataBankResult<MultiBatchCells>>,
+    pub(crate) cleanup: RetiredCleanupGuard,
     pub(crate) access_config: ScheduledAccessConfig,
     pub(crate) strategy: AccessStrategy,
     pub(crate) projected_sparse_data_strategy: ProjectedSparseDataGroupStrategy,
@@ -56,6 +63,10 @@ where
     active_requests: usize,
     active_responses: usize,
     response_limit: usize,
+    /// One source item selected while waiting for another event. It is consumed
+    /// by the next fill pass so no batch is lost between the selector and the
+    /// request-submission path.
+    pending_source: Option<MultiBatchCells>,
     planned_ready: VecDeque<PlannedBatch>,
     completed: CompletedQueue<T>,
 }
@@ -75,6 +86,7 @@ where
             active_requests: 0,
             active_responses: 0,
             response_limit,
+            pending_source: None,
             planned_ready: VecDeque::new(),
             completed: CompletedQueue::with_capacity(prefetch_step),
         }
@@ -85,6 +97,7 @@ where
             && self.outstanding == 0
             && self.active_requests == 0
             && self.active_responses == 0
+            && self.pending_source.is_none()
             && self.planned_ready.is_empty()
     }
 }
@@ -157,8 +170,26 @@ pub(crate) enum ProducerEvent<T>
 where
     T: DataValue,
 {
+    Cancelled,
+    Source(Result<DataBankResult<MultiBatchCells>, flume::RecvError>),
     Planned(Result<PlannedMessage, flume::RecvError>),
     Done(Result<DoneMessage<T>, flume::RecvError>),
+}
+
+const CANCELLABLE_WAIT: Duration = Duration::from_millis(20);
+/// Hard process-wide ceiling for detached user `Iterator::next()` calls.
+///
+/// A synchronous iterator cannot be safely force-stopped. A permanently
+/// blocking source therefore keeps its permit until it returns, which bounds
+/// orphaned forwarder threads across every DataBank in this process.
+const MAX_BATCH_SOURCE_FORWARDERS: usize = 64;
+static BATCH_SOURCE_FORWARDER_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn batch_source_forwarder_limiter() -> Arc<Semaphore> {
+    Arc::clone(
+        BATCH_SOURCE_FORWARDER_LIMITER
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_BATCH_SOURCE_FORWARDERS))),
+    )
 }
 
 pub(crate) struct ActiveBatchGuard {
@@ -172,11 +203,142 @@ impl Drop for ActiveBatchGuard {
     }
 }
 
-impl<T, I> PrefetchProducer<T, I>
+/// Detach the user-provided batch iterator from the cancellable producer.
+///
+/// Rust cannot asynchronously interrupt arbitrary `Iterator::next()` code. The
+/// forwarder therefore is deliberately not joined: after session cancellation
+/// it exits as soon as a pending `next()` returns, while `PrefetchCells::close`
+/// can still join the producer immediately. A source that never returns from
+/// `next()` keeps only this forwarder thread and its own state alive. Such
+/// threads are bounded by a fixed process-wide permit limit; once exhausted,
+/// creating another scheduled prefetch fails instead of leaking another OS
+/// thread.
+pub(crate) fn spawn_batch_source_forwarder<I>(
+    batch_source: I,
+    cancel: Arc<PrefetchCancelRegistry>,
+    profiler: ScheduledPrefetchProfiler,
+    capacity: usize,
+) -> io::Result<flume::Receiver<DataBankResult<MultiBatchCells>>>
+where
+    I: Iterator + Send + 'static,
+    I::Item: Into<MultiBatchCells> + Send,
+{
+    spawn_batch_source_forwarder_with_limiter(
+        batch_source,
+        cancel,
+        profiler,
+        capacity,
+        batch_source_forwarder_limiter(),
+    )
+}
+
+fn spawn_batch_source_forwarder_with_limiter<I>(
+    batch_source: I,
+    cancel: Arc<PrefetchCancelRegistry>,
+    profiler: ScheduledPrefetchProfiler,
+    capacity: usize,
+    limiter: Arc<Semaphore>,
+) -> io::Result<flume::Receiver<DataBankResult<MultiBatchCells>>>
+where
+    I: Iterator + Send + 'static,
+    I::Item: Into<MultiBatchCells> + Send,
+{
+    spawn_batch_source_forwarder_with_limiter_and_spawner(
+        batch_source,
+        cancel,
+        profiler,
+        capacity,
+        limiter,
+        |task| {
+            thread::Builder::new()
+                .name("databank-prefetch-source".to_string())
+                .spawn(task)
+                .map(|_| ())
+        },
+    )
+}
+
+fn spawn_batch_source_forwarder_with_limiter_and_spawner<I, S>(
+    mut batch_source: I,
+    cancel: Arc<PrefetchCancelRegistry>,
+    profiler: ScheduledPrefetchProfiler,
+    capacity: usize,
+    limiter: Arc<Semaphore>,
+    spawn: S,
+) -> io::Result<flume::Receiver<DataBankResult<MultiBatchCells>>>
+where
+    I: Iterator + Send + 'static,
+    I::Item: Into<MultiBatchCells> + Send,
+    S: FnOnce(Box<dyn FnOnce() + Send + 'static>) -> io::Result<()>,
+{
+    let permit = limiter.try_acquire_owned().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "scheduled prefetch source-forwarder limit reached",
+        )
+    })?;
+    let (tx, rx) = flume::bounded(capacity.max(1));
+    spawn(Box::new(move || {
+        // Do not release this when the session closes: an arbitrary user
+        // `next()` may still be blocked. Drop releases it only when the
+        // detached source thread actually returns or unwinds.
+        let _permit = permit;
+        while !cancel.is_cancelled() {
+            let next_started = profiler.start_batch_source_next();
+            let next = panic::catch_unwind(AssertUnwindSafe(|| batch_source.next()));
+            profiler.record_batch_source_next(next_started);
+            let cells = match next {
+                Ok(Some(cells)) => cells,
+                Ok(None) => break,
+                Err(_) => {
+                    let _ = send_source_message(
+                        &tx,
+                        &cancel,
+                        Err(DataBankError::PrefetchProducerPanic),
+                    );
+                    return;
+                }
+            };
+            let batch = match panic::catch_unwind(AssertUnwindSafe(|| cells.into())) {
+                Ok(batch) => batch,
+                Err(_) => {
+                    let _ = send_source_message(
+                        &tx,
+                        &cancel,
+                        Err(DataBankError::PrefetchProducerPanic),
+                    );
+                    return;
+                }
+            };
+            profiler.record_source_batch(batch.total_cells().unwrap_or(usize::MAX));
+            if !send_source_message(&tx, &cancel, Ok(batch)) {
+                return;
+            }
+        }
+    }))?;
+    Ok(rx)
+}
+
+fn send_source_message(
+    tx: &flume::Sender<DataBankResult<MultiBatchCells>>,
+    cancel: &PrefetchCancelRegistry,
+    mut message: DataBankResult<MultiBatchCells>,
+) -> bool {
+    loop {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        match tx.send_timeout(message, CANCELLABLE_WAIT) {
+            Ok(()) => return true,
+            Err(flume::SendTimeoutError::Timeout(next_message)) => message = next_message,
+            Err(flume::SendTimeoutError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+impl<T> PrefetchProducer<T>
 where
     T: DataValue,
-    I: Iterator,
-    I::Item: Into<MultiBatchCells>,
 {
     pub(crate) fn run(mut self) {
         let profile_round = if let Some((round, profiler)) = self.profiler.begin_round() {
@@ -244,18 +406,24 @@ where
             && state.outstanding < self.prefetch_step
             && !self.cancel.is_cancelled()
         {
-            let next_started = self.profiler.start_batch_source_next();
-            let next = self.batch_source.next();
-            self.profiler.record_batch_source_next(next_started);
-            let Some(cells) = next else {
-                state.source_done = true;
-                self.profiler.inc_source_exhausted();
-                progressed = true;
-                break;
+            let batch = match state.pending_source.take() {
+                Some(batch) => batch,
+                None => match self.source_rx.try_recv() {
+                    Ok(Ok(batch)) => batch,
+                    Ok(Err(err)) => {
+                        self.handle_source_error(state, err);
+                        progressed = true;
+                        break;
+                    }
+                    Err(flume::TryRecvError::Empty) => break,
+                    Err(flume::TryRecvError::Disconnected) => {
+                        state.source_done = true;
+                        self.profiler.inc_source_exhausted();
+                        progressed = true;
+                        break;
+                    }
+                },
             };
-            let batch = cells.into();
-            self.profiler
-                .record_source_batch(batch.total_cells().unwrap_or(usize::MAX));
             let seq = state.next_read_seq;
             state.next_read_seq += 1;
             state.outstanding += 1;
@@ -274,10 +442,13 @@ where
                 Arc::clone(&self.cancel),
                 planned_tx.clone(),
                 self.profiler.clone(),
+                self.cleanup.clone(),
                 self.profiler.start_request_queue_wait(),
             );
             let submit_started = self.profiler.start_submit_request();
-            let submit_result = self.compute.submit_request(job);
+            let submit_result = self
+                .compute
+                .submit_request_cancellable(job, || self.cancel.is_cancelled());
             self.profiler.record_submit_request(submit_started);
             if let Err(err) = submit_result {
                 self.profiler.inc_submit_request_error();
@@ -308,29 +479,63 @@ where
         progressed
     }
 
+    fn handle_source_error(&self, state: &mut ProducerState<T>, err: DataBankError) {
+        // Preserve the existing ordered terminal-error contract: batches read
+        // before the source failure are emitted first, then this synthetic
+        // source position reports the panic/error.
+        state.source_done = true;
+        state.stop_reading = true;
+        let seq = state.next_read_seq;
+        state.next_read_seq += 1;
+        state.outstanding += 1;
+        state.completed.insert(seq, Err(err));
+    }
+
     fn wait_for_event(
         &self,
         state: &mut ProducerState<T>,
         planned_rx: &flume::Receiver<PlannedMessage>,
         done_rx: &flume::Receiver<DoneMessage<T>>,
     ) -> bool {
-        if state.active_requests == 0 && state.active_responses == 0 {
+        let can_read_source = !state.source_done
+            && !state.stop_reading
+            && state.outstanding < self.prefetch_step
+            && state.pending_source.is_none();
+        if !can_read_source && state.active_requests == 0 && state.active_responses == 0 {
             return false;
         }
 
+        let cancel_rx = self.cancel.cancel_receiver();
+        let mut selector = flume::Selector::new().recv(&cancel_rx, |_| ProducerEvent::Cancelled);
+        if can_read_source {
+            selector = selector.recv(&self.source_rx, ProducerEvent::Source);
+        }
+        if state.active_requests > 0 {
+            selector = selector.recv(planned_rx, ProducerEvent::Planned);
+        }
+        if state.active_responses > 0 {
+            selector = selector.recv(done_rx, ProducerEvent::Done);
+        }
+
         let wait_started = self.profiler.start_coordinator_wait();
-        let event = match (state.active_requests > 0, state.active_responses > 0) {
-            (true, true) => flume::Selector::new()
-                .recv(planned_rx, ProducerEvent::Planned)
-                .recv(done_rx, ProducerEvent::Done)
-                .wait(),
-            (true, false) => ProducerEvent::Planned(planned_rx.recv()),
-            (false, true) => ProducerEvent::Done(done_rx.recv()),
-            (false, false) => return false,
-        };
+        let event = selector.wait();
         self.profiler.record_coordinator_wait(wait_started);
 
         match event {
+            ProducerEvent::Cancelled => false,
+            ProducerEvent::Source(Ok(Ok(batch))) => {
+                state.pending_source = Some(batch);
+                true
+            }
+            ProducerEvent::Source(Ok(Err(err))) => {
+                self.handle_source_error(state, err);
+                true
+            }
+            ProducerEvent::Source(Err(_)) => {
+                state.source_done = true;
+                self.profiler.inc_source_exhausted();
+                true
+            }
             ProducerEvent::Planned(Ok(message)) => {
                 self.handle_planned_message(state, message);
                 true
@@ -396,10 +601,13 @@ where
                 Arc::clone(&self.cancel),
                 done_tx.clone(),
                 self.profiler.clone(),
+                self.cleanup.clone(),
                 self.profiler.start_response_queue_wait(),
             );
             let submit_started = self.profiler.start_submit_response();
-            let submit_result = self.compute.submit_response(job);
+            let submit_result = self
+                .compute
+                .submit_response_cancellable(job, || self.cancel.is_cancelled());
             self.profiler.record_submit_response(submit_started);
             if let Err(err) = submit_result {
                 self.profiler.inc_submit_response_error();
@@ -467,9 +675,14 @@ pub(crate) fn make_prefetch_request_job(
     registry: Arc<PrefetchCancelRegistry>,
     planned_tx: flume::Sender<PlannedMessage>,
     profiler: ScheduledPrefetchProfiler,
+    cleanup: RetiredCleanupGuard,
     queued_at: ProfileTimer,
 ) -> ComputeJob {
     Box::new(move || {
+        // Keep the cleanup callback with this queued closure. It is especially
+        // important when cancellation drops the last dataset Arc from a job
+        // after the consumer already returned from `close`.
+        let _cleanup = cleanup;
         profiler.inc_request_job();
         profiler.record_request_queue_wait(queued_at);
         let total_started = profiler.start_request_total();
@@ -492,6 +705,18 @@ pub(crate) fn make_prefetch_request_job(
                     return Err(DataBankError::PrefetchCancelled);
                 }
                 let cancel = PrefetchCancel::new(access.clone());
+                // Register before projected-sparse preplanning can build a
+                // ScheduledAccess and block in its first `next()`. The guard
+                // unregisters on every error, panic unwind, or dropped channel;
+                // successful work transfers it to the response lifecycle.
+                registry.register(seq, Arc::clone(&cancel));
+                let registration = ActiveBatchGuard {
+                    seq,
+                    registry: Arc::clone(&registry),
+                };
+                if registry.is_cancelled() || cancel.is_cancelled() {
+                    return Err(DataBankError::PrefetchCancelled);
+                }
                 preplan_selected_sparse_request(
                     &access,
                     &strategy,
@@ -523,13 +748,13 @@ pub(crate) fn make_prefetch_request_job(
                 );
                 profiler.record_request_schedule(schedule_started);
                 let scheduled = scheduled_result?;
-                registry.register(seq, Arc::clone(&cancel));
                 Ok(Box::new(PlannedBatch {
                     seq,
                     plan,
                     scheduled,
                     strategy: strategy_for_response,
                     cancel,
+                    registration,
                 }))
             }))
             .unwrap_or(Err(DataBankError::ComputeWorkerPanic));
@@ -537,11 +762,9 @@ pub(crate) fn make_prefetch_request_job(
             profiler.inc_request_error();
         }
         let send_started = profiler.start_request_send();
-        if let Err(err) = planned_tx.send(PlannedMessage { seq, result }) {
-            if let Ok(planned) = err.0.result {
-                registry.unregister(planned.seq);
-            }
-        }
+        // On a disconnected channel the message (and its registration guard)
+        // is dropped here, which unregisters the preplan handle automatically.
+        let _ = planned_tx.send(PlannedMessage { seq, result });
         profiler.record_request_send(send_started);
         profiler.record_request_total(total_started);
         Ok(())
@@ -781,12 +1004,14 @@ pub(crate) fn make_prefetch_response_job<T>(
     registry: Arc<PrefetchCancelRegistry>,
     done_tx: flume::Sender<DoneMessage<T>>,
     profiler: ScheduledPrefetchProfiler,
+    cleanup: RetiredCleanupGuard,
     queued_at: ProfileTimer,
 ) -> ComputeJob
 where
     T: DataValue,
 {
     Box::new(move || {
+        let _cleanup = cleanup;
         profiler.inc_response_job();
         profiler.record_response_queue_wait(queued_at);
         let total_started = profiler.start_response_total();
@@ -796,11 +1021,8 @@ where
             mut scheduled,
             strategy,
             cancel,
+            registration: _registration,
         } = planned;
-        let _guard = ActiveBatchGuard {
-            seq,
-            registry: Arc::clone(&registry),
-        };
         let result = panic::catch_unwind(AssertUnwindSafe(
             || -> DataBankResult<PrefetchedBatch<T>> {
                 if registry.is_cancelled() || cancel.is_cancelled() {
@@ -836,4 +1058,108 @@ where
         profiler.record_response_total(total_started);
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        spawn_batch_source_forwarder_with_limiter,
+        spawn_batch_source_forwarder_with_limiter_and_spawner,
+    };
+    use crate::databank::gene_axis::MultiBatchCells;
+    use crate::databank::scheduled::profile::ScheduledPrefetchProfiler;
+    use crate::databank::scheduled::types::PrefetchCancelRegistry;
+    use std::io;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    struct GatedSource {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Iterator for GatedSource {
+        type Item = MultiBatchCells;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+            None
+        }
+    }
+
+    #[test]
+    fn source_forwarder_limiter_rejects_without_spawning() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let held = limiter
+            .clone()
+            .try_acquire_owned()
+            .expect("hold only source-forwarder permit");
+        let err = spawn_batch_source_forwarder_with_limiter(
+            std::iter::empty::<MultiBatchCells>(),
+            PrefetchCancelRegistry::new(),
+            ScheduledPrefetchProfiler::from_env(),
+            1,
+            Arc::clone(&limiter),
+        )
+        .expect_err("a full process limiter must reject another forwarder");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(held);
+        assert!(limiter.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn source_forwarder_spawn_failure_releases_permit() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let err = spawn_batch_source_forwarder_with_limiter_and_spawner(
+            std::iter::empty::<MultiBatchCells>(),
+            PrefetchCancelRegistry::new(),
+            ScheduledPrefetchProfiler::from_env(),
+            1,
+            Arc::clone(&limiter),
+            |_task| Err(io::Error::other("injected source-forwarder spawn failure")),
+        )
+        .expect_err("injected spawn failure");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            limiter.try_acquire().is_ok(),
+            "the dropped task closure must release its owned permit"
+        );
+    }
+
+    #[test]
+    fn gated_source_releases_limiter_permit_after_returning() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let rx = spawn_batch_source_forwarder_with_limiter(
+            GatedSource {
+                started: started_tx,
+                release: release_rx,
+            },
+            PrefetchCancelRegistry::new(),
+            ScheduledPrefetchProfiler::from_env(),
+            1,
+            Arc::clone(&limiter),
+        )
+        .expect("spawn gated source forwarder");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source entered blocking next");
+        assert!(
+            limiter.try_acquire().is_err(),
+            "the blocked source must retain its process-wide permit"
+        );
+        release_tx.send(()).expect("release gated source");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_err(),
+            "forwarder should finish and disconnect after the source returns"
+        );
+        assert!(
+            limiter.try_acquire().is_ok(),
+            "normal forwarder exit must release its permit"
+        );
+    }
 }

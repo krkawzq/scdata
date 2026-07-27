@@ -432,10 +432,12 @@ impl ScheduledPrefetchProfiler {
             .filter_map(format_metric)
             .collect::<Vec<_>>()
             .join(" ");
+        // Profiling diagnostics must not corrupt machine-readable stdout from
+        // callers such as scripts/bench_access.py, which emits result JSON there.
         if metrics.is_empty() {
-            println!("{}", snapshot.summary_line());
+            eprintln!("{}", snapshot.summary_line());
         } else {
-            println!("{} {}", snapshot.summary_line(), metrics);
+            eprintln!("{} {}", snapshot.summary_line(), metrics);
         }
     }
 }

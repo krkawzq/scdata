@@ -181,9 +181,13 @@ class ArrayMeta:
     #: rectilinear chunk grids).  False for regular grids; true for scdata's
     #: cell-aligned CSR layout.
     variable_chunks: bool = False
-    #: Explicit rectilinear chunk boundaries, one tuple per axis.  Regular
+    #: Logical rectilinear chunk boundaries, one tuple per axis.  Regular
     #: grids leave this empty.
     chunk_boundaries: tuple[tuple[int, ...], ...] = ()
+    #: Physical codec-buffer boundaries for rectilinear chunks.  Zarr permits
+    #: only the final declared edge to overshoot the logical shape; this field
+    #: preserves that decoded byte size while ``chunk_boundaries`` stays clipped.
+    chunk_codec_boundaries: tuple[tuple[int, ...], ...] = ()
     #: One store-root-relative path per chunk (``store_kind="dir"`` only).
     chunk_paths: tuple[str, ...] = ()
     #: Actual local file per chunk.  Empty means the Rust binding joins
@@ -239,6 +243,31 @@ class ArrayMeta:
                 if any(a >= b for a, b in zip(bounds, bounds[1:])):
                     raise ValueError(f"chunk_boundaries[{axis}] must be strictly increasing")
             object.__setattr__(self, "chunk_boundaries", boundaries)
+
+        codec_boundaries = tuple(
+            tuple(int(x) for x in axis) for axis in self.chunk_codec_boundaries
+        )
+        if codec_boundaries:
+            if not boundaries:
+                raise ValueError("chunk_codec_boundaries require chunk_boundaries")
+            if len(codec_boundaries) != len(boundaries):
+                raise ValueError(
+                    "chunk_codec_boundaries rank must match chunk_boundaries rank"
+                )
+            for axis, (logical, physical) in enumerate(zip(boundaries, codec_boundaries)):
+                if len(physical) != len(logical):
+                    raise ValueError(
+                        f"chunk_codec_boundaries[{axis}] length must match chunk_boundaries[{axis}]"
+                    )
+                if physical[0] != 0 or any(a >= b for a, b in zip(physical, physical[1:])):
+                    raise ValueError(
+                        f"chunk_codec_boundaries[{axis}] must start at 0 and be strictly increasing"
+                    )
+                if physical[:-1] != logical[:-1] or physical[-1] < logical[-1]:
+                    raise ValueError(
+                        f"chunk_codec_boundaries[{axis}] may only extend the final logical edge"
+                    )
+            object.__setattr__(self, "chunk_codec_boundaries", codec_boundaries)
 
         lengths = _as_u64_array(self.chunk_lengths, "chunk_lengths")
         object.__setattr__(self, "chunk_lengths", lengths)
@@ -347,6 +376,7 @@ class ArrayMeta:
         codec: CodecPipeline | None = None,
         variable_chunks: bool = False,
         chunk_boundaries: Iterable[Iterable[int]] | None = None,
+        chunk_codec_boundaries: Iterable[Iterable[int]] | None = None,
         chunk_offsets: Iterable[int] | None = None,
         chunk_file_paths: Iterable[str] | None = None,
     ) -> "ArrayMeta":
@@ -370,7 +400,8 @@ class ArrayMeta:
 
         ``variable_chunks=True`` marks a zarr v3 rectilinear chunk grid
         (scdata's cell-aligned CSR layout).  Pass ``chunk_boundaries`` so Rust
-        can map coordinates to chunks and compute each decoded chunk size.
+        can map coordinates to chunks.  ``chunk_codec_boundaries`` is needed
+        only when Zarr's final declared edge extends beyond the logical shape.
         """
         return cls(
             shape=shape,
@@ -383,6 +414,9 @@ class ArrayMeta:
             variable_chunks=variable_chunks,
             chunk_boundaries=tuple(tuple(axis) for axis in chunk_boundaries)
             if chunk_boundaries is not None
+            else (),
+            chunk_codec_boundaries=tuple(tuple(axis) for axis in chunk_codec_boundaries)
+            if chunk_codec_boundaries is not None
             else (),
             chunk_paths=tuple(chunk_paths),
             chunk_file_paths=tuple(chunk_file_paths) if chunk_file_paths is not None else (),

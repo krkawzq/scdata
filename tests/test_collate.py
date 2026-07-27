@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import pytest
 
@@ -28,13 +30,17 @@ def _make_batch_dict(
     cell_ids: list[int],
     parts: dict[int, tuple[list[int], CellBatch]],  # file_id -> (positions, cell_batch)
 ) -> ScDataBatch:
-    return {  # type: ignore[return-value]
-        "file_ids": np.asarray(file_ids, dtype=np.intp),
-        "cell_ids": np.asarray(cell_ids, dtype=np.intp),
-        "batches": {fid: cb for fid, (_, cb) in parts.items()},
-        "cells": {fid: np.asarray(cb.cells, dtype=np.intp) for fid, (_, cb) in parts.items()},
-        "positions": {fid: np.asarray(pos, dtype=np.intp) for fid, (pos, _) in parts.items()},
-    }
+    # The legacy fallback deliberately omits ``ScDataBatch[\"batch\"]``.
+    return cast(
+        ScDataBatch,
+        {
+            "file_ids": np.asarray(file_ids, dtype=np.intp),
+            "cell_ids": np.asarray(cell_ids, dtype=np.intp),
+            "batches": {fid: cb for fid, (_, cb) in parts.items()},
+            "cells": {fid: np.asarray(cb.cells, dtype=np.intp) for fid, (_, cb) in parts.items()},
+            "positions": {fid: np.asarray(pos, dtype=np.intp) for fid, (pos, _) in parts.items()},
+        },
+    )
 
 
 def test_stitch_single_file_full_batch() -> None:
@@ -94,9 +100,117 @@ def test_stitch_uses_positions_for_partial_overlap() -> None:
     cb0 = _batch([7], [[9.0, 9.0]], num_genes=2)
     cb1 = _batch([3], [[1.0, 1.0]], num_genes=2)
     batch = _make_batch_dict(
-        file_ids=[0, 1],
-        cell_ids=[7, 3],
+        file_ids=[1, 0],
+        cell_ids=[3, 7],
         parts={0: ([1], cb0), 1: ([0], cb1)},
     )
     out = stitch_dense_collate(batch)
     np.testing.assert_array_equal(out["x"].numpy(), [[1.0, 1.0], [9.0, 9.0]])
+
+
+def test_stitch_decoded_batch_is_zero_copy_and_validates_metadata() -> None:
+    cb = _batch([7, 3], [[9.0, 9.0], [1.0, 1.0]], num_genes=2)
+    batch = _make_batch_dict(
+        file_ids=[0, 1],
+        cell_ids=[7, 3],
+        parts={0: ([0], _batch([7], [[9.0, 9.0]], 2)), 1: ([1], _batch([3], [[1.0, 1.0]], 2))},
+    )
+    batch["batch"] = cb
+    out = stitch_dense_collate(batch)
+    assert np.shares_memory(out["x"].numpy(), cb.data)
+    np.testing.assert_array_equal(out["x"].numpy(), cb.to_numpy())
+
+    bad = dict(batch)
+    bad["cell_ids"] = np.asarray([7], dtype=np.intp)
+    with pytest.raises(ValueError, match="cell_ids"):
+        stitch_dense_collate(bad)  # type: ignore[arg-type]
+
+
+def test_stitch_rejects_empty_fallback_without_schema() -> None:
+    batch = cast(
+        ScDataBatch,
+        {
+            "file_ids": np.empty(0, dtype=np.intp),
+            "cell_ids": np.empty(0, dtype=np.intp),
+            "batches": {},
+            "cells": {},
+            "positions": {},
+        },
+    )
+    with pytest.raises(ValueError, match="empty batch"):
+        stitch_dense_collate(batch)
+
+
+def test_stitch_rejects_incompatible_fallback_schema_and_shape() -> None:
+    cb0 = _batch([0], [[1.0, 2.0]], num_genes=2)
+    cb1 = CellBatch.from_array(
+        cells=np.asarray([1], dtype=np.intp),
+        data=np.asarray([3.0, 4.0], dtype=np.float64),
+        num_genes=2,
+        gene_names=("g0", "g1"),
+    )
+    bad_dtype = _make_batch_dict(
+        file_ids=[0, 1],
+        cell_ids=[0, 1],
+        parts={0: ([0], cb0), 1: ([1], cb1)},
+    )
+    with pytest.raises(ValueError, match="dtype"):
+        stitch_dense_collate(bad_dtype)
+
+    bad_names = _make_batch_dict(
+        file_ids=[0, 1],
+        cell_ids=[0, 1],
+        parts={
+            0: ([0], cb0),
+            1: (
+                [1],
+                CellBatch.from_array(
+                    cells=np.asarray([1], dtype=np.intp),
+                    data=np.asarray([3.0, 4.0], dtype=np.float32),
+                    num_genes=2,
+                    gene_names=("h0", "h1"),
+                ),
+            ),
+        },
+    )
+    with pytest.raises(ValueError, match="gene_names"):
+        stitch_dense_collate(bad_names)
+
+    bad_shape = _make_batch_dict(
+        file_ids=[0, 1],
+        cell_ids=[0, 1],
+        parts={0: ([0, 1], cb0)},
+    )
+    with pytest.raises(ValueError, match="row count"):
+        stitch_dense_collate(bad_shape)
+
+
+def test_stitch_rejects_incomplete_or_inconsistent_positions() -> None:
+    cb0 = _batch([0], [[1.0, 2.0]], num_genes=2)
+    cb1 = _batch([1], [[3.0, 4.0]], num_genes=2)
+    duplicate = _make_batch_dict(
+        file_ids=[0, 1],
+        cell_ids=[0, 1],
+        parts={0: ([0], cb0), 1: ([0], cb1)},
+    )
+    with pytest.raises(ValueError, match="found duplicate"):
+        stitch_dense_collate(duplicate)
+
+    wrong_cell = _make_batch_dict(
+        file_ids=[0, 1],
+        cell_ids=[0, 1],
+        parts={0: ([0], cb0), 1: ([1], cb1)},
+    )
+    wrong_cell["cells"] = {0: np.asarray([0], dtype=np.intp), 1: np.asarray([9], dtype=np.intp)}
+    with pytest.raises(ValueError, match="cells"):
+        stitch_dense_collate(wrong_cell)
+
+
+def test_stitch_rejects_duplicate_positions_within_one_file_part() -> None:
+    duplicate_within_part = _make_batch_dict(
+        file_ids=[0, 0],
+        cell_ids=[0, 1],
+        parts={0: ([0, 0], _batch([0, 1], [[1.0, 2.0], [3.0, 4.0]], 2))},
+    )
+    with pytest.raises(ValueError, match="must not repeat"):
+        stitch_dense_collate(duplicate_within_part)
