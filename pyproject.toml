@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Single-cell data storage, compression, and loading toolkit with a Rust core"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.16"
 dependencies = [
     "numcodecs>=0.13.1",
     "numpy>=2.2.6",
@@ -16,6 +16,10 @@ dependencies = [
 
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Rust",
     "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Bio-Informatics",

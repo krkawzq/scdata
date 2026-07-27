@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-≥3.12-blue?logo=python&logoColor=white"></a>
+  <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12–3.15-blue?logo=python&logoColor=white"></a>
   <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/Rust-core-dea584?logo=rust&logoColor=white"></a>
   <a href="https://github.com/zarr-developers/zarr-specs"><img alt="Zarr v3" src="https://img.shields.io/badge/Zarr-v3-purple"></a>
   <img alt="status" src="https://img.shields.io/badge/status-WIP-orange">
@@ -60,7 +60,7 @@ uv run maturin develop --uv          # editable build
 uv pip install -e .
 ```
 
-**Requirements:** Python ≥ 3.12, numpy ≥ 2.2, numcodecs ≥ 0.13. Install
+**Requirements:** Python 3.12–3.15, numpy ≥ 2.2, numcodecs ≥ 0.13. Install
 `anndata==0.13.2` / `zarr>=3.1.6,<3.3` only for conversion and round-trip
 validation (`uv pip install -e ".[anndata]"`).
 
