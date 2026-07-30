@@ -988,9 +988,13 @@ def _v3_build_dense_dataset(
 def _v3_read_gene_names(store: Store, var_key: str) -> tuple[str, ...]:
     """Read the var index as gene names from a v3 store.
 
-    The var group is a v3 group; its ``_index`` child is a v3 string array
-    (``data_type: "string"``).  String chunk files decode via the VLenUTF8
-    codec embedded in the chunk itself, so we read+decode them here.
+    Supported index encodings:
+
+    * plain v3 string array (``data_type: "string"``)
+    * AnnData categorical group (``encoding-type: categorical``)
+    * AnnData nullable string group (``encoding-type: nullable-string-array``)
+
+    A gene index must not contain missing entries.
     """
     group_key = f"{var_key}/zarr.json"
     if not store.exists(group_key):
@@ -1025,16 +1029,18 @@ def _v3_read_gene_names(store: Store, var_key: str) -> tuple[str, ...]:
     if node_type == "array":
         return _v3_read_string_array(store, index_key)
     if node_type != "group":
-        raise StoreError(f"{index_key}: expected string array or categorical group")
+        raise StoreError(f"{index_key}: expected string array or encoded index group")
     attrs = index_meta.get("attributes")
     encoding_type = attrs.get("encoding-type") if isinstance(attrs, dict) else None
-    if encoding_type != "categorical":
-        raise StoreError(f"{index_key}: unsupported var index encoding {encoding_type!r}")
-    return _v3_read_categorical_array(store, index_key)
+    if encoding_type == "categorical":
+        return _v3_read_categorical_array(store, index_key)
+    if encoding_type == "nullable-string-array":
+        return _v3_read_nullable_string_array(store, index_key)
+    raise StoreError(f"{index_key}: unsupported var index encoding {encoding_type!r}")
 
 
 def _v3_read_categorical_array(store: Store, group_key: str) -> tuple[str, ...]:
-    """Read a standard AnnData categorical index from ``codes``/``categories``."""
+    """Read an AnnData categorical index from ``codes`` / ``categories``."""
     categories = _v3_read_string_array(store, f"{group_key}/categories")
     codes = _parse_v3_array(store, f"{group_key}/codes")
     if len(codes.shape) != 1:
@@ -1046,10 +1052,117 @@ def _v3_read_categorical_array(store: Store, group_key: str) -> tuple[str, ...]:
         if 0 <= index < len(categories):
             names.append(categories[index])
         else:
-            # A gene index cannot contain a missing categorical entry (``-1``)
-            # or a category code outside its declared category array.
             raise StoreError(f"{group_key}/codes contains invalid category code {index}")
     return tuple(names)
+
+
+def _v3_read_nullable_string_array(store: Store, group_key: str) -> tuple[str, ...]:
+    """Read an AnnData ``nullable-string-array`` from ``values`` / ``mask``.
+
+    Layout::
+
+        <group>/values   full-length v3 string array
+        <group>/mask     full-length bool array; True marks a null entry
+
+    Gene names cannot be null: any True mask entry raises.
+    """
+    values = _v3_read_string_array(store, f"{group_key}/values")
+    mask = _v3_read_bool_array(store, f"{group_key}/mask")
+    if len(values) != len(mask):
+        raise StoreError(
+            f"{group_key}: values length {len(values)} != mask length {len(mask)}"
+        )
+    nulls = [i for i, is_null in enumerate(mask) if is_null]
+    if nulls:
+        preview = ", ".join(str(i) for i in nulls[:8])
+        more = "" if len(nulls) <= 8 else f" … (+{len(nulls) - 8} more)"
+        raise StoreError(
+            f"{group_key}: gene index contains {len(nulls)} null entries "
+            f"at positions [{preview}{more}]"
+        )
+    return values
+
+
+def _v3_read_bool_array(store: Store, array_key: str) -> tuple[bool, ...]:
+    """Decode a 1D v3 bool array.
+
+    Absent chunks are filled with the array ``fill_value`` (default ``False``).
+    """
+    key = f"{array_key}/zarr.json"
+    if not store.exists(key):
+        raise StoreError(f"missing array: {array_key}")
+    meta = _expect_object(_read_json(store, key), key)
+    if _v3_node_type(meta, key) != "array":
+        raise StoreError(f"{key}: expected node_type 'array'")
+    data_type = meta.get("data_type")
+    if data_type not in ("bool", "boolean"):
+        raise StoreError(f"{array_key}: expected bool data_type, got {data_type!r}")
+    shape = _parse_shape(meta.get("shape"), key)
+    if len(shape) != 1:
+        raise StoreError(f"{array_key}: bool array must be 1D, got shape {shape}")
+    count = shape[0]
+
+    fill_value = meta.get("fill_value", False)
+    if fill_value is None:
+        fill_bool = False
+    elif isinstance(fill_value, bool):
+        fill_bool = fill_value
+    else:
+        raise StoreError(f"{key}: bool fill_value must be a boolean or null")
+
+    chunk_grid = meta.get("chunk_grid")
+    if not isinstance(chunk_grid, dict) or chunk_grid.get("name") != "regular":
+        raise StoreError(f"{key}: bool array must use a regular chunk grid")
+    grid_cfg = chunk_grid.get("configuration")
+    if not isinstance(grid_cfg, dict):
+        raise StoreError(f"{key}: chunk_grid missing configuration")
+    chunk_shape = _parse_chunk_shape(grid_cfg.get("chunk_shape"), key)
+    if len(chunk_shape) != 1:
+        raise StoreError(f"{key}: bool chunk_shape must be 1D")
+    codec = _v3_codec_pipeline(meta.get("codecs"), key, serializer="bytes")
+    chunk_paths, chunk_lengths = _v3_chunk_files(
+        store,
+        array_key,
+        shape,
+        chunk_shape,
+        meta.get("chunk_key_encoding"),
+        key,
+    )
+
+    out = [fill_bool] * count
+    chunk_len = chunk_shape[0]
+    for chunk_index, (path, length) in enumerate(zip(chunk_paths, chunk_lengths, strict=True)):
+        start = chunk_index * chunk_len
+        stop = min(count, start + chunk_len)
+        n = stop - start
+        if n <= 0:
+            continue
+        if length == 0:
+            continue
+        raw = store.read_bytes(path)
+        decoded = _decode_v3_bool_chunk(raw, codec, n)
+        out[start:stop] = decoded[:n]
+    return tuple(out)
+
+
+def _decode_v3_bool_chunk(raw: bytes, codec: CodecPipeline, expected: int) -> list[bool]:
+    """Decode one fixed-size bool chunk: compressor chain, then raw bytes."""
+    from numcodecs import get_codec
+
+    data = raw
+    try:
+        if codec.compressor is not None:
+            data = _as_bytes(get_codec(dict(codec.compressor)).decode(data))
+        for flt in reversed(codec.filters):
+            data = _as_bytes(get_codec(dict(flt)).decode(data))
+    except Exception as err:
+        raise StoreError(f"failed to decode v3 bool chunk: {err}") from err
+    data = _as_bytes(data)
+    if len(data) < expected:
+        raise StoreError(
+            f"bool chunk decoded to {len(data)} bytes, expected at least {expected}"
+        )
+    return [byte != 0 for byte in data[:expected]]
 
 
 def _v3_read_string_array(store: Store, array_key: str) -> tuple[str, ...]:
