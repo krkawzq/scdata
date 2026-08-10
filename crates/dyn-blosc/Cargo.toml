@@ -1,0 +1,20 @@
+[package]
+name = "dyn-blosc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust unified encoder and decoder for Blosc1 and DynBlosc chunks"
+readme = "README.md"
+publish.workspace = true
+
+[lib]
+name = "dyn_blosc"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zstd = { version = "0.13", default-features = false }
+
+[dev-dependencies]
