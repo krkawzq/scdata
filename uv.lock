@@ -574,7 +574,7 @@ requires-dist = [
 provides-extras = ["scipy", "anndata", "dev"]
 
 [[package]]
-name = "scdata"
+name = "sc-load"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [

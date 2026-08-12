@@ -47,7 +47,12 @@ from .io import (
 )
 from .limits import DEFAULT_N_WORKERS, DEFAULT_READ_LIMITS, ReadLimits
 from .store import Store, StoreInfo
-from .write_options import DEFAULT_WRITE_OPTIONS, WriteOptions
+from .write_options import (
+    DEFAULT_BLOCK_BUDGET,
+    DEFAULT_CHUNK_BUDGET,
+    DEFAULT_WRITE_OPTIONS,
+    WriteOptions,
+)
 
 # Optional AnnData bridge (imports anndata / zarr lazily inside the functions).
 from .anndata import read_scc, write_scc
@@ -55,6 +60,8 @@ from .anndata import read_scc, write_scc
 __all__ = [
     "DEFAULT_READ_LIMITS",
     "DEFAULT_N_WORKERS",
+    "DEFAULT_BLOCK_BUDGET",
+    "DEFAULT_CHUNK_BUDGET",
     "DEFAULT_WRITE_OPTIONS",
     "FORMAT_NAME",
     "FORMAT_VERSION",

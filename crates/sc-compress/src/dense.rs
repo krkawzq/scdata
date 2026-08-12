@@ -30,25 +30,16 @@ pub struct DenseWriter {
 }
 
 impl DenseWriter {
-    pub fn new(dir: impl AsRef<Path>) -> Self {
+    /// Create a writer. Callers must pass chunk/block partitions explicitly.
+    pub fn new(dir: impl AsRef<Path>, chunk: Partition, block: Partition) -> Self {
         Self {
             dir: dir.as_ref().to_path_buf(),
-            chunk: Partition::fixed_cells(1024),
-            block: Partition::fixed_cells(16),
+            chunk,
+            block,
             // `block_size` is overwritten from `block` × n_genes × dtype at write time.
             compressor: Compressor::blosc1_lz4(1),
             threads: default_threads(),
         }
-    }
-
-    pub fn chunk(mut self, partition: Partition) -> Self {
-        self.chunk = partition;
-        self
-    }
-
-    pub fn block(mut self, partition: Partition) -> Self {
-        self.block = partition;
-        self
     }
 
     /// Sets Blosc1 codec options. Any configured `block_size` is ignored and

@@ -3,8 +3,8 @@ members = [
     "crates/dyn-blosc",
     "crates/sc-compress",
     "crates/sc-compress/python",
-    "crates/scdata",
-    "crates/scdata/python",
+    "crates/sc-load",
+    "crates/sc-load/python",
 ]
 resolver = "2"
 

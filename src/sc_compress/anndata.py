@@ -110,7 +110,8 @@ def write_scc(
         ``"auto"`` (default) picks zip when ``path`` ends with ``.zip``.
     options
         Chunk/block partition knobs applied to every sc-compress matrix.
-        Dense payloads require ``cells`` policies; CSR may use ``budget``.
+        ``budget`` is native for CSR; dense budgets are lowered in Python to
+        ``fixed_cells`` from each matrix's row width.
     n_workers
         Per-matrix chunk workers. Overrides ``options.n_workers`` when provided.
     overwrite
@@ -148,8 +149,10 @@ def write_scc(
     ensure_writable_path(root, overwrite=overwrite)
     write_opts = resolve_write_options(options, n_workers=n_workers)
     n_cells = int(adata.n_obs)
-    has_dense_matrix = _preflight_write_adata(adata)
-    write_opts.resolve(dense=has_dense_matrix)
+    _preflight_write_adata(adata)
+    # Validate partition knobs. Dense budgets are lowered per matrix once the
+    # row width is known inside :func:`write_dense`.
+    write_opts.resolve(dense=False)
     matrix_total = _count_scc_matrices(adata)
     if store_kind == "zip":
         _prepare_zip_target(root)
@@ -948,7 +951,7 @@ def _validate_value_dtype(matrix: Any, *, context: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# store helpers (directory / zip), adapted from scdata.io._anndata
+# Store helpers for directory and ZIP targets.
 # ---------------------------------------------------------------------------
 
 

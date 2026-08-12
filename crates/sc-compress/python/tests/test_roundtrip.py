@@ -18,7 +18,16 @@ def test_public_storage_dtype_constants_are_immutable() -> None:
 def test_dense_roundtrip_and_row_range(tmp_path: Path) -> None:
     root = tmp_path / "dense"
     values = np.arange(24, dtype=np.float32).reshape(6, 4)
-    scc.write_dense(root, values, options=scc.WriteOptions(chunk_cells=2))
+    scc.write_dense(
+        root,
+        values,
+        options=scc.WriteOptions(
+            chunk_policy="cells",
+            chunk_cells=2,
+            block_policy="cells",
+            block_cells=1,
+        ),
+    )
 
     with scc.open_store(root) as store:
         assert store.kind == "dense"
@@ -94,7 +103,16 @@ def test_csr_roundtrip_via_scipy(tmp_path: Path) -> None:
         shape=(2, 3),
     )
     # Writer canonicalizes row order.
-    scc.write_csr(root, csr, options=scc.WriteOptions(chunk_cells=1, block_cells=1))
+    scc.write_csr(
+        root,
+        csr,
+        options=scc.WriteOptions(
+            chunk_policy="cells",
+            chunk_cells=1,
+            block_policy="cells",
+            block_cells=1,
+        ),
+    )
 
     store = scc.open_store(root)
     assert store.kind == "csr"
@@ -178,20 +196,24 @@ def test_read_limits_object_and_python_integer_validation(tmp_path: Path) -> Non
         scc.write_dense(
             tmp_path / "bad-partition",
             np.ones((1, 1), dtype=np.uint16),
-            options=scc.WriteOptions(chunk_cells=True),  # type: ignore[arg-type]
+            options=scc.WriteOptions(
+                chunk_policy="cells",
+                chunk_cells=True,  # type: ignore[arg-type]
+                block_policy="cells",
+                block_cells=1,
+            ),
         )
     sparse = pytest.importorskip("scipy.sparse")
     with pytest.raises(scc.InvalidArgumentError, match="chunk_budget is required"):
         scc.write_csr(
             tmp_path / "missing-budget",
             sparse.csr_matrix(np.ones((2, 2), dtype=np.float32)),
-            options=scc.WriteOptions(chunk_policy="budget"),
-        )
-    with pytest.raises(scc.InvalidArgumentError, match="dense writes require"):
-        scc.write_dense(
-            tmp_path / "dense-budget",
-            np.ones((2, 2), dtype=np.float32),
-            options=scc.WriteOptions(chunk_policy="budget", chunk_budget=64),
+            options=scc.WriteOptions(
+                chunk_policy="budget",
+                chunk_budget=None,
+                block_policy="cells",
+                block_cells=1,
+            ),
         )
 
 
@@ -251,6 +273,46 @@ def test_csr_bytes_budget_policy_roundtrip(tmp_path: Path) -> None:
             np.array([], dtype=np.float32),
             (0.5, 1),
         )
+
+
+def test_dense_bytes_budget_lowers_to_fixed_cells(tmp_path: Path) -> None:
+    root = tmp_path / "dense-budget"
+    # row_bytes = 4 cols * 4 bytes = 16; budgets 64 / 32 → ceil → 4 / 2 cells.
+    values = np.arange(24, dtype=np.float32).reshape(6, 4)
+    scc.write_dense(
+        root,
+        values,
+        options=scc.WriteOptions(
+            chunk_policy="budget",
+            chunk_budget=64,
+            block_policy="budget",
+            block_budget=32,
+        ),
+    )
+    meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    assert meta["partition"]["chunk"] == {"strategy": "fixed_cells", "n": 4}
+    assert meta["partition"]["block"] == {"strategy": "fixed_cells", "n": 2}
+    np.testing.assert_array_equal(scc.open_store(root).read(), values)
+
+
+def test_default_write_options_use_byte_budgets() -> None:
+    assert scc.DEFAULT_CHUNK_BUDGET == 100 << 20
+    assert scc.DEFAULT_BLOCK_BUDGET == 400 << 10
+    opts = scc.DEFAULT_WRITE_OPTIONS
+    assert opts.chunk_policy == "budget"
+    assert opts.block_policy == "budget"
+    assert opts.chunk_budget == scc.DEFAULT_CHUNK_BUDGET
+    assert opts.block_budget == scc.DEFAULT_BLOCK_BUDGET
+    chunk, block = opts.resolve(dense=False)
+    assert (chunk.policy, chunk.n) == ("budget", scc.DEFAULT_CHUNK_BUDGET)
+    assert (block.policy, block.n) == ("budget", scc.DEFAULT_BLOCK_BUDGET)
+    dense_chunk, dense_block = opts.resolve(dense=True, row_bytes=16)
+    assert dense_chunk.policy == "cells"
+    assert dense_block.policy == "cells"
+    assert dense_chunk.n * 16 >= scc.DEFAULT_CHUNK_BUDGET
+    assert dense_block.n * 16 >= scc.DEFAULT_BLOCK_BUDGET
+    assert (dense_chunk.n - 1) * 16 < scc.DEFAULT_CHUNK_BUDGET
+    assert (dense_block.n - 1) * 16 < scc.DEFAULT_BLOCK_BUDGET
 
 
 def test_overwrite_false_refuses_existing_path(tmp_path: Path) -> None:
