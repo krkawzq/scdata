@@ -923,6 +923,7 @@ fn io_error(error: Errno) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Partition;
 
     #[test]
     fn changed_target_is_preserved() {
@@ -1017,7 +1018,7 @@ mod tests {
     fn portable_commit_keeps_the_old_generation_readable() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("matrix");
-        crate::DenseWriter::new(&target)
+        crate::DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
             .write(&[1u16, 2, 3, 4], [2, 2])
             .unwrap();
         let old = DirectoryStore::open(&target).unwrap();
@@ -1059,7 +1060,7 @@ mod tests {
     fn portable_commits_serialize_competing_replacements() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("matrix");
-        crate::DenseWriter::new(&target)
+        crate::DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
             .write(&[1u16], [1, 1])
             .unwrap();
 
@@ -1095,7 +1096,7 @@ mod tests {
     fn writer_can_replace_store_with_large_valid_metadata() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("matrix");
-        crate::DenseWriter::new(&target)
+        crate::DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
             .write(&[1u16], [1, 1])
             .unwrap();
 
@@ -1113,7 +1114,7 @@ mod tests {
                 > u64::try_from(ReadLimits::default().metadata_size()).unwrap()
         );
 
-        crate::DenseWriter::new(&target)
+        crate::DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
             .write(&[2u16], [1, 1])
             .unwrap();
         assert_eq!(

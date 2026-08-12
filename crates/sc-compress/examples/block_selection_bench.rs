@@ -35,9 +35,7 @@ fn main() {
     let dense_values = (0..rows * cols)
         .map(|value| u16::try_from(value % 251).unwrap())
         .collect::<Vec<_>>();
-    DenseWriter::new(&dense_root)
-        .chunk(Partition::fixed_cells(4_096))
-        .block(Partition::fixed_cells(8))
+    DenseWriter::new(&dense_root, Partition::fixed_cells(4_096), Partition::fixed_cells(8))
         .threads(4)
         .write(&dense_values, [rows as u64, cols as u64])
         .unwrap();
@@ -100,9 +98,7 @@ fn main() {
             values.push(((row + col) % 251) as u16);
         }
     }
-    CsrWriter::new(&csr_root)
-        .chunk(Partition::fixed_cells(4_096))
-        .block(Partition::fixed_cells(8))
+    CsrWriter::new(&csr_root, Partition::fixed_cells(4_096), Partition::fixed_cells(8))
         .threads(4)
         .write(&indptr, &indices, &values, [rows as u64, cols as u64])
         .unwrap();
@@ -148,9 +144,7 @@ fn main() {
             sparse_col_values.push((row * nnz_per_row + offset) as f64);
         }
     }
-    CsrWriter::new(&sparse_cols_root)
-        .chunk(Partition::fixed_cells(rows as u64))
-        .block(Partition::fixed_cells(1))
+    CsrWriter::new(&sparse_cols_root, Partition::fixed_cells(rows as u64), Partition::fixed_cells(1))
         .threads(4)
         .write(
             &sparse_col_indptr,

@@ -1,0 +1,135 @@
+"""Typed snapshots returned by compiled plans and live sessions."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping as MappingABC
+from dataclasses import dataclass, field, fields
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
+
+IoMode = Literal["auto", "blocking", "uring"]
+SessionState = Literal["running", "failed", "cancelled", "finished"]
+
+__all__ = ["PlanStats", "RuntimeStats", "SessionState"]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanStats:
+    input_rows: int
+    block_jobs: int
+    jobs: int
+    data_io_ops: int
+    indices_io_ops: int
+    predicted_physical_bytes: int
+    gap_bytes: int
+    maximum_encoded_bytes_per_side: int
+    maximum_decoded_bytes_per_job: int
+    arena_bytes: int
+    compile_working_set_bytes: int
+    retained_whole_key_bytes: int
+    output_ring_bytes: int
+    compile_time_io_bytes: int
+    compile_time_io_ops: int
+    predicted_io_seconds: float
+    profile: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "profile", _freeze_mapping(self.profile))
+
+    @classmethod
+    def _from_mapping(cls, values: Mapping[str, Any]) -> PlanStats:
+        known = {
+            "input_rows",
+            "block_jobs",
+            "jobs",
+            "data_io_ops",
+            "indices_io_ops",
+            "predicted_physical_bytes",
+            "gap_bytes",
+            "maximum_encoded_bytes_per_side",
+            "maximum_decoded_bytes_per_job",
+            "arena_bytes",
+            "compile_working_set_bytes",
+            "retained_whole_key_bytes",
+            "output_ring_bytes",
+            "compile_time_io_bytes",
+            "compile_time_io_ops",
+            "predicted_io_seconds",
+        }
+        profile = MappingProxyType(
+            {key: value for key, value in values.items() if key not in known}
+        )
+        return cls(**{key: values[key] for key in known}, profile=profile)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a plain dictionary suitable for logging or serialization."""
+        return {
+            item.name: _to_plain(self.profile)
+            if item.name == "profile"
+            else getattr(self, item.name)
+            for item in fields(self)
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStats:
+    requested_io_mode: IoMode
+    requested_queue_depth: int
+    actual_io_mode: IoMode
+    actual_queue_depth: int
+    worker_count: int
+    max_inflight_jobs_per_worker: int
+    max_inflight_encoded_bytes_per_worker: int
+    max_decoded_bytes_per_worker: int
+    state: SessionState
+    profile: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "profile", _freeze_mapping(self.profile))
+
+    @classmethod
+    def _from_mapping(cls, values: Mapping[str, Any]) -> RuntimeStats:
+        known = {
+            "requested_io_mode",
+            "requested_queue_depth",
+            "actual_io_mode",
+            "actual_queue_depth",
+            "worker_count",
+            "max_inflight_jobs_per_worker",
+            "max_inflight_encoded_bytes_per_worker",
+            "max_decoded_bytes_per_worker",
+            "state",
+        }
+        profile = MappingProxyType(
+            {key: value for key, value in values.items() if key not in known}
+        )
+        return cls(**{key: values[key] for key in known}, profile=profile)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a plain dictionary suitable for logging or serialization."""
+        return {
+            item.name: _to_plain(self.profile)
+            if item.name == "profile"
+            else getattr(self, item.name)
+            for item in fields(self)
+        }
+
+
+def _freeze_mapping(values: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType({key: _freeze(value) for key, value in values.items()})
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, MappingABC):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _to_plain(value: Any) -> Any:
+    if isinstance(value, MappingABC):
+        return {key: _to_plain(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_to_plain(item) for item in value]
+    return value

@@ -3,7 +3,7 @@ requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
-name = "scdata"
+name = "sc-load"
 version = "0.2.0"
 description = "Compile ordered single-cell row requests into reusable prefetch plans over sc-compress matrices"
 readme = "README.md"
@@ -42,13 +42,13 @@ sc-compress = { path = "crates/sc-compress/python", editable = true }
 [tool.maturin]
 bindings = "pyo3"
 features = ["extension-module"]
-manifest-path = "crates/scdata/python/Cargo.toml"
-module-name = "scdata._core"
+manifest-path = "crates/sc-load/python/Cargo.toml"
+module-name = "sc_load._core"
 python-source = "src"
 
 [tool.pytest.ini_options]
 testpaths = [
-    "crates/scdata/python/tests",
+    "crates/sc-load/python/tests",
     "crates/sc-compress/python/tests",
 ]
 pythonpath = ["src"]

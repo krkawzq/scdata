@@ -63,10 +63,7 @@ pub fn write_dense(
     validate_n_workers(n_workers)?;
     let (chunk, block) = partitions(chunk_policy, chunk_n, block_policy, block_n)?;
     dispatch_dense(values, |values, shape| {
-        let writer = DenseWriter::new(&path)
-            .chunk(chunk)
-            .block(block)
-            .threads(n_workers);
+        let writer = DenseWriter::new(&path, chunk, block).threads(n_workers);
         match values {
             DenseValues::U16(values) => {
                 py.allow_threads(|| writer.write(values, shape)).map_sc()?
@@ -131,10 +128,7 @@ pub fn write_csr(
     let indices = copy_u64_1d(indices, "indices")?;
     let shape = [n_rows, n_cols];
     dispatch_csr_data(data, |data| {
-        let writer = CsrWriter::new(&path)
-            .chunk(chunk)
-            .block(block)
-            .threads(n_workers);
+        let writer = CsrWriter::new(&path, chunk, block).threads(n_workers);
         py.allow_threads(move || match data {
             CsrData::U16(data) => writer.write_promoted(indptr, indices, data, shape),
             CsrData::U32(data) => writer.write_promoted(indptr, indices, data, shape),

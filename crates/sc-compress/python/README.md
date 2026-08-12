@@ -48,8 +48,9 @@ from scipy import sparse
 
 values = np.arange(24, dtype=np.float32).reshape(6, 4)
 scc.write("matrix.sc", values, n_workers=8)  # dense/sparse dispatch stays in Python
-# Partition policies map to Rust Partition::fixed_cells / bytes_budget:
-# scc.write_csr(path, csr, options=scc.WriteOptions(chunk_policy="budget", chunk_budget=1 << 20))
+# Defaults use byte budgets (chunk=100 MiB, block=400 KiB). CSR keeps bytes_budget;
+# dense budgets are lowered in Python to fixed_cells that meet/exceed the target:
+# scc.write_csr(path, csr, options=scc.WriteOptions(chunk_budget=1 << 20, block_budget=400 << 10))
 
 with scc.open_store("matrix.sc", n_workers=8) as store:
     print(store)
@@ -115,7 +116,9 @@ store = scc.open_store(path, limits=limits, max_block_count=2_000_000)
 Write partitioning uses the same pattern via :class:`sc_compress.WriteOptions`:
 
 ```python
-opts = scc.WriteOptions(chunk_cells=512, block_cells=16, n_workers=8)
+opts = scc.WriteOptions(chunk_budget=16 << 20, block_budget=256 << 10, n_workers=8)
+# or fixed cell counts:
+# opts = scc.WriteOptions(chunk_policy="cells", chunk_cells=512, block_policy="cells", block_cells=16)
 scc.write(path, values, options=opts, overwrite=False)
 ```
 

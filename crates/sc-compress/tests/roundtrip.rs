@@ -15,8 +15,7 @@ fn dense_typed_roundtrip_and_range() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dense");
     let values = (0..24).map(|value| value as f32).collect::<Vec<_>>();
-    DenseWriter::new(&root)
-        .chunk(Partition::fixed_cells(2))
+    DenseWriter::new(&root, Partition::fixed_cells(2), Partition::fixed_cells(16))
         .threads(4)
         .write(&values, [6, 4])
         .unwrap();
@@ -31,9 +30,7 @@ fn dense_typed_roundtrip_and_range() {
 fn csr_typed_roundtrip_canonicalizes_rows() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("csr");
-    CsrWriter::new(&root)
-        .chunk(Partition::fixed_cells(1))
-        .block(Partition::fixed_cells(1))
+    CsrWriter::new(&root, Partition::fixed_cells(1), Partition::fixed_cells(1))
         .threads(4)
         .write(&[0u64, 2, 3], &[2u32, 0, 1], &[20i32, 0, 10], [2, 3])
         .unwrap();
@@ -52,8 +49,7 @@ fn store_selection_preserves_fancy_order_and_duplicates() {
     let temp = tempfile::tempdir().unwrap();
     let dense_root = temp.path().join("dense-select");
     let dense_values = (0u16..16).collect::<Vec<_>>();
-    DenseWriter::new(&dense_root)
-        .chunk(Partition::fixed_cells(2))
+    DenseWriter::new(&dense_root, Partition::fixed_cells(2), Partition::fixed_cells(16))
         .write(&dense_values, [8, 2])
         .unwrap();
     let dense = open_dense(&dense_root).unwrap();
@@ -77,8 +73,7 @@ fn store_selection_preserves_fancy_order_and_duplicates() {
     let indptr = (0u64..=8).collect::<Vec<_>>();
     let indices = (0u32..8).map(|row| row % 3).collect::<Vec<_>>();
     let values = (10u16..18).collect::<Vec<_>>();
-    CsrWriter::new(&csr_root)
-        .chunk(Partition::fixed_cells(2))
+    CsrWriter::new(&csr_root, Partition::fixed_cells(2), Partition::fixed_cells(16))
         .write(&indptr, &indices, &values, [8, 3])
         .unwrap();
     let csr = open_csr(&csr_root).unwrap();
@@ -118,9 +113,7 @@ fn store_selection_supports_range_stride_mask_and_empty_axes() {
     let temp = tempfile::tempdir().unwrap();
     let dense_root = temp.path().join("dense-axis-forms");
     let dense_values = (0u16..16).collect::<Vec<_>>();
-    DenseWriter::new(&dense_root)
-        .chunk(Partition::fixed_cells(4))
-        .block(Partition::fixed_cells(1))
+    DenseWriter::new(&dense_root, Partition::fixed_cells(4), Partition::fixed_cells(1))
         .write(&dense_values, [4, 4])
         .unwrap();
     let dense = open_dense(&dense_root).unwrap();
@@ -141,9 +134,7 @@ fn store_selection_supports_range_stride_mask_and_empty_axes() {
     assert_eq!(empty.shape(), [0, 2]);
 
     let csr_root = temp.path().join("csr-axis-forms");
-    CsrWriter::new(&csr_root)
-        .chunk(Partition::fixed_cells(4))
-        .block(Partition::fixed_cells(1))
+    CsrWriter::new(&csr_root, Partition::fixed_cells(4), Partition::fixed_cells(1))
         .write(
             &[0u64, 1, 2, 3, 4],
             &[0u32, 1, 2, 3],
@@ -180,9 +171,7 @@ fn store_csr_2d_selection_matches_in_memory_kernel_across_axis_forms() {
     let data = (0..indices.len())
         .map(|value| u16::try_from(value * 7 + 3).unwrap())
         .collect::<Vec<_>>();
-    CsrWriter::new(&root)
-        .chunk(Partition::fixed_cells(2))
-        .block(Partition::fixed_cells(1))
+    CsrWriter::new(&root, Partition::fixed_cells(2), Partition::fixed_cells(1))
         .write(&indptr, &indices, &data, shape)
         .unwrap();
     let store = open_csr(&root).unwrap();
@@ -229,7 +218,7 @@ fn store_csr_2d_selection_matches_in_memory_kernel_across_axis_forms() {
 fn csr_sorted_rows_stay_aligned_and_duplicates_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("sorted");
-    CsrWriter::new(&root)
+    CsrWriter::new(&root, Partition::fixed_cells(1024), Partition::fixed_cells(16))
         .write(&[0u64, 2], &[0u32, 2], &[4i32, 5], [1, 3])
         .unwrap();
 
@@ -237,7 +226,7 @@ fn csr_sorted_rows_stay_aligned_and_duplicates_are_rejected() {
     assert_eq!(u16_values(&indices), vec![0, 2]);
     assert_eq!(i32_values(&data), vec![4, 5]);
 
-    assert!(CsrWriter::new(temp.path().join("duplicates"))
+    assert!(CsrWriter::new(temp.path().join("duplicates"), Partition::fixed_cells(1024), Partition::fixed_cells(16))
         .write(&[0u64, 2], &[1u32, 1], &[4i32, 5], [1, 3])
         .is_err());
 }
@@ -256,8 +245,7 @@ fn opened_directory_matrices_support_concurrent_decodes() {
     let dense_values = (0..rows * cols)
         .map(|value| u16::try_from(value).unwrap())
         .collect::<Vec<_>>();
-    DenseWriter::new(&dense_root)
-        .chunk(Partition::fixed_cells(4))
+    DenseWriter::new(&dense_root, Partition::fixed_cells(4), Partition::fixed_cells(16))
         .threads(4)
         .write(&dense_values, [rows as u64, cols as u64])
         .unwrap();
@@ -271,8 +259,7 @@ fn opened_directory_matrices_support_concurrent_decodes() {
     let csr_values = (0..rows as u16)
         .map(|value| value + 100)
         .collect::<Vec<_>>();
-    CsrWriter::new(&csr_root)
-        .chunk(Partition::fixed_cells(4))
+    CsrWriter::new(&csr_root, Partition::fixed_cells(4), Partition::fixed_cells(16))
         .threads(4)
         .write(
             &indptr,
@@ -309,7 +296,7 @@ fn dense_reads_from_stored_and_deflated_zip_entries() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dense");
     let values = vec![1u16, 2, 3, 4];
-    DenseWriter::new(&root).write(&values, [2, 2]).unwrap();
+    DenseWriter::new(&root, Partition::fixed_cells(1024), Partition::fixed_cells(16)).write(&values, [2, 2]).unwrap();
 
     for method in [
         zip::CompressionMethod::Stored,
@@ -341,7 +328,7 @@ fn zip_store_supports_concurrent_deflated_reads() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dense-concurrent");
     let values = (0..8_192u32).collect::<Vec<_>>();
-    DenseWriter::new(&root)
+    DenseWriter::new(&root, Partition::fixed_cells(1024), Partition::fixed_cells(16))
         .threads(4)
         .write(&values, [128, 64])
         .unwrap();
@@ -370,7 +357,7 @@ fn zip_store_supports_concurrent_deflated_reads() {
 fn csr_reads_from_deflated_zip_entries() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("csr");
-    CsrWriter::new(&root)
+    CsrWriter::new(&root, Partition::fixed_cells(1024), Partition::fixed_cells(16))
         .write(&[0u64, 1, 2], &[0u32, 1], &[1f32, 2.0], [2, 2])
         .unwrap();
     let zip_path = temp.path().join("csr-deflated.zip");
@@ -453,8 +440,7 @@ fn dense_and_csr_support_2d_on_demand_select() {
     // Dense: 6×4 matrix, select fancy rows + column strip.
     let dense_root = temp.path().join("dense-select");
     let values: Vec<f32> = (0..24).map(|v| v as f32).collect();
-    DenseWriter::new(&dense_root)
-        .chunk(Partition::fixed_cells(2))
+    DenseWriter::new(&dense_root, Partition::fixed_cells(2), Partition::fixed_cells(16))
         .threads(4)
         .write(&values, [6, 4])
         .unwrap();
@@ -476,8 +462,7 @@ fn dense_and_csr_support_2d_on_demand_select() {
 
     // CSR: densify a gene subset for a mini-batch of cells.
     let csr_root = temp.path().join("csr-select");
-    CsrWriter::new(&csr_root)
-        .chunk(Partition::fixed_cells(1))
+    CsrWriter::new(&csr_root, Partition::fixed_cells(1), Partition::fixed_cells(16))
         .threads(4)
         .write(
             &[0u64, 2, 3, 5],

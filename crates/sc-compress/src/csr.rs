@@ -57,25 +57,16 @@ pub struct CsrWriter {
 }
 
 impl CsrWriter {
-    pub fn new(dir: impl AsRef<Path>) -> Self {
+    /// Create a writer. Callers must pass chunk/block partitions explicitly.
+    pub fn new(dir: impl AsRef<Path>, chunk: Partition, block: Partition) -> Self {
         Self {
             dir: dir.as_ref().to_path_buf(),
-            chunk: Partition::fixed_cells(1024),
-            block: Partition::fixed_cells(16),
+            chunk,
+            block,
             compressor: Compressor::dyn_blosc_lz4(),
             indptr_compressor: Compressor::zstd(3),
             threads: default_threads(),
         }
-    }
-
-    pub fn chunk(mut self, partition: Partition) -> Self {
-        self.chunk = partition;
-        self
-    }
-
-    pub fn block(mut self, partition: Partition) -> Self {
-        self.block = partition;
-        self
     }
 
     pub fn compressor(mut self, compressor: Compressor) -> Self {
@@ -304,7 +295,7 @@ impl CsrWriter {
 pub struct CsrMatrix {
     store: Arc<dyn ByteStore>,
     meta: CsrMeta,
-    /// Shared indptr so consumers (e.g. scdata) can pin without copying.
+    /// Shared indptr so consumers (e.g. sc-load) can pin without copying.
     indptr: Arc<[u64]>,
     limits: ReadLimits,
 }

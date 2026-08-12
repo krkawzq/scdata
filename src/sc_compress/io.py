@@ -46,8 +46,8 @@ def write(
     to :func:`write_dense` and coerced with :func:`numpy.asarray`.
 
     Partitioning follows :class:`~sc_compress.WriteOptions`: ``policy='cells'``
-    → ``fixed_cells``; ``policy='budget'`` → ``bytes_budget``. Dense matrices
-    only support ``cells``.
+    → ``fixed_cells``; ``policy='budget'`` → ``bytes_budget`` for CSR. Dense
+    ``budget`` policies are lowered in Python to ``fixed_cells``.
     """
     if is_sparse_matrix(matrix):
         write_csr(
@@ -79,8 +79,9 @@ def write_dense(
     path_obj = ensure_path(path)
     ensure_writable_path(path_obj, overwrite=overwrite)
     opts = resolve_write_options(options, n_workers=n_workers)
-    chunk, block = opts.resolve(dense=True)
     array = normalize_dense(values)
+    row_bytes = int(array.shape[1]) * int(array.dtype.itemsize)
+    chunk, block = opts.resolve(dense=True, row_bytes=row_bytes)
     _core._write_dense(
         str(path_obj),
         array,

@@ -22,6 +22,8 @@ _INT64_MAX = int(np.iinfo(np.int64).max)
 PartitionPolicy = Literal["cells", "budget"]
 DEFAULT_CHUNK_CELLS = 1024
 DEFAULT_BLOCK_CELLS = 16
+DEFAULT_CHUNK_BUDGET = 100 << 20  # 100 MiB
+DEFAULT_BLOCK_BUDGET = 400 << 10  # 400 KiB
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +32,18 @@ class ResolvedPartition:
 
     policy: PartitionPolicy
     n: int
+
+
+def dense_cells_for_budget(budget: int, row_bytes: int) -> int:
+    """Smallest fixed-cell count whose packed size is >= ``budget``.
+
+    When a single row already exceeds the budget, returns ``1``.
+    """
+    budget_n = as_int(budget, name="budget", minimum=1)
+    row_n = as_int(row_bytes, name="row_bytes", minimum=0)
+    if row_n == 0:
+        return 1
+    return max(1, (budget_n + row_n - 1) // row_n)
 
 
 def as_int(
@@ -110,18 +124,21 @@ def resolve_partition(
 
 def resolve_write_partitions(
     *,
-    chunk_policy: object = "cells",
-    block_policy: object = "cells",
+    chunk_policy: object = "budget",
+    block_policy: object = "budget",
     chunk_cells: object | None = None,
     block_cells: object | None = None,
-    chunk_budget: object | None = None,
-    block_budget: object | None = None,
+    chunk_budget: object | None = DEFAULT_CHUNK_BUDGET,
+    block_budget: object | None = DEFAULT_BLOCK_BUDGET,
     dense: bool = False,
+    row_bytes: object | None = None,
 ) -> tuple[ResolvedPartition, ResolvedPartition]:
     """Resolve chunk/block partitions for a write call.
 
     ``policy='cells'`` maps to Rust ``Partition::FixedCells``; ``policy='budget'``
-    maps to ``Partition::BytesBudget``. Dense matrices only support ``cells``.
+    maps to ``Partition::BytesBudget`` for CSR. Dense ``budget`` policies are
+    lowered in Python to ``fixed_cells`` that meet or slightly exceed the budget
+    given ``row_bytes = n_cols * dtype.itemsize``.
     """
     chunk = resolve_partition(
         policy=chunk_policy,
@@ -137,11 +154,29 @@ def resolve_write_partitions(
         default_cells=DEFAULT_BLOCK_CELLS,
         name="block",
     )
-    if dense and (chunk.policy != "cells" or block.policy != "cells"):
-        _invalid_argument(
-            "dense writes require chunk_policy='cells' and block_policy='cells' "
-            "(bytes_budget is CSR-only)"
-        )
+    if not dense:
+        return chunk, block
+
+    if chunk.policy == "budget" or block.policy == "budget":
+        if row_bytes is None:
+            _invalid_argument(
+                "dense budget partitions require row_bytes "
+                "(n_cols * dtype.itemsize) to lower to fixed_cells"
+            )
+        row_n = as_int(row_bytes, name="row_bytes", minimum=0)
+
+        def _lower(part: ResolvedPartition) -> ResolvedPartition:
+            if part.policy == "cells":
+                return part
+            return ResolvedPartition(
+                policy="cells",
+                n=dense_cells_for_budget(part.n, row_n),
+            )
+
+        chunk = _lower(chunk)
+        block = _lower(block)
+        if chunk.n < block.n:
+            chunk = ResolvedPartition(policy="cells", n=block.n)
     return chunk, block
 
 
