@@ -63,6 +63,7 @@ pub(super) fn dispatch_sse2(src: StorageDType, dst: OutputDType) -> Option<Conve
         (S::I16, O::F32) => sse2_i16_f32,
         (S::U16, O::F32) => sse2_u16_f32,
         (S::I32, O::F32) => sse2_i32_f32,
+        (S::U32, O::F32) => sse2_u32_f32,
         (S::I16, O::F64) => sse2_i16_f64,
         (S::U16, O::F64) => sse2_u16_f64,
         (S::I32, O::F64) => sse2_i32_f64,
@@ -81,7 +82,18 @@ pub(super) fn dispatch_gather32_avx512(
         (S::I32 | S::U32, O::I32 | O::U32) | (S::F32, O::F32) => gather32_copy_avx512,
         (S::I32, O::F32) => gather32_i32_f32_avx512,
         (S::U32, O::F32) => gather32_u32_f32_avx512,
+        (S::I32, O::I64 | O::U64) if std::arch::is_x86_feature_detected!("avx2") => {
+            gather32_i32_i64_avx512
+        }
+        (S::U32, O::I64 | O::U64) if std::arch::is_x86_feature_detected!("avx2") => {
+            gather32_u32_i64_avx512
+        }
         (S::I32, O::F64) if std::arch::is_x86_feature_detected!("avx2") => gather32_i32_f64_avx512,
+        (S::U32, O::F64) if std::arch::is_x86_feature_detected!("avx2") => gather32_u32_f64_avx512,
+        (S::F32, O::F64) if std::arch::is_x86_feature_detected!("avx2") => gather32_f32_f64_avx512,
+        (S::U64, O::F64) if std::arch::is_x86_feature_detected!("avx512dq") => {
+            gather32_u64_f64_avx512
+        }
         _ => return None,
     })
 }
@@ -96,6 +108,11 @@ pub(super) fn dispatch_gather32_avx2(
         (S::I32 | S::U32, O::I32 | O::U32) | (S::F32, O::F32) => gather32_copy_avx2,
         (S::I32, O::F32) => gather32_i32_f32_avx2,
         (S::U32, O::F32) => gather32_u32_f32_avx2,
+        (S::I32, O::I64 | O::U64) => gather32_i32_i64_avx2,
+        (S::U32, O::I64 | O::U64) => gather32_u32_i64_avx2,
+        (S::I32, O::F64) => gather32_i32_f64_avx2,
+        (S::U32, O::F64) => gather32_u32_f64_avx2,
+        (S::F32, O::F64) => gather32_f32_f64_avx2,
         _ => return None,
     })
 }
@@ -242,6 +259,161 @@ unsafe fn gather32_i32_f64_avx512(
     Ok(())
 }
 
+macro_rules! gather32_i32_to_i64_avx512 {
+    ($name:ident, $src_ty:ty, $extend:ident, $tail:expr) => {
+        #[target_feature(enable = "avx2,avx512f")]
+        unsafe fn $name(
+            input: *const u8,
+            output: *mut u8,
+            source_offsets: &[i32],
+            target_byte: usize,
+            _op: &ConvertOp,
+        ) -> Result<()> {
+            const LANES: usize = 8;
+            let vector_count = source_offsets.len() / LANES * LANES;
+            // SAFETY: each compiler-built offset names one complete 32-bit
+            // source and the contiguous target contains one 64-bit slot per lane.
+            unsafe {
+                let target = output.add(target_byte);
+                for index in (0..vector_count).step_by(LANES) {
+                    let offsets =
+                        _mm256_loadu_si256(source_offsets.as_ptr().add(index).cast::<__m256i>());
+                    let values = _mm256_i32gather_epi32::<1>(input.cast::<i32>(), offsets);
+                    _mm512_storeu_si512(target.add(index * 8).cast::<__m512i>(), $extend(values));
+                }
+                let convert = $tail;
+                for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
+                    let value = input
+                        .add(source_byte as usize)
+                        .cast::<$src_ty>()
+                        .read_unaligned();
+                    target
+                        .add((vector_count + index) * 8)
+                        .cast::<u64>()
+                        .write_unaligned(convert(value));
+                }
+            }
+            Ok(())
+        }
+    };
+}
+
+gather32_i32_to_i64_avx512!(
+    gather32_i32_i64_avx512,
+    i32,
+    _mm512_cvtepi32_epi64,
+    |value: i32| (i64::from(value) as u64).to_le()
+);
+gather32_i32_to_i64_avx512!(
+    gather32_u32_i64_avx512,
+    u32,
+    _mm512_cvtepu32_epi64,
+    |value: u32| u64::from(value).to_le()
+);
+
+#[target_feature(enable = "avx2,avx512f")]
+unsafe fn gather32_u32_f64_avx512(
+    input: *const u8,
+    output: *mut u8,
+    source_offsets: &[i32],
+    target_byte: usize,
+    _op: &ConvertOp,
+) -> Result<()> {
+    const LANES: usize = 8;
+    let vector_count = source_offsets.len() / LANES * LANES;
+    // SAFETY: all gather offsets and contiguous f64 stores are compiler-sealed.
+    unsafe {
+        let target = output.add(target_byte);
+        for index in (0..vector_count).step_by(LANES) {
+            let offsets = _mm256_loadu_si256(source_offsets.as_ptr().add(index).cast::<__m256i>());
+            let values = _mm256_i32gather_epi32::<1>(input.cast::<i32>(), offsets);
+            _mm512_storeu_pd(
+                target.add(index * 8).cast::<f64>(),
+                _mm512_cvtepu32_pd(values),
+            );
+        }
+        for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
+            let value = input
+                .add(source_byte as usize)
+                .cast::<u32>()
+                .read_unaligned();
+            target
+                .add((vector_count + index) * 8)
+                .cast::<f64>()
+                .write_unaligned(f64::from(value));
+        }
+    }
+    Ok(())
+}
+
+#[target_feature(enable = "avx2,avx512f")]
+unsafe fn gather32_f32_f64_avx512(
+    input: *const u8,
+    output: *mut u8,
+    source_offsets: &[i32],
+    target_byte: usize,
+    _op: &ConvertOp,
+) -> Result<()> {
+    const LANES: usize = 8;
+    let vector_count = source_offsets.len() / LANES * LANES;
+    // SAFETY: all gather offsets and contiguous f64 stores are compiler-sealed.
+    unsafe {
+        let target = output.add(target_byte);
+        for index in (0..vector_count).step_by(LANES) {
+            let offsets = _mm256_loadu_si256(source_offsets.as_ptr().add(index).cast::<__m256i>());
+            let values = _mm256_i32gather_ps::<1>(input.cast::<f32>(), offsets);
+            _mm512_storeu_pd(target.add(index * 8).cast::<f64>(), _mm512_cvtps_pd(values));
+        }
+        for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
+            let bits = input
+                .add(source_byte as usize)
+                .cast::<u32>()
+                .read_unaligned();
+            target
+                .add((vector_count + index) * 8)
+                .cast::<f64>()
+                .write_unaligned(f64::from(f32::from_bits(bits)));
+        }
+    }
+    Ok(())
+}
+
+#[target_feature(enable = "avx512f,avx512dq")]
+unsafe fn gather32_u64_f64_avx512(
+    input: *const u8,
+    output: *mut u8,
+    source_offsets: &[i32],
+    target_byte: usize,
+    _op: &ConvertOp,
+) -> Result<()> {
+    const LANES: usize = 8;
+    let vector_count = source_offsets.len() / LANES * LANES;
+    // SAFETY: the signed byte offsets address complete u64 values and the
+    // target run has one complete f64 slot per gathered lane.
+    unsafe {
+        let target = output.add(target_byte);
+        for index in (0..vector_count).step_by(LANES) {
+            let offsets = _mm256_loadu_si256(source_offsets.as_ptr().add(index).cast::<__m256i>());
+            let values = _mm512_i32gather_epi64::<1>(offsets, input.cast::<i64>());
+            _mm512_storeu_pd(
+                target.add(index * 8).cast::<f64>(),
+                _mm512_cvtepu64_pd(values),
+            );
+        }
+        for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
+            let value = input
+                .add(source_byte as usize)
+                .cast::<u64>()
+                .read_unaligned();
+            target
+                .add((vector_count + index) * 8)
+                .cast::<f64>()
+                .write_unaligned(value as f64);
+        }
+    }
+    Ok(())
+}
+
 #[target_feature(enable = "avx2")]
 unsafe fn gather32_copy_avx2(
     input: *const u8,
@@ -346,6 +518,166 @@ unsafe fn gather32_u32_f32_avx2(
                 .add((vector_count + index) * 4)
                 .cast::<u32>()
                 .write_unaligned((value as f32).to_bits());
+        }
+    }
+    Ok(())
+}
+
+macro_rules! gather32_i32_to_i64_avx2 {
+    ($name:ident, $src_ty:ty, $extend:ident, $tail:expr) => {
+        #[target_feature(enable = "avx2")]
+        unsafe fn $name(
+            input: *const u8,
+            output: *mut u8,
+            source_offsets: &[i32],
+            target_byte: usize,
+            _op: &ConvertOp,
+        ) -> Result<()> {
+            const LANES: usize = 4;
+            let vector_count = source_offsets.len() / LANES * LANES;
+            // SAFETY: the compiler-built offsets and target run cover every
+            // gathered 32-bit source and widened 64-bit destination.
+            unsafe {
+                let target = output.add(target_byte);
+                for index in (0..vector_count).step_by(LANES) {
+                    let offsets =
+                        _mm_loadu_si128(source_offsets.as_ptr().add(index).cast::<__m128i>());
+                    let values = _mm_i32gather_epi32::<1>(input.cast::<i32>(), offsets);
+                    _mm256_storeu_si256(target.add(index * 8).cast::<__m256i>(), $extend(values));
+                }
+                let convert = $tail;
+                for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
+                    let value = input
+                        .add(source_byte as usize)
+                        .cast::<$src_ty>()
+                        .read_unaligned();
+                    target
+                        .add((vector_count + index) * 8)
+                        .cast::<u64>()
+                        .write_unaligned(convert(value));
+                }
+            }
+            Ok(())
+        }
+    };
+}
+
+gather32_i32_to_i64_avx2!(
+    gather32_i32_i64_avx2,
+    i32,
+    _mm256_cvtepi32_epi64,
+    |value: i32| (i64::from(value) as u64).to_le()
+);
+gather32_i32_to_i64_avx2!(
+    gather32_u32_i64_avx2,
+    u32,
+    _mm256_cvtepu32_epi64,
+    |value: u32| u64::from(value).to_le()
+);
+
+#[target_feature(enable = "avx2")]
+unsafe fn gather32_i32_f64_avx2(
+    input: *const u8,
+    output: *mut u8,
+    source_offsets: &[i32],
+    target_byte: usize,
+    _op: &ConvertOp,
+) -> Result<()> {
+    const LANES: usize = 4;
+    let vector_count = source_offsets.len() / LANES * LANES;
+    // SAFETY: all gather offsets and contiguous f64 stores are compiler-sealed.
+    unsafe {
+        let target = output.add(target_byte);
+        for index in (0..vector_count).step_by(LANES) {
+            let offsets = _mm_loadu_si128(source_offsets.as_ptr().add(index).cast::<__m128i>());
+            let values = _mm_i32gather_epi32::<1>(input.cast::<i32>(), offsets);
+            _mm256_storeu_pd(
+                target.add(index * 8).cast::<f64>(),
+                _mm256_cvtepi32_pd(values),
+            );
+        }
+        for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
+            let value = input
+                .add(source_byte as usize)
+                .cast::<i32>()
+                .read_unaligned();
+            target
+                .add((vector_count + index) * 8)
+                .cast::<f64>()
+                .write_unaligned(f64::from(value));
+        }
+    }
+    Ok(())
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn gather32_u32_f64_avx2(
+    input: *const u8,
+    output: *mut u8,
+    source_offsets: &[i32],
+    target_byte: usize,
+    _op: &ConvertOp,
+) -> Result<()> {
+    const LANES: usize = 4;
+    let vector_count = source_offsets.len() / LANES * LANES;
+    let correction = _mm256_set1_pd(4_294_967_296.0);
+    // SAFETY: all gather offsets and contiguous stores are compiler-sealed;
+    // signed conversion plus a masked 2^32 correction covers the u32 domain.
+    unsafe {
+        let target = output.add(target_byte);
+        for index in (0..vector_count).step_by(LANES) {
+            let offsets = _mm_loadu_si128(source_offsets.as_ptr().add(index).cast::<__m128i>());
+            let values = _mm_i32gather_epi32::<1>(input.cast::<i32>(), offsets);
+            let signed = _mm256_cvtepi32_pd(values);
+            let negative = _mm_srai_epi32::<31>(values);
+            let negative = _mm256_cvtepi32_epi64(negative);
+            let add = _mm256_and_pd(_mm256_castsi256_pd(negative), correction);
+            _mm256_storeu_pd(
+                target.add(index * 8).cast::<f64>(),
+                _mm256_add_pd(signed, add),
+            );
+        }
+        for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
+            let value = input
+                .add(source_byte as usize)
+                .cast::<u32>()
+                .read_unaligned();
+            target
+                .add((vector_count + index) * 8)
+                .cast::<f64>()
+                .write_unaligned(f64::from(value));
+        }
+    }
+    Ok(())
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn gather32_f32_f64_avx2(
+    input: *const u8,
+    output: *mut u8,
+    source_offsets: &[i32],
+    target_byte: usize,
+    _op: &ConvertOp,
+) -> Result<()> {
+    const LANES: usize = 4;
+    let vector_count = source_offsets.len() / LANES * LANES;
+    // SAFETY: every compiler-built offset and contiguous destination slot is valid.
+    unsafe {
+        let target = output.add(target_byte);
+        for index in (0..vector_count).step_by(LANES) {
+            let offsets = _mm_loadu_si128(source_offsets.as_ptr().add(index).cast::<__m128i>());
+            let values = _mm_i32gather_ps::<1>(input.cast::<f32>(), offsets);
+            _mm256_storeu_pd(target.add(index * 8).cast::<f64>(), _mm256_cvtps_pd(values));
+        }
+        for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
+            let bits = input
+                .add(source_byte as usize)
+                .cast::<u32>()
+                .read_unaligned();
+            target
+                .add((vector_count + index) * 8)
+                .cast::<f64>()
+                .write_unaligned(f64::from(f32::from_bits(bits)));
         }
     }
     Ok(())
@@ -1262,6 +1594,32 @@ unsafe fn sse2_i32_f32(
         for index in (0..vector_count).step_by(LANES) {
             let values = _mm_loadu_si128(input.add(index * 4).cast::<__m128i>());
             _mm_storeu_ps(output.add(index * 4).cast::<f32>(), _mm_cvtepi32_ps(values));
+        }
+    }
+    finish_scalar!(input, output, vector_count, count, op);
+    Ok(())
+}
+
+#[target_feature(enable = "sse2")]
+unsafe fn sse2_u32_f32(
+    input: *const u8,
+    output: *mut u8,
+    count: usize,
+    op: &ConvertOp,
+) -> Result<()> {
+    const LANES: usize = 4;
+    let vector_count = count / LANES * LANES;
+    let correction = _mm_set1_ps(4_294_967_296.0);
+    // SAFETY: SSE2 is baseline on x86_64 and every unaligned operation stays
+    // inside the caller-validated four-element windows. Signed conversion plus
+    // a 2^32 correction covers the complete u32 domain.
+    unsafe {
+        for index in (0..vector_count).step_by(LANES) {
+            let values = _mm_loadu_si128(input.add(index * 4).cast::<__m128i>());
+            let signed = _mm_cvtepi32_ps(values);
+            let negative = _mm_srai_epi32::<31>(values);
+            let add = _mm_and_ps(_mm_castsi128_ps(negative), correction);
+            _mm_storeu_ps(output.add(index * 4).cast::<f32>(), _mm_add_ps(signed, add));
         }
     }
     finish_scalar!(input, output, vector_count, count, op);

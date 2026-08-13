@@ -128,16 +128,8 @@ def write_scc(
         Optional ``callback(name, index, total)`` invoked after each
         sc-compress matrix is written (``index`` is 1-based).
     """
-    try:
-        import anndata as ad
-        import zarr
-    except ModuleNotFoundError as error:
-        if error.name in {"anndata", "zarr"}:
-            raise ImportError(
-                "AnnData support requires anndata and zarr; install with scdata-toolkit[anndata]"
-            ) from None
-        raise
-
+    import anndata as ad
+    import zarr
     from anndata.experimental import write_dispatched
 
     if not isinstance(adata, ad.AnnData):
@@ -286,15 +278,8 @@ def read_scc(
     num_workers
         Per-matrix chunk workers. Overrides ``limits.num_workers`` when provided.
     """
-    try:
-        import anndata as ad
-        import zarr
-    except ModuleNotFoundError as error:
-        if error.name in {"anndata", "zarr"}:
-            raise ImportError(
-                "AnnData support requires anndata and zarr; install with scdata-toolkit[anndata]"
-            ) from None
-        raise
+    import anndata as ad
+    import zarr
     from anndata._io.specs import read_elem
     from anndata._io.utils import _read_legacy_raw
     from anndata._io.zarr import read_dataframe
@@ -1142,14 +1127,7 @@ def _open_store_for_read(path: Path) -> tuple[Any, Path | None]:
     Returns ``(group, archive_path)``.  ``archive_path`` is set for ZIP inputs
     so matrix reads can use :func:`scdata.open_store` with ``zip_prefix``.
     """
-    try:
-        import zarr
-    except ModuleNotFoundError as error:
-        if error.name == "zarr":
-            raise ImportError(
-                "Zarr support requires zarr; install with scdata-toolkit[anndata]"
-            ) from None
-        raise
+    import zarr
     from zarr.storage import ZipStore
 
     if path.is_file():
@@ -1169,14 +1147,7 @@ def _open_store_for_read(path: Path) -> tuple[Any, Path | None]:
 @contextmanager
 def _write_config() -> Iterator[None]:
     """Disable AnnData auto-sharding for annotation arrays during write."""
-    try:
-        import anndata as ad
-    except ModuleNotFoundError as error:
-        if error.name in {"anndata", "zarr"}:
-            raise ImportError(
-                "AnnData support requires anndata and zarr; install with scdata-toolkit[anndata]"
-            ) from None
-        raise
+    import anndata as ad
 
     override = (
         ad.settings.override(auto_shard_zarr_v3=False)

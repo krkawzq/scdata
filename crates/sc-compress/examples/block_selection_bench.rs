@@ -1,4 +1,7 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::fmt;
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use sc_compress::{
@@ -6,22 +9,94 @@ use sc_compress::{
     Partition, ReadLimits, SelectedArray, Selection,
 };
 
-fn median(mut samples: Vec<Duration>) -> Duration {
+struct CountingAllocator;
+
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: every operation forwards the original allocation contract unchanged
+// to the system allocator and only records successful allocations.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is forwarded unchanged.
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is forwarded unchanged.
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: `pointer` and `layout` came from the system allocator.
+        unsafe { System.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the original allocation and requested size are forwarded unchanged.
+        let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
+        if !new_pointer.is_null() {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        }
+        new_pointer
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[derive(Clone, Copy)]
+struct Measurement {
+    elapsed: Duration,
+    allocations: usize,
+    allocated_bytes: usize,
+}
+
+impl fmt::Display for Measurement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "median={:?} allocations={} allocated_bytes={}",
+            self.elapsed, self.allocations, self.allocated_bytes
+        )
+    }
+}
+
+fn median<T: Ord + Copy>(samples: &mut [T]) -> T {
     samples.sort_unstable();
     samples[samples.len() / 2]
 }
 
-fn measure(mut operation: impl FnMut()) -> Duration {
+fn measure(mut operation: impl FnMut()) -> Measurement {
     operation();
-    median(
-        (0..7)
-            .map(|_| {
-                let start = Instant::now();
-                operation();
-                start.elapsed()
-            })
-            .collect(),
-    )
+    let mut elapsed = Vec::with_capacity(7);
+    let mut allocations = Vec::with_capacity(7);
+    let mut allocated_bytes = Vec::with_capacity(7);
+    for _ in 0..7 {
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        let start = Instant::now();
+        operation();
+        elapsed.push(start.elapsed());
+        allocations.push(ALLOCATIONS.load(Ordering::Relaxed));
+        allocated_bytes.push(ALLOCATED_BYTES.load(Ordering::Relaxed));
+    }
+    Measurement {
+        elapsed: median(&mut elapsed),
+        allocations: median(&mut allocations),
+        allocated_bytes: median(&mut allocated_bytes),
+    }
 }
 
 fn main() {
@@ -44,7 +119,21 @@ fn main() {
     .write(&dense_values, [rows as u64, cols as u64])
     .unwrap();
     let dense = open_dense_with_limits(&dense_root, limits).unwrap();
+    let dense_single =
+        open_dense_with_limits(&dense_root, ReadLimits::default().threads(1)).unwrap();
+    let tiny_rows = Selection::rows_only(AxisIndex::positions([0, 8, 16, 24]));
+    let tiny_dense_single = measure(|| {
+        black_box(dense_single.select(tiny_rows.clone()).unwrap());
+    });
+    let tiny_dense_parallel = measure(|| {
+        black_box(dense.select(tiny_rows.clone()).unwrap());
+    });
+    println!("dense_tiny_threads1 {tiny_dense_single}");
+    println!("dense_tiny_threads4 {tiny_dense_parallel}");
     let selection = Selection::rows_only(AxisIndex::positions(selected_rows.clone()));
+    let direct_dense_single = measure(|| {
+        black_box(dense_single.select(selection.clone()).unwrap());
+    });
     let direct_dense = measure(|| {
         black_box(dense.select(selection.clone()).unwrap());
     });
@@ -60,14 +149,18 @@ fn main() {
         }
         black_box(output);
     });
-    println!("dense_block_scatter median={direct_dense:?}");
-    println!("dense_bounding_window median={bounding_dense:?}");
+    println!("dense_block_scatter_threads1 {direct_dense_single}");
+    println!("dense_block_scatter_threads4 {direct_dense}");
+    println!("dense_bounding_window {bounding_dense}");
 
     let selected_cols = (0..cols as u64).step_by(4).collect::<Vec<_>>();
     let selection_2d = Selection::new(
         AxisIndex::positions(selected_rows.clone()),
         AxisIndex::positions(selected_cols.clone()),
     );
+    let direct_dense_2d_single = measure(|| {
+        black_box(dense_single.select(selection_2d.clone()).unwrap());
+    });
     let direct_dense_2d = measure(|| {
         black_box(dense.select(selection_2d.clone()).unwrap());
     });
@@ -86,8 +179,9 @@ fn main() {
         }
         black_box(output);
     });
-    println!("dense_2d_block_scatter median={direct_dense_2d:?}");
-    println!("dense_2d_bounding_window median={bounding_dense_2d:?}");
+    println!("dense_2d_block_scatter_threads1 {direct_dense_2d_single}");
+    println!("dense_2d_block_scatter_threads4 {direct_dense_2d}");
+    println!("dense_2d_bounding_window {bounding_dense_2d}");
 
     let csr_root = temp.path().join("csr");
     let nnz_per_row = 64usize;
@@ -111,7 +205,29 @@ fn main() {
     .write(&indptr, &indices, &values, [rows as u64, cols as u64])
     .unwrap();
     let csr = open_csr_with_limits(&csr_root, limits).unwrap();
+    let csr_single = open_csr_with_limits(&csr_root, ReadLimits::default().threads(1)).unwrap();
+    let tiny_csr_single = measure(|| {
+        black_box(
+            csr_single
+                .select(tiny_rows.clone(), CsrOutput::Sparse)
+                .unwrap(),
+        );
+    });
+    let tiny_csr_parallel = measure(|| {
+        black_box(csr.select(tiny_rows.clone(), CsrOutput::Sparse).unwrap());
+    });
+    println!("csr_tiny_threads1 {tiny_csr_single}");
+    println!("csr_tiny_threads4 {tiny_csr_parallel}");
     let selection = Selection::rows_only(AxisIndex::positions(selected_rows.clone()));
+    let direct_csr_single = measure(|| {
+        let result = csr_single
+            .select(selection.clone(), CsrOutput::Sparse)
+            .unwrap();
+        let SelectedArray::Csr(result) = result else {
+            unreachable!();
+        };
+        black_box(result);
+    });
     let direct_csr = measure(|| {
         let result = csr.select(selection.clone(), CsrOutput::Sparse).unwrap();
         let SelectedArray::Csr(result) = result else {
@@ -136,17 +252,26 @@ fn main() {
         }
         black_box((output_indices, output_data));
     });
-    println!("csr_block_scatter median={direct_csr:?}");
-    println!("csr_bounding_window median={bounding_csr:?}");
+    println!("csr_block_scatter_threads1 {direct_csr_single}");
+    println!("csr_block_scatter_threads4 {direct_csr}");
+    println!("csr_bounding_window {bounding_csr}");
 
     let wide_column_selection = Selection::new(AxisIndex::All, AxisIndex::range(8, 56));
+    let direct_csr_wide_columns_single = measure(|| {
+        black_box(
+            csr_single
+                .select(wide_column_selection.clone(), CsrOutput::Sparse)
+                .unwrap(),
+        );
+    });
     let direct_csr_wide_columns = measure(|| {
         black_box(
             csr.select(wide_column_selection.clone(), CsrOutput::Sparse)
                 .unwrap(),
         );
     });
-    println!("csr_wide_column_range median={direct_csr_wide_columns:?}");
+    println!("csr_wide_column_range_threads1 {direct_csr_wide_columns_single}");
+    println!("csr_wide_column_range_threads4 {direct_csr_wide_columns}");
 
     let sparse_cols_root = temp.path().join("csr-sparse-columns");
     let sparse_col_indptr = (0..=rows)
@@ -186,6 +311,6 @@ fn main() {
     let full_sparse_col_rows = measure(|| {
         black_box(sparse_cols.decode_rows(0..rows as u64).unwrap());
     });
-    println!("csr_sparse_col_block_scatter median={direct_sparse_cols:?}");
-    println!("csr_sparse_col_full_rows median={full_sparse_col_rows:?}");
+    println!("csr_sparse_col_block_scatter {direct_sparse_cols}");
+    println!("csr_sparse_col_full_rows {full_sparse_col_rows}");
 }

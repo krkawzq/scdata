@@ -694,6 +694,18 @@ impl ByteStore for DirectoryStore {
     }
 
     fn read_range(&self, key: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        self.read_range_into(key, offset, len, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn read_range_into(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        buffer: &mut Vec<u8>,
+    ) -> Result<()> {
         let file = self.open_value(key)?;
         let file_len = file
             .metadata()
@@ -712,16 +724,16 @@ impl ByteStore for DirectoryStore {
             Error::corrupt("directory store range", "available length exceeds usize")
         })?;
         let to_read = len.min(available);
-        let mut buffer = zeroed_buffer(to_read)?;
+        resize_buffer(buffer, to_read)?;
         if to_read == 0 {
-            return Ok(buffer);
+            return Ok(());
         }
-        file.read_exact_at(&mut buffer, offset)
+        file.read_exact_at(buffer, offset)
             .map_err(|error| Error::Path {
                 path: self.root.join(key),
                 message: error.to_string(),
             })?;
-        Ok(buffer)
+        Ok(())
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
@@ -914,6 +926,16 @@ fn zeroed_buffer(len: usize) -> Result<Vec<u8>> {
     buffer.try_reserve_exact(len)?;
     buffer.resize(len, 0);
     Ok(buffer)
+}
+
+fn resize_buffer(buffer: &mut Vec<u8>, len: usize) -> Result<()> {
+    if buffer.len() < len {
+        buffer.try_reserve_exact(len - buffer.len())?;
+        buffer.resize(len, 0);
+    } else {
+        buffer.truncate(len);
+    }
+    Ok(())
 }
 
 fn io_error(error: Errno) -> std::io::Error {

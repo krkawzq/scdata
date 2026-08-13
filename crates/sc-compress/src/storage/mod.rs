@@ -93,6 +93,26 @@ pub trait ByteStore: Send + Sync {
 
     fn read_range(&self, key: &str, offset: u64, len: usize) -> Result<Vec<u8>>;
 
+    /// Read a range into caller-owned reusable storage.
+    ///
+    /// Implementations may override this to preserve `output` capacity. The
+    /// default keeps existing custom stores source-compatible, but may replace
+    /// the allocation on every call.
+    fn read_range_into(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        // A store using the compatibility path cannot reuse this allocation.
+        // Release it before `read_range` allocates the replacement so retained
+        // worker scratch and the returned range are not live at the same time.
+        drop(std::mem::take(output));
+        *output = self.read_range(key, offset, len)?;
+        Ok(())
+    }
+
     fn exists(&self, key: &str) -> Result<bool>;
 
     /// Report true only when a non-zero offset does not replay the value prefix.

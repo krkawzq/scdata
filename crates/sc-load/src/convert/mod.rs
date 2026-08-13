@@ -59,6 +59,7 @@ type ConvertCsrFn = unsafe fn(
     output: *mut u8,
     count: usize,
     map: Option<&CsrMap>,
+    op: &ConvertOp,
 );
 type ValidateSliceFn = unsafe fn(input: *const u8, count: usize, op: &ConvertOp) -> bool;
 
@@ -160,6 +161,32 @@ impl ConvertOp {
         }
     }
 
+    #[cfg(all(test, target_arch = "x86_64", target_endian = "little"))]
+    fn force_gather32_avx2_for_test(&mut self) -> bool {
+        self.convert_map_gather32 = scalar_gather32;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return false;
+        }
+        let Some(kernel) = simd::dispatch_gather32_avx2(self.src, self.dst) else {
+            return false;
+        };
+        self.convert_map_gather32 = kernel;
+        true
+    }
+
+    #[cfg(all(test, target_arch = "x86_64", target_endian = "little"))]
+    fn force_gather32_avx512_for_test(&mut self) -> bool {
+        self.convert_map_gather32 = scalar_gather32;
+        if !std::arch::is_x86_feature_detected!("avx512f") {
+            return false;
+        }
+        let Some(kernel) = simd::dispatch_gather32_avx512(self.src, self.dst) else {
+            return false;
+        };
+        self.convert_map_gather32 = kernel;
+        true
+    }
+
     /// Validate the only conversion class that can fail during execution.
     #[inline]
     pub(crate) fn validate_one(&self, input: &[u8]) -> Result<()> {
@@ -200,12 +227,17 @@ impl ConvertOp {
             return Some(16);
         }
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
-        if self.src == StorageDType::I32
-            && self.dst == OutputDType::F64
-            && std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("avx512f")
         {
-            return Some(8);
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && simd::dispatch_gather32_avx512(self.src, self.dst).is_some()
+            {
+                return Some(8);
+            }
+            if std::arch::is_x86_feature_detected!("avx2")
+                && simd::dispatch_gather32_avx2(self.src, self.dst).is_some()
+            {
+                return Some(8);
+            }
         }
         None
     }
@@ -364,9 +396,29 @@ impl ConvertOp {
         };
         // SAFETY: validation proved both source arrays contain `count`
         // elements, all indices/map targets are in range, and output is unique.
-        unsafe { kernel(values, indices, output, count, map) };
+        unsafe { kernel(values, indices, output, count, map, self) };
         true
     }
+}
+
+fn dispatch_fallback_csr_fn<const INDEX_BYTES: usize>(
+    src: StorageDType,
+    dst: OutputDType,
+) -> Option<ConvertCsrFn> {
+    use OutputDType as O;
+    use StorageDType as S;
+    Some(match (src, dst) {
+        (S::I16, O::U16) => csr_fallback_i16_u16::<INDEX_BYTES>,
+        (S::I16, O::U32) => csr_fallback_i16_u32::<INDEX_BYTES>,
+        (S::I16, O::U64) => csr_fallback_i16_u64::<INDEX_BYTES>,
+        (S::I32, O::U32) => csr_fallback_i32_u32::<INDEX_BYTES>,
+        (S::I32, O::U64) => csr_fallback_i32_u64::<INDEX_BYTES>,
+        (S::I64, O::U64) => csr_fallback_i64_u64::<INDEX_BYTES>,
+        (S::U16, O::I16) => csr_fallback_u16_i16::<INDEX_BYTES>,
+        (S::U32, O::I32) => csr_fallback_u32_i32::<INDEX_BYTES>,
+        (S::U64, O::I64) => csr_fallback_u64_i64::<INDEX_BYTES>,
+        _ => return None,
+    })
 }
 
 fn dispatch_csr_fn<const INDEX_BYTES: usize>(
@@ -375,7 +427,7 @@ fn dispatch_csr_fn<const INDEX_BYTES: usize>(
     write_fallback: bool,
 ) -> Option<ConvertCsrFn> {
     if write_fallback {
-        return None;
+        return dispatch_fallback_csr_fn::<INDEX_BYTES>(src, dst);
     }
     use OutputDType as O;
     use StorageDType as S;
@@ -410,9 +462,26 @@ fn dispatch_csr_fn<const INDEX_BYTES: usize>(
     })
 }
 
+fn dispatch_fallback_map_fn(src: StorageDType, dst: OutputDType) -> Option<ConvertMapFn> {
+    use OutputDType as O;
+    use StorageDType as S;
+    Some(match (src, dst) {
+        (S::I16, O::U16) => mapped_fallback_i16_u16,
+        (S::I16, O::U32) => mapped_fallback_i16_u32,
+        (S::I16, O::U64) => mapped_fallback_i16_u64,
+        (S::I32, O::U32) => mapped_fallback_i32_u32,
+        (S::I32, O::U64) => mapped_fallback_i32_u64,
+        (S::I64, O::U64) => mapped_fallback_i64_u64,
+        (S::U16, O::I16) => mapped_fallback_u16_i16,
+        (S::U32, O::I32) => mapped_fallback_u32_i32,
+        (S::U64, O::I64) => mapped_fallback_u64_i64,
+        _ => return None,
+    })
+}
+
 fn dispatch_map_fn(src: StorageDType, dst: OutputDType, write_fallback: bool) -> ConvertMapFn {
     if write_fallback {
-        return scalar_map;
+        return dispatch_fallback_map_fn(src, dst).unwrap_or(scalar_map);
     }
     use OutputDType as O;
     use StorageDType as S;
@@ -447,13 +516,33 @@ fn dispatch_map_fn(src: StorageDType, dst: OutputDType, write_fallback: bool) ->
     }
 }
 
+fn dispatch_fallback_packed_map_fn(
+    src: StorageDType,
+    dst: OutputDType,
+) -> Option<ConvertPackedMapFn> {
+    use OutputDType as O;
+    use StorageDType as S;
+    Some(match (src, dst) {
+        (S::I16, O::U16) => packed_fallback_i16_u16,
+        (S::I16, O::U32) => packed_fallback_i16_u32,
+        (S::I16, O::U64) => packed_fallback_i16_u64,
+        (S::I32, O::U32) => packed_fallback_i32_u32,
+        (S::I32, O::U64) => packed_fallback_i32_u64,
+        (S::I64, O::U64) => packed_fallback_i64_u64,
+        (S::U16, O::I16) => packed_fallback_u16_i16,
+        (S::U32, O::I32) => packed_fallback_u32_i32,
+        (S::U64, O::I64) => packed_fallback_u64_i64,
+        _ => return None,
+    })
+}
+
 fn dispatch_packed_map_fn(
     src: StorageDType,
     dst: OutputDType,
     write_fallback: bool,
 ) -> ConvertPackedMapFn {
     if write_fallback {
-        return scalar_packed_map;
+        return dispatch_fallback_packed_map_fn(src, dst).unwrap_or(scalar_packed_map);
     }
     use OutputDType as O;
     use StorageDType as S;
@@ -488,13 +577,30 @@ fn dispatch_packed_map_fn(
     }
 }
 
+fn dispatch_fallback_gather32_fn(src: StorageDType, dst: OutputDType) -> Option<ConvertGather32Fn> {
+    use OutputDType as O;
+    use StorageDType as S;
+    Some(match (src, dst) {
+        (S::I16, O::U16) => gather32_fallback_i16_u16,
+        (S::I16, O::U32) => gather32_fallback_i16_u32,
+        (S::I16, O::U64) => gather32_fallback_i16_u64,
+        (S::I32, O::U32) => gather32_fallback_i32_u32,
+        (S::I32, O::U64) => gather32_fallback_i32_u64,
+        (S::I64, O::U64) => gather32_fallback_i64_u64,
+        (S::U16, O::I16) => gather32_fallback_u16_i16,
+        (S::U32, O::I32) => gather32_fallback_u32_i32,
+        (S::U64, O::I64) => gather32_fallback_u64_i64,
+        _ => return None,
+    })
+}
+
 fn dispatch_gather32_fn(
     src: StorageDType,
     dst: OutputDType,
     write_fallback: bool,
 ) -> ConvertGather32Fn {
     if write_fallback {
-        return scalar_gather32;
+        return dispatch_fallback_gather32_fn(src, dst).unwrap_or(scalar_gather32);
     }
     #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
     if std::arch::is_x86_feature_detected!("avx512f") {
@@ -514,6 +620,23 @@ fn dispatch_gather32_fn(
         (S::I32 | S::U32, O::I32 | O::U32) | (S::F32, O::F32) => gather32_copy,
         _ => scalar_gather32,
     }
+}
+
+fn dispatch_fallback_slice_fn(src: StorageDType, dst: OutputDType) -> Option<ConvertSliceFn> {
+    use OutputDType as O;
+    use StorageDType as S;
+    Some(match (src, dst) {
+        (S::I16, O::U16) => slice_fallback_i16_u16,
+        (S::I16, O::U32) => slice_fallback_i16_u32,
+        (S::I16, O::U64) => slice_fallback_i16_u64,
+        (S::I32, O::U32) => slice_fallback_i32_u32,
+        (S::I32, O::U64) => slice_fallback_i32_u64,
+        (S::I64, O::U64) => slice_fallback_i64_u64,
+        (S::U16, O::I16) => slice_fallback_u16_i16,
+        (S::U32, O::I32) => slice_fallback_u32_i32,
+        (S::U64, O::I64) => slice_fallback_u64_i64,
+        _ => return None,
+    })
 }
 
 fn dispatch_validate_slice_fn(
@@ -542,7 +665,7 @@ fn dispatch_validate_slice_fn(
 
 fn dispatch_slice_fn(src: StorageDType, dst: OutputDType, write_fallback: bool) -> ConvertSliceFn {
     if write_fallback {
-        return scalar_slice;
+        return dispatch_fallback_slice_fn(src, dst).unwrap_or(scalar_slice);
     }
 
     use OutputDType as O;
@@ -1157,12 +1280,350 @@ macro_rules! dispatch_csr_map {
     }};
 }
 
+macro_rules! checked_fallback_kernels {
+    (
+        $slice:ident,
+        $mapped:ident,
+        $packed:ident,
+        $gather:ident,
+        $csr:ident,
+        $src_bytes:expr,
+        $dst_bytes:expr,
+        $dst_ty:ty,
+        $load:ident,
+        $load_fallback:ident,
+        $store:ident,
+        $overflow:expr,
+        $convert:expr
+    ) => {
+        unsafe fn $slice(
+            input: *const u8,
+            output: *mut u8,
+            count: usize,
+            op: &ConvertOp,
+        ) -> Result<()> {
+            let overflow = $overflow;
+            let convert = $convert;
+            // SAFETY: `fallback` contains one complete destination value.
+            let fallback = unsafe { $load_fallback(op.fallback.as_ptr()) };
+            for element in 0..count {
+                // SAFETY: the caller proves complete source/destination spans.
+                unsafe {
+                    let value = $load(input.add(element * $src_bytes));
+                    let value = if overflow(value) {
+                        fallback
+                    } else {
+                        convert(value)
+                    };
+                    $store(output.add(element * $dst_bytes), value);
+                }
+            }
+            Ok(())
+        }
+
+        unsafe fn $mapped(
+            input: *const u8,
+            output: *mut u8,
+            entries: &[DenseMapEntry],
+            op: &ConvertOp,
+        ) -> Result<()> {
+            let overflow = $overflow;
+            let convert = $convert;
+            // SAFETY: `fallback` contains one complete destination value.
+            let fallback = unsafe { $load_fallback(op.fallback.as_ptr()) };
+            for entry in entries {
+                // SAFETY: compiler-built offsets address complete elements.
+                unsafe {
+                    let value = $load(input.add(entry.source_byte));
+                    let value = if overflow(value) {
+                        fallback
+                    } else {
+                        convert(value)
+                    };
+                    $store(output.add(entry.target_byte), value);
+                }
+            }
+            Ok(())
+        }
+
+        unsafe fn $packed(
+            input: *const u8,
+            output: *mut u8,
+            entries: &[u64],
+            op: &ConvertOp,
+        ) -> Result<()> {
+            let overflow = $overflow;
+            let convert = $convert;
+            // SAFETY: `fallback` contains one complete destination value.
+            let fallback = unsafe { $load_fallback(op.fallback.as_ptr()) };
+            for &entry in entries {
+                let (source_byte, target_byte) = unpack_dense_offsets(entry);
+                // SAFETY: compiler-packed offsets address complete elements.
+                unsafe {
+                    let value = $load(input.add(source_byte));
+                    let value = if overflow(value) {
+                        fallback
+                    } else {
+                        convert(value)
+                    };
+                    $store(output.add(target_byte), value);
+                }
+            }
+            Ok(())
+        }
+
+        unsafe fn $gather(
+            input: *const u8,
+            output: *mut u8,
+            source_offsets: &[i32],
+            target_byte: usize,
+            op: &ConvertOp,
+        ) -> Result<()> {
+            let overflow = $overflow;
+            let convert = $convert;
+            // SAFETY: `fallback` contains one complete destination value.
+            let fallback = unsafe { $load_fallback(op.fallback.as_ptr()) };
+            for (element, &source_byte) in source_offsets.iter().enumerate() {
+                // SAFETY: compiler-built offsets and the contiguous target run
+                // address complete, non-overlapping elements.
+                unsafe {
+                    let value = $load(input.add(source_byte as usize));
+                    let value = if overflow(value) {
+                        fallback
+                    } else {
+                        convert(value)
+                    };
+                    $store(output.add(target_byte + element * $dst_bytes), value);
+                }
+            }
+            Ok(())
+        }
+
+        unsafe fn $csr<const INDEX_BYTES: usize>(
+            values: *const u8,
+            indices: *const u8,
+            output: *mut u8,
+            count: usize,
+            map: Option<&CsrMap>,
+            op: &ConvertOp,
+        ) {
+            #[inline(always)]
+            unsafe fn kernel<const INDEX_BYTES: usize, const MAP_KIND: u8>(
+                values: *const u8,
+                indices: *const u8,
+                output: *mut u8,
+                count: usize,
+                packed_map: *const u32,
+                wide_map: *const usize,
+                fallback: $dst_ty,
+            ) {
+                let overflow = $overflow;
+                let convert = $convert;
+                for element in 0..count {
+                    // SAFETY: prevalidation proves the index and selected map
+                    // entry are present and the resulting target is in bounds.
+                    let target = unsafe {
+                        csr_target::<INDEX_BYTES, $dst_bytes, MAP_KIND>(
+                            indices, element, packed_map, wide_map,
+                        )
+                    };
+                    if target != usize::MAX {
+                        // SAFETY: the source and destination each contain one
+                        // complete, non-overlapping element.
+                        unsafe {
+                            let value = $load(values.add(element * $src_bytes));
+                            let value = if overflow(value) {
+                                fallback
+                            } else {
+                                convert(value)
+                            };
+                            $store(output.add(target), value);
+                        }
+                    }
+                }
+            }
+
+            // SAFETY: `fallback` contains one complete destination value.
+            let fallback = unsafe { $load_fallback(op.fallback.as_ptr()) };
+            // SAFETY: the wrapper prevalidated the selected map and extents.
+            unsafe {
+                match map {
+                    None => kernel::<INDEX_BYTES, CSR_MAP_IDENTITY>(
+                        values,
+                        indices,
+                        output,
+                        count,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        fallback,
+                    ),
+                    Some(CsrMap::Packed32(entries)) => kernel::<INDEX_BYTES, CSR_MAP_PACKED>(
+                        values,
+                        indices,
+                        output,
+                        count,
+                        entries.as_ptr(),
+                        std::ptr::null(),
+                        fallback,
+                    ),
+                    Some(CsrMap::Wide(entries)) => kernel::<INDEX_BYTES, CSR_MAP_WIDE>(
+                        values,
+                        indices,
+                        output,
+                        count,
+                        std::ptr::null(),
+                        entries.as_ptr(),
+                        fallback,
+                    ),
+                }
+            }
+        }
+    };
+}
+
+checked_fallback_kernels!(
+    slice_fallback_i16_u16,
+    mapped_fallback_i16_u16,
+    packed_fallback_i16_u16,
+    gather32_fallback_i16_u16,
+    csr_fallback_i16_u16,
+    2,
+    2,
+    u16,
+    load_i16_ptr,
+    load_u16_ptr,
+    store_u16_ptr,
+    |value: i16| value < 0,
+    |value: i16| value as u16
+);
+checked_fallback_kernels!(
+    slice_fallback_i16_u32,
+    mapped_fallback_i16_u32,
+    packed_fallback_i16_u32,
+    gather32_fallback_i16_u32,
+    csr_fallback_i16_u32,
+    2,
+    4,
+    u32,
+    load_i16_ptr,
+    load_u32_ptr,
+    store_u32_ptr,
+    |value: i16| value < 0,
+    |value: i16| value as u32
+);
+checked_fallback_kernels!(
+    slice_fallback_i16_u64,
+    mapped_fallback_i16_u64,
+    packed_fallback_i16_u64,
+    gather32_fallback_i16_u64,
+    csr_fallback_i16_u64,
+    2,
+    8,
+    u64,
+    load_i16_ptr,
+    load_u64_ptr,
+    store_u64_ptr,
+    |value: i16| value < 0,
+    |value: i16| value as u64
+);
+checked_fallback_kernels!(
+    slice_fallback_i32_u32,
+    mapped_fallback_i32_u32,
+    packed_fallback_i32_u32,
+    gather32_fallback_i32_u32,
+    csr_fallback_i32_u32,
+    4,
+    4,
+    u32,
+    load_i32_ptr,
+    load_u32_ptr,
+    store_u32_ptr,
+    |value: i32| value < 0,
+    |value: i32| value as u32
+);
+checked_fallback_kernels!(
+    slice_fallback_i32_u64,
+    mapped_fallback_i32_u64,
+    packed_fallback_i32_u64,
+    gather32_fallback_i32_u64,
+    csr_fallback_i32_u64,
+    4,
+    8,
+    u64,
+    load_i32_ptr,
+    load_u64_ptr,
+    store_u64_ptr,
+    |value: i32| value < 0,
+    |value: i32| value as u64
+);
+checked_fallback_kernels!(
+    slice_fallback_i64_u64,
+    mapped_fallback_i64_u64,
+    packed_fallback_i64_u64,
+    gather32_fallback_i64_u64,
+    csr_fallback_i64_u64,
+    8,
+    8,
+    u64,
+    load_i64_ptr,
+    load_u64_ptr,
+    store_u64_ptr,
+    |value: i64| value < 0,
+    |value: i64| value as u64
+);
+checked_fallback_kernels!(
+    slice_fallback_u16_i16,
+    mapped_fallback_u16_i16,
+    packed_fallback_u16_i16,
+    gather32_fallback_u16_i16,
+    csr_fallback_u16_i16,
+    2,
+    2,
+    i16,
+    load_u16_ptr,
+    load_i16_ptr,
+    store_i16_ptr,
+    |value: u16| value > i16::MAX as u16,
+    |value: u16| value as i16
+);
+checked_fallback_kernels!(
+    slice_fallback_u32_i32,
+    mapped_fallback_u32_i32,
+    packed_fallback_u32_i32,
+    gather32_fallback_u32_i32,
+    csr_fallback_u32_i32,
+    4,
+    4,
+    i32,
+    load_u32_ptr,
+    load_i32_ptr,
+    store_i32_ptr,
+    |value: u32| value > i32::MAX as u32,
+    |value: u32| value as i32
+);
+checked_fallback_kernels!(
+    slice_fallback_u64_i64,
+    mapped_fallback_u64_i64,
+    packed_fallback_u64_i64,
+    gather32_fallback_u64_i64,
+    csr_fallback_u64_i64,
+    8,
+    8,
+    i64,
+    load_u64_ptr,
+    load_i64_ptr,
+    store_i64_ptr,
+    |value: u64| value > i64::MAX as u64,
+    |value: u64| value as i64
+);
+
 unsafe fn csr_copy<const INDEX_BYTES: usize, const BYTES: usize>(
     values: *const u8,
     indices: *const u8,
     output: *mut u8,
     count: usize,
     map: Option<&CsrMap>,
+    _op: &ConvertOp,
 ) {
     #[inline(always)]
     unsafe fn kernel<const INDEX_BYTES: usize, const MAP_KIND: u8, const BYTES: usize>(
@@ -1232,6 +1693,7 @@ macro_rules! csr_kernel {
             output: *mut u8,
             count: usize,
             map: Option<&CsrMap>,
+            _op: &ConvertOp,
         ) {
             #[inline(always)]
             unsafe fn kernel<const INDEX_BYTES: usize, const MAP_KIND: u8>(
@@ -1469,6 +1931,12 @@ unsafe fn load_f32_ptr(input: *const u8) -> f32 {
 }
 
 #[inline(always)]
+unsafe fn store_i16_ptr(output: *mut u8, value: i16) {
+    // SAFETY: caller guarantees one complete possibly unaligned i16 destination.
+    unsafe { output.cast::<i16>().write_unaligned(value.to_le()) };
+}
+
+#[inline(always)]
 unsafe fn store_i32_ptr(output: *mut u8, value: i32) {
     // SAFETY: caller guarantees one complete possibly unaligned i32 destination.
     unsafe { output.cast::<i32>().write_unaligned(value.to_le()) };
@@ -1478,6 +1946,12 @@ unsafe fn store_i32_ptr(output: *mut u8, value: i32) {
 unsafe fn store_i64_ptr(output: *mut u8, value: i64) {
     // SAFETY: caller guarantees one complete possibly unaligned i64 destination.
     unsafe { output.cast::<i64>().write_unaligned(value.to_le()) };
+}
+
+#[inline(always)]
+unsafe fn store_u16_ptr(output: *mut u8, value: u16) {
+    // SAFETY: caller guarantees one complete possibly unaligned u16 destination.
+    unsafe { output.cast::<u16>().write_unaligned(value.to_le()) };
 }
 
 #[inline(always)]
@@ -1720,4 +2194,347 @@ fn kernel_u32_f64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()
 fn kernel_u64_f64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
     store_f64(output, load_u64(input) as f64);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::output::Fill;
+
+    fn check_fallback_edge(src: StorageDType, dst: OutputDType, input: Vec<u8>, fallback: Fill) {
+        let count = input.len() / src.size();
+        assert_eq!(input.len(), count * src.size());
+        let output = OutputSpec::new(count, dst, fallback)
+            .unwrap()
+            .overflow(OverflowPolicy::UseValue(fallback))
+            .unwrap();
+        let specialized = ConvertOp::resolve(src, &output).unwrap();
+        let mut generic = specialized;
+        generic.force_generic_for_test();
+
+        let mut expected = vec![0xa5; count * dst.size()];
+        specialized
+            .convert_slice_prevalidated(&input, &mut expected)
+            .unwrap();
+        let mut generic_slice = vec![0xa5; expected.len()];
+        generic
+            .convert_slice_prevalidated(&input, &mut generic_slice)
+            .unwrap();
+        assert_eq!(expected, generic_slice, "slice {src}->{dst}");
+
+        let wide = DenseMap::Wide {
+            entries: Arc::from(
+                (0..count)
+                    .map(|source| DenseMapEntry {
+                        source_byte: source * src.size(),
+                        target_byte: (count - source - 1) * dst.size(),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            covers_output: true,
+        };
+        let packed = DenseMap::Packed32 {
+            entries: Arc::from(
+                (0..count)
+                    .map(|source| {
+                        let source_byte = (source * src.size()) as u64;
+                        let target_byte = ((count - source - 1) * dst.size()) as u64;
+                        source_byte | (target_byte << 32)
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            covers_output: true,
+        };
+        let gather = DenseMap::Gather32 {
+            source_offsets: Arc::from(
+                (0..count)
+                    .rev()
+                    .map(|source| (source * src.size()) as i32)
+                    .collect::<Vec<_>>(),
+            ),
+            target_byte: 0,
+            covers_output: true,
+        };
+        for (name, map) in [("wide", wide), ("packed", packed), ("gather", gather)] {
+            let mut actual = vec![0xa5; expected.len()];
+            let mut reference = vec![0xa5; expected.len()];
+            // SAFETY: every test map covers one complete source and destination
+            // element exactly once in separate allocations.
+            unsafe {
+                specialized
+                    .convert_map_prevalidated(input.as_ptr(), actual.as_mut_ptr(), &map)
+                    .unwrap();
+                generic
+                    .convert_map_prevalidated(input.as_ptr(), reference.as_mut_ptr(), &map)
+                    .unwrap();
+            }
+            assert_eq!(actual, reference, "{name} {src}->{dst}");
+        }
+
+        for index_size in [2usize, 4] {
+            let indices = (0..count)
+                .flat_map(|index| match index_size {
+                    2 => (index as u16).to_le_bytes().to_vec(),
+                    4 => (index as u32).to_le_bytes().to_vec(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            let mut actual = vec![0xa5; expected.len()];
+            // SAFETY: indices name distinct in-bounds destinations and both
+            // buffers contain exactly `count` complete elements.
+            let used = unsafe {
+                specialized.convert_csr_prevalidated(
+                    input.as_ptr(),
+                    indices.as_ptr(),
+                    actual.as_mut_ptr(),
+                    count,
+                    index_size,
+                    None,
+                )
+            };
+            assert!(used, "CSR {index_size}-byte dispatch {src}->{dst}");
+            assert_eq!(actual, expected, "CSR {index_size}-byte {src}->{dst}");
+        }
+    }
+
+    #[test]
+    fn typed_fallback_kernels_match_generic_for_every_checked_sign_edge() {
+        let i16_input = [-1i16, 0, i16::MAX, -2, 42]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        check_fallback_edge(
+            StorageDType::I16,
+            OutputDType::U16,
+            i16_input.clone(),
+            Fill::U16(61_337),
+        );
+        check_fallback_edge(
+            StorageDType::I16,
+            OutputDType::U32,
+            i16_input.clone(),
+            Fill::U32(4_000_000_001),
+        );
+        check_fallback_edge(
+            StorageDType::I16,
+            OutputDType::U64,
+            i16_input,
+            Fill::U64(u64::MAX - 7),
+        );
+
+        let i32_input = [-1i32, 0, i32::MAX, -2, 42]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        check_fallback_edge(
+            StorageDType::I32,
+            OutputDType::U32,
+            i32_input.clone(),
+            Fill::U32(4_000_000_001),
+        );
+        check_fallback_edge(
+            StorageDType::I32,
+            OutputDType::U64,
+            i32_input,
+            Fill::U64(u64::MAX - 7),
+        );
+
+        check_fallback_edge(
+            StorageDType::I64,
+            OutputDType::U64,
+            [-1i64, 0, i64::MAX, -2, 42]
+                .into_iter()
+                .flat_map(i64::to_le_bytes)
+                .collect(),
+            Fill::U64(u64::MAX - 7),
+        );
+        check_fallback_edge(
+            StorageDType::U16,
+            OutputDType::I16,
+            [0u16, i16::MAX as u16, i16::MAX as u16 + 1, u16::MAX, 42]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            Fill::I16(-31_111),
+        );
+        check_fallback_edge(
+            StorageDType::U32,
+            OutputDType::I32,
+            [0u32, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX, 42]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+            Fill::I32(-2_000_000_001),
+        );
+        check_fallback_edge(
+            StorageDType::U64,
+            OutputDType::I64,
+            [0u64, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX, 42]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect(),
+            Fill::I64(i64::MIN + 17),
+        );
+    }
+
+    fn check_gather32_edge(src: StorageDType, dst: OutputDType, input: Vec<u8>, expected: Vec<u8>) {
+        const COUNT: usize = 35;
+        assert_eq!(input.len(), COUNT * 2 * src.size());
+        assert_eq!(expected.len(), COUNT * dst.size());
+        let fill = match dst {
+            OutputDType::I64 => Fill::I64(0),
+            OutputDType::U64 => Fill::U64(0),
+            OutputDType::F64 => Fill::F64(0.0),
+            _ => panic!("test only covers eight-byte destinations"),
+        };
+        let output = OutputSpec::new(COUNT + 2, dst, fill)
+            .unwrap()
+            .overflow(OverflowPolicy::Unchecked)
+            .unwrap()
+            .float_cast(FloatCastPolicy::AllowRounding);
+        let op = ConvertOp::resolve(src, &output).unwrap();
+        let map = DenseMap::Gather32 {
+            source_offsets: Arc::from(
+                (0..COUNT)
+                    .map(|index| (index * 2 * src.size()) as i32)
+                    .collect::<Vec<_>>(),
+            ),
+            target_byte: dst.size() as u32,
+            covers_output: false,
+        };
+        let mut kernels = vec![("auto", op)];
+        let mut generic = op;
+        generic.force_generic_for_test();
+        kernels.push(("generic", generic));
+        #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+        {
+            let mut avx2 = op;
+            if avx2.force_gather32_avx2_for_test() {
+                kernels.push(("avx2", avx2));
+            }
+            let mut avx512 = op;
+            if avx512.force_gather32_avx512_for_test() {
+                kernels.push(("avx512", avx512));
+            }
+        }
+        for (kernel, op) in kernels {
+            let mut actual = vec![0xa5; (COUNT + 2) * dst.size()];
+            // SAFETY: every offset selects one complete even-positioned source
+            // and the target run lies between two complete guard elements.
+            unsafe {
+                op.convert_map_prevalidated(input.as_ptr(), actual.as_mut_ptr(), &map)
+                    .unwrap();
+            }
+            assert_eq!(
+                &actual[..dst.size()],
+                vec![0xa5; dst.size()],
+                "leading guard for {kernel} {src}->{dst}"
+            );
+            assert_eq!(
+                &actual[dst.size()..dst.size() + expected.len()],
+                expected,
+                "values for {kernel} {src}->{dst}"
+            );
+            assert_eq!(
+                &actual[dst.size() + expected.len()..],
+                vec![0xa5; dst.size()],
+                "trailing guard for {kernel} {src}->{dst}"
+            );
+        }
+    }
+
+    #[test]
+    fn gather32_widening_kernels_cover_all_specialized_edges_and_tails() {
+        const INPUT_COUNT: usize = 70;
+        let i32_values = (0..INPUT_COUNT)
+            .map(|index| index as i32 * 1_000_003 - 31_000_000)
+            .collect::<Vec<_>>();
+        check_gather32_edge(
+            StorageDType::I32,
+            OutputDType::I64,
+            i32_values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            i32_values
+                .iter()
+                .step_by(2)
+                .flat_map(|&value| i64::from(value).to_le_bytes())
+                .collect(),
+        );
+        check_gather32_edge(
+            StorageDType::I32,
+            OutputDType::U64,
+            i32_values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            i32_values
+                .iter()
+                .step_by(2)
+                .flat_map(|&value| (value as u64).to_le_bytes())
+                .collect(),
+        );
+
+        let u32_values = (0..INPUT_COUNT)
+            .map(|index| (index as u32).wrapping_mul(123_456_789))
+            .collect::<Vec<_>>();
+        for dst in [OutputDType::I64, OutputDType::U64, OutputDType::F64] {
+            let expected = u32_values
+                .iter()
+                .step_by(2)
+                .flat_map(|&value| match dst {
+                    OutputDType::I64 => i64::from(value).to_le_bytes(),
+                    OutputDType::U64 => u64::from(value).to_le_bytes(),
+                    OutputDType::F64 => f64::from(value).to_le_bytes(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            check_gather32_edge(
+                StorageDType::U32,
+                dst,
+                u32_values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                expected,
+            );
+        }
+
+        let f32_values = (0..INPUT_COUNT)
+            .map(|index| index as f32 * 0.25 - 7.0)
+            .collect::<Vec<_>>();
+        check_gather32_edge(
+            StorageDType::F32,
+            OutputDType::F64,
+            f32_values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            f32_values
+                .iter()
+                .step_by(2)
+                .flat_map(|&value| f64::from(value).to_le_bytes())
+                .collect(),
+        );
+
+        let u64_values = (0..INPUT_COUNT)
+            .map(|index| (index as u64).wrapping_mul(1_000_000_000_000_003))
+            .collect::<Vec<_>>();
+        check_gather32_edge(
+            StorageDType::U64,
+            OutputDType::F64,
+            u64_values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            u64_values
+                .iter()
+                .step_by(2)
+                .flat_map(|&value| (value as f64).to_le_bytes())
+                .collect(),
+        );
+    }
 }

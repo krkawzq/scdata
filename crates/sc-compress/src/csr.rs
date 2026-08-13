@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -420,18 +421,29 @@ impl CsrMatrix {
             indptr,
             indices,
             nnz_requests,
+            mut scatter_requests,
         } = self.decode_selected_indices(rows)?;
         let n_nnz = indptr.last().copied().unwrap_or(0);
         let data_size = self.meta.data.dtype.size();
         let data_len = checked_meta_byte_len(n_nnz, data_size, "data output")?;
         let source_indptr_len = self.source_indptr_resident()?;
         let output_indptr_len = resident_bytes::<u64>(indptr.len(), "selected indptr")?;
+        if n_nnz != 0 {
+            rescale_csr_requests(
+                &self.meta.data.path,
+                &nnz_requests,
+                data_size,
+                &mut scatter_requests,
+            )?;
+        }
         let resident_decoded = self.limits.check_decoded_sum(
             [
                 source_indptr_len,
                 output_indptr_len,
                 indices.len(),
                 data_len,
+                nnz_requests_resident(&nnz_requests)?,
+                scatter_requests_resident(&scatter_requests)?,
             ],
             "csr selected resident output",
         )?;
@@ -442,11 +454,10 @@ impl CsrMatrix {
 
         // Index decoding and bounds validation finish before any data request
         // is issued, so corrupt indices cannot trigger value I/O.
-        let data_requests = scale_csr_requests(&self.meta.data.path, &nnz_requests, data_size)?;
         decode_blosc_scatter_into(
             &self.meta.data.compressor,
             RangeDecodeContext::new(self.store.as_ref(), resident_decoded, self.limits),
-            &data_requests,
+            &scatter_requests,
             &mut data,
         )?;
 
@@ -484,15 +495,21 @@ impl CsrMatrix {
             Vec::new()
         } else {
             let (request_count, mapping_count) = csr_nnz_plan_upper_bound(self, rows)?;
+            let longest_request_path = if self.meta.indices.path.len() >= self.meta.data.path.len()
+            {
+                &self.meta.indices.path
+            } else {
+                &self.meta.data.path
+            };
             let plan_resident =
-                csr_nnz_plan_upper_resident(request_count, mapping_count, &self.meta.indices.path)?;
+                csr_nnz_plan_upper_resident(request_count, mapping_count, longest_request_path)?;
             self.limits.check_decoded_sum(
                 [base_resident, plan_resident],
                 "csr selected resident output",
             )?;
             plan_csr_nnz_requests(self, rows, &indptr)?
         };
-        if n_nnz != 0 {
+        let scatter_requests = if n_nnz != 0 {
             let requests = scale_csr_requests(&self.meta.indices.path, &nnz_requests, index_size)?;
             let resident_decoded = self.limits.check_decoded_sum(
                 [
@@ -508,11 +525,15 @@ impl CsrMatrix {
                 &requests,
                 &mut indices,
             )?;
-        }
+            requests
+        } else {
+            Vec::new()
+        };
         Ok(DecodedCsrIndices {
             indptr,
             indices,
             nnz_requests,
+            scatter_requests,
         })
     }
 
@@ -546,6 +567,7 @@ impl CsrMatrix {
             indptr,
             indices,
             nnz_requests: _,
+            scatter_requests: _,
         } = self.decode_selected_indices_unvalidated(rows)?;
         let SelectedColumnPlan {
             layout,
@@ -638,6 +660,7 @@ struct DecodedCsrIndices {
     indptr: Vec<u64>,
     indices: Vec<u8>,
     nnz_requests: Vec<NnzScatterRequest>,
+    scatter_requests: Vec<BloscScatterRequest>,
 }
 
 fn selected_indptr(matrix: &CsrMatrix, rows: &NormalizedAxis) -> Result<Vec<u64>> {
@@ -1489,6 +1512,60 @@ fn scale_csr_requests(
         });
     }
     Ok(output)
+}
+
+fn rescale_csr_requests(
+    path: &str,
+    requests: &[NnzScatterRequest],
+    element_size: usize,
+    output: &mut [BloscScatterRequest],
+) -> Result<()> {
+    if output.len() != requests.len() {
+        return Err(Error::corrupt(
+            "CSR request plan",
+            "scaled request count changed between index and data decode",
+        ));
+    }
+    for (request, scaled) in requests.iter().zip(output) {
+        rewrite_chunk_key(&mut scaled.key, path, request.chunk as u64)?;
+        scaled.expected = checked_meta_byte_len(request.expected_nnz, element_size, "CSR chunk")?;
+        scaled.mappings.clear();
+        scaled.mappings.try_reserve_exact(request.mappings.len())?;
+        for (source, destination) in &request.mappings {
+            scaled.mappings.push(ScatterMapping {
+                source: checked_meta_byte_len(source.start, element_size, "CSR source")?
+                    ..checked_meta_byte_len(source.end, element_size, "CSR source")?,
+                destination: checked_meta_byte_len(
+                    destination.start,
+                    element_size,
+                    "CSR destination",
+                )?
+                    ..checked_meta_byte_len(destination.end, element_size, "CSR destination")?,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_chunk_key(key: &mut String, path: &str, chunk: u64) -> Result<()> {
+    key.clear();
+    let digits = if chunk == 0 {
+        1
+    } else {
+        chunk.ilog10() as usize + 1
+    };
+    let required = path
+        .len()
+        .checked_add(usize::from(!path.is_empty()))
+        .and_then(|len| len.checked_add(digits))
+        .ok_or_else(|| Error::invalid_argument("CSR chunk key length overflow"))?;
+    key.try_reserve(required)?;
+    if !path.is_empty() {
+        key.push_str(path);
+        key.push('/');
+    }
+    write!(key, "{chunk}")
+        .map_err(|_| Error::corrupt("CSR request plan", "writing a chunk key into String failed"))
 }
 
 fn checked_byte_len(count: u64, element_size: usize, context: &str) -> Result<usize> {

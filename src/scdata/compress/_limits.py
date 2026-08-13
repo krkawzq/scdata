@@ -19,7 +19,7 @@ class ReadLimits:
     """Upper bounds applied while opening and decoding a store.
 
     The object is immutable and safe to reuse. Keyword overrides on
-    :func:`scdata.open` are applied on top of this object.
+    :func:`scdata.open_store` are applied on top of this object.
     """
 
     max_metadata_size: int = _DEFAULT_MAXIMUM_METADATA_SIZE

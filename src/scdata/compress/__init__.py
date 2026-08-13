@@ -29,8 +29,6 @@ from scdata.compress._write_options import (
 from scdata.compress import _zip as zip
 from scdata.exceptions import Error, InvalidArgumentError, PerformanceWarning
 
-open = open_store
-
 __all__ = [
     "DEFAULT_BLOCK_BUDGET",
     "DEFAULT_CHUNK_BUDGET",
@@ -51,7 +49,6 @@ __all__ = [
     "WriteOptions",
     "is_index_dtype",
     "is_value_dtype",
-    "open",
     "open_store",
     "write",
     "write_csr",

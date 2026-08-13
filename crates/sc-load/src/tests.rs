@@ -192,8 +192,7 @@ fn dense_mapping_gathers_i32_into_contiguous_f64_targets() {
     ))
     .unwrap();
     #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
-    let fast_gather = std::arch::is_x86_feature_detected!("avx2")
-        && std::arch::is_x86_feature_detected!("avx512f");
+    let fast_gather = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(all(target_arch = "x86_64", target_endian = "little")))]
     let fast_gather = false;
     assert_eq!(
@@ -216,6 +215,112 @@ fn dense_mapping_gathers_i32_into_contiguous_f64_targets() {
             .iter()
             .step_by(2)
             .map(|&value| f64::from(value))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn dense_mapping_plans_widening_64_bit_gather_kernels() {
+    fn sparse_even_targets() -> FeatureMap {
+        FeatureMap::new(
+            (0..64)
+                .map(|column| (column % 2 == 0).then_some(column / 2))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let i32_path = temporary.path().join("dense-map-gather-i32-i64");
+    let i32_values = (0..64)
+        .map(|value| value * 1_000_003 - 31_000_000)
+        .collect::<Vec<i32>>();
+    DenseWriter::new(
+        &i32_path,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16),
+    )
+    .write(&i32_values, [1, 64])
+    .unwrap();
+    let i32_plan = compile(PlanSpec::new(
+        vec![Source::new(0, Dataset::open(&i32_path).unwrap()).feature_map(sparse_even_targets())],
+        vec![RowRef::new(SourceId::new(0), 0)],
+        OutputSpec::new(32, OutputDType::I64, Fill::I64(-1)).unwrap(),
+        1,
+        2,
+    ))
+    .unwrap();
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    let i32_fast_gather = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(all(target_arch = "x86_64", target_endian = "little")))]
+    let i32_fast_gather = false;
+    assert_eq!(
+        matches!(
+            i32_plan.inner.source_plans[0].dense_map,
+            Some(crate::plan::DenseMap::Gather32 { .. })
+        ),
+        i32_fast_gather
+    );
+    let mut i32_session = i32_plan.open(blocking(1)).unwrap();
+    assert_eq!(
+        i32_session
+            .next_batch()
+            .unwrap()
+            .unwrap()
+            .row_as::<i64>(0)
+            .unwrap(),
+        &i32_values
+            .iter()
+            .step_by(2)
+            .map(|&value| i64::from(value))
+            .collect::<Vec<_>>()
+    );
+
+    let u64_path = temporary.path().join("dense-map-gather-u64-f64");
+    let u64_values = (0..64)
+        .map(|value| (value as u64).wrapping_mul(1_000_000_000_000_003))
+        .collect::<Vec<_>>();
+    DenseWriter::new(
+        &u64_path,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16),
+    )
+    .write(&u64_values, [1, 64])
+    .unwrap();
+    let u64_plan = compile(PlanSpec::new(
+        vec![Source::new(0, Dataset::open(&u64_path).unwrap()).feature_map(sparse_even_targets())],
+        vec![RowRef::new(SourceId::new(0), 0)],
+        OutputSpec::new(32, OutputDType::F64, Fill::F64(-1.0))
+            .unwrap()
+            .float_cast(crate::FloatCastPolicy::AllowRounding),
+        1,
+        2,
+    ))
+    .unwrap();
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    let u64_fast_gather = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512dq");
+    #[cfg(not(all(target_arch = "x86_64", target_endian = "little")))]
+    let u64_fast_gather = false;
+    assert_eq!(
+        matches!(
+            u64_plan.inner.source_plans[0].dense_map,
+            Some(crate::plan::DenseMap::Gather32 { .. })
+        ),
+        u64_fast_gather
+    );
+    let mut u64_session = u64_plan.open(blocking(1)).unwrap();
+    assert_eq!(
+        u64_session
+            .next_batch()
+            .unwrap()
+            .unwrap()
+            .row_as::<f64>(0)
+            .unwrap(),
+        &u64_values
+            .iter()
+            .step_by(2)
+            .map(|&value| value as f64)
             .collect::<Vec<_>>()
     );
 }
@@ -1191,6 +1296,72 @@ fn wide_mapping_fallback_preserves_dense_and_csr_semantics() {
             .collect::<Vec<_>>(),
         [7, 5]
     );
+}
+
+#[test]
+fn mapped_validation_only_checks_values_with_a_destination() {
+    use std::sync::Arc;
+
+    use crate::convert::ConvertOp;
+    use crate::plan::{CellTask, CsrMap, DenseMap, DenseMapEntry, SourcePlan, UNMAPPED_TARGET};
+    use crate::source::OutputSlot;
+
+    let output = OutputSpec::new(2, OutputDType::I16, Fill::I16(0)).unwrap();
+    let convert = ConvertOp::resolve(sc_compress::DType::U16, &output).unwrap();
+    let dense = SourcePlan {
+        n_cols: 3,
+        value_dtype: sc_compress::DType::U16,
+        index: None,
+        feature_map: None,
+        dense_map: Some(DenseMap::Wide {
+            entries: Arc::from([
+                DenseMapEntry {
+                    source_byte: 0,
+                    target_byte: 0,
+                },
+                DenseMapEntry {
+                    source_byte: 4,
+                    target_byte: 2,
+                },
+            ]),
+            covers_output: true,
+        }),
+        convert,
+    };
+    let dense_task = CellTask::new(OutputSlot::new(0, false).unwrap(), 0..6, None).unwrap();
+    let unselected_overflow = [5u16, 40_000, 7]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    crate::scatter::validate_row(&dense, &dense_task, &unselected_overflow, &[]).unwrap();
+
+    let csr = SourcePlan {
+        n_cols: 3,
+        value_dtype: sc_compress::DType::U16,
+        index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
+        feature_map: Some(CsrMap::Wide(Arc::from([0, UNMAPPED_TARGET, 2]))),
+        dense_map: None,
+        convert,
+    };
+    let csr_task = CellTask::new(OutputSlot::new(0, false).unwrap(), 0..6, Some(0..6)).unwrap();
+    let indices = [0u16, 1, 2]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    crate::scatter::validate_row(&csr, &csr_task, &unselected_overflow, &indices).unwrap();
+
+    let selected_overflow = [40_000u16, 6, 7]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        crate::scatter::validate_row(&dense, &dense_task, &selected_overflow, &[]),
+        Err(Error::Conversion(_))
+    ));
+    assert!(matches!(
+        crate::scatter::validate_row(&csr, &csr_task, &selected_overflow, &indices),
+        Err(Error::Conversion(_))
+    ));
 }
 
 #[test]
@@ -2616,6 +2787,34 @@ fn benchmark_int64_uint64_specialized_kernels() {
         },
         5,
     );
+    let gather_map = crate::plan::DenseMap::Gather32 {
+        source_offsets: std::sync::Arc::from(
+            (0..count)
+                .step_by(4)
+                .map(|source| i32::try_from(source * 4).unwrap())
+                .collect::<Vec<_>>(),
+        ),
+        target_byte: 0,
+        covers_output: true,
+    };
+    let gather_map_time = best_of(
+        || {
+            for _ in 0..mapped_iterations {
+                // SAFETY: every compiler-style byte offset addresses one
+                // complete source and the target is one contiguous run.
+                unsafe {
+                    specialized_i32_i64
+                        .convert_map_prevalidated(
+                            black_box(i32_input.as_ptr()),
+                            black_box(mapped_destination.as_mut_ptr()),
+                            black_box(&gather_map),
+                        )
+                        .unwrap();
+                }
+            }
+        },
+        5,
+    );
 
     let csr_count = 64 * 1024;
     let csr_iterations = 512;
@@ -2714,8 +2913,111 @@ fn benchmark_int64_uint64_specialized_kernels() {
         5,
     );
 
+    let fallback_output = OutputSpec::new(count, OutputDType::U64, Fill::U64(0))
+        .unwrap()
+        .overflow(OverflowPolicy::UseValue(Fill::U64(u64::MAX)))
+        .unwrap();
+    let specialized_fallback = ConvertOp::resolve(StorageDType::I64, &fallback_output).unwrap();
+    let mut generic_fallback = specialized_fallback;
+    generic_fallback.force_generic_for_test();
+    let mut fallback_destination = vec![0u8; count * 8];
+    let specialized_fallback_time = best_of(
+        || {
+            for _ in 0..iterations {
+                specialized_fallback
+                    .convert_slice_prevalidated(
+                        black_box(&i64_input),
+                        black_box(&mut fallback_destination),
+                    )
+                    .unwrap();
+            }
+        },
+        5,
+    );
+    let generic_fallback_time = best_of(
+        || {
+            for _ in 0..iterations {
+                generic_fallback
+                    .convert_slice_prevalidated(
+                        black_box(&i64_input),
+                        black_box(&mut fallback_destination),
+                    )
+                    .unwrap();
+            }
+        },
+        5,
+    );
+
+    let u64_input = (0..count)
+        .flat_map(|index| {
+            (index as u64)
+                .wrapping_mul(1_000_000_000_000_003)
+                .to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let u64_f64 = ConvertOp::resolve(StorageDType::U64, &f64_output).unwrap();
+    let u64_packed_map = crate::plan::DenseMap::Packed32 {
+        entries: std::sync::Arc::from(
+            (0..count)
+                .step_by(4)
+                .map(|source| {
+                    let source_byte = u32::try_from(source * 8).unwrap();
+                    let target_byte = u32::try_from(source / 4 * 8).unwrap();
+                    u64::from(source_byte) | (u64::from(target_byte) << 32)
+                })
+                .collect::<Vec<_>>(),
+        ),
+        covers_output: true,
+    };
+    let u64_gather_map = crate::plan::DenseMap::Gather32 {
+        source_offsets: std::sync::Arc::from(
+            (0..count)
+                .step_by(4)
+                .map(|source| i32::try_from(source * 8).unwrap())
+                .collect::<Vec<_>>(),
+        ),
+        target_byte: 0,
+        covers_output: true,
+    };
+    let u64_packed_time = best_of(
+        || {
+            for _ in 0..mapped_iterations {
+                // SAFETY: both maps address the same complete, disjoint
+                // source/destination elements.
+                unsafe {
+                    u64_f64
+                        .convert_map_prevalidated(
+                            black_box(u64_input.as_ptr()),
+                            black_box(mapped_destination.as_mut_ptr()),
+                            black_box(&u64_packed_map),
+                        )
+                        .unwrap();
+                }
+            }
+        },
+        5,
+    );
+    let u64_gather_time = best_of(
+        || {
+            for _ in 0..mapped_iterations {
+                // SAFETY: the gather offsets and target run match the packed
+                // map measured immediately above.
+                unsafe {
+                    u64_f64
+                        .convert_map_prevalidated(
+                            black_box(u64_input.as_ptr()),
+                            black_box(mapped_destination.as_mut_ptr()),
+                            black_box(&u64_gather_map),
+                        )
+                        .unwrap();
+                }
+            }
+        },
+        5,
+    );
+
     eprintln!(
-        "64-bit specialized kernels: i32->i64 contiguous specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x; i64->f64 contiguous specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x; i32->i64 packed-map specialized={:.2} Mvalue/s generic={:.2} Mvalue/s speedup={:.2}x; i32->i64 CSR specialized={:.2} Mvalue/s generic={:.2} Mvalue/s speedup={:.2}x; i64 sign validation specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x",
+        "64-bit specialized kernels: i32->i64 contiguous specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x; i64->f64 contiguous specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x; i32->i64 packed-map specialized={:.2} Mvalue/s generic={:.2} Mvalue/s speedup={:.2}x; i32->i64 gather/packed={:.2}x; u64->f64 gather/packed={:.2}x; i32->i64 CSR specialized={:.2} Mvalue/s generic={:.2} Mvalue/s speedup={:.2}x; i64 sign validation specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x; i64->u64 fallback specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x",
         gib_per_second(count * 12, iterations, specialized_i32_i64_time),
         gib_per_second(count * 12, iterations, generic_i32_i64_time),
         generic_i32_i64_time.as_secs_f64() / specialized_i32_i64_time.as_secs_f64(),
@@ -2725,12 +3027,17 @@ fn benchmark_int64_uint64_specialized_kernels() {
         million_values_per_second(mapped_count, mapped_iterations, specialized_map_time),
         million_values_per_second(mapped_count, mapped_iterations, generic_map_time),
         generic_map_time.as_secs_f64() / specialized_map_time.as_secs_f64(),
+        specialized_map_time.as_secs_f64() / gather_map_time.as_secs_f64(),
+        u64_packed_time.as_secs_f64() / u64_gather_time.as_secs_f64(),
         million_values_per_second(csr_count, csr_iterations, specialized_csr_time),
         million_values_per_second(csr_count, csr_iterations, generic_csr_time),
         generic_csr_time.as_secs_f64() / specialized_csr_time.as_secs_f64(),
         gib_per_second(count * 8, validation_iterations, specialized_validation_time),
         gib_per_second(count * 8, validation_iterations, generic_validation_time),
         generic_validation_time.as_secs_f64() / specialized_validation_time.as_secs_f64(),
+        gib_per_second(count * 16, iterations, specialized_fallback_time),
+        gib_per_second(count * 16, iterations, generic_fallback_time),
+        generic_fallback_time.as_secs_f64() / specialized_fallback_time.as_secs_f64(),
     );
 }
 
@@ -2763,6 +3070,7 @@ struct MemoryStore {
     values: HashMap<String, Vec<u8>>,
     efficient_ranges: bool,
     reads: std::sync::atomic::AtomicUsize,
+    read_into_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl MemoryStore {
@@ -2788,6 +3096,11 @@ impl MemoryStore {
     fn reset_read_count(&self) {
         self.reads.store(0, std::sync::atomic::Ordering::Relaxed);
     }
+
+    fn read_into_count(&self) -> usize {
+        self.read_into_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl ByteStore for MemoryStore {
@@ -2810,6 +3123,30 @@ impl ByteStore for MemoryStore {
             .min(value.len());
         let end = start.saturating_add(len).min(value.len());
         Ok(value[start..end].to_vec())
+    }
+
+    fn read_range_into(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        output: &mut Vec<u8>,
+    ) -> sc_compress::Result<()> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.read_into_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let value = self
+            .values
+            .get(key)
+            .ok_or_else(|| sc_compress::Error::NotFound { key: key.into() })?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(value.len());
+        let end = start.saturating_add(len).min(value.len());
+        output.clear();
+        output.extend_from_slice(&value[start..end]);
+        Ok(())
     }
 
     fn exists(&self, key: &str) -> sc_compress::Result<bool> {
@@ -2900,6 +3237,7 @@ fn key_backends_separate_range_reads_from_bounded_whole_key_reuse() {
     );
     let range_plan = compile_memory(&range_store, 1024 * 1024);
     let range_compile_reads = range_store.read_count();
+    let range_compile_read_into = range_store.read_into_count();
     assert_eq!(range_plan.stats().retained_whole_key_bytes, 0);
     assert!(range_plan
         .inner
@@ -2917,4 +3255,65 @@ fn key_backends_separate_range_reads_from_bounded_whole_key_reuse() {
         &[11, 12]
     );
     assert!(range_store.read_count() > range_compile_reads);
+    assert!(range_store.read_into_count() > range_compile_read_into);
+}
+
+#[test]
+#[ignore = "manual release-mode SSE2 conversion benchmark"]
+fn benchmark_u32_f32_sse2_kernel() {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    fn best_of(mut run: impl FnMut(), rounds: usize) -> Duration {
+        (0..rounds)
+            .map(|_| {
+                let started = Instant::now();
+                run();
+                started.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    let count = 256 * 1024;
+    let iterations = 256;
+    let input = (0..count as u32)
+        .flat_map(|value| value.wrapping_mul(1_000_003).to_le_bytes())
+        .collect::<Vec<_>>();
+    let output = OutputSpec::new(count, OutputDType::F32, Fill::F32(0.0))
+        .unwrap()
+        .float_cast(crate::FloatCastPolicy::AllowRounding);
+    let mut scalar = crate::convert::ConvertOp::resolve(sc_compress::DType::U32, &output).unwrap();
+    scalar.force_scalar_for_test();
+    let mut sse2 = scalar;
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    sse2.force_sse2_for_test();
+    let mut destination = vec![0u8; count * 4];
+
+    let scalar_time = best_of(
+        || {
+            for _ in 0..iterations {
+                scalar
+                    .convert_slice_prevalidated(black_box(&input), black_box(&mut destination))
+                    .unwrap();
+            }
+        },
+        5,
+    );
+    let sse2_time = best_of(
+        || {
+            for _ in 0..iterations {
+                sse2.convert_slice_prevalidated(black_box(&input), black_box(&mut destination))
+                    .unwrap();
+            }
+        },
+        5,
+    );
+    let bytes = (count * 8 * iterations) as f64;
+    eprintln!(
+        "u32->f32 scalar={:.2} GiB/s sse2={:.2} GiB/s speedup={:.3}x",
+        bytes / scalar_time.as_secs_f64() / (1024.0 * 1024.0 * 1024.0),
+        bytes / sse2_time.as_secs_f64() / (1024.0 * 1024.0 * 1024.0),
+        scalar_time.as_secs_f64() / sse2_time.as_secs_f64(),
+    );
 }

@@ -6,7 +6,8 @@ use crate::error::{Error, Result};
 use crate::select::NormalizedAxis;
 
 use super::util::{
-    assume_init_bytes, checked_mul, par_for_row_blocks, uninit_bytes, usize_from_u64,
+    assume_init_bytes, checked_mul, copy_elem_unchecked, par_for_row_blocks, uninit_bytes,
+    usize_from_u64,
 };
 
 /// Select arbitrary rows and columns from a dense row-major buffer.
@@ -203,9 +204,9 @@ pub fn dense_select(
                     // `(local_row, local_col)` owns a distinct output element,
                     // and the source matrix does not alias the output buffer.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            values.as_ptr().add(src_off),
+                        copy_elem_unchecked(
                             block.as_mut_ptr().cast::<u8>().add(dst_off),
+                            values.as_ptr().add(src_off),
                             elem,
                         );
                     }

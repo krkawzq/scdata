@@ -170,6 +170,18 @@ impl ByteStore for ZipStore {
     }
 
     fn read_range(&self, key: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        self.read_range_into(key, offset, len, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn read_range_into(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        buffer: &mut Vec<u8>,
+    ) -> Result<()> {
         let entry = self.entry(key)?;
         if offset > entry.size {
             return Err(Error::corrupt(
@@ -183,14 +195,14 @@ impl ByteStore for ZipStore {
         let available = usize::try_from(entry.size - offset)
             .map_err(|_| Error::corrupt("zip entry range", "available length exceeds usize"))?;
         let to_read = len.min(available);
-        let mut buffer = zeroed_buffer(to_read)?;
+        resize_buffer(buffer, to_read)?;
         if to_read == 0 {
-            return Ok(buffer);
+            return Ok(());
         }
         if offset == 0 && u64::try_from(to_read).ok() == Some(entry.size) {
-            self.read_full_entry(key, &entry, &mut buffer)?;
+            self.read_full_entry(key, &entry, buffer)?;
         } else if entry.compression == CompressionMethod::Stored && !entry.encrypted {
-            self.read_stored_range(key, &entry, offset, &mut buffer)?;
+            self.read_stored_range(key, &entry, offset, buffer)?;
         } else {
             let mut archive = self.archive();
             let mut file = archive.by_index(entry.index)?;
@@ -205,7 +217,7 @@ impl ByteStore for ZipStore {
                     ));
                 }
             }
-            file.read_exact(&mut buffer)?;
+            file.read_exact(buffer)?;
             if u64::try_from(to_read)
                 .ok()
                 .and_then(|to_read| offset.checked_add(to_read))
@@ -214,7 +226,7 @@ impl ByteStore for ZipStore {
                 require_eof(&mut file, key)?;
             }
         }
-        Ok(buffer)
+        Ok(())
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
@@ -267,6 +279,16 @@ fn zeroed_buffer(len: usize) -> Result<Vec<u8>> {
     buffer.try_reserve_exact(len)?;
     buffer.resize(len, 0);
     Ok(buffer)
+}
+
+fn resize_buffer(buffer: &mut Vec<u8>, len: usize) -> Result<()> {
+    if buffer.len() < len {
+        buffer.try_reserve_exact(len - buffer.len())?;
+        buffer.resize(len, 0);
+    } else {
+        buffer.truncate(len);
+    }
+    Ok(())
 }
 
 /// Independent logical cursor backed by positioned reads on one immutable

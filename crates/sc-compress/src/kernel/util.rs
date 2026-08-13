@@ -114,9 +114,25 @@ where
 /// writable bytes respectively, and the two ranges must not overlap.
 #[inline(always)]
 pub(crate) unsafe fn copy_elem_unchecked(dst: *mut u8, src: *const u8, elem_size: usize) {
-    // SAFETY: the caller provides the complete pointer validity, length, and
-    // non-overlap invariants required by `copy_nonoverlapping`.
-    unsafe { std::ptr::copy_nonoverlapping(src, dst, elem_size) };
+    // Keep the matrix widths visible to the optimizer. A runtime-length
+    // `copy_nonoverlapping` in an element loop otherwise lowers to a tiny
+    // memcpy call instead of one unaligned load/store pair.
+    // SAFETY: the caller guarantees readable/writable non-overlapping spans of
+    // `elem_size`; each specialized arm accesses exactly that many bytes.
+    unsafe {
+        match elem_size {
+            2 => dst
+                .cast::<u16>()
+                .write_unaligned(src.cast::<u16>().read_unaligned()),
+            4 => dst
+                .cast::<u32>()
+                .write_unaligned(src.cast::<u32>().read_unaligned()),
+            8 => dst
+                .cast::<u64>()
+                .write_unaligned(src.cast::<u64>().read_unaligned()),
+            _ => std::ptr::copy_nonoverlapping(src, dst, elem_size),
+        }
+    }
 }
 
 /// Read a CSR column index (u16/u32 LE) at element position `pos` without a
@@ -189,5 +205,27 @@ pub(crate) unsafe fn write_index_unchecked(
             }
         }
         _ => unreachable!("CSR index size is 2 or 4"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_elem_unchecked;
+
+    #[test]
+    fn element_copy_preserves_supported_widths_and_arbitrary_pieces() {
+        let source = [
+            0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb,
+        ];
+        for size in [2usize, 4, 8, 3] {
+            let mut destination = [0xa5; 12];
+            // SAFETY: both arrays contain `size` initialized/writable bytes and
+            // are distinct allocations.
+            unsafe {
+                copy_elem_unchecked(destination.as_mut_ptr(), source.as_ptr(), size);
+            }
+            assert_eq!(&destination[..size], &source[..size]);
+            assert_eq!(&destination[size..], &[0xa5; 12][size..]);
+        }
     }
 }

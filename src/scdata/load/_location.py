@@ -255,15 +255,7 @@ def _read_index_names_zarr(
     *,
     missing_ok: bool = False,
 ) -> tuple[str, ...] | None:
-    try:
-        import anndata  # noqa: F401
-        import zarr
-    except ModuleNotFoundError as error:
-        if error.name in {"anndata", "zarr"}:
-            raise ImportError(
-                "AnnData support requires anndata and zarr; install with scdata-toolkit[anndata]"
-            ) from None
-        raise
+    import zarr
     from anndata._io.zarr import read_dataframe
     from zarr.errors import GroupNotFoundError
     from zarr.storage import ZipStore

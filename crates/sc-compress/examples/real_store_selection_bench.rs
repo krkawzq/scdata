@@ -54,6 +54,18 @@ impl ByteStore for InstrumentedStore {
         self.inner.read_range(key, offset, len)
     }
 
+    fn read_range_into(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.stats.calls.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes.fetch_add(len as u64, Ordering::Relaxed);
+        self.inner.read_range_into(key, offset, len, output)
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         self.inner.exists(key)
     }

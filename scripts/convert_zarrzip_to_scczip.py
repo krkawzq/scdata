@@ -2,9 +2,11 @@
 """Convert boss-format ``*.zarr.zip`` stores to ``*.scc.zip`` side-by-side.
 
 Uses **scdata 0.1** ``read_zarr`` for the source layout (rectilinear CSR /
-dense1d / ``.zarr.zip``) and **sc-compress 0.2** ``write_scc`` for the
+dense1d / ``.zarr.zip``) and **scdata-toolkit 0.2** ``write_scc`` for the
 destination.  Both packages live in the dedicated convert venv
-(``.venv-convert``): ``scdata`` is the 0.1 wheel, ``sc_compress`` is 0.2.
+(``.venv-convert``): ``scdata`` is the 0.1 wheel (import ``scdata``),
+``scdata-toolkit`` is installed as import ``scdata_toolkit`` so the two
+do not collide.
 
 Destination path is the source path with the ``.zarr.zip`` suffix replaced by
 ``.scc.zip``.  Existing destinations are skipped unless ``--overwrite``.
@@ -60,6 +62,88 @@ def _iter_sources(roots: list[Path]) -> list[Path]:
     return out
 
 
+_SCC_VALUE_DTYPES = {
+    "float32",
+    "float64",
+    "int16",
+    "int32",
+    "int64",
+    "uint16",
+    "uint32",
+    "uint64",
+}
+
+
+def _promote_matrix(matrix):
+    """Losslessly widen dtypes that sc-compress cannot store (int8/uint8/bool/float16)."""
+    import numpy as np
+    from scipy import sparse
+
+    if matrix is None:
+        return matrix
+    dtype = getattr(matrix, "dtype", None)
+    if dtype is None:
+        return matrix
+    kind = np.dtype(dtype)
+    if kind.name in _SCC_VALUE_DTYPES:
+        return matrix
+    if kind.kind == "b":
+        target = np.uint16
+    elif kind.kind == "u" and kind.itemsize <= 1:
+        target = np.uint16
+    elif kind.kind == "i" and kind.itemsize <= 1:
+        target = np.int16
+    elif kind == np.dtype("float16"):
+        target = np.float32
+    else:
+        return matrix
+    if sparse.issparse(matrix):
+        return matrix.astype(target)
+    return np.asarray(matrix).astype(target, copy=False)
+
+
+def _promote_scc_dtypes(adata):
+    """Widen unsupported numeric cell-aligned matrices so write_scc can accept them."""
+    import pandas as pd
+
+    adata.X = _promote_matrix(adata.X)
+    for key in list(adata.layers.keys()):
+        adata.layers[key] = _promote_matrix(adata.layers[key])
+    for slot_name in ("obsm", "obsp"):
+        slot = getattr(adata, slot_name)
+        for key in list(slot.keys()):
+            value = slot[key]
+            if isinstance(value, pd.DataFrame):
+                continue
+            slot[key] = _promote_matrix(value)
+    if adata.raw is None:
+        return adata
+    promoted = _promote_matrix(adata.raw.X)
+    if promoted is adata.raw.X:
+        return adata
+    raw = adata.raw.to_adata()
+    raw.X = promoted
+    adata.raw = raw
+    return adata
+
+
+def _as_dense_rows(matrix, n: int):
+    """First ``n`` rows as a dense ndarray (SciPy CSR or scdata-toolkit ScCsr)."""
+    import numpy as np
+    from scipy import sparse
+
+    sl = matrix[:n]
+    if sparse.issparse(sl):
+        return np.asarray(sl.toarray())
+    toarray = getattr(sl, "toarray", None)
+    if callable(toarray):
+        return np.asarray(toarray())
+    to_numpy = getattr(sl, "to_numpy", None)
+    if callable(to_numpy):
+        return np.asarray(to_numpy())
+    return np.asarray(sl)
+
+
 def convert_one(
     src: str,
     *,
@@ -69,8 +153,7 @@ def convert_one(
 ) -> dict:
     """Worker entry: return a result dict (picklable)."""
     from scdata.io import read_zarr
-    import scdata.compress as scc
-    from scipy import sparse
+    import scdata_toolkit as scc
     import numpy as np
 
     src_path = Path(src)
@@ -98,6 +181,7 @@ def convert_one(
         adata = read_zarr(src_path)
         result["n_obs"] = int(adata.n_obs)
         result["n_vars"] = int(adata.n_vars)
+        _promote_scc_dtypes(adata)
 
         scc.write_scc(
             adata,
@@ -116,17 +200,13 @@ def convert_one(
                     f"{adata.n_obs}x{adata.n_vars} -> {back.n_obs}x{back.n_vars}"
                 )
             n = min(16, adata.n_obs)
-            x1 = adata.X
-            x2 = back.X
-            if sparse.issparse(x1):
-                a = x1[:n].toarray()
-            else:
-                a = np.asarray(x1[:n])
-            if sparse.issparse(x2):
-                b = x2[:n].toarray()
-            else:
-                b = np.asarray(x2[:n])
-            if not np.array_equal(a, b) and not np.allclose(a, b, equal_nan=True):
+            a = _as_dense_rows(adata.X, n)
+            b = _as_dense_rows(back.X, n)
+            if not np.array_equal(a, b) and not np.allclose(
+                a.astype(np.float64, copy=False),
+                b.astype(np.float64, copy=False),
+                equal_nan=True,
+            ):
                 maxdiff = float(np.nanmax(np.abs(a.astype(np.float64) - b.astype(np.float64))))
                 raise RuntimeError(f"value mismatch on first {n} rows, maxdiff={maxdiff}")
 

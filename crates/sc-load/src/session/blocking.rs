@@ -159,14 +159,13 @@ fn read_side_inner(
                 )));
             }
             let len = end - start;
-            let bytes = store.read_range(key, side.read_range.start, len)?;
-            if bytes.len() != len {
+            store.read_range_into(key, side.read_range.start, len, output)?;
+            if output.len() != len {
                 return Err(Error::StalePlan(format!(
                     "range key '{key}' returned {} bytes, expected {len}",
-                    bytes.len()
+                    output.len()
                 )));
             }
-            *output = bytes;
             if len > 0 {
                 #[cfg(feature = "profile")]
                 {
@@ -187,14 +186,20 @@ fn read_side_inner(
                 output.clear();
                 return Ok(());
             }
-            let bytes = store.read_limited(key, *declared_len)?;
-            if bytes.len() != *declared_len {
+            let current_len = usize::try_from(store.len(key)?)
+                .map_err(|_| Error::ResourceLimit("whole-key length exceeds usize".into()))?;
+            if current_len != *declared_len {
                 return Err(Error::StalePlan(format!(
-                    "whole key '{key}' returned {} bytes, expected {declared_len}",
-                    bytes.len()
+                    "whole key '{key}' has {current_len} bytes, expected {declared_len}"
                 )));
             }
-            *output = bytes;
+            store.read_range_into(key, 0, *declared_len, output)?;
+            if output.len() != *declared_len {
+                return Err(Error::StalePlan(format!(
+                    "whole key '{key}' returned {} bytes, expected {declared_len}",
+                    output.len()
+                )));
+            }
             if *declared_len > 0 {
                 #[cfg(feature = "profile")]
                 {
