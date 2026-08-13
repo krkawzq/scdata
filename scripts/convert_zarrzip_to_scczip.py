@@ -69,7 +69,7 @@ def convert_one(
 ) -> dict:
     """Worker entry: return a result dict (picklable)."""
     from scdata.io import read_zarr
-    import sc_compress as scc
+    import scdata.compress as scc
     from scipy import sparse
     import numpy as np
 

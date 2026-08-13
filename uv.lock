@@ -549,38 +549,12 @@ wheels = [
 ]
 
 [[package]]
-name = "sc-compress"
-version = "0.2.0"
-source = { editable = "crates/sc-compress/python" }
-dependencies = [
-    { name = "numpy" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "anndata", marker = "extra == 'anndata'", specifier = ">=0.11" },
-    { name = "anndata", marker = "extra == 'dev'", specifier = ">=0.11" },
-    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.8,<2" },
-    { name = "numpy", specifier = ">=2.2.6" },
-    { name = "pandas", marker = "extra == 'dev'", specifier = ">=2" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12" },
-    { name = "scipy", marker = "extra == 'anndata'", specifier = ">=1.13" },
-    { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.13" },
-    { name = "scipy", marker = "extra == 'scipy'", specifier = ">=1.13" },
-    { name = "zarr", marker = "extra == 'anndata'", specifier = ">=3" },
-    { name = "zarr", marker = "extra == 'dev'", specifier = ">=3" },
-]
-provides-extras = ["scipy", "anndata", "dev"]
-
-[[package]]
-name = "sc-load"
+name = "scdata-toolkit"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "anndata" },
     { name = "numpy" },
-    { name = "sc-compress" },
     { name = "zarr" },
 ]
 
@@ -592,6 +566,9 @@ dev = [
     { name = "ruff" },
     { name = "scipy" },
 ]
+scipy = [
+    { name = "scipy" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -601,11 +578,11 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'dev'", specifier = ">=2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12" },
-    { name = "sc-compress", editable = "crates/sc-compress/python" },
     { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.13" },
+    { name = "scipy", marker = "extra == 'scipy'", specifier = ">=1.13" },
     { name = "zarr", specifier = ">=3" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["scipy", "dev"]
 
 [[package]]
 name = "scipy"

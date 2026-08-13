@@ -3,15 +3,14 @@ requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
-name = "sc-load"
+name = "scdata-toolkit"
 version = "0.2.0"
-description = "Compile ordered single-cell row requests into reusable prefetch plans over sc-compress matrices"
+description = "Compress, AnnData, and prefetch loading for single-cell matrices"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12,<3.16"
 dependencies = [
     "numpy>=2.2.6",
-    "sc-compress",
     "anndata>=0.11",
     "zarr>=3",
 ]
@@ -28,6 +27,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+scipy = ["scipy>=1.13"]
 dev = [
     "maturin>=1.8,<2",
     "pytest>=8.0",
@@ -36,21 +36,15 @@ dev = [
     "pandas>=2",
 ]
 
-[tool.uv.sources]
-sc-compress = { path = "crates/sc-compress/python", editable = true }
-
 [tool.maturin]
 bindings = "pyo3"
 features = ["extension-module"]
-manifest-path = "crates/sc-load/python/Cargo.toml"
-module-name = "sc_load._core"
+manifest-path = "crates/scdata-python/Cargo.toml"
+module-name = "scdata._core"
 python-source = "src"
 
 [tool.pytest.ini_options]
-testpaths = [
-    "crates/sc-load/python/tests",
-    "crates/sc-compress/python/tests",
-]
+testpaths = ["src/tests"]
 pythonpath = ["src"]
 
 [tool.ruff]

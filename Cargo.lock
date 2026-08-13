@@ -182,9 +182,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.13"
+version = "0.7.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -301,9 +301,9 @@ dependencies = [
 
 [[package]]
 name = "num-integer"
-version = "0.1.46"
+version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
+checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
 dependencies = [
  "num-traits",
 ]
@@ -526,15 +526,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sc-compress-python"
-version = "0.2.0"
-dependencies = [
- "numpy",
- "pyo3",
- "sc-compress",
-]
-
-[[package]]
 name = "sc-load"
 version = "0.2.0"
 dependencies = [
@@ -550,7 +541,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sc-load-python"
+name = "scdata-python"
 version = "0.2.0"
 dependencies = [
  "numpy",

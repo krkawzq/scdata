@@ -1,16 +1,12 @@
-# sc-load
+# scdata-toolkit
 
-`sc-load` compiles an ordered list of `(source, row)` requests into a reusable,
-block-granular prefetch plan over sc-compress matrices stored inside AnnData
-[`.scc` / `.scc.zip`](crates/sc-compress/python/README.md) containers. Every execution
-session owns its workers, output ring, cancellation state, and runtime
-statistics.
+PyPI name `scdata-toolkit`, import name `scdata`. One Python package for
+in-memory matrices (`ScDense` / `ScCsr`), sc-compress store I/O, AnnData
+`.scc` / `.scc.zip` containers, and prefetch planning.
 
-The public API is Python-first. Container resolution, feature-name convenience
-reads, validation, lifecycle helpers, typed statistics, and NumPy ergonomics
-live in `src/sc_load`. The private `sc_load._core` extension only keeps opened
-storage handles, compiled plans, execution sessions, and the batch copy into
-owned NumPy memory.
+Rust stays split (`dyn-blosc`, `sc-compress`, `sc-load`). The public Python
+classes live in `src/scdata`; `scdata._core` is a private function-style
+extension that only holds opaque handles and hot kernels.
 
 ## Development install
 
@@ -25,49 +21,48 @@ Python 3.12 or newer and NumPy 2.2 or newer are required.
 
 ```python
 import numpy as np
-import sc_load
+import scdata
 
 # Open one matrix inside an AnnData scc container (directory or ZIP).
-dataset = sc_load.register("sample.scc.zip", key="X")
+dataset = scdata.register("sample.scc.zip", key="X")
 
 # Optional: attach a caller-built feature map (length == n_cols; None/-1 drops).
 dataset = dataset.with_feature_map([2, None, 0, 1])
-output = sc_load.OutputSpec(4, np.float32, fill=-1)
+output = scdata.load.OutputSpec(4, np.float32, fill=-1)
 
-for batch in sc_load.prefetch(
+for batch in scdata.prefetch(
     dataset,
     [7, 2, 11],
     output=output,
     batch_size=256,
     prefetch_step=8,
-    config=sc_load.SessionConfig(io_mode="auto"),
+    config=scdata.SessionConfig(io_mode="auto"),
 ):
     # `batch` is compact, NumPy-owned, and remains valid after the Rust ring
     # slot has been released and reused.
     consume(batch)
 
 # For smaller results, compile once and materialize.
-plan = sc_load.compile(dataset, [7, 2, 11], output=output)
+plan = scdata.compile(dataset, [7, 2, 11], output=output)
 matrix = plan.read()
 ```
 
 `register()` accepts `.scc` directories and `.scc.zip` archives. Select the
 matrix with `key=` (`"X"`, `"layers/<name>"`, `"raw/X"`, `"obsm/<name>"`, …).
-Resolution uses `sc_compress.zip.list_stores` / the same `meta.json` layout as
-`sc_compress.open_store`. Expression keys expose `feature_names` from `var` /
+Resolution uses `scdata.compress.zip.list_stores` / the same `meta.json` layout as
+`scdata.open_store`. Expression keys expose `feature_names` from `var` /
 `raw/var` so callers can build maps externally; embedding keys leave
-`feature_names` as `None`. `limits=` accepts `sc_load.ReadLimits` or
-`sc_compress.ReadLimits`.
+`feature_names` as `None`. `limits=` accepts `scdata.ReadLimits`.
 
 Multiple datasets use collection order as `source_id`:
 
 ```python
-a = sc_load.register("a.scc", key="X", feature_map=map_a)
-b = sc_load.register("b.scc", key="X", feature_map=map_b)
-plan = sc_load.compile(
+a = scdata.register("a.scc", key="X", feature_map=map_a)
+b = scdata.register("b.scc", key="X", feature_map=map_b)
+plan = scdata.compile(
     [a, b],
     [(0, 10), (1, 3), (0, 11)],
-    output=sc_load.OutputSpec(n_genes, np.float32, fill=0),
+    output=scdata.load.OutputSpec(n_genes, np.float32, fill=0),
 )
 ```
 
@@ -84,10 +79,10 @@ once; logical batches are assigned round-robin across ranks.
 ```python
 import multiprocessing as mp
 
-import sc_load
+import scdata
 
 
-def consume_rank(loader: sc_load.DistributedIterator) -> None:
+def consume_rank(loader: scdata.load.DistributedIterator) -> None:
     with loader:
         for batch in loader:
             train_step(batch)
@@ -97,7 +92,7 @@ if __name__ == "__main__":
     context = mp.get_context("spawn")
     with plan.open_distributed(
         world_size=4,
-        config=sc_load.SessionConfig(worker_count=8, io_mode="auto"),
+        config=scdata.SessionConfig(worker_count=8, io_mode="auto"),
     ) as distributed:
         processes = [
             context.Process(target=consume_rank, args=(loader,))
@@ -149,13 +144,11 @@ The Rust execution model and lower-level invariants are documented in
 
 CI builds and tests on every push/PR to `main`. Pushing a `v*` tag (for example
 `v0.2.0`) builds Linux manylinux wheels (`x86_64`, `aarch64`) plus sdists for
-both `sc-compress` and `sc-load`, then uploads them to PyPI.
+`scdata-toolkit`, then uploads it to PyPI.
 
-1. Create a PyPI API token with upload access to both projects.
+1. Create a PyPI API token with upload access to `scdata-toolkit`.
 2. Add repository secret `PYPI_API_TOKEN`.
-3. Keep package versions aligned (`pyproject.toml` and
-   `crates/sc-compress/python/pyproject.toml`, currently driven by the Cargo
-   workspace version).
+3. Keep the package version aligned with the Cargo workspace version.
 4. Tag and push when ready:
 
 ```sh
