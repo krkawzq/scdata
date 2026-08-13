@@ -1,8 +1,7 @@
 # scdata-toolkit
 
-PyPI name `scdata-toolkit`, import name `scdata`. One Python package for
-in-memory matrices (`ScDense` / `ScCsr`), sc-compress store I/O, AnnData
-`.scc` / `.scc.zip` containers, and prefetch planning.
+PyPI name `scdata-toolkit`, import name `scdata`. One Python package for on-disk SCC matrices (`ScDense` / `ScCsr`), store I/O,
+AnnData `.scc` / `.scc.zip` containers, and prefetch planning.
 
 Rust stays split (`dyn-blosc`, `sc-compress`, `sc-load`). The public Python
 classes live in `src/scdata`; `scdata._core` is a private function-style
@@ -26,13 +25,15 @@ import scdata
 # Open one matrix inside an AnnData scc container (directory or ZIP).
 dataset = scdata.register("sample.scc.zip", key="X")
 
-# Optional: attach a caller-built feature map (length == n_cols; None/-1 drops).
-dataset = dataset.with_feature_map([2, None, 0, 1])
+# Optional: align genes onto a target name list by exact string identity.
+dataset = dataset.with_aligned_features(["g2", "g0", "extra", "gX"])
+# Equivalent: dataset.with_feature_map(scdata.load.build_feature_map(source, target))
 output = scdata.load.OutputSpec(4, np.float32, fill=-1)
 
+rows = dataset.rows_for(["c7", "c2", "c11"])  # needs obs_names
 for batch in scdata.prefetch(
     dataset,
-    [7, 2, 11],
+    rows,
     output=output,
     batch_size=256,
     prefetch_step=8,
@@ -43,26 +44,33 @@ for batch in scdata.prefetch(
     consume(batch)
 
 # For smaller results, compile once and materialize.
-plan = scdata.compile(dataset, [7, 2, 11], output=output)
+plan = scdata.compile(dataset, rows, output=output)
 matrix = plan.read()
 ```
 
-`register()` accepts `.scc` directories and `.scc.zip` archives. Select the
-matrix with `key=` (`"X"`, `"layers/<name>"`, `"raw/X"`, `"obsm/<name>"`, …).
-Resolution uses `scdata.compress.zip.list_stores` / the same `meta.json` layout as
-`scdata.open_store`. Expression keys expose `feature_names` from `var` /
-`raw/var` so callers can build maps externally; embedding keys leave
-`feature_names` as `None`. `limits=` accepts `scdata.ReadLimits`.
+`register()` accepts `.scc` directories and `.scc.zip` archives. Discover
+available matrices with `scdata.load.list_keys(path)` (`"X"`, `"layers/<name>"`,
+`"raw/X"`, `"obsm/<name>"`, …), then pass `key=`. Expression keys expose
+`feature_names` / `var_names` from `var` / `raw/var`; embedding keys leave
+`feature_names` as `None`. Cell-aligned keys expose `obs_names` from container
+`obs`. Build a gene map with `scdata.load.build_feature_map(source, target)`
+(exact string identity; pandas `Index` accepted) or
+`dataset.with_aligned_features(target_names)`. `limits=` accepts
+`scdata.ReadLimits`. `Dataset` is pickleable (re-opens the store in the
+receiving process) and supports `close()` / `with register(...) as dataset`.
 
 Multiple datasets use collection order as `source_id`:
 
 ```python
-a = scdata.register("a.scc", key="X", feature_map=map_a)
-b = scdata.register("b.scc", key="X", feature_map=map_b)
+a = scdata.register("a.scc", key="X")
+b = scdata.register("b.scc", key="X")
+target = a.feature_names  # or any ordered gene list
+a = a.with_aligned_features(target)
+b = b.with_aligned_features(target)
 plan = scdata.compile(
     [a, b],
     [(0, 10), (1, 3), (0, 11)],
-    output=scdata.load.OutputSpec(n_genes, np.float32, fill=0),
+    output=scdata.load.OutputSpec(len(target), np.float32, fill=0),
 )
 ```
 
@@ -92,7 +100,7 @@ if __name__ == "__main__":
     context = mp.get_context("spawn")
     with plan.open_distributed(
         world_size=4,
-        config=scdata.SessionConfig(worker_count=8, io_mode="auto"),
+        config=scdata.SessionConfig(num_workers=8, io_mode="auto"),
     ) as distributed:
         processes = [
             context.Process(target=consume_rank, args=(loader,))
@@ -119,7 +127,7 @@ session so the producer and other ranks do not hang. `ranks()` creates its
 remaining handles atomically: descriptor or allocation failure leaves every
 rank retryable and closes handles created by that failed call.
 
-Potentially rounding `i32/u32 -> f32` conversion requires
+Potentially rounding `i32/u32 -> f32` and `i64/u64 -> f64` conversion requires
 `allow_float_rounding=True`. Signedness/range failures are controlled by the
 output overflow policy: `error`, `use_fill`, `use_value`, or `unchecked`.
 

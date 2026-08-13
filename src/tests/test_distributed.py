@@ -12,12 +12,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from scdata import _core
 from scdata.anndata import write_scc
 import scdata.load as sc_load
-import scdata.load.distributed as distributed_module
+import scdata.load._distributed as distributed_module
 
 pytestmark = pytest.mark.skipif(
-    not hasattr(sc_load._core, "shared_attach"),
+    not hasattr(_core, "shared_attach"),
     reason="distributed shared rings require Linux with lock-free 64-bit atomics",
 )
 
@@ -60,10 +61,12 @@ def _close_inherited_handles(
     iterator: sc_load.DistributedIterator,
     server: Any,
 ) -> None:
-    sc_load._core.shared_cancel(server)
+    from scdata.exceptions import Error
+
+    _core.shared_cancel(server)
     try:
-        sc_load._core.shared_duplicate_fd(server)
-    except sc_load._core.CoreError:
+        _core.shared_duplicate_fd(server)
+    except Error:
         pass
     else:
         raise AssertionError("inherited producer unexpectedly duplicated its descriptor")
@@ -96,7 +99,7 @@ def _plan(tmp_path: Path, rows: int = 8) -> tuple[sc_load.Plan, np.ndarray]:
 
 def test_distributed_rank_iterators_preserve_round_robin_batches(tmp_path: Path) -> None:
     plan, values = _plan(tmp_path)
-    config = sc_load.SessionConfig(worker_count=2, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=2, io_mode="blocking")
     with plan.open_distributed(2, config) as distributed:
         rank0 = distributed.rank(0)
         rank1 = distributed.rank(1)
@@ -112,7 +115,7 @@ def test_distributed_rank_iterators_preserve_round_robin_batches(tmp_path: Path)
 
 def test_distributed_zero_copy_view_is_read_only_and_leased(tmp_path: Path) -> None:
     plan, values = _plan(tmp_path, rows=2)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     with plan.open_distributed(1, config) as distributed:
         iterator = distributed.rank(0, copy=False)
         batch = iterator.next_batch()
@@ -131,8 +134,46 @@ def test_distributed_zero_copy_view_is_read_only_and_leased(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
+    "values",
+    [
+        np.array(
+            [
+                [np.iinfo(np.int64).min, -(1 << 53) - 1],
+                [(1 << 53) + 1, np.iinfo(np.int64).max],
+            ],
+            dtype=np.int64,
+        ),
+        np.array(
+            [
+                [0, (1 << 53) + 1],
+                [(1 << 63) + 1, np.iinfo(np.uint64).max],
+            ],
+            dtype=np.uint64,
+        ),
+    ],
+    ids=["int64", "uint64"],
+)
+def test_distributed_zero_copy_preserves_64_bit_integer_precision(
+    tmp_path: Path,
+    values: np.ndarray,
+) -> None:
+    dataset = sc_load.register(_write_matrix(tmp_path, values))
+    plan = sc_load.compile(dataset, range(2), batch_size=2, prefetch_step=2)
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
+
+    with plan.open_distributed(1, config) as distributed:
+        batch = distributed.rank(0, copy=False).next_batch()
+        assert batch is not None
+        assert batch.dtype == values.dtype
+        assert not batch.flags.owndata
+        np.testing.assert_array_equal(batch, values)
+        del batch
+        distributed.wait(timeout=5)
+
+
+@pytest.mark.parametrize(
     "dtype",
-    [np.int16, np.int32, np.uint16, np.uint32, np.float32, np.float64],
+    [np.int16, np.int32, np.int64, np.uint16, np.uint32, np.uint64, np.float32, np.float64],
 )
 def test_distributed_copy_returns_compact_numpy_owned_batches(
     tmp_path: Path,
@@ -147,7 +188,7 @@ def test_distributed_copy_returns_compact_numpy_owned_batches(
         batch_size=2,
         prefetch_step=2,
     )
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     with plan.open_distributed(1, config) as distributed:
         iterator = distributed.rank(0)
         batch = iterator.next_batch()
@@ -184,7 +225,7 @@ def test_distributed_copy_supports_zero_width_output(tmp_path: Path) -> None:
         batch_size=2,
         prefetch_step=2,
     )
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     with plan.open_distributed(1, config) as distributed:
         iterator = distributed.rank(0)
         batch = iterator.next_batch()
@@ -206,11 +247,11 @@ def test_distributed_copy_supports_zero_width_output(tmp_path: Path) -> None:
 
 def test_distributed_validation_and_cancellation(tmp_path: Path) -> None:
     plan, _ = _plan(tmp_path)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     with pytest.raises(ValueError, match="world_size"):
         plan.open_distributed(0, config)
     with pytest.raises(sc_load.ResourceLimitError):
-        plan.open_distributed(1, config, maximum_control_bytes=1)
+        plan.open_distributed(1, config, max_control_bytes=1)
 
     distributed = plan.open_distributed(1, config)
     first = distributed.rank(0)
@@ -225,7 +266,7 @@ def test_distributed_validation_and_cancellation(tmp_path: Path) -> None:
 
 def test_distributed_ranks_validates_even_when_no_ranks_remain(tmp_path: Path) -> None:
     plan, _ = _plan(tmp_path, rows=2)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     distributed = plan.open_distributed(1, config)
     iterator = distributed.ranks()[0]
     with pytest.raises(TypeError, match="copy"):
@@ -242,7 +283,7 @@ def test_distributed_ranks_rolls_back_partial_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan, _ = _plan(tmp_path)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     distributed = plan.open_distributed(3, config)
     original = sc_load.DistributedSession._new_iterator
     created: list[sc_load.DistributedIterator] = []
@@ -301,7 +342,7 @@ def test_distributed_iterator_close_releases_every_resource_after_error(
 
     iterator._client = object()  # type: ignore[assignment]
     iterator._owner_pid = os.getpid()
-    monkeypatch.setattr(sc_load._core, "shared_close", failing_close)
+    monkeypatch.setattr(_core, "shared_close", failing_close)
     try:
         with pytest.raises(OSError, match="injected client close failure"):
             iterator.close()
@@ -339,9 +380,9 @@ def test_distributed_iterator_rejects_mismatched_descriptor_metadata(
             self.closed = True
 
     client = _MismatchedClient()
-    monkeypatch.setattr(sc_load._core, "shared_attach", lambda _fd, _rank: client)
+    monkeypatch.setattr(_core, "shared_attach", lambda _fd, _rank: client)
     monkeypatch.setattr(
-        sc_load._core,
+        _core,
         "shared_client_meta",
         lambda attached: {
             "rank": attached.rank,
@@ -353,7 +394,7 @@ def test_distributed_iterator_rejects_mismatched_descriptor_metadata(
             "dtype": attached.dtype,
         },
     )
-    monkeypatch.setattr(sc_load._core, "shared_close", lambda attached: attached.close())
+    monkeypatch.setattr(_core, "shared_close", lambda attached: attached.close())
     try:
         with pytest.raises(RuntimeError, match="metadata does not match"):
             iterator.__enter__()
@@ -375,8 +416,8 @@ def test_distributed_iterator_serializes_concurrent_first_consumers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan, values = _plan(tmp_path, rows=8)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
-    original = sc_load._core.shared_attach
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
+    original = _core.shared_attach
     first_entered = threading.Event()
     release_first = threading.Event()
     call_lock = threading.Lock()
@@ -393,7 +434,7 @@ def test_distributed_iterator_serializes_concurrent_first_consumers(
                 raise TimeoutError("first attach was not released")
         return original(fd, rank)
 
-    monkeypatch.setattr(sc_load._core, "shared_attach", delayed_attach)
+    monkeypatch.setattr(_core, "shared_attach", delayed_attach)
     with plan.open_distributed(1, config) as distributed:
         iterator = distributed.rank(0)
         batches: list[np.ndarray[Any, Any]] = []
@@ -432,8 +473,8 @@ def test_distributed_iterator_serializes_read_and_next_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan, values = _plan(tmp_path, rows=16)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
-    original = distributed_module._call_core
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
+    original = _core.shared_read
     read_entered = threading.Event()
     allow_read = threading.Event()
 
@@ -441,14 +482,13 @@ def test_distributed_iterator_serializes_read_and_next_batch(
         iterator = distributed.rank(0)
         iterator.__enter__()
 
-        def delayed_call(function: Any, *args: Any, **kwargs: Any) -> Any:
-            if getattr(function, "__name__", "") == "shared_read":
-                read_entered.set()
-                if not allow_read.wait(timeout=5):
-                    raise TimeoutError("read was not released")
-            return original(function, *args, **kwargs)
+        def delayed_read(client: Any, remaining: int) -> Any:
+            read_entered.set()
+            if not allow_read.wait(timeout=5):
+                raise TimeoutError("read was not released")
+            return original(client, remaining)
 
-        monkeypatch.setattr(distributed_module, "_call_core", delayed_call)
+        monkeypatch.setattr(_core, "shared_read", delayed_read)
         results: dict[str, Any] = {}
         errors: list[BaseException] = []
 
@@ -485,7 +525,7 @@ def test_distributed_zero_copy_reports_held_ring_slot(tmp_path: Path) -> None:
     values = np.arange(18, dtype=np.float32).reshape(6, 3)
     dataset = sc_load.register(_write_matrix(tmp_path, values))
     plan = sc_load.compile(dataset, range(6), batch_size=2, prefetch_step=2)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     with plan.open_distributed(1, config) as distributed:
         iterator = distributed.rank(0, copy=False)
         first = iterator.next_batch()
@@ -500,7 +540,7 @@ def test_distributed_zero_copy_reports_held_ring_slot(tmp_path: Path) -> None:
 
 def test_distributed_iterator_close_wakes_a_concurrent_next(tmp_path: Path) -> None:
     plan, _ = _plan(tmp_path, rows=16)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     distributed = plan.open_distributed(2, config)
     iterator = distributed.rank(0)
     assert iterator.next_batch() is not None
@@ -532,7 +572,7 @@ def test_distributed_iterator_close_wakes_a_concurrent_next(tmp_path: Path) -> N
 @pytest.mark.skipif(not hasattr(mp, "get_context"), reason="multiprocessing unavailable")
 def test_distributed_iterator_transfers_to_spawned_processes(tmp_path: Path) -> None:
     plan, values = _plan(tmp_path)
-    config = sc_load.SessionConfig(worker_count=2, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=2, io_mode="blocking")
     context = mp.get_context("spawn")
     queue = context.Queue()
     with plan.open_distributed(2, config) as distributed:
@@ -561,7 +601,7 @@ def test_distributed_iterator_transfers_to_spawned_processes(tmp_path: Path) -> 
 @pytest.mark.skipif(not hasattr(mp, "get_context"), reason="multiprocessing unavailable")
 def test_distributed_detects_a_rank_process_that_exits_without_cleanup(tmp_path: Path) -> None:
     plan, _ = _plan(tmp_path)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     context = mp.get_context("spawn")
     attached = context.Event()
     with plan.open_distributed(1, config) as distributed:
@@ -580,7 +620,7 @@ def test_distributed_detects_a_rank_process_that_exits_without_cleanup(tmp_path:
 @pytest.mark.skipif(not hasattr(mp, "get_context"), reason="multiprocessing unavailable")
 def test_distributed_reclaims_dead_owner_for_an_empty_rank(tmp_path: Path) -> None:
     plan, values = _plan(tmp_path, rows=2)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     context = mp.get_context("spawn")
     attached = context.Event()
     with plan.open_distributed(2, config) as distributed:
@@ -607,7 +647,7 @@ def test_closing_an_attached_iterator_after_fork_does_not_cancel_parent(
     tmp_path: Path,
 ) -> None:
     plan, values = _plan(tmp_path)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     context = mp.get_context("fork")
     with plan.open_distributed(1, config) as distributed:
         iterator = distributed.rank(0)
@@ -630,7 +670,7 @@ def test_closing_an_attached_iterator_after_fork_does_not_cancel_parent(
 )
 def test_closing_inherited_session_does_not_close_child_rank(tmp_path: Path) -> None:
     plan, values = _plan(tmp_path)
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     context = mp.get_context("fork")
     queue = context.Queue()
     with plan.open_distributed(1, config) as distributed:
@@ -659,7 +699,7 @@ def test_empty_distributed_plan_finishes_for_every_rank() -> None:
     )
     with plan.open_distributed(
         3,
-        sc_load.SessionConfig(worker_count=1, io_mode="blocking"),
+        sc_load.SessionConfig(num_workers=1, io_mode="blocking"),
     ) as distributed:
         for iterator in distributed.ranks():
             result = iterator.read()

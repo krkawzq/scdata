@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,7 +10,9 @@ use crate::codec::Compressor;
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::io_util::{read_meta, u64_slice_from_le_bytes, u64_slice_to_le_bytes, write_meta};
-use crate::kernel::{output_index_dtype, read_index_unchecked, write_index, GatherColumns};
+use crate::kernel::{
+    output_index_dtype, read_index_unchecked, write_index_unchecked, GatherColumns,
+};
 use crate::limits::ReadLimits;
 use crate::meta::{ArrayMeta, ChunkGridMeta, CsrMeta, MetaBody, MetaFile, PartitionMeta};
 use crate::numeric::{
@@ -20,7 +24,7 @@ use crate::partition::{plan_csr_blocks, validate_indptr, visit_csr_chunks, Block
 use crate::range_decode::{
     decode_blosc_scatter_into, BloscScatterRequest, RangeDecodeContext, ScatterMapping,
 };
-use crate::select::{CsrOutput, NormalizedAxis};
+use crate::select::{visit_run_chunks, AxisRun, CsrOutput, NormalizedAxis};
 use crate::storage::{chunk_key, ByteStore, ByteStoreMut, DirectoryTransaction, StoreLocation};
 
 const INDPTR_FILE: &str = "indptr";
@@ -450,6 +454,20 @@ impl CsrMatrix {
     }
 
     fn decode_selected_indices(&self, rows: &NormalizedAxis) -> Result<DecodedCsrIndices> {
+        let decoded = self.decode_selected_indices_unvalidated(rows)?;
+        validate_decoded_csr_indices(
+            &decoded.indptr,
+            &decoded.indices,
+            self.index_dtype(),
+            self.n_cols(),
+        )?;
+        Ok(decoded)
+    }
+
+    fn decode_selected_indices_unvalidated(
+        &self,
+        rows: &NormalizedAxis,
+    ) -> Result<DecodedCsrIndices> {
         rows.validate(self.n_rows())?;
         let indptr = selected_indptr(self, rows)?;
         let n_nnz = indptr.last().copied().unwrap_or(0);
@@ -457,31 +475,39 @@ impl CsrMatrix {
         let indices_len = checked_meta_byte_len(n_nnz, index_size, "indices output")?;
         let source_indptr_len = self.source_indptr_resident()?;
         let output_indptr_len = resident_bytes::<u64>(indptr.len(), "selected indptr")?;
-        let resident_decoded = self.limits.check_decoded_sum(
+        let base_resident = self.limits.check_decoded_sum(
             [source_indptr_len, output_indptr_len, indices_len],
             "csr selected indices resident output",
         )?;
         let mut indices = zeroed_vec(indices_len)?;
-        let nnz_requests = plan_csr_nnz_requests(self, rows, &indptr)?;
+        let nnz_requests = if n_nnz == 0 {
+            Vec::new()
+        } else {
+            let (request_count, mapping_count) = csr_nnz_plan_upper_bound(self, rows)?;
+            let plan_resident =
+                csr_nnz_plan_upper_resident(request_count, mapping_count, &self.meta.indices.path)?;
+            self.limits.check_decoded_sum(
+                [base_resident, plan_resident],
+                "csr selected resident output",
+            )?;
+            plan_csr_nnz_requests(self, rows, &indptr)?
+        };
         if n_nnz != 0 {
             let requests = scale_csr_requests(&self.meta.indices.path, &nnz_requests, index_size)?;
+            let resident_decoded = self.limits.check_decoded_sum(
+                [
+                    base_resident,
+                    nnz_requests_resident(&nnz_requests)?,
+                    scatter_requests_resident(&requests)?,
+                ],
+                "csr selected resident output",
+            )?;
             decode_blosc_scatter_into(
                 &self.meta.indices.compressor,
                 RangeDecodeContext::new(self.store.as_ref(), resident_decoded, self.limits),
                 &requests,
                 &mut indices,
             )?;
-            if let Some((position, value)) =
-                first_out_of_bounds_index(&indices, self.index_dtype(), self.n_cols())
-            {
-                return Err(Error::corrupt(
-                    "csr indices",
-                    format!(
-                        "index at decoded position {position} is {value}, outside 0..{}",
-                        self.n_cols()
-                    ),
-                ));
-            }
         }
         Ok(DecodedCsrIndices {
             indptr,
@@ -520,8 +546,13 @@ impl CsrMatrix {
             indptr,
             indices,
             nnz_requests: _,
-        } = self.decode_selected_indices(rows)?;
-        let SelectedColumnPlan { layout, mappings } = plan_selected_columns(
+        } = self.decode_selected_indices_unvalidated(rows)?;
+        let SelectedColumnPlan {
+            layout,
+            data_requests,
+        } = plan_selected_columns(
+            self,
+            rows,
             &indptr,
             &indices,
             cols,
@@ -533,13 +564,6 @@ impl CsrMatrix {
                 limits: self.limits,
             },
         )?;
-        let nnz_requests = plan_selected_data_requests(self, rows, &indptr, mappings)?;
-        let data_requests = scale_csr_requests(
-            &self.meta.data.path,
-            &nnz_requests,
-            self.value_dtype().size(),
-        )?;
-        drop(nnz_requests);
         let request_resident = scatter_requests_resident(&data_requests)?;
         drop(indices);
         drop(indptr);
@@ -624,45 +648,53 @@ fn selected_indptr(matrix: &CsrMatrix, rows: &NormalizedAxis) -> Result<Vec<u64>
     let mut output = Vec::new();
     output.try_reserve_exact(output_len)?;
     output.push(0);
-    match rows {
-        NormalizedAxis::Contiguous { start, end } => {
-            let start = usize::try_from(*start)
-                .map_err(|_| Error::invalid_argument("row start exceeds usize"))?;
-            let end = usize::try_from(*end)
-                .map_err(|_| Error::invalid_argument("row end exceeds usize"))?;
-            let base = matrix.indptr[start];
-            for &offset in &matrix.indptr[start + 1..=end] {
-                output.push(offset - base);
-            }
-        }
-        NormalizedAxis::Gather { positions } => {
-            for &position in positions {
-                let row = usize::try_from(position)
-                    .map_err(|_| Error::invalid_argument("row position exceeds usize"))?;
-                let row_nnz = matrix.indptr[row + 1] - matrix.indptr[row];
-                let next = output
-                    .last()
-                    .copied()
-                    .unwrap_or(0u64)
-                    .checked_add(row_nnz)
-                    .ok_or_else(|| Error::invalid_argument("selected CSR nnz overflow"))?;
-                output.push(next);
-            }
-        }
-    }
+    rows.visit_runs(|run| append_selected_indptr_run(matrix, run, &mut output))?;
     Ok(output)
+}
+
+fn append_selected_indptr_run(
+    matrix: &CsrMatrix,
+    run: AxisRun,
+    output: &mut Vec<u64>,
+) -> Result<()> {
+    if run.source_step == 1 {
+        let start = usize::try_from(run.source)
+            .map_err(|_| Error::invalid_argument("row start exceeds usize"))?;
+        let count = usize::try_from(run.count)
+            .map_err(|_| Error::invalid_argument("selected row count exceeds usize"))?;
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| Error::invalid_argument("selected row end overflow"))?;
+        let base_out = output.last().copied().unwrap_or(0);
+        let base_in = matrix.indptr[start];
+        for &offset in &matrix.indptr[start + 1..=end] {
+            output.push(
+                base_out
+                    .checked_add(offset - base_in)
+                    .ok_or_else(|| Error::invalid_argument("selected CSR nnz overflow"))?,
+            );
+        }
+        return Ok(());
+    }
+    for index in 0..run.count {
+        let row = usize::try_from(run.nth(index)?)
+            .map_err(|_| Error::invalid_argument("row position exceeds usize"))?;
+        let row_nnz = matrix.indptr[row + 1] - matrix.indptr[row];
+        let next = output
+            .last()
+            .copied()
+            .unwrap_or(0u64)
+            .checked_add(row_nnz)
+            .ok_or_else(|| Error::invalid_argument("selected CSR nnz overflow"))?;
+        output.push(next);
+    }
+    Ok(())
 }
 
 struct NnzScatterRequest {
     chunk: usize,
     expected_nnz: u64,
     mappings: Vec<(Range<u64>, Range<u64>)>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SelectedValueMapping {
-    source_position: usize,
-    destination_position: usize,
 }
 
 enum SelectedColumnLayout {
@@ -676,7 +708,7 @@ enum SelectedColumnLayout {
 
 struct SelectedColumnPlan {
     layout: SelectedColumnLayout,
-    mappings: Vec<SelectedValueMapping>,
+    data_requests: Vec<BloscScatterRequest>,
 }
 
 #[derive(Clone, Copy)]
@@ -689,6 +721,8 @@ struct SelectedColumnContext {
 }
 
 fn plan_selected_columns(
+    matrix: &CsrMatrix,
+    rows: &NormalizedAxis,
     indptr: &[u64],
     indices: &[u8],
     cols: &NormalizedAxis,
@@ -726,6 +760,10 @@ fn plan_selected_columns(
             .len()
             .checked_mul(std::mem::size_of::<(u64, u32)>())
             .ok_or_else(|| Error::invalid_argument("column gather map size overflow"))?,
+        NormalizedAxis::Strided { len, .. } => usize::try_from(*len)
+            .ok()
+            .and_then(|len| len.checked_mul(std::mem::size_of::<(u64, u32)>()))
+            .ok_or_else(|| Error::invalid_argument("column gather map size overflow"))?,
         NormalizedAxis::Contiguous { .. } => 0,
     };
     limits.check_decoded_sum(
@@ -738,48 +776,56 @@ fn plan_selected_columns(
         ],
         "CSR direct column planning preflight",
     )?;
-    let gather = match cols {
-        NormalizedAxis::Gather { positions } => Some(GatherColumns::new(source_n_cols, positions)?),
-        NormalizedAxis::Contiguous { .. } => None,
-    };
-    let col_range = match cols {
-        NormalizedAxis::Contiguous { start, end } => Some((*start, *end)),
-        NormalizedAxis::Gather { .. } => None,
-    };
+    let gather = column_gather(source_n_cols, cols)?;
+    let col_range = cols.as_range().map(|range| (range.start, range.end));
 
     let mut row_counts = Vec::new();
     row_counts.try_reserve_exact(n_rows)?;
-    let mut total = 0usize;
-    for row in 0..n_rows {
-        let start = usize::try_from(indptr[row])
-            .map_err(|_| Error::invalid_argument("selected row start exceeds usize"))?;
-        let end = usize::try_from(indptr[row + 1])
-            .map_err(|_| Error::invalid_argument("selected row end exceeds usize"))?;
-        let count = if let Some((first_col, past_last_col)) = col_range {
-            let first = lower_bound_decoded_index(indices, start, end, index_size, first_col);
-            let past_last =
-                lower_bound_decoded_index(indices, first, end, index_size, past_last_col);
-            past_last - first
-        } else {
-            let gather = gather
-                .as_ref()
-                .expect("gather lookup exists for non-contiguous columns");
-            let mut count = 0usize;
-            for position in start..end {
-                // SAFETY: the exact packed index length and indptr bounds were
-                // validated above, so every row position contains one index.
-                let source = unsafe { read_index_unchecked(indices, position, index_size) };
-                count = count
-                    .checked_add(gather.destinations(source).len())
-                    .ok_or_else(|| Error::invalid_argument("selected CSR nnz overflow"))?;
+    row_counts.resize(n_rows, 0usize);
+    let threads = limits.thread_count().max(1);
+    let job = 64usize;
+    let job_count = n_rows.div_ceil(job);
+    let mut remaining = row_counts.as_mut_slice();
+    let mut row_start = 0usize;
+    parallel::try_for_each_stream(
+        threads,
+        job_count,
+        |emit| {
+            while row_start < n_rows {
+                let row_end = (row_start + job).min(n_rows);
+                let tail = std::mem::take(&mut remaining);
+                let (block, tail) = tail.split_at_mut(row_end - row_start);
+                remaining = tail;
+                emit((row_start, block))?;
+                row_start = row_end;
             }
-            count
-        };
-        total = total
+            Ok(())
+        },
+        |(start, block)| {
+            for (offset, slot) in block.iter_mut().enumerate() {
+                let row = start + offset;
+                let row_start = usize::try_from(indptr[row])
+                    .map_err(|_| Error::invalid_argument("selected row start exceeds usize"))?;
+                let row_end = usize::try_from(indptr[row + 1])
+                    .map_err(|_| Error::invalid_argument("selected row end exceeds usize"))?;
+                *slot = count_selected_columns_checked(
+                    indices,
+                    row_start,
+                    row_end,
+                    index_size,
+                    source_n_cols as u64,
+                    col_range,
+                    gather.as_ref(),
+                )?;
+            }
+            Ok(())
+        },
+    )?;
+    let total = row_counts.iter().try_fold(0usize, |total, &count| {
+        total
             .checked_add(count)
-            .ok_or_else(|| Error::invalid_argument("selected CSR nnz overflow"))?;
-        row_counts.push(count);
-    }
+            .ok_or_else(|| Error::invalid_argument("selected CSR nnz overflow"))
+    })?;
 
     let n_out_cols = usize::try_from(cols.len())
         .map_err(|_| Error::invalid_argument("selected column count exceeds usize"))?;
@@ -789,13 +835,37 @@ fn plan_selected_columns(
         DType::U16
     };
     let sparse_index_size = sparse_index_dtype.size();
-    let mapping_bytes = total
-        .checked_mul(
-            std::mem::size_of::<SelectedValueMapping>()
-                + std::mem::size_of::<(Range<u64>, Range<u64>)>()
-                + std::mem::size_of::<ScatterMapping>(),
-        )
+    let mapping_upper_bound = if output == CsrOutput::Sparse && col_range.is_some() {
+        row_counts.iter().filter(|&&count| count != 0).count()
+    } else {
+        total
+    };
+    let mapping_bytes = mapping_upper_bound
+        .checked_mul(2)
+        .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<ScatterMapping>()))
         .ok_or_else(|| Error::invalid_argument("selected mapping size overflow"))?;
+    let active_request_upper_bound = row_counts
+        .iter()
+        .filter(|&&count| count != 0)
+        .count()
+        .min(matrix.meta.chunks.n_chunks());
+    let request_entry_bytes = std::mem::size_of::<(usize, BloscScatterRequest)>()
+        .checked_mul(2)
+        .and_then(|bytes| {
+            bytes.checked_add(
+                matrix
+                    .meta
+                    .data
+                    .path
+                    .len()
+                    .saturating_add(1)
+                    .saturating_add(20),
+            )
+        })
+        .ok_or_else(|| Error::invalid_argument("selected request size overflow"))?;
+    let request_bytes = active_request_upper_bound
+        .checked_mul(request_entry_bytes)
+        .ok_or_else(|| Error::invalid_argument("selected request size overflow"))?;
     let gather_bytes = gather
         .as_ref()
         .map_or(Ok(0), GatherColumns::resident_bytes)?;
@@ -820,6 +890,7 @@ fn plan_selected_columns(
             indices.len(),
             row_counts_bytes,
             mapping_bytes,
+            request_bytes,
             gather_bytes,
             scratch_bytes,
             layout_bytes,
@@ -827,8 +898,6 @@ fn plan_selected_columns(
         "CSR direct column planning working set",
     )?;
 
-    let mut mappings = Vec::new();
-    mappings.try_reserve_exact(total)?;
     let mut sparse_indptr = Vec::new();
     let mut sparse_indices = Vec::new();
     if output == CsrOutput::Sparse {
@@ -853,6 +922,8 @@ fn plan_selected_columns(
         )?;
     }
 
+    let value_size = matrix.value_dtype().size();
+    let mut requests = BTreeMap::<usize, BloscScatterRequest>::new();
     let mut output_cursor = 0usize;
     let mut gather_entries = Vec::new();
     for row in 0..n_rows {
@@ -860,36 +931,94 @@ fn plan_selected_columns(
             .map_err(|_| Error::invalid_argument("selected row start exceeds usize"))?;
         let end = usize::try_from(indptr[row + 1])
             .map_err(|_| Error::invalid_argument("selected row end exceeds usize"))?;
+        if row_counts[row] == 0 {
+            continue;
+        }
+        let source_row = normalized_axis_position(rows, row)?;
+        let source_row_usize = usize::try_from(source_row)
+            .map_err(|_| Error::invalid_argument("source row exceeds usize"))?;
+        let chunk = matrix.meta.chunks.chunk_of(source_row)?;
+        let (chunk_row_start, chunk_row_end) =
+            matrix.meta.chunks.cell_range(chunk, matrix.n_rows())?;
+        let chunk_row_start = usize::try_from(chunk_row_start)
+            .map_err(|_| Error::invalid_meta("chunk row start exceeds usize"))?;
+        let chunk_row_end = usize::try_from(chunk_row_end)
+            .map_err(|_| Error::invalid_meta("chunk row end exceeds usize"))?;
+        let chunk_nnz_start = matrix.indptr[chunk_row_start];
+        let chunk_nnz_end = matrix.indptr[chunk_row_end];
+        let request = match requests.entry(chunk) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(BloscScatterRequest {
+                key: chunk_key(&matrix.meta.data.path, chunk as u64),
+                expected: checked_meta_byte_len(
+                    chunk_nnz_end - chunk_nnz_start,
+                    value_size,
+                    "CSR chunk",
+                )?,
+                mappings: Vec::new(),
+            }),
+        };
+        let row_data = SelectedDataRow {
+            selected_start: start,
+            selected_end: end,
+            source_start: matrix.indptr[source_row_usize],
+            source_end: matrix.indptr[source_row_usize + 1],
+            chunk_start: chunk_nnz_start,
+            value_size,
+        };
         if let Some((first_col, past_last_col)) = col_range {
             let first = lower_bound_decoded_index(indices, start, end, index_size, first_col);
             let past_last =
                 lower_bound_decoded_index(indices, first, end, index_size, past_last_col);
-            for position in first..past_last {
-                // SAFETY: both lower bounds lie inside this validated row.
-                let source = unsafe { read_index_unchecked(indices, position, index_size) };
-                let destination_col = usize::try_from(source - first_col)
-                    .map_err(|_| Error::invalid_argument("selected column exceeds usize"))?;
-                let destination_position = match output {
-                    CsrOutput::Sparse => {
-                        write_index(
-                            &mut sparse_indices,
-                            output_cursor,
-                            sparse_index_size,
-                            destination_col as u64,
-                        )?;
-                        output_cursor
+            match output {
+                CsrOutput::Sparse => {
+                    let destination_start = output_cursor;
+                    for position in first..past_last {
+                        // SAFETY: both lower bounds lie inside this validated row.
+                        let source = unsafe { read_index_unchecked(indices, position, index_size) };
+                        let destination_col =
+                            usize::try_from(source - first_col).map_err(|_| {
+                                Error::invalid_argument("selected column exceeds usize")
+                            })?;
+                        // SAFETY: `sparse_indices` was sized from the exact
+                        // count pass, `output_cursor < total`, and the remapped
+                        // column fits the selected output index dtype.
+                        unsafe {
+                            write_index_unchecked(
+                                sparse_indices.as_mut_ptr(),
+                                output_cursor,
+                                sparse_index_size,
+                                destination_col as u64,
+                            );
+                        }
+                        output_cursor += 1;
                     }
-                    CsrOutput::Dense => row
+                    row_data.push_mapping(
+                        request,
+                        first..past_last,
+                        destination_start..output_cursor,
+                    )?;
+                }
+                CsrOutput::Dense => {
+                    let row_base = row
                         .checked_mul(n_out_cols)
-                        .and_then(|base| base.checked_add(destination_col))
-                        .ok_or_else(|| Error::invalid_argument("dense destination overflow"))?,
-                };
-                mappings.push(SelectedValueMapping {
-                    source_position: position,
-                    destination_position,
-                });
-                if output == CsrOutput::Sparse {
-                    output_cursor += 1;
+                        .ok_or_else(|| Error::invalid_argument("dense destination overflow"))?;
+                    for position in first..past_last {
+                        // SAFETY: both lower bounds lie inside this validated row.
+                        let source = unsafe { read_index_unchecked(indices, position, index_size) };
+                        let destination_col =
+                            usize::try_from(source - first_col).map_err(|_| {
+                                Error::invalid_argument("selected column exceeds usize")
+                            })?;
+                        let destination = row_base
+                            .checked_add(destination_col)
+                            .ok_or_else(|| Error::invalid_argument("dense destination overflow"))?;
+                        row_data.push_mapping(
+                            request,
+                            position..position + 1,
+                            destination..destination + 1,
+                        )?;
+                    }
                 }
             }
         } else {
@@ -898,27 +1027,25 @@ fn plan_selected_columns(
                 .expect("gather lookup exists for non-contiguous columns");
             gather_entries.clear();
             gather_entries.try_reserve(row_counts[row])?;
-            for position in start..end {
-                // SAFETY: the exact packed index length and row bounds were
-                // validated before the scan.
-                let source = unsafe { read_index_unchecked(indices, position, index_size) };
-                for &(_, destination) in gather.destinations(source) {
-                    gather_entries.push((destination, position));
-                }
-            }
-            if output == CsrOutput::Sparse {
+            gather.collect_hits(indices, start, end, index_size, &mut gather_entries)?;
+            if output == CsrOutput::Sparse && !gather.destinations_are_ordered() {
                 gather_entries.sort_unstable_by_key(|&(destination, _)| destination);
             }
             for &(destination_col, source_position) in &gather_entries {
                 let destination_col = destination_col as usize;
                 let destination_position = match output {
                     CsrOutput::Sparse => {
-                        write_index(
-                            &mut sparse_indices,
-                            output_cursor,
-                            sparse_index_size,
-                            destination_col as u64,
-                        )?;
+                        // SAFETY: `sparse_indices` was sized from the exact
+                        // count pass, `output_cursor < total`, and destinations
+                        // originate from validated selected-column positions.
+                        unsafe {
+                            write_index_unchecked(
+                                sparse_indices.as_mut_ptr(),
+                                output_cursor,
+                                sparse_index_size,
+                                destination_col as u64,
+                            );
+                        }
                         output_cursor
                     }
                     CsrOutput::Dense => row
@@ -926,18 +1053,22 @@ fn plan_selected_columns(
                         .and_then(|base| base.checked_add(destination_col))
                         .ok_or_else(|| Error::invalid_argument("dense destination overflow"))?,
                 };
-                mappings.push(SelectedValueMapping {
-                    source_position,
-                    destination_position,
-                });
+                row_data.push_mapping(
+                    request,
+                    source_position..source_position + 1,
+                    destination_position..destination_position + 1,
+                )?;
                 if output == CsrOutput::Sparse {
                     output_cursor += 1;
                 }
             }
         }
     }
-    debug_assert_eq!(mappings.len(), total);
     debug_assert!(output != CsrOutput::Sparse || output_cursor == total);
+
+    let mut data_requests = Vec::new();
+    data_requests.try_reserve_exact(requests.len())?;
+    data_requests.extend(requests.into_values());
 
     let layout = match output {
         CsrOutput::Sparse => SelectedColumnLayout::Sparse {
@@ -947,7 +1078,179 @@ fn plan_selected_columns(
         },
         CsrOutput::Dense => SelectedColumnLayout::Dense,
     };
-    Ok(SelectedColumnPlan { layout, mappings })
+    Ok(SelectedColumnPlan {
+        layout,
+        data_requests,
+    })
+}
+
+fn count_selected_columns_checked(
+    indices: &[u8],
+    start: usize,
+    end: usize,
+    index_size: usize,
+    source_n_cols: u64,
+    col_range: Option<(u64, u64)>,
+    gather: Option<&GatherColumns>,
+) -> Result<usize> {
+    if let Some((first_col, past_last_col)) = col_range {
+        let mut count = 0usize;
+        let mut previous = None;
+        for position in start..end {
+            // SAFETY: the caller supplies one complete validated packed row.
+            let source = unsafe { read_index_unchecked(indices, position, index_size) };
+            validate_decoded_index(position, source, previous, source_n_cols)?;
+            previous = Some(source);
+            count += usize::from(source >= first_col && source < past_last_col);
+        }
+        return Ok(count);
+    }
+
+    let gather = gather.expect("gather lookup exists for non-contiguous columns");
+    if gather.prefer_binary_search(end.saturating_sub(start)) {
+        validate_decoded_index_row(indices, start, end, index_size, source_n_cols)?;
+        return gather.count_hits(indices, start, end, index_size);
+    }
+    let mut count = 0usize;
+    let mut previous = None;
+    for position in start..end {
+        // SAFETY: the caller supplies one complete validated packed row.
+        let source = unsafe { read_index_unchecked(indices, position, index_size) };
+        validate_decoded_index(position, source, previous, source_n_cols)?;
+        previous = Some(source);
+        count = count
+            .checked_add(gather.destinations(source).len())
+            .ok_or_else(|| Error::invalid_argument("CSR selected nnz overflow"))?;
+    }
+    Ok(count)
+}
+
+fn validate_decoded_index_row(
+    indices: &[u8],
+    start: usize,
+    end: usize,
+    index_size: usize,
+    source_n_cols: u64,
+) -> Result<()> {
+    let mut previous = None;
+    for position in start..end {
+        // SAFETY: the caller supplies one complete validated packed row.
+        let source = unsafe { read_index_unchecked(indices, position, index_size) };
+        validate_decoded_index(position, source, previous, source_n_cols)?;
+        previous = Some(source);
+    }
+    Ok(())
+}
+
+fn validate_decoded_index(
+    position: usize,
+    source: u64,
+    previous: Option<u64>,
+    source_n_cols: u64,
+) -> Result<()> {
+    if source >= source_n_cols {
+        return Err(Error::corrupt(
+            "csr indices",
+            format!("index at decoded position {position} is {source}, outside 0..{source_n_cols}"),
+        ));
+    }
+    if previous.is_some_and(|previous| previous >= source) {
+        return Err(Error::corrupt(
+            "csr indices",
+            format!(
+                "indices at decoded position {position} are not strictly increasing within the row"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct SelectedDataRow {
+    selected_start: usize,
+    selected_end: usize,
+    source_start: u64,
+    source_end: u64,
+    chunk_start: u64,
+    value_size: usize,
+}
+
+impl SelectedDataRow {
+    fn push_mapping(
+        self,
+        request: &mut BloscScatterRequest,
+        source: Range<usize>,
+        destination: Range<usize>,
+    ) -> Result<()> {
+        if source.is_empty() {
+            return Ok(());
+        }
+        if source.start < self.selected_start
+            || source.end > self.selected_end
+            || source.len() != destination.len()
+        {
+            return Err(Error::invalid_argument(
+                "selected data mapping is outside its CSR row",
+            ));
+        }
+        let local_start = u64::try_from(source.start - self.selected_start)
+            .map_err(|_| Error::invalid_argument("selected row offset exceeds u64"))?;
+        let local_end = u64::try_from(source.end - self.selected_start)
+            .map_err(|_| Error::invalid_argument("selected row offset exceeds u64"))?;
+        let source_start = self
+            .source_start
+            .checked_add(local_start)
+            .ok_or_else(|| Error::invalid_argument("source nnz position overflow"))?;
+        let source_end = self
+            .source_start
+            .checked_add(local_end)
+            .ok_or_else(|| Error::invalid_argument("source nnz position overflow"))?;
+        if source_end > self.source_end || source_start < self.chunk_start {
+            return Err(Error::invalid_argument(
+                "selected data mapping exceeds its source CSR row",
+            ));
+        }
+        let destination_start = u64::try_from(destination.start)
+            .map_err(|_| Error::invalid_argument("destination position exceeds u64"))?;
+        let destination_end = u64::try_from(destination.end)
+            .map_err(|_| Error::invalid_argument("destination position exceeds u64"))?;
+        push_scatter_mapping(
+            &mut request.mappings,
+            ScatterMapping {
+                source: checked_meta_byte_len(
+                    source_start - self.chunk_start,
+                    self.value_size,
+                    "CSR source",
+                )?
+                    ..checked_meta_byte_len(
+                        source_end - self.chunk_start,
+                        self.value_size,
+                        "CSR source",
+                    )?,
+                destination: checked_meta_byte_len(
+                    destination_start,
+                    self.value_size,
+                    "CSR destination",
+                )?
+                    ..checked_meta_byte_len(destination_end, self.value_size, "CSR destination")?,
+            },
+        )
+    }
+}
+
+fn push_scatter_mapping(mappings: &mut Vec<ScatterMapping>, mapping: ScatterMapping) -> Result<()> {
+    if let Some(previous) = mappings.last_mut() {
+        if previous.source.end == mapping.source.start
+            && previous.destination.end == mapping.destination.start
+        {
+            previous.source.end = mapping.source.end;
+            previous.destination.end = mapping.destination.end;
+            return Ok(());
+        }
+    }
+    mappings.try_reserve(1)?;
+    mappings.push(mapping);
+    Ok(())
 }
 
 #[inline]
@@ -973,106 +1276,72 @@ fn lower_bound_decoded_index(
     start
 }
 
-fn plan_selected_data_requests(
-    matrix: &CsrMatrix,
-    rows: &NormalizedAxis,
-    selected_indptr: &[u64],
-    mappings: impl IntoIterator<Item = SelectedValueMapping>,
-) -> Result<Vec<NnzScatterRequest>> {
-    let n_selected_rows = selected_indptr
-        .len()
-        .checked_sub(1)
-        .ok_or_else(|| Error::invalid_argument("selected CSR indptr is empty"))?;
-    let mut requests = Vec::new();
-    requests.try_reserve_exact(matrix.meta.chunks.n_chunks())?;
-    requests.resize_with(matrix.meta.chunks.n_chunks(), || None);
-    let mut selected_row = 0usize;
-
-    for mapping in mappings {
-        while selected_row < n_selected_rows
-            && mapping.source_position
-                >= usize::try_from(selected_indptr[selected_row + 1])
-                    .map_err(|_| Error::invalid_argument("selected CSR row end exceeds usize"))?
-        {
-            selected_row += 1;
+fn column_gather(n_cols: usize, cols: &NormalizedAxis) -> Result<Option<GatherColumns>> {
+    match cols {
+        NormalizedAxis::Contiguous { .. } => Ok(None),
+        NormalizedAxis::Gather { positions } => Ok(Some(GatherColumns::new(n_cols, positions)?)),
+        NormalizedAxis::Strided { .. } => {
+            let positions = cols.to_positions();
+            Ok(Some(GatherColumns::new(n_cols, &positions)?))
         }
-        if selected_row >= n_selected_rows {
-            return Err(Error::invalid_argument(
-                "selected value position is outside selected indptr",
-            ));
-        }
-        let selected_row_start = usize::try_from(selected_indptr[selected_row])
-            .map_err(|_| Error::invalid_argument("selected CSR row start exceeds usize"))?;
-        if mapping.source_position < selected_row_start {
-            return Err(Error::invalid_argument(
-                "selected value positions are not grouped by row",
-            ));
-        }
-        let source_row = normalized_axis_position(rows, selected_row)?;
-        let source_row_usize = usize::try_from(source_row)
-            .map_err(|_| Error::invalid_argument("source row exceeds usize"))?;
-        let chunk = matrix.meta.chunks.chunk_of(source_row)?;
-        let (chunk_row_start, chunk_row_end) =
-            matrix.meta.chunks.cell_range(chunk, matrix.n_rows())?;
-        let chunk_row_start = usize::try_from(chunk_row_start)
-            .map_err(|_| Error::invalid_meta("chunk row start exceeds usize"))?;
-        let chunk_row_end = usize::try_from(chunk_row_end)
-            .map_err(|_| Error::invalid_meta("chunk row end exceeds usize"))?;
-        let chunk_nnz_start = matrix.indptr[chunk_row_start];
-        let chunk_nnz_end = matrix.indptr[chunk_row_end];
-        let row_offset = mapping.source_position - selected_row_start;
-        let row_offset = u64::try_from(row_offset)
-            .map_err(|_| Error::invalid_argument("source row offset exceeds u64"))?;
-        let source_global = matrix.indptr[source_row_usize]
-            .checked_add(row_offset)
-            .ok_or_else(|| Error::invalid_argument("source nnz position overflow"))?;
-        if source_global >= matrix.indptr[source_row_usize + 1] {
-            return Err(Error::invalid_argument(
-                "selected value position exceeds its source row",
-            ));
-        }
-        let source = source_global - chunk_nnz_start;
-        let source_end = source
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_argument("source nnz range overflow"))?;
-        let destination = u64::try_from(mapping.destination_position)
-            .map_err(|_| Error::invalid_argument("destination nnz position exceeds u64"))?;
-        let destination_end = destination
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_argument("destination nnz range overflow"))?;
-        let request = requests[chunk].get_or_insert_with(|| NnzScatterRequest {
-            chunk,
-            expected_nnz: chunk_nnz_end - chunk_nnz_start,
-            mappings: Vec::new(),
-        });
-        push_nnz_mapping(
-            &mut request.mappings,
-            source..source_end,
-            destination..destination_end,
-        )?;
     }
-
-    Ok(requests.into_iter().flatten().collect())
 }
 
 fn normalized_axis_position(axis: &NormalizedAxis, position: usize) -> Result<u64> {
-    match axis {
-        NormalizedAxis::Contiguous { start, end } => {
-            let position = u64::try_from(position)
-                .map_err(|_| Error::invalid_argument("row position exceeds u64"))?;
-            let source = start
-                .checked_add(position)
-                .ok_or_else(|| Error::invalid_argument("row position overflow"))?;
-            if source >= *end {
-                return Err(Error::invalid_argument("row position is out of bounds"));
-            }
-            Ok(source)
-        }
-        NormalizedAxis::Gather { positions } => positions
-            .get(position)
-            .copied()
-            .ok_or_else(|| Error::invalid_argument("row position is out of bounds")),
-    }
+    axis.nth(
+        u64::try_from(position).map_err(|_| Error::invalid_argument("row position exceeds u64"))?,
+    )
+}
+
+fn csr_nnz_plan_upper_bound(matrix: &CsrMatrix, rows: &NormalizedAxis) -> Result<(usize, usize)> {
+    let mut request_count = 0usize;
+    let mut mapping_count = 0usize;
+    rows.visit_runs(|run| {
+        visit_run_chunks(
+            run,
+            |row| matrix.meta.chunks.chunk_of(row),
+            |chunk| matrix.meta.chunks.cell_range(chunk, matrix.n_rows()),
+            |_, subrun| {
+                request_count = request_count
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invalid_argument("CSR request count overflow"))?;
+                let mappings = if subrun.source_step == 1 {
+                    1
+                } else {
+                    usize::try_from(subrun.count)
+                        .map_err(|_| Error::invalid_argument("CSR mapping count exceeds usize"))?
+                };
+                mapping_count = mapping_count
+                    .checked_add(mappings)
+                    .ok_or_else(|| Error::invalid_argument("CSR mapping count overflow"))?;
+                Ok(())
+            },
+        )
+    })?;
+    Ok((
+        request_count.min(matrix.meta.chunks.n_chunks()),
+        mapping_count,
+    ))
+}
+
+fn csr_nnz_plan_upper_resident(
+    request_count: usize,
+    mapping_count: usize,
+    path: &str,
+) -> Result<usize> {
+    let request_bytes = std::mem::size_of::<NnzScatterRequest>()
+        .checked_add(std::mem::size_of::<BloscScatterRequest>())
+        .and_then(|bytes| bytes.checked_add(4 * std::mem::size_of::<usize>()))
+        .and_then(|bytes| bytes.checked_add(path.len().saturating_add(21)))
+        .and_then(|bytes| bytes.checked_mul(request_count))
+        .ok_or_else(|| Error::invalid_argument("CSR request plan size overflow"))?;
+    let mapping_bytes = std::mem::size_of::<(Range<u64>, Range<u64>)>()
+        .checked_add(std::mem::size_of::<ScatterMapping>())
+        .and_then(|bytes| bytes.checked_mul(mapping_count))
+        .ok_or_else(|| Error::invalid_argument("CSR mapping plan size overflow"))?;
+    request_bytes
+        .checked_add(mapping_bytes)
+        .ok_or_else(|| Error::invalid_argument("CSR request plan resident size overflow"))
 }
 
 fn plan_csr_nnz_requests(
@@ -1080,91 +1349,95 @@ fn plan_csr_nnz_requests(
     rows: &NormalizedAxis,
     output_indptr: &[u64],
 ) -> Result<Vec<NnzScatterRequest>> {
-    match rows {
-        NormalizedAxis::Contiguous { start, end } => {
-            let start_row = usize::try_from(*start)
-                .map_err(|_| Error::invalid_argument("row start exceeds usize"))?;
-            let output_base = matrix.indptr[start_row];
-            let mut requests = Vec::new();
-            for chunk in matrix.meta.chunks.overlapping_chunks(*start, *end) {
-                let (chunk_row_start, chunk_row_end) =
-                    matrix.meta.chunks.cell_range(chunk, matrix.n_rows())?;
-                let chunk_start = usize::try_from(chunk_row_start)
-                    .map_err(|_| Error::invalid_meta("chunk row start exceeds usize"))?;
-                let chunk_end = usize::try_from(chunk_row_end)
-                    .map_err(|_| Error::invalid_meta("chunk row end exceeds usize"))?;
-                let chunk_nnz_start = matrix.indptr[chunk_start];
-                let chunk_nnz_end = matrix.indptr[chunk_end];
-                let overlap_row_start = usize::try_from((*start).max(chunk_row_start))
-                    .map_err(|_| Error::invalid_meta("overlap row start exceeds usize"))?;
-                let overlap_row_end = usize::try_from((*end).min(chunk_row_end))
-                    .map_err(|_| Error::invalid_meta("overlap row end exceeds usize"))?;
-                let source_start = matrix.indptr[overlap_row_start] - chunk_nnz_start;
-                let source_end = matrix.indptr[overlap_row_end] - chunk_nnz_start;
-                if source_start == source_end {
-                    continue;
-                }
-                let destination_start = matrix.indptr[overlap_row_start] - output_base;
-                let destination_end = matrix.indptr[overlap_row_end] - output_base;
-                let mut mappings = Vec::new();
-                mappings.try_reserve_exact(1)?;
-                mappings.push((source_start..source_end, destination_start..destination_end));
-                requests.try_reserve(1)?;
-                requests.push(NnzScatterRequest {
-                    chunk,
-                    expected_nnz: chunk_nnz_end - chunk_nnz_start,
-                    mappings,
-                });
-            }
-            Ok(requests)
-        }
-        NormalizedAxis::Gather { positions } => {
-            let mut items = Vec::new();
-            items.try_reserve_exact(positions.len())?;
-            for (destination, &source) in positions.iter().enumerate() {
-                items.push((matrix.meta.chunks.chunk_of(source)?, source, destination));
-            }
-            items.sort_unstable();
-            let mut requests = Vec::new();
-            let mut cursor = 0usize;
-            while cursor < items.len() {
-                let chunk = items[cursor].0;
-                let (chunk_row_start, chunk_row_end) =
-                    matrix.meta.chunks.cell_range(chunk, matrix.n_rows())?;
-                let chunk_start = usize::try_from(chunk_row_start)
-                    .map_err(|_| Error::invalid_meta("chunk row start exceeds usize"))?;
-                let chunk_end = usize::try_from(chunk_row_end)
-                    .map_err(|_| Error::invalid_meta("chunk row end exceeds usize"))?;
-                let chunk_nnz_start = matrix.indptr[chunk_start];
-                let chunk_nnz_end = matrix.indptr[chunk_end];
-                let mut mappings = Vec::new();
-                while cursor < items.len() && items[cursor].0 == chunk {
-                    let (_, source, destination) = items[cursor];
-                    let source_row = usize::try_from(source)
-                        .map_err(|_| Error::invalid_argument("row position exceeds usize"))?;
-                    let source_start = matrix.indptr[source_row] - chunk_nnz_start;
-                    let source_end = matrix.indptr[source_row + 1] - chunk_nnz_start;
-                    let destination_start = output_indptr[destination];
-                    let destination_end = output_indptr[destination + 1];
-                    push_nnz_mapping(
-                        &mut mappings,
-                        source_start..source_end,
-                        destination_start..destination_end,
-                    )?;
-                    cursor += 1;
-                }
-                if !mappings.is_empty() {
-                    requests.try_reserve(1)?;
-                    requests.push(NnzScatterRequest {
-                        chunk,
-                        expected_nnz: chunk_nnz_end - chunk_nnz_start,
-                        mappings,
-                    });
-                }
-            }
-            Ok(requests)
-        }
+    let mut requests = BTreeMap::<usize, NnzScatterRequest>::new();
+    rows.visit_runs(|run| {
+        visit_run_chunks(
+            run,
+            |row| matrix.meta.chunks.chunk_of(row),
+            |chunk| matrix.meta.chunks.cell_range(chunk, matrix.n_rows()),
+            |chunk, subrun| {
+                append_csr_run_nnz_request(matrix, output_indptr, &mut requests, chunk, subrun)
+            },
+        )
+    })?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(requests.len())?;
+    output.extend(requests.into_values());
+    Ok(output)
+}
+
+fn append_csr_run_nnz_request(
+    matrix: &CsrMatrix,
+    output_indptr: &[u64],
+    requests: &mut BTreeMap<usize, NnzScatterRequest>,
+    chunk: usize,
+    run: AxisRun,
+) -> Result<()> {
+    let (chunk_row_start, chunk_row_end) = matrix.meta.chunks.cell_range(chunk, matrix.n_rows())?;
+    let chunk_start = usize::try_from(chunk_row_start)
+        .map_err(|_| Error::invalid_meta("chunk row start exceeds usize"))?;
+    let chunk_end = usize::try_from(chunk_row_end)
+        .map_err(|_| Error::invalid_meta("chunk row end exceeds usize"))?;
+    let chunk_nnz_start = matrix.indptr[chunk_start];
+    let chunk_nnz_end = matrix.indptr[chunk_end];
+    if run.source_step == 1 {
+        let start = usize::try_from(run.source)
+            .map_err(|_| Error::invalid_argument("row start exceeds usize"))?;
+        let count = usize::try_from(run.count)
+            .map_err(|_| Error::invalid_argument("selected row count exceeds usize"))?;
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| Error::invalid_argument("selected row end overflow"))?;
+        let destination = usize::try_from(run.destination)
+            .map_err(|_| Error::invalid_argument("destination row exceeds usize"))?;
+        return push_chunk_nnz_mapping(
+            requests,
+            chunk,
+            chunk_nnz_end - chunk_nnz_start,
+            (matrix.indptr[start] - chunk_nnz_start)..(matrix.indptr[end] - chunk_nnz_start),
+            output_indptr[destination]..output_indptr[destination + count],
+        );
     }
+    for index in 0..run.count {
+        let source_row = usize::try_from(run.nth(index)?)
+            .map_err(|_| Error::invalid_argument("row position exceeds usize"))?;
+        let destination = usize::try_from(
+            run.destination
+                .checked_add(index)
+                .ok_or_else(|| Error::invalid_argument("destination row overflow"))?,
+        )
+        .map_err(|_| Error::invalid_argument("destination row exceeds usize"))?;
+        push_chunk_nnz_mapping(
+            requests,
+            chunk,
+            chunk_nnz_end - chunk_nnz_start,
+            (matrix.indptr[source_row] - chunk_nnz_start)
+                ..(matrix.indptr[source_row + 1] - chunk_nnz_start),
+            output_indptr[destination]..output_indptr[destination + 1],
+        )?;
+    }
+    Ok(())
+}
+
+fn push_chunk_nnz_mapping(
+    requests: &mut BTreeMap<usize, NnzScatterRequest>,
+    chunk: usize,
+    expected_nnz: u64,
+    source: Range<u64>,
+    destination: Range<u64>,
+) -> Result<()> {
+    if source.is_empty() {
+        return Ok(());
+    }
+    let request = match requests.entry(chunk) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(NnzScatterRequest {
+            chunk,
+            expected_nnz,
+            mappings: Vec::new(),
+        }),
+    };
+    push_nnz_mapping(&mut request.mappings, source, destination)
 }
 
 fn push_nnz_mapping(
@@ -1239,16 +1512,35 @@ fn scatter_requests_resident(requests: &[BloscScatterRequest]) -> Result<usize> 
         resident_bytes::<BloscScatterRequest>(requests.len(), "scatter requests")?,
         |resident, request| {
             resident
-                .checked_add(request.key.len())
+                .checked_add(request.key.capacity())
                 .and_then(|resident| {
                     resident.checked_add(
                         request
                             .mappings
-                            .len()
+                            .capacity()
                             .checked_mul(std::mem::size_of::<ScatterMapping>())?,
                     )
                 })
                 .ok_or_else(|| Error::invalid_argument("scatter request resident size overflow"))
+        },
+    )
+}
+
+fn nnz_requests_resident(requests: &[NnzScatterRequest]) -> Result<usize> {
+    requests.iter().try_fold(
+        resident_bytes::<NnzScatterRequest>(requests.len(), "CSR nnz requests")?,
+        |resident, request| {
+            resident
+                .checked_add(
+                    request
+                        .mappings
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<(Range<u64>, Range<u64>)>())
+                        .ok_or_else(|| {
+                            Error::invalid_argument("CSR nnz request mapping size overflow")
+                        })?,
+                )
+                .ok_or_else(|| Error::invalid_argument("CSR nnz request resident size overflow"))
         },
     )
 }
@@ -1304,20 +1596,27 @@ fn zeroed_vec(len: usize) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn first_out_of_bounds_index(indices: &[u8], dtype: DType, n_cols: u64) -> Option<(usize, u64)> {
-    match dtype {
-        DType::U16 => indices
-            .chunks_exact(2)
-            .map(|bytes| u64::from(u16::from_le_bytes([bytes[0], bytes[1]])))
-            .enumerate()
-            .find(|(_, value)| *value >= n_cols),
-        DType::U32 => indices
-            .chunks_exact(4)
-            .map(|bytes| u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
-            .enumerate()
-            .find(|(_, value)| *value >= n_cols),
-        DType::U64 | DType::I16 | DType::I32 | DType::F32 | DType::F64 => None,
+fn validate_decoded_csr_indices(
+    indptr: &[u64],
+    indices: &[u8],
+    dtype: DType,
+    n_cols: u64,
+) -> Result<()> {
+    if !dtype.is_csr_index() {
+        return Err(Error::corrupt(
+            "csr indices",
+            format!("invalid CSR index dtype {dtype}"),
+        ));
     }
+    let index_size = dtype.size();
+    for bounds in indptr.windows(2) {
+        let start = usize::try_from(bounds[0])
+            .map_err(|_| Error::corrupt("csr indices", "row start exceeds usize"))?;
+        let end = usize::try_from(bounds[1])
+            .map_err(|_| Error::corrupt("csr indices", "row end exceeds usize"))?;
+        validate_decoded_index_row(indices, start, end, index_size, n_cols)?;
+    }
+    Ok(())
 }
 
 /// Sort each CSR row by column index and reject duplicates.

@@ -2,35 +2,43 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field
-from typing import Literal, cast
+from typing import Literal
 
-from scdata import _core
-from scdata.exceptions import _call_core
-from scdata.load._validation import as_float, as_int
+from scdata._validate import as_float, as_int
 
 IoMode = Literal["auto", "blocking", "uring"]
 
 __all__ = ["IoMode", "PlanConfig", "ResourceLimits", "SessionConfig"]
 
-_PLAN_DEFAULTS = _call_core(_core.plan_config_defaults)
-_SESSION_DEFAULTS = _call_core(_core.session_config_defaults)
+_MIB = 1024 * 1024
+_GIB = 1024 * 1024 * 1024
 _U32_MAX = (1 << 32) - 1
+DEFAULT_MAX_CONTROL_BYTES = 64 * _MIB
+
+
+def _cpu_count() -> int:
+    return os.cpu_count() or 1
+
+
+def _default_compile_io_concurrency() -> int:
+    return min(_cpu_count(), 32)
 
 
 @dataclass(frozen=True, slots=True)
 class ResourceLimits:
     """Hard limits for compiler arenas, output rings, and individual jobs."""
 
-    max_output_buffer_bytes: int = int(_PLAN_DEFAULTS["max_output_buffer_bytes"])
-    max_compile_arena_bytes: int = int(_PLAN_DEFAULTS["max_compile_arena_bytes"])
-    max_compile_working_set_bytes: int = int(_PLAN_DEFAULTS["max_compile_working_set_bytes"])
-    max_retained_whole_key_bytes: int = int(_PLAN_DEFAULTS["max_retained_whole_key_bytes"])
-    max_blocks_per_job: int = int(_PLAN_DEFAULTS["max_blocks_per_job"])
-    max_cells_per_job: int = int(_PLAN_DEFAULTS["max_cells_per_job"])
-    max_encoded_bytes_per_side: int = int(_PLAN_DEFAULTS["max_encoded_bytes_per_side"])
-    max_decoded_bytes_per_job: int = int(_PLAN_DEFAULTS["max_decoded_bytes_per_job"])
+    max_output_buffer_bytes: int = 2 * _GIB
+    max_compile_arena_bytes: int = 2 * _GIB
+    max_compile_working_set_bytes: int = 40 * _GIB
+    max_retained_whole_key_bytes: int = 512 * _MIB
+    max_blocks_per_job: int = 4096
+    max_cells_per_job: int = 1_000_000
+    max_encoded_bytes_per_side: int = 1 * _GIB
+    max_decoded_bytes_per_job: int = 2 * _GIB
 
     def __post_init__(self) -> None:
         for name in self.__slots__:
@@ -55,13 +63,13 @@ class ResourceLimits:
 class PlanConfig:
     """Static compiler cost model and resource limits."""
 
-    compile_io_concurrency: int = int(_PLAN_DEFAULTS["compile_io_concurrency"])
-    io_bandwidth_bytes_per_second: float = float(_PLAN_DEFAULTS["io_bandwidth_bytes_per_second"])
-    io_operations_per_second: float = float(_PLAN_DEFAULTS["io_operations_per_second"])
-    coalescing_distance: int = int(_PLAN_DEFAULTS["coalescing_distance"])
-    max_coalesced_io_bytes: int = int(_PLAN_DEFAULTS["max_coalesced_io_bytes"])
-    target_decoded_bytes_per_job: int = int(_PLAN_DEFAULTS["target_decoded_bytes_per_job"])
-    delta_bytes: float = float(_PLAN_DEFAULTS["delta_bytes"])
+    compile_io_concurrency: int = field(default_factory=_default_compile_io_concurrency)
+    io_bandwidth_bytes_per_second: float = float(8 * _GIB)
+    io_operations_per_second: float = 100_000.0
+    coalescing_distance: int = 1
+    max_coalesced_io_bytes: int = 32 * _MIB
+    target_decoded_bytes_per_job: int = 64 * _MIB
+    delta_bytes: float = 4096.0
     limits: ResourceLimits = field(default_factory=ResourceLimits)
 
     def __post_init__(self) -> None:
@@ -150,25 +158,22 @@ class PlanConfig:
 class SessionConfig:
     """Worker backend and aggregate resident-buffer limits for one session."""
 
-    worker_count: int | None = None
-    io_mode: IoMode = cast(IoMode, _SESSION_DEFAULTS["io_mode"])
-    queue_depth: int = int(_SESSION_DEFAULTS["queue_depth"])
-    max_inflight_jobs_per_worker: int = int(_SESSION_DEFAULTS["max_inflight_jobs_per_worker"])
-    max_inflight_encoded_bytes_per_worker: int = int(
-        _SESSION_DEFAULTS["max_inflight_encoded_bytes_per_worker"]
-    )
-    max_decoded_bytes_per_worker: int = int(_SESSION_DEFAULTS["max_decoded_bytes_per_worker"])
+    num_workers: int = field(default_factory=_cpu_count)
+    io_mode: IoMode = "auto"
+    queue_depth: int = 64
+    max_inflight_jobs_per_worker: int = 32
+    max_inflight_encoded_bytes_per_worker: int = 512 * _MIB
+    max_decoded_bytes_per_worker: int = 2 * _GIB
     max_total_inflight_io_ops: int | None = None
     max_total_inflight_encoded_bytes: int | None = None
     max_total_decoded_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        if self.worker_count is not None:
-            object.__setattr__(
-                self,
-                "worker_count",
-                as_int(self.worker_count, "worker_count", minimum=1),
-            )
+        object.__setattr__(
+            self,
+            "num_workers",
+            as_int(self.num_workers, "num_workers", minimum=1),
+        )
         if not isinstance(self.io_mode, str):
             raise TypeError("io_mode must be a string")
         mode = self.io_mode.strip().lower()
@@ -195,20 +200,15 @@ class SessionConfig:
                 object.__setattr__(self, name, as_int(value, name, minimum=1))
 
     def _to_core(self) -> dict[str, int | str]:
-        workers = (
-            int(_SESSION_DEFAULTS["worker_count"])
-            if self.worker_count is None
-            else self.worker_count
-        )
         io_ops_per_worker = self.queue_depth if self.io_mode != "blocking" else 1
-        required_io_ops = _checked_product(workers, io_ops_per_worker, "in-flight I/O ops")
+        required_io_ops = _checked_product(self.num_workers, io_ops_per_worker, "in-flight I/O ops")
         required_encoded = _checked_product(
-            workers,
+            self.num_workers,
             self.max_inflight_encoded_bytes_per_worker,
             "in-flight encoded bytes",
         )
         required_decoded = _checked_product(
-            workers,
+            self.num_workers,
             self.max_decoded_bytes_per_worker,
             "decoded bytes",
         )
@@ -228,7 +228,7 @@ class SessionConfig:
             "max_total_decoded_bytes",
         )
         return {
-            "worker_count": workers,
+            "num_workers": self.num_workers,
             "io_mode": self.io_mode,
             "queue_depth": self.queue_depth,
             "max_inflight_jobs_per_worker": self.max_inflight_jobs_per_worker,

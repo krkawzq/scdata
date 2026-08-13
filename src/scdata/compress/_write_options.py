@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from scdata._core import DEFAULT_N_WORKERS
 from scdata.compress._validate import (
     DEFAULT_BLOCK_BUDGET,
     DEFAULT_CHUNK_BUDGET,
@@ -14,7 +13,6 @@ from scdata.compress._validate import (
     as_int,
     resolve_write_partitions,
 )
-from scdata.exceptions import _invalid_argument
 
 __all__ = [
     "DEFAULT_BLOCK_BUDGET",
@@ -43,13 +41,13 @@ class WriteOptions:
     block_cells: int | None = None
     chunk_budget: int | None = DEFAULT_CHUNK_BUDGET
     block_budget: int | None = DEFAULT_BLOCK_BUDGET
-    n_workers: int = DEFAULT_N_WORKERS
+    num_workers: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
-            "n_workers",
-            as_int(self.n_workers, name="n_workers", minimum=1, maximum=_UINTP_MAX),
+            "num_workers",
+            as_int(self.num_workers, name="num_workers", minimum=1, maximum=_UINTP_MAX),
         )
 
     def with_overrides(
@@ -61,7 +59,7 @@ class WriteOptions:
         block_cells: int | None = None,
         chunk_budget: int | None = None,
         block_budget: int | None = None,
-        n_workers: int | None = None,
+        num_workers: int | None = None,
     ) -> WriteOptions:
         """Return a copy with only the non-``None`` values replaced."""
         changes = {
@@ -73,7 +71,7 @@ class WriteOptions:
                 ("block_cells", block_cells),
                 ("chunk_budget", chunk_budget),
                 ("block_budget", block_budget),
-                ("n_workers", n_workers),
+                ("num_workers", num_workers),
             )
             if value is not None
         }
@@ -110,13 +108,13 @@ def resolve_write_options(
     block_cells: int | None = None,
     chunk_budget: int | None = None,
     block_budget: int | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
 ) -> WriteOptions:
     """Apply optional keyword overrides on top of ``options`` or the defaults."""
     if options is None:
         options = DEFAULT_WRITE_OPTIONS
     elif not isinstance(options, WriteOptions):
-        _invalid_argument(f"options must be WriteOptions or None, got {type(options).__name__}")
+        raise TypeError(f"options must be WriteOptions or None, got {type(options).__name__}")
     return options.with_overrides(
         chunk_policy=chunk_policy,
         block_policy=block_policy,
@@ -124,5 +122,5 @@ def resolve_write_options(
         block_cells=block_cells,
         chunk_budget=chunk_budget,
         block_budget=block_budget,
-        n_workers=n_workers,
+        num_workers=num_workers,
     )

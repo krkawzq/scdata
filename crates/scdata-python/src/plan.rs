@@ -22,10 +22,7 @@ pub(crate) struct PyPlan {
 }
 
 #[pyfunction]
-pub(crate) fn plan_meta<'py>(
-    py: Python<'py>,
-    plan: &PyPlan,
-) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn plan_meta<'py>(py: Python<'py>, plan: &PyPlan) -> PyResult<Bound<'py, PyDict>> {
     let inner = &plan.inner;
     let values = PyDict::new(py);
     values.set_item("batch_size", inner.batch_size())?;
@@ -39,10 +36,7 @@ pub(crate) fn plan_meta<'py>(
 }
 
 #[pyfunction]
-pub(crate) fn plan_stats<'py>(
-    py: Python<'py>,
-    plan: &PyPlan,
-) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn plan_stats<'py>(py: Python<'py>, plan: &PyPlan) -> PyResult<Bound<'py, PyDict>> {
     plan_stats_to_dict(py, plan.inner.stats())
 }
 
@@ -60,20 +54,20 @@ pub(crate) fn plan_open(
 
 #[cfg(all(target_os = "linux", target_has_atomic = "64"))]
 #[pyfunction]
-#[pyo3(signature = (plan, config, world_size, maximum_control_bytes=None))]
+#[pyo3(signature = (plan, config, world_size, max_control_bytes))]
 pub(crate) fn plan_open_shared(
     py: Python<'_>,
     plan: &PyPlan,
     config: &Bound<'_, PyDict>,
     world_size: usize,
-    maximum_control_bytes: Option<usize>,
+    max_control_bytes: usize,
 ) -> PyResult<PySharedServer> {
     let plan = plan.inner.clone();
     let config = session_config_from_dict(config)?;
-    let mut shared = SharedConfig::new(world_size).map_sc()?;
-    if let Some(maximum) = maximum_control_bytes {
-        shared = shared.with_max_control_bytes(maximum).map_sc()?;
-    }
+    let shared = SharedConfig::new(world_size)
+        .map_sc()?
+        .with_max_control_bytes(max_control_bytes)
+        .map_sc()?;
     let server = py
         .allow_threads(move || plan.open_shared(config, shared))
         .map_sc()?;

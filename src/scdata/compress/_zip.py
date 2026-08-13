@@ -18,8 +18,8 @@ from tempfile import TemporaryDirectory
 from typing import Any, SupportsIndex
 
 from scdata.compress._validate import ensure_path
-from scdata.exceptions import PerformanceWarning, _invalid_argument
-from scdata.compress.write_options import WriteOptions
+from scdata.compress._write_options import WriteOptions
+from scdata.exceptions import PerformanceWarning
 
 __all__ = [
     "list_stores",
@@ -39,21 +39,21 @@ def archive_path(archive: Archive) -> Path:
     if isinstance(archive, zipfile.ZipFile):
         filename = archive.filename
         if not filename:
-            _invalid_argument("ZipFile must be backed by a filesystem path for sc-compress reads")
+            raise ValueError("ZipFile must be backed by a filesystem path for sc-compress reads")
         return ensure_path(filename)
     return ensure_path(archive)
 
 
 def normalize_prefix(prefix: str) -> str:
     if not isinstance(prefix, str):
-        _invalid_argument(f"prefix must be str, got {type(prefix).__name__}")
+        raise TypeError(f"prefix must be str, got {type(prefix).__name__}")
     if "\\" in prefix or "\0" in prefix:
-        _invalid_argument(f"invalid ZIP prefix {prefix!r}")
+        raise ValueError(f"invalid ZIP prefix {prefix!r}")
     normalized = prefix.strip("/")
     if not normalized:
         return ""
     if any(part in ("", ".", "..") for part in normalized.split("/")):
-        _invalid_argument(f"invalid ZIP prefix {prefix!r}")
+        raise ValueError(f"invalid ZIP prefix {prefix!r}")
     return normalized
 
 
@@ -118,12 +118,12 @@ def write(
     matrix: Any,
     *,
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
 ) -> None:
     """Write a dense or sparse matrix into a ZIP archive."""
-    from scdata.compress.io import write as write_matrix
+    from scdata.compress._io import write as write_matrix
 
     _write_via_directory(
         archive,
@@ -132,7 +132,7 @@ def write(
             path,
             matrix,
             options=options,
-            n_workers=n_workers,
+            num_workers=num_workers,
             overwrite=True,
         ),
         compression=compression,
@@ -146,12 +146,12 @@ def write_dense(
     values: Any,
     *,
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
 ) -> None:
     """Write a dense matrix into ``archive`` under ``prefix``."""
-    from scdata.compress.io import write_dense as write_dense_matrix
+    from scdata.compress._io import write_dense as write_dense_matrix
 
     _write_via_directory(
         archive,
@@ -160,7 +160,7 @@ def write_dense(
             path,
             values,
             options=options,
-            n_workers=n_workers,
+            num_workers=num_workers,
             overwrite=True,
         ),
         compression=compression,
@@ -174,12 +174,12 @@ def write_csr(
     matrix: Any,
     *,
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
 ) -> None:
     """Write a SciPy sparse matrix into ``archive`` under ``prefix``."""
-    from scdata.compress.io import write_csr as write_csr_matrix
+    from scdata.compress._io import write_csr as write_csr_matrix
 
     _write_via_directory(
         archive,
@@ -188,7 +188,7 @@ def write_csr(
             path,
             matrix,
             options=options,
-            n_workers=n_workers,
+            num_workers=num_workers,
             overwrite=True,
         ),
         compression=compression,
@@ -205,12 +205,12 @@ def write_csr_arrays(
     shape: tuple[int, int] | list[int],
     *,
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
 ) -> None:
     """Write explicit CSR buffers into ``archive`` under ``prefix``."""
-    from scdata.compress.io import write_csr_arrays as write_csr_buffers
+    from scdata.compress._io import write_csr_arrays as write_csr_buffers
 
     _write_via_directory(
         archive,
@@ -222,7 +222,7 @@ def write_csr_arrays(
             data,
             shape,
             options=options,
-            n_workers=n_workers,
+            num_workers=num_workers,
             overwrite=True,
         ),
         compression=compression,
@@ -267,11 +267,11 @@ def _pack_impl(
     compression, compresslevel = _validate_compression(compression, compresslevel)
     _validate_archive_writer(archive)
     if root.is_symlink():
-        _invalid_argument(f"store_dir must not be a symbolic link: {root}")
+        raise ValueError(f"store_dir must not be a symbolic link: {root}")
     if not root.is_dir():
-        _invalid_argument(f"store_dir is not a directory: {root}")
+        raise NotADirectoryError(f"store_dir is not a directory: {root}")
     if not (root / META_NAME).is_file():
-        _invalid_argument(f"store_dir is missing {META_NAME}: {root}")
+        raise FileNotFoundError(f"store_dir is missing {META_NAME}: {root}")
     _reject_archive_inside_store(archive, root)
 
     planned = [
@@ -279,16 +279,16 @@ def _pack_impl(
         for relative, absolute in _iter_store_files(root)
     ]
     if not planned:
-        _invalid_argument(f"store_dir contains no files: {root}")
+        raise ValueError(f"store_dir contains no files: {root}")
     for arcname, _ in planned:
         if not _is_safe_member_name(arcname):
-            _invalid_argument(f"store contains an unsafe ZIP member name: {arcname!r}")
+            raise ValueError(f"store contains an unsafe ZIP member name: {arcname!r}")
         try:
             encoded_name = arcname.encode("utf-8")
         except UnicodeEncodeError:
-            _invalid_argument(f"ZIP member name is not valid UTF-8: {arcname!r}")
+            raise ValueError(f"ZIP member name is not valid UTF-8: {arcname!r}")
         if len(encoded_name) > 65_535:
-            _invalid_argument(
+            raise ValueError(
                 f"ZIP member name is {len(encoded_name)} encoded bytes; maximum is 65535"
             )
 
@@ -305,7 +305,7 @@ def _pack_impl(
             preview = ", ".join(repr(name) for name in collisions[:3])
             if len(collisions) > 3:
                 preview += f", ... ({len(collisions)} total)"
-            _invalid_argument(
+            raise ValueError(
                 f"ZIP already contains target member(s): {preview}; choose another prefix"
             )
         for arcname, absolute in planned:
@@ -331,7 +331,7 @@ def _iter_store_files(root: Path) -> Iterable[tuple[str, Path]]:
         filenames.sort()
         for dirname in dirnames:
             if (base / dirname).is_symlink():
-                _invalid_argument(f"store contains a symbolic-link directory: {base / dirname}")
+                raise ValueError(f"store contains a symbolic-link directory: {base / dirname}")
         dirnames[:] = [name for name in dirnames if not name.startswith(".sc-compress-staging-")]
         for filename in filenames:
             if filename.startswith("."):
@@ -339,9 +339,9 @@ def _iter_store_files(root: Path) -> Iterable[tuple[str, Path]]:
             absolute = base / filename
             metadata = absolute.stat(follow_symlinks=False)
             if stat.S_ISLNK(metadata.st_mode):
-                _invalid_argument(f"store contains a symbolic-link file: {absolute}")
+                raise ValueError(f"store contains a symbolic-link file: {absolute}")
             if not stat.S_ISREG(metadata.st_mode):
-                _invalid_argument(f"store contains a non-regular file: {absolute}")
+                raise ValueError(f"store contains a non-regular file: {absolute}")
             yield absolute.relative_to(root).as_posix(), absolute
 
 
@@ -350,7 +350,7 @@ def _reject_archive_inside_store(archive: Archive, root: Path) -> None:
         return
     path = archive_path(archive).resolve(strict=False)
     if path.is_relative_to(root.resolve()):
-        _invalid_argument("archive path must not be inside the store being packed")
+        raise ValueError("archive path must not be inside the store being packed")
 
 
 def _member_collides(
@@ -373,9 +373,9 @@ def _validate_compression(
     compresslevel: object | None,
 ) -> tuple[int, int | None]:
     if isinstance(compression, bool):
-        _invalid_argument("compression must be a zipfile compression constant, not bool")
+        raise TypeError("compression must be a zipfile compression constant, not bool")
     if not isinstance(compression, SupportsIndex):
-        _invalid_argument(
+        raise TypeError(
             f"compression must be a zipfile compression constant, got {compression!r}"
         )
     method = index(compression)
@@ -390,34 +390,34 @@ def _validate_compression(
     if zip_zstandard is not None:
         supported.add(zip_zstandard)
     if method not in supported:
-        _invalid_argument(f"unsupported ZIP compression method: {method}")
+        raise ValueError(f"unsupported ZIP compression method: {method}")
 
     checker = getattr(zipfile, "_check_compression", None)
     if checker is not None:
         try:
             checker(method)
         except (NotImplementedError, RuntimeError) as error:
-            _invalid_argument(str(error))
+            raise ValueError(str(error))
 
     level: int | None = None
     if compresslevel is not None:
         if isinstance(compresslevel, bool):
-            _invalid_argument("compresslevel must be an integer or None, not bool")
+            raise TypeError("compresslevel must be an integer or None, not bool")
         if not isinstance(compresslevel, SupportsIndex):
-            _invalid_argument(f"compresslevel must be an integer or None, got {compresslevel!r}")
+            raise TypeError(f"compresslevel must be an integer or None, got {compresslevel!r}")
         level = index(compresslevel)
 
     if level is not None and method == zipfile.ZIP_DEFLATED and not -1 <= level <= 9:
-        _invalid_argument("ZIP_DEFLATED compresslevel must be between -1 and 9")
+        raise ValueError("ZIP_DEFLATED compresslevel must be between -1 and 9")
     if level is not None and method == zipfile.ZIP_BZIP2 and not 1 <= level <= 9:
-        _invalid_argument("ZIP_BZIP2 compresslevel must be between 1 and 9")
+        raise ValueError("ZIP_BZIP2 compresslevel must be between 1 and 9")
     if (
         level is not None
         and zip_zstandard is not None
         and method == zip_zstandard
         and not -131_072 <= level <= 22
     ):
-        _invalid_argument("ZIP_ZSTANDARD compresslevel must be between -131072 and 22")
+        raise ValueError("ZIP_ZSTANDARD compresslevel must be between -131072 and 22")
     return method, level
 
 
@@ -440,7 +440,7 @@ def _write_member(
 ) -> None:
     metadata = absolute.stat(follow_symlinks=False)
     if not stat.S_ISREG(metadata.st_mode):
-        _invalid_argument(f"store file changed while packing: {absolute}")
+        raise ValueError(f"store file changed while packing: {absolute}")
 
     flags = os.O_RDONLY
     for flag_name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
@@ -448,7 +448,7 @@ def _write_member(
     try:
         descriptor = os.open(absolute, flags)
     except OSError as error:
-        _invalid_argument(f"cannot safely open store file {absolute}: {error}")
+        raise OSError(f"cannot safely open store file {absolute}: {error}") from error
 
     with os.fdopen(descriptor, "rb") as source:
         opened = os.fstat(source.fileno())
@@ -456,7 +456,7 @@ def _write_member(
             opened.st_dev,
             opened.st_ino,
         ) != (metadata.st_dev, metadata.st_ino):
-            _invalid_argument(f"store file changed while packing: {absolute}")
+            raise ValueError(f"store file changed while packing: {absolute}")
 
         date_time = time.localtime(opened.st_mtime)[:6]
         if not getattr(zf, "_strict_timestamps", True):
@@ -477,7 +477,7 @@ def _write_member(
 def _zip_reader(archive: Archive) -> Iterator[zipfile.ZipFile]:
     if isinstance(archive, zipfile.ZipFile):
         if archive.fp is None:
-            _invalid_argument("ZipFile is closed")
+            raise ValueError("ZipFile is closed")
         yield archive
         return
     with zipfile.ZipFile(ensure_path(archive), mode="r") as zf:
@@ -500,16 +500,18 @@ def _validate_archive_writer(archive: Archive) -> None:
     if not isinstance(archive, zipfile.ZipFile):
         path = ensure_path(archive)
         if path.name in ("", ".", ".."):
-            _invalid_argument(f"archive path must name a ZIP file, got {path}")
+            raise ValueError(f"archive path must name a ZIP file, got {path}")
         if path.exists() or path.is_symlink():
+            if path.is_dir():
+                raise IsADirectoryError(f"archive path is a directory: {path}")
             if not path.is_file():
-                _invalid_argument(f"archive path is not a regular file: {path}")
+                raise ValueError(f"archive path is not a regular file: {path}")
             if not zipfile.is_zipfile(path):
-                _invalid_argument(f"existing archive path is not a ZIP file: {path}")
+                raise ValueError(f"existing archive path is not a ZIP file: {path}")
         return
     if archive.fp is None:
-        _invalid_argument("ZipFile is closed")
+        raise ValueError("ZipFile is closed")
     if archive.mode not in ("w", "x", "a"):
-        _invalid_argument(
+        raise ValueError(
             f"ZipFile must be opened for writing (mode 'w', 'x', or 'a'), got {archive.mode!r}"
         )

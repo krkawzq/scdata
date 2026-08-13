@@ -124,6 +124,17 @@ impl ConvertOp {
         self.convert_slice = scalar_slice;
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_generic_for_test(&mut self) {
+        self.convert_slice = scalar_slice;
+        self.convert_map_wide = scalar_map;
+        self.convert_map_packed = scalar_packed_map;
+        self.convert_map_gather32 = scalar_gather32;
+        self.convert_csr_u16 = None;
+        self.convert_csr_u32 = None;
+        self.validate_slice = scalar_validate_slice;
+    }
+
     #[cfg(all(test, target_arch = "x86_64", target_endian = "little"))]
     pub(crate) fn force_sse2_for_test(&mut self) {
         if let Some(kernel) = simd::dispatch_sse2(self.src, self.dst) {
@@ -158,10 +169,12 @@ impl ConvertOp {
         use OutputDType as O;
         use StorageDType as S;
         let valid = match (self.src, self.dst) {
-            (S::I16, O::U16 | O::U32) => load_i16(input) >= 0,
-            (S::I32, O::U32) => load_i32(input) >= 0,
+            (S::I16, O::U16 | O::U32 | O::U64) => load_i16(input) >= 0,
+            (S::I32, O::U32 | O::U64) => load_i32(input) >= 0,
+            (S::I64, O::U64) => load_i64(input) >= 0,
             (S::U16, O::I16) => load_u16(input) <= i16::MAX as u16,
             (S::U32, O::I32) => load_u32(input) <= i32::MAX as u32,
+            (S::U64, O::I64) => load_u64(input) <= i64::MAX as u64,
             _ => true,
         };
         if valid {
@@ -369,11 +382,19 @@ fn dispatch_csr_fn<const INDEX_BYTES: usize>(
     Some(match (src, dst) {
         (S::I16 | S::U16, O::I16 | O::U16) => csr_copy::<INDEX_BYTES, 2>,
         (S::I32 | S::U32, O::I32 | O::U32) | (S::F32, O::F32) => csr_copy::<INDEX_BYTES, 4>,
-        (S::F64, O::F64) => csr_copy::<INDEX_BYTES, 8>,
+        (S::I64 | S::U64, O::I64 | O::U64) | (S::F64, O::F64) => csr_copy::<INDEX_BYTES, 8>,
         (S::I16, O::I32) => csr_i16_i32::<INDEX_BYTES>,
         (S::I16, O::U32) => csr_i16_u32::<INDEX_BYTES>,
+        (S::I16, O::I64) => csr_i16_i64::<INDEX_BYTES>,
+        (S::I16, O::U64) => csr_i16_u64::<INDEX_BYTES>,
         (S::U16, O::I32) => csr_u16_i32::<INDEX_BYTES>,
         (S::U16, O::U32) => csr_u16_u32::<INDEX_BYTES>,
+        (S::U16, O::I64) => csr_u16_i64::<INDEX_BYTES>,
+        (S::U16, O::U64) => csr_u16_u64::<INDEX_BYTES>,
+        (S::I32, O::I64) => csr_i32_i64::<INDEX_BYTES>,
+        (S::I32, O::U64) => csr_i32_u64::<INDEX_BYTES>,
+        (S::U32, O::I64) => csr_u32_i64::<INDEX_BYTES>,
+        (S::U32, O::U64) => csr_u32_u64::<INDEX_BYTES>,
         (S::I16, O::F32) => csr_i16_f32::<INDEX_BYTES>,
         (S::U16, O::F32) => csr_u16_f32::<INDEX_BYTES>,
         (S::I32, O::F32) => csr_i32_f32::<INDEX_BYTES>,
@@ -383,6 +404,8 @@ fn dispatch_csr_fn<const INDEX_BYTES: usize>(
         (S::I32, O::F64) => csr_i32_f64::<INDEX_BYTES>,
         (S::U32, O::F64) => csr_u32_f64::<INDEX_BYTES>,
         (S::F32, O::F64) => csr_f32_f64::<INDEX_BYTES>,
+        (S::I64, O::F64) => csr_i64_f64::<INDEX_BYTES>,
+        (S::U64, O::F64) => csr_u64_f64::<INDEX_BYTES>,
         _ => return None,
     })
 }
@@ -396,11 +419,19 @@ fn dispatch_map_fn(src: StorageDType, dst: OutputDType, write_fallback: bool) ->
     match (src, dst) {
         (S::I16 | S::U16, O::I16 | O::U16) => mapped_copy::<2>,
         (S::I32 | S::U32, O::I32 | O::U32) | (S::F32, O::F32) => mapped_copy::<4>,
-        (S::F64, O::F64) => mapped_copy::<8>,
+        (S::I64 | S::U64, O::I64 | O::U64) | (S::F64, O::F64) => mapped_copy::<8>,
         (S::I16, O::I32) => mapped_i16_i32,
         (S::I16, O::U32) => mapped_i16_u32,
+        (S::I16, O::I64) => mapped_i16_i64,
+        (S::I16, O::U64) => mapped_i16_u64,
         (S::U16, O::I32) => mapped_u16_i32,
         (S::U16, O::U32) => mapped_u16_u32,
+        (S::U16, O::I64) => mapped_u16_i64,
+        (S::U16, O::U64) => mapped_u16_u64,
+        (S::I32, O::I64) => mapped_i32_i64,
+        (S::I32, O::U64) => mapped_i32_u64,
+        (S::U32, O::I64) => mapped_u32_i64,
+        (S::U32, O::U64) => mapped_u32_u64,
         (S::I16, O::F32) => mapped_i16_f32,
         (S::U16, O::F32) => mapped_u16_f32,
         (S::I32, O::F32) => mapped_i32_f32,
@@ -410,6 +441,8 @@ fn dispatch_map_fn(src: StorageDType, dst: OutputDType, write_fallback: bool) ->
         (S::I32, O::F64) => mapped_i32_f64,
         (S::U32, O::F64) => mapped_u32_f64,
         (S::F32, O::F64) => mapped_f32_f64,
+        (S::I64, O::F64) => mapped_i64_f64,
+        (S::U64, O::F64) => mapped_u64_f64,
         _ => scalar_map,
     }
 }
@@ -427,11 +460,19 @@ fn dispatch_packed_map_fn(
     match (src, dst) {
         (S::I16 | S::U16, O::I16 | O::U16) => packed_copy::<2>,
         (S::I32 | S::U32, O::I32 | O::U32) | (S::F32, O::F32) => packed_copy::<4>,
-        (S::F64, O::F64) => packed_copy::<8>,
+        (S::I64 | S::U64, O::I64 | O::U64) | (S::F64, O::F64) => packed_copy::<8>,
         (S::I16, O::I32) => packed_i16_i32,
         (S::I16, O::U32) => packed_i16_u32,
+        (S::I16, O::I64) => packed_i16_i64,
+        (S::I16, O::U64) => packed_i16_u64,
         (S::U16, O::I32) => packed_u16_i32,
         (S::U16, O::U32) => packed_u16_u32,
+        (S::U16, O::I64) => packed_u16_i64,
+        (S::U16, O::U64) => packed_u16_u64,
+        (S::I32, O::I64) => packed_i32_i64,
+        (S::I32, O::U64) => packed_i32_u64,
+        (S::U32, O::I64) => packed_u32_i64,
+        (S::U32, O::U64) => packed_u32_u64,
         (S::I16, O::F32) => packed_i16_f32,
         (S::U16, O::F32) => packed_u16_f32,
         (S::I32, O::F32) => packed_i32_f32,
@@ -441,6 +482,8 @@ fn dispatch_packed_map_fn(
         (S::I32, O::F64) => packed_i32_f64,
         (S::U32, O::F64) => packed_u32_f64,
         (S::F32, O::F64) => packed_f32_f64,
+        (S::I64, O::F64) => packed_i64_f64,
+        (S::U64, O::F64) => packed_u64_f64,
         _ => scalar_packed_map,
     }
 }
@@ -510,6 +553,8 @@ fn dispatch_slice_fn(src: StorageDType, dst: OutputDType, write_fallback: bool) 
             | (S::I32, O::I32 | O::U32)
             | (S::U16, O::U16 | O::I16)
             | (S::U32, O::U32 | O::I32)
+            | (S::I64, O::I64 | O::U64)
+            | (S::U64, O::U64 | O::I64)
             | (S::F32, O::F32)
             | (S::F64, O::F64)
     ) {
@@ -534,7 +579,19 @@ fn dispatch_slice_fn(src: StorageDType, dst: OutputDType, write_fallback: bool) 
     if let Some(kernel) = simd::dispatch_sse2(src, dst) {
         return kernel;
     }
-    scalar_slice
+    match (src, dst) {
+        (S::I16, O::I64) => slice_i16_i64,
+        (S::I16, O::U64) => slice_i16_u64,
+        (S::U16, O::I64) => slice_u16_i64,
+        (S::U16, O::U64) => slice_u16_u64,
+        (S::I32, O::I64) => slice_i32_i64,
+        (S::I32, O::U64) => slice_i32_u64,
+        (S::U32, O::I64) => slice_u32_i64,
+        (S::U32, O::U64) => slice_u32_u64,
+        (S::I64, O::F64) => slice_i64_f64,
+        (S::U64, O::F64) => slice_u64_f64,
+        _ => scalar_slice,
+    }
 }
 
 unsafe fn copy_slice(
@@ -575,23 +632,40 @@ unsafe fn scalar_slice(
 }
 
 unsafe fn scalar_validate_slice(input: *const u8, count: usize, op: &ConvertOp) -> bool {
-    // All currently fallible conversions are same-width signedness edges. OR
-    // reduction turns per-element range branches into one sign-bit test.
-    if op.src_size == 2 {
-        let mut bits = 0u16;
-        for index in 0..count {
-            // SAFETY: the caller proves `count` complete two-byte elements.
-            bits |= u16::from_le(unsafe { input.add(index << 1).cast::<u16>().read_unaligned() });
+    // Every fallible integer signedness edge is valid exactly when the source
+    // sign bit is clear. OR reduction turns per-element checks into one test.
+    match op.src_size {
+        2 => {
+            let mut bits = 0u16;
+            for index in 0..count {
+                // SAFETY: the caller proves `count` complete two-byte elements.
+                bits |=
+                    u16::from_le(unsafe { input.add(index << 1).cast::<u16>().read_unaligned() });
+            }
+            bits & 0x8000 == 0
         }
-        bits & 0x8000 == 0
-    } else {
-        debug_assert_eq!(op.src_size, 4);
-        let mut bits = 0u32;
-        for index in 0..count {
-            // SAFETY: the caller proves `count` complete four-byte elements.
-            bits |= u32::from_le(unsafe { input.add(index << 2).cast::<u32>().read_unaligned() });
+        4 => {
+            let mut bits = 0u32;
+            for index in 0..count {
+                // SAFETY: the caller proves `count` complete four-byte elements.
+                bits |=
+                    u32::from_le(unsafe { input.add(index << 2).cast::<u32>().read_unaligned() });
+            }
+            bits & 0x8000_0000 == 0
         }
-        bits & 0x8000_0000 == 0
+        8 => {
+            let mut bits = 0u64;
+            for index in 0..count {
+                // SAFETY: the caller proves `count` complete eight-byte elements.
+                bits |=
+                    u64::from_le(unsafe { input.add(index << 3).cast::<u64>().read_unaligned() });
+            }
+            bits & 0x8000_0000_0000_0000 == 0
+        }
+        _ => {
+            debug_assert!(false, "checked conversion has unsupported source width");
+            false
+        }
     }
 }
 
@@ -722,6 +796,109 @@ unsafe fn packed_copy<const BYTES: usize>(
     Ok(())
 }
 
+macro_rules! slice_kernel {
+    ($name:ident, $src_bytes:expr, $dst_bytes:expr, $load:ident, $store:ident, $convert:expr) => {
+        unsafe fn $name(
+            input: *const u8,
+            output: *mut u8,
+            count: usize,
+            _op: &ConvertOp,
+        ) -> Result<()> {
+            let convert = $convert;
+            for index in 0..count {
+                // SAFETY: the caller proves both buffers contain `count`
+                // complete elements and the source/destination do not overlap.
+                unsafe {
+                    let value = $load(input.add(index * $src_bytes));
+                    $store(output.add(index * $dst_bytes), convert(value));
+                }
+            }
+            Ok(())
+        }
+    };
+}
+
+slice_kernel!(
+    slice_i16_i64,
+    2,
+    8,
+    load_i16_ptr,
+    store_i64_ptr,
+    |v: i16| { i64::from(v) }
+);
+slice_kernel!(
+    slice_i16_u64,
+    2,
+    8,
+    load_i16_ptr,
+    store_u64_ptr,
+    |v: i16| v as u64
+);
+slice_kernel!(
+    slice_u16_i64,
+    2,
+    8,
+    load_u16_ptr,
+    store_i64_ptr,
+    |v: u16| { i64::from(v) }
+);
+slice_kernel!(
+    slice_u16_u64,
+    2,
+    8,
+    load_u16_ptr,
+    store_u64_ptr,
+    |v: u16| { u64::from(v) }
+);
+slice_kernel!(
+    slice_i32_i64,
+    4,
+    8,
+    load_i32_ptr,
+    store_i64_ptr,
+    |v: i32| { i64::from(v) }
+);
+slice_kernel!(
+    slice_i32_u64,
+    4,
+    8,
+    load_i32_ptr,
+    store_u64_ptr,
+    |v: i32| v as u64
+);
+slice_kernel!(
+    slice_u32_i64,
+    4,
+    8,
+    load_u32_ptr,
+    store_i64_ptr,
+    |v: u32| { i64::from(v) }
+);
+slice_kernel!(
+    slice_u32_u64,
+    4,
+    8,
+    load_u32_ptr,
+    store_u64_ptr,
+    |v: u32| { u64::from(v) }
+);
+slice_kernel!(
+    slice_i64_f64,
+    8,
+    8,
+    load_i64_ptr,
+    store_f64_ptr,
+    |v: i64| v as f64
+);
+slice_kernel!(
+    slice_u64_f64,
+    8,
+    8,
+    load_u64_ptr,
+    store_f64_ptr,
+    |v: u64| v as f64
+);
+
 macro_rules! mapped_kernel {
     ($name:ident, $load:ident, $store:ident, $convert:expr) => {
         unsafe fn $name(
@@ -779,6 +956,30 @@ mapped_kernel!(mapped_u16_i32, load_u16_ptr, store_i32_ptr, |value: u16| {
 mapped_kernel!(mapped_u16_u32, load_u16_ptr, store_u32_ptr, |value: u16| {
     u32::from(value)
 });
+mapped_kernel!(mapped_i16_i64, load_i16_ptr, store_i64_ptr, |value: i16| {
+    i64::from(value)
+});
+mapped_kernel!(mapped_i16_u64, load_i16_ptr, store_u64_ptr, |value: i16| {
+    value as u64
+});
+mapped_kernel!(mapped_u16_i64, load_u16_ptr, store_i64_ptr, |value: u16| {
+    i64::from(value)
+});
+mapped_kernel!(mapped_u16_u64, load_u16_ptr, store_u64_ptr, |value: u16| {
+    u64::from(value)
+});
+mapped_kernel!(mapped_i32_i64, load_i32_ptr, store_i64_ptr, |value: i32| {
+    i64::from(value)
+});
+mapped_kernel!(mapped_i32_u64, load_i32_ptr, store_u64_ptr, |value: i32| {
+    value as u64
+});
+mapped_kernel!(mapped_u32_i64, load_u32_ptr, store_i64_ptr, |value: u32| {
+    i64::from(value)
+});
+mapped_kernel!(mapped_u32_u64, load_u32_ptr, store_u64_ptr, |value: u32| {
+    u64::from(value)
+});
 mapped_kernel!(mapped_i16_f32, load_i16_ptr, store_f32_ptr, |value: i16| {
     f32::from(value)
 });
@@ -806,6 +1007,12 @@ mapped_kernel!(mapped_u32_f64, load_u32_ptr, store_f64_ptr, |value: u32| {
 mapped_kernel!(mapped_f32_f64, load_f32_ptr, store_f64_ptr, |value: f32| {
     f64::from(value)
 });
+mapped_kernel!(mapped_i64_f64, load_i64_ptr, store_f64_ptr, |value: i64| {
+    value as f64
+});
+mapped_kernel!(mapped_u64_f64, load_u64_ptr, store_f64_ptr, |value: u64| {
+    value as f64
+});
 
 packed_kernel!(packed_i16_i32, load_i16_ptr, store_i32_ptr, |value: i16| {
     i32::from(value)
@@ -818,6 +1025,30 @@ packed_kernel!(packed_u16_i32, load_u16_ptr, store_i32_ptr, |value: u16| {
 });
 packed_kernel!(packed_u16_u32, load_u16_ptr, store_u32_ptr, |value: u16| {
     u32::from(value)
+});
+packed_kernel!(packed_i16_i64, load_i16_ptr, store_i64_ptr, |value: i16| {
+    i64::from(value)
+});
+packed_kernel!(packed_i16_u64, load_i16_ptr, store_u64_ptr, |value: i16| {
+    value as u64
+});
+packed_kernel!(packed_u16_i64, load_u16_ptr, store_i64_ptr, |value: u16| {
+    i64::from(value)
+});
+packed_kernel!(packed_u16_u64, load_u16_ptr, store_u64_ptr, |value: u16| {
+    u64::from(value)
+});
+packed_kernel!(packed_i32_i64, load_i32_ptr, store_i64_ptr, |value: i32| {
+    i64::from(value)
+});
+packed_kernel!(packed_i32_u64, load_i32_ptr, store_u64_ptr, |value: i32| {
+    value as u64
+});
+packed_kernel!(packed_u32_i64, load_u32_ptr, store_i64_ptr, |value: u32| {
+    i64::from(value)
+});
+packed_kernel!(packed_u32_u64, load_u32_ptr, store_u64_ptr, |value: u32| {
+    u64::from(value)
 });
 packed_kernel!(packed_i16_f32, load_i16_ptr, store_f32_ptr, |value: i16| {
     f32::from(value)
@@ -845,6 +1076,12 @@ packed_kernel!(packed_u32_f64, load_u32_ptr, store_f64_ptr, |value: u32| {
 });
 packed_kernel!(packed_f32_f64, load_f32_ptr, store_f64_ptr, |value: f32| {
     f64::from(value)
+});
+packed_kernel!(packed_i64_f64, load_i64_ptr, store_f64_ptr, |value: i64| {
+    value as f64
+});
+packed_kernel!(packed_u64_f64, load_u64_ptr, store_f64_ptr, |value: u64| {
+    value as f64
 });
 
 const CSR_MAP_IDENTITY: u8 = 0;
@@ -1044,6 +1281,28 @@ csr_kernel!(csr_u16_i32, 2, 4, load_u16_ptr, store_i32_ptr, |v: u16| {
 csr_kernel!(csr_u16_u32, 2, 4, load_u16_ptr, store_u32_ptr, |v: u16| {
     u32::from(v)
 });
+csr_kernel!(csr_i16_i64, 2, 8, load_i16_ptr, store_i64_ptr, |v: i16| {
+    i64::from(v)
+});
+csr_kernel!(csr_i16_u64, 2, 8, load_i16_ptr, store_u64_ptr, |v: i16| v
+    as u64);
+csr_kernel!(csr_u16_i64, 2, 8, load_u16_ptr, store_i64_ptr, |v: u16| {
+    i64::from(v)
+});
+csr_kernel!(csr_u16_u64, 2, 8, load_u16_ptr, store_u64_ptr, |v: u16| {
+    u64::from(v)
+});
+csr_kernel!(csr_i32_i64, 4, 8, load_i32_ptr, store_i64_ptr, |v: i32| {
+    i64::from(v)
+});
+csr_kernel!(csr_i32_u64, 4, 8, load_i32_ptr, store_u64_ptr, |v: i32| v
+    as u64);
+csr_kernel!(csr_u32_i64, 4, 8, load_u32_ptr, store_i64_ptr, |v: u32| {
+    i64::from(v)
+});
+csr_kernel!(csr_u32_u64, 4, 8, load_u32_ptr, store_u64_ptr, |v: u32| {
+    u64::from(v)
+});
 csr_kernel!(csr_i16_f32, 2, 4, load_i16_ptr, store_f32_ptr, |v: i16| {
     f32::from(v)
 });
@@ -1069,6 +1328,10 @@ csr_kernel!(csr_u32_f64, 4, 8, load_u32_ptr, store_f64_ptr, |v: u32| {
 csr_kernel!(csr_f32_f64, 4, 8, load_f32_ptr, store_f64_ptr, |v: f32| {
     f64::from(v)
 });
+csr_kernel!(csr_i64_f64, 8, 8, load_i64_ptr, store_f64_ptr, |v: i64| v
+    as f64);
+csr_kernel!(csr_u64_f64, 8, 8, load_u64_ptr, store_f64_ptr, |v: u64| v
+    as f64);
 
 fn dispatch_fn(src: StorageDType, dst: OutputDType) -> Option<Convert1Fn> {
     use OutputDType as O;
@@ -1076,24 +1339,38 @@ fn dispatch_fn(src: StorageDType, dst: OutputDType) -> Option<Convert1Fn> {
     Some(match (src, dst) {
         (S::I16, O::I16) => kernel_i16_i16,
         (S::I16, O::I32) => kernel_i16_i32,
+        (S::I16, O::I64) => kernel_i16_i64,
         (S::I16, O::U16) => kernel_i16_u16,
         (S::I16, O::U32) => kernel_i16_u32,
+        (S::I16, O::U64) => kernel_i16_u64,
         (S::I16, O::F32) => kernel_i16_f32,
         (S::I16, O::F64) => kernel_i16_f64,
         (S::I32, O::I32) => kernel_i32_i32,
+        (S::I32, O::I64) => kernel_i32_i64,
         (S::I32, O::U32) => kernel_i32_u32,
+        (S::I32, O::U64) => kernel_i32_u64,
         (S::I32, O::F32) => kernel_i32_f32,
         (S::I32, O::F64) => kernel_i32_f64,
+        (S::I64, O::I64) => kernel_i64_i64,
+        (S::I64, O::U64) => kernel_i64_u64,
+        (S::I64, O::F64) => kernel_i64_f64,
         (S::U16, O::U16) => kernel_u16_u16,
         (S::U16, O::U32) => kernel_u16_u32,
+        (S::U16, O::U64) => kernel_u16_u64,
         (S::U16, O::I16) => kernel_u16_i16,
         (S::U16, O::I32) => kernel_u16_i32,
+        (S::U16, O::I64) => kernel_u16_i64,
         (S::U16, O::F32) => kernel_u16_f32,
         (S::U16, O::F64) => kernel_u16_f64,
         (S::U32, O::U32) => kernel_u32_u32,
+        (S::U32, O::U64) => kernel_u32_u64,
         (S::U32, O::I32) => kernel_u32_i32,
+        (S::U32, O::I64) => kernel_u32_i64,
         (S::U32, O::F32) => kernel_u32_f32,
         (S::U32, O::F64) => kernel_u32_f64,
+        (S::U64, O::U64) => kernel_u64_u64,
+        (S::U64, O::I64) => kernel_u64_i64,
+        (S::U64, O::F64) => kernel_u64_f64,
         (S::F32, O::F32) => kernel_f32_f32,
         (S::F32, O::F64) => kernel_f32_f64,
         (S::F64, O::F64) => kernel_f64_f64,
@@ -1107,11 +1384,17 @@ fn load_i16(input: &[u8]) -> i16 {
 fn load_i32(input: &[u8]) -> i32 {
     i32::from_le_bytes(input[..4].try_into().unwrap())
 }
+fn load_i64(input: &[u8]) -> i64 {
+    i64::from_le_bytes(input[..8].try_into().unwrap())
+}
 fn load_u16(input: &[u8]) -> u16 {
     u16::from_le_bytes(input[..2].try_into().unwrap())
 }
 fn load_u32(input: &[u8]) -> u32 {
     u32::from_le_bytes(input[..4].try_into().unwrap())
+}
+fn load_u64(input: &[u8]) -> u64 {
+    u64::from_le_bytes(input[..8].try_into().unwrap())
 }
 fn load_f32(input: &[u8]) -> f32 {
     f32::from_le_bytes(input[..4].try_into().unwrap())
@@ -1122,11 +1405,17 @@ fn store_i16(output: &mut [u8], value: i16) {
 fn store_i32(output: &mut [u8], value: i32) {
     output[..4].copy_from_slice(&value.to_le_bytes());
 }
+fn store_i64(output: &mut [u8], value: i64) {
+    output[..8].copy_from_slice(&value.to_le_bytes());
+}
 fn store_u16(output: &mut [u8], value: u16) {
     output[..2].copy_from_slice(&value.to_le_bytes());
 }
 fn store_u32(output: &mut [u8], value: u32) {
     output[..4].copy_from_slice(&value.to_le_bytes());
+}
+fn store_u64(output: &mut [u8], value: u64) {
+    output[..8].copy_from_slice(&value.to_le_bytes());
 }
 fn store_f32(output: &mut [u8], value: f32) {
     output[..4].copy_from_slice(&value.to_le_bytes());
@@ -1148,6 +1437,12 @@ unsafe fn load_i32_ptr(input: *const u8) -> i32 {
 }
 
 #[inline(always)]
+unsafe fn load_i64_ptr(input: *const u8) -> i64 {
+    // SAFETY: caller guarantees one complete possibly unaligned i64 element.
+    i64::from_le(unsafe { input.cast::<i64>().read_unaligned() })
+}
+
+#[inline(always)]
 unsafe fn load_u16_ptr(input: *const u8) -> u16 {
     // SAFETY: caller guarantees one complete possibly unaligned u16 element.
     u16::from_le(unsafe { input.cast::<u16>().read_unaligned() })
@@ -1157,6 +1452,12 @@ unsafe fn load_u16_ptr(input: *const u8) -> u16 {
 unsafe fn load_u32_ptr(input: *const u8) -> u32 {
     // SAFETY: caller guarantees one complete possibly unaligned u32 element.
     u32::from_le(unsafe { input.cast::<u32>().read_unaligned() })
+}
+
+#[inline(always)]
+unsafe fn load_u64_ptr(input: *const u8) -> u64 {
+    // SAFETY: caller guarantees one complete possibly unaligned u64 element.
+    u64::from_le(unsafe { input.cast::<u64>().read_unaligned() })
 }
 
 #[inline(always)]
@@ -1174,9 +1475,21 @@ unsafe fn store_i32_ptr(output: *mut u8, value: i32) {
 }
 
 #[inline(always)]
+unsafe fn store_i64_ptr(output: *mut u8, value: i64) {
+    // SAFETY: caller guarantees one complete possibly unaligned i64 destination.
+    unsafe { output.cast::<i64>().write_unaligned(value.to_le()) };
+}
+
+#[inline(always)]
 unsafe fn store_u32_ptr(output: *mut u8, value: u32) {
     // SAFETY: caller guarantees one complete possibly unaligned u32 destination.
     unsafe { output.cast::<u32>().write_unaligned(value.to_le()) };
+}
+
+#[inline(always)]
+unsafe fn store_u64_ptr(output: *mut u8, value: u64) {
+    // SAFETY: caller guarantees one complete possibly unaligned u64 destination.
+    unsafe { output.cast::<u64>().write_unaligned(value.to_le()) };
 }
 
 #[inline(always)]
@@ -1212,12 +1525,20 @@ fn kernel_i32_i32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()
     output[..4].copy_from_slice(&input[..4]);
     Ok(())
 }
+fn kernel_i64_i64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    output[..8].copy_from_slice(&input[..8]);
+    Ok(())
+}
 fn kernel_u16_u16(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
     output[..2].copy_from_slice(&input[..2]);
     Ok(())
 }
 fn kernel_u32_u32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
     output[..4].copy_from_slice(&input[..4]);
+    Ok(())
+}
+fn kernel_u64_u64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    output[..8].copy_from_slice(&input[..8]);
     Ok(())
 }
 fn kernel_f32_f32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
@@ -1233,12 +1554,36 @@ fn kernel_i16_i32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()
     store_i32(output, i32::from(load_i16(input)));
     Ok(())
 }
+fn kernel_i16_i64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    store_i64(output, i64::from(load_i16(input)));
+    Ok(())
+}
+fn kernel_i32_i64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    store_i64(output, i64::from(load_i32(input)));
+    Ok(())
+}
 fn kernel_u16_u32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
     store_u32(output, u32::from(load_u16(input)));
     Ok(())
 }
+fn kernel_u16_u64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    store_u64(output, u64::from(load_u16(input)));
+    Ok(())
+}
+fn kernel_u32_u64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    store_u64(output, u64::from(load_u32(input)));
+    Ok(())
+}
 fn kernel_u16_i32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
     store_i32(output, i32::from(load_u16(input)));
+    Ok(())
+}
+fn kernel_u16_i64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    store_i64(output, i64::from(load_u16(input)));
+    Ok(())
+}
+fn kernel_u32_i64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    store_i64(output, i64::from(load_u32(input)));
     Ok(())
 }
 fn kernel_f32_f64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
@@ -1266,6 +1611,16 @@ fn kernel_i16_u32(input: &[u8], output: &mut [u8], op: &ConvertOp) -> Result<()>
     Ok(())
 }
 
+fn kernel_i16_u64(input: &[u8], output: &mut [u8], op: &ConvertOp) -> Result<()> {
+    let v = load_i16(input);
+    if v < 0 && op.write_fallback {
+        write_fallback(output, op);
+        return Ok(());
+    }
+    store_u64(output, v as u64);
+    Ok(())
+}
+
 fn kernel_i32_u32(input: &[u8], output: &mut [u8], op: &ConvertOp) -> Result<()> {
     let v = load_i32(input);
     if v < 0 && op.write_fallback {
@@ -1273,6 +1628,26 @@ fn kernel_i32_u32(input: &[u8], output: &mut [u8], op: &ConvertOp) -> Result<()>
         return Ok(());
     }
     store_u32(output, v as u32);
+    Ok(())
+}
+
+fn kernel_i32_u64(input: &[u8], output: &mut [u8], op: &ConvertOp) -> Result<()> {
+    let v = load_i32(input);
+    if v < 0 && op.write_fallback {
+        write_fallback(output, op);
+        return Ok(());
+    }
+    store_u64(output, v as u64);
+    Ok(())
+}
+
+fn kernel_i64_u64(input: &[u8], output: &mut [u8], op: &ConvertOp) -> Result<()> {
+    let v = load_i64(input);
+    if v < 0 && op.write_fallback {
+        write_fallback(output, op);
+        return Ok(());
+    }
+    store_u64(output, v as u64);
     Ok(())
 }
 
@@ -1296,6 +1671,16 @@ fn kernel_u32_i32(input: &[u8], output: &mut [u8], op: &ConvertOp) -> Result<()>
     Ok(())
 }
 
+fn kernel_u64_i64(input: &[u8], output: &mut [u8], op: &ConvertOp) -> Result<()> {
+    let v = load_u64(input);
+    if v > i64::MAX as u64 && op.write_fallback {
+        write_fallback(output, op);
+        return Ok(());
+    }
+    store_i64(output, v as i64);
+    Ok(())
+}
+
 fn kernel_i16_f32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
     store_f32(output, f32::from(load_i16(input)));
     Ok(())
@@ -1312,6 +1697,10 @@ fn kernel_i32_f64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()
     store_f64(output, f64::from(load_i32(input)));
     Ok(())
 }
+fn kernel_i64_f64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    store_f64(output, load_i64(input) as f64);
+    Ok(())
+}
 fn kernel_u16_f32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
     store_f32(output, f32::from(load_u16(input)));
     Ok(())
@@ -1326,5 +1715,9 @@ fn kernel_u32_f32(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()
 }
 fn kernel_u32_f64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
     store_f64(output, f64::from(load_u32(input)));
+    Ok(())
+}
+fn kernel_u64_f64(input: &[u8], output: &mut [u8], _op: &ConvertOp) -> Result<()> {
+    store_f64(output, load_u64(input) as f64);
     Ok(())
 }

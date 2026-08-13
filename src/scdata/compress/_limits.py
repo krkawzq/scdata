@@ -4,17 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from scdata._core import (
-    DEFAULT_MAXIMUM_BLOCK_COUNT,
-    DEFAULT_MAXIMUM_DECODED_SIZE,
-    DEFAULT_MAXIMUM_ENCODED_SIZE,
-    DEFAULT_MAXIMUM_METADATA_SIZE,
-    DEFAULT_N_WORKERS,
-)
 from scdata.compress._validate import _UINTP_MAX, as_int
-from scdata.exceptions import _invalid_argument
 
-__all__ = ["DEFAULT_N_WORKERS", "DEFAULT_READ_LIMITS", "ReadLimits"]
+__all__ = ["DEFAULT_READ_LIMITS", "ReadLimits"]
+
+_DEFAULT_MAXIMUM_METADATA_SIZE = 1024 * 1024
+_DEFAULT_MAXIMUM_ENCODED_SIZE = 1024 * 1024 * 1024
+_DEFAULT_MAXIMUM_DECODED_SIZE = 1024 * 1024 * 1024
+_DEFAULT_MAXIMUM_BLOCK_COUNT = 1_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,14 +19,14 @@ class ReadLimits:
     """Upper bounds applied while opening and decoding a store.
 
     The object is immutable and safe to reuse. Keyword overrides on
-    :func:`scdata.open_store` are applied on top of this object.
+    :func:`scdata.open` are applied on top of this object.
     """
 
-    max_metadata_size: int = DEFAULT_MAXIMUM_METADATA_SIZE
-    max_encoded_size: int = DEFAULT_MAXIMUM_ENCODED_SIZE
-    max_decoded_size: int = DEFAULT_MAXIMUM_DECODED_SIZE
-    max_block_count: int = DEFAULT_MAXIMUM_BLOCK_COUNT
-    n_workers: int = DEFAULT_N_WORKERS
+    max_metadata_size: int = _DEFAULT_MAXIMUM_METADATA_SIZE
+    max_encoded_size: int = _DEFAULT_MAXIMUM_ENCODED_SIZE
+    max_decoded_size: int = _DEFAULT_MAXIMUM_DECODED_SIZE
+    max_block_count: int = _DEFAULT_MAXIMUM_BLOCK_COUNT
+    num_workers: int = 1
 
     def __post_init__(self) -> None:
         for name in (
@@ -45,8 +42,8 @@ class ReadLimits:
             )
         object.__setattr__(
             self,
-            "n_workers",
-            as_int(self.n_workers, name="n_workers", minimum=1, maximum=_UINTP_MAX),
+            "num_workers",
+            as_int(self.num_workers, name="num_workers", minimum=1, maximum=_UINTP_MAX),
         )
 
     def with_overrides(
@@ -56,7 +53,7 @@ class ReadLimits:
         max_encoded_size: object | None = None,
         max_decoded_size: object | None = None,
         max_block_count: object | None = None,
-        n_workers: object | None = None,
+        num_workers: object | None = None,
     ) -> ReadLimits:
         """Return a copy with only the non-``None`` values replaced."""
         changes = {
@@ -66,7 +63,7 @@ class ReadLimits:
                 ("max_encoded_size", max_encoded_size),
                 ("max_decoded_size", max_decoded_size),
                 ("max_block_count", max_block_count),
-                ("n_workers", n_workers),
+                ("num_workers", num_workers),
             )
             if value is not None
         }
@@ -83,16 +80,16 @@ def resolve_read_limits(
     max_encoded_size: object | None = None,
     max_decoded_size: object | None = None,
     max_block_count: object | None = None,
-    n_workers: object | None = None,
+    num_workers: object | None = None,
 ) -> ReadLimits:
     if limits is None:
         limits = DEFAULT_READ_LIMITS
     elif not isinstance(limits, ReadLimits):
-        _invalid_argument(f"limits must be ReadLimits or None, got {type(limits).__name__}")
+        raise TypeError(f"limits must be ReadLimits or None, got {type(limits).__name__}")
     return limits.with_overrides(
         max_metadata_size=max_metadata_size,
         max_encoded_size=max_encoded_size,
         max_decoded_size=max_decoded_size,
         max_block_count=max_block_count,
-        n_workers=n_workers,
+        num_workers=num_workers,
     )

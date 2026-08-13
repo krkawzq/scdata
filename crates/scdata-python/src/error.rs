@@ -1,10 +1,60 @@
-//! A single structured error type for the private extension boundary.
+//! Python exception types for the public `scdata.exceptions` hierarchy.
 
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyType;
+use pyo3::PyTypeInfo;
 
-create_exception!(_core, CoreError, PyException);
+create_exception!(_core, Error, PyException);
+create_exception!(_core, Warning, PyUserWarning);
+create_exception!(_core, PerformanceWarning, Warning);
+
+macro_rules! define_errors {
+    ($(($cls:ident, $kind:literal),)+) => {
+        $(create_exception!(_core, $cls, Error);)+
+
+        fn typed_err(message: impl Into<String>, kind: &'static str) -> PyErr {
+            let message = message.into();
+            match kind {
+                $($kind => $cls::new_err(message),)+
+                _ => Error::new_err(message),
+            }
+        }
+
+        fn register_errors(module: &Bound<'_, PyModule>) -> PyResult<()> {
+            export_type::<Error>(module, "Error", Some("unknown"))?;
+            $(export_type::<$cls>(module, stringify!($cls), Some($kind))?;)+
+            Ok(())
+        }
+    };
+}
+
+define_errors! {
+    (InvalidArgumentError, "invalid_argument"),
+    (InvalidInputError, "invalid_input"),
+    (InvalidConfigError, "invalid_config"),
+    (InvalidDatasetError, "invalid_dataset"),
+    (InvalidMetaError, "invalid_meta"),
+    (ResourceLimitError, "resource_limit"),
+    (StalePlanError, "stale_plan"),
+    (UnsupportedError, "unsupported"),
+    (IoError, "io"),
+    (JsonError, "json"),
+    (CodecError, "codec"),
+    (ZipError, "zip"),
+    (DecodeError, "decode"),
+    (PromotionError, "promotion"),
+    (ConversionError, "conversion"),
+    (CancelledError, "cancelled"),
+    (SessionError, "session"),
+    (WorkerPanicError, "worker_panic"),
+    (AllocationError, "allocation"),
+    (InternalError, "internal"),
+    (NotFoundError, "not_found"),
+    (CorruptDataError, "corrupt_data"),
+    (PathError, "path"),
+}
 
 pub(crate) fn compress_kind(error: &sc_compress::Error) -> &'static str {
     match error {
@@ -42,11 +92,14 @@ pub(crate) fn load_kind(error: &sc_load::Error) -> &'static str {
 }
 
 pub(crate) fn from_compress(error: sc_compress::Error) -> PyErr {
-    attach_kind(CoreError::new_err(error.to_string()), compress_kind(&error))
+    if matches!(error, sc_compress::Error::InvalidArgument(_)) {
+        return PyValueError::new_err(error.to_string());
+    }
+    typed_err(error.to_string(), compress_kind(&error))
 }
 
 pub(crate) fn from_load(error: sc_load::Error) -> PyErr {
-    attach_kind(CoreError::new_err(error.to_string()), load_kind(&error))
+    typed_err(error.to_string(), load_kind(&error))
 }
 
 pub(crate) fn from_rust(error: sc_load::Error) -> PyErr {
@@ -54,18 +107,11 @@ pub(crate) fn from_rust(error: sc_load::Error) -> PyErr {
 }
 
 pub(crate) fn invalid_argument(message: impl Into<String>) -> PyErr {
-    attach_kind(CoreError::new_err(message.into()), "invalid_argument")
+    PyValueError::new_err(message.into())
 }
 
 pub(crate) fn invalid_input(message: impl Into<String>) -> PyErr {
-    attach_kind(CoreError::new_err(message.into()), "invalid_input")
-}
-
-fn attach_kind(error: PyErr, kind: &'static str) -> PyErr {
-    Python::with_gil(|py| {
-        let _result = error.value(py).setattr("kind", kind);
-        error
-    })
+    typed_err(message, "invalid_input")
 }
 
 pub(crate) trait ResultExt<T> {
@@ -84,6 +130,21 @@ impl<T> ResultExt<T> for Result<T, sc_load::Error> {
     }
 }
 
+fn export_type<T>(module: &Bound<'_, PyModule>, name: &str, kind: Option<&str>) -> PyResult<()>
+where
+    T: PyTypeInfo,
+{
+    let cls: Bound<'_, PyType> = module.py().get_type::<T>();
+    cls.setattr("__module__", "scdata.exceptions")?;
+    if let Some(kind) = kind {
+        cls.setattr("kind", kind)?;
+    }
+    module.add(name, cls)
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("CoreError", module.py().get_type::<CoreError>())
+    register_errors(module)?;
+    export_type::<Warning>(module, "Warning", None)?;
+    export_type::<PerformanceWarning>(module, "PerformanceWarning", None)?;
+    Ok(())
 }

@@ -1,5 +1,6 @@
 //! Linux shared-ring bindings. NumPy arrays borrow read-only ring generations.
 
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -322,7 +323,9 @@ pub(crate) fn shared_next<'py>(
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
     client.ensure_process()?;
     match py.allow_threads(|| client.next_owned()) {
-        Ok(Some(batch)) => batch_into_array(py, batch).map(Some),
+        Ok(Some(batch)) => {
+            cancel_incomplete_on_error(client, batch_into_array(py, batch)).map(Some)
+        }
         Ok(None) => Ok(None),
         Err(NextError::Rust(error)) => Err(from_rust(error)),
         Err(NextError::Closed) => Err(invalid_argument("shared client is closed")),
@@ -336,7 +339,9 @@ pub(crate) fn shared_next_copy<'py>(
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
     client.ensure_process()?;
     match py.allow_threads(|| client.next_owned()) {
-        Ok(Some(batch)) => batch_into_owned_array(py, batch).map(Some),
+        Ok(Some(batch)) => {
+            cancel_incomplete_on_error(client, batch_into_owned_array(py, batch)).map(Some)
+        }
         Ok(None) => Ok(None),
         Err(NextError::Rust(error)) => Err(from_rust(error)),
         Err(NextError::Closed) => Err(invalid_argument("shared client is closed")),
@@ -367,8 +372,10 @@ pub(crate) fn shared_read<'py>(
     match client.metadata.dtype {
         OutputDType::I16 => typed_read_array::<i16>(py, client, expected_rows),
         OutputDType::I32 => typed_read_array::<i32>(py, client, expected_rows),
+        OutputDType::I64 => typed_read_array::<i64>(py, client, expected_rows),
         OutputDType::U16 => typed_read_array::<u16>(py, client, expected_rows),
         OutputDType::U32 => typed_read_array::<u32>(py, client, expected_rows),
+        OutputDType::U64 => typed_read_array::<u64>(py, client, expected_rows),
         OutputDType::F32 => typed_read_array::<f32>(py, client, expected_rows),
         OutputDType::F64 => typed_read_array::<f64>(py, client, expected_rows),
     }
@@ -379,9 +386,11 @@ pub(crate) fn shared_close(py: Python<'_>, client: &PySharedClient) {
     if std::process::id() != client.process_id {
         return;
     }
-    client.cancellation.cancel_if_incomplete();
-    let inner = client.slot.lock().client.take();
-    py.allow_threads(move || drop(inner));
+    py.allow_threads(|| {
+        client.cancellation.cancel_if_incomplete();
+        let inner = client.slot.lock().client.take();
+        drop(inner);
+    });
 }
 
 #[pyfunction]
@@ -390,7 +399,16 @@ pub(crate) fn shared_client_meta<'py>(
     client: &PySharedClient,
 ) -> PyResult<Bound<'py, PyDict>> {
     client.ensure_process()?;
-    let slot = client.slot.lock();
+    let (closed, exhausted, next_logical_batch) = py.allow_threads(|| {
+        let slot = client.slot.lock();
+        (
+            slot.client.is_none(),
+            slot.exhausted,
+            slot.client
+                .as_ref()
+                .and_then(SharedClient::next_logical_batch),
+        )
+    });
     let values = PyDict::new(py);
     values.set_item("rank", client.rank)?;
     values.set_item("world_size", client.metadata.world_size)?;
@@ -399,12 +417,9 @@ pub(crate) fn shared_client_meta<'py>(
     values.set_item("batch_size", client.metadata.batch_size)?;
     values.set_item("batch_count", client.rank_batch_count)?;
     values.set_item("dtype", client.metadata.dtype.as_str())?;
-    values.set_item("closed", slot.client.is_none())?;
-    values.set_item("exhausted", slot.exhausted)?;
-    values.set_item(
-        "next_logical_batch",
-        slot.client.as_ref().and_then(SharedClient::next_logical_batch),
-    )?;
+    values.set_item("closed", closed)?;
+    values.set_item("exhausted", exhausted)?;
+    values.set_item("next_logical_batch", next_logical_batch)?;
     Ok(values)
 }
 
@@ -423,19 +438,44 @@ enum NextError {
     Closed,
 }
 
-#[pyclass(name = "_SharedBatch", module = "scdata._core", frozen)]
-struct PySharedBatch {
-    batch: SharedBatch,
+fn cancel_incomplete_on_error<T>(client: &PySharedClient, result: PyResult<T>) -> PyResult<T> {
+    if result.is_err() {
+        client.cancellation.cancel_if_incomplete();
+    }
+    result
 }
 
+#[pyclass(name = "_SharedBatch", module = "scdata._core", frozen)]
+struct PySharedBatch {
+    batch: ManuallyDrop<SharedBatch>,
+    process_id: u32,
+}
+
+impl Drop for PySharedBatch {
+    fn drop(&mut self) {
+        if std::process::id() != self.process_id {
+            return;
+        }
+        // SAFETY: the creating process owns the only destructor for this lease.
+        // A post-fork child leaves its copied lease untouched until process exit.
+        unsafe { ManuallyDrop::drop(&mut self.batch) };
+    }
+}
 
 fn batch_into_array<'py>(py: Python<'py>, batch: SharedBatch) -> PyResult<Bound<'py, PyAny>> {
-    let owner = Bound::new(py, PySharedBatch { batch })?;
-    let (pointer, rows, cols, row_stride, dtype) = {
+    let owner = Bound::new(
+        py,
+        PySharedBatch {
+            batch: ManuallyDrop::new(batch),
+            process_id: std::process::id(),
+        },
+    )?;
+    let (pointer, byte_len, rows, cols, row_stride, dtype) = {
         let owner_ref = owner.borrow();
         let bytes = owner_ref.batch.bytes().map_sc()?;
         (
             bytes.as_ptr(),
+            bytes.len(),
             owner_ref.batch.rows(),
             owner_ref.batch.n_cols(),
             owner_ref.batch.row_stride_bytes(),
@@ -444,19 +484,21 @@ fn batch_into_array<'py>(py: Python<'py>, batch: SharedBatch) -> PyResult<Bound<
     };
     #[cfg(target_endian = "big")]
     {
-        let _ = (pointer, rows, cols, row_stride, dtype, owner);
+        let _ = (pointer, byte_len, rows, cols, row_stride, dtype, owner);
         return Err(from_rust(Error::Unsupported(
             "shared NumPy views require a little-endian target".into(),
         )));
     }
     #[cfg(target_endian = "little")]
     match dtype {
-        OutputDType::I16 => typed_array::<i16>(owner, pointer, rows, cols, row_stride),
-        OutputDType::I32 => typed_array::<i32>(owner, pointer, rows, cols, row_stride),
-        OutputDType::U16 => typed_array::<u16>(owner, pointer, rows, cols, row_stride),
-        OutputDType::U32 => typed_array::<u32>(owner, pointer, rows, cols, row_stride),
-        OutputDType::F32 => typed_array::<f32>(owner, pointer, rows, cols, row_stride),
-        OutputDType::F64 => typed_array::<f64>(owner, pointer, rows, cols, row_stride),
+        OutputDType::I16 => typed_array::<i16>(owner, pointer, byte_len, rows, cols, row_stride),
+        OutputDType::I32 => typed_array::<i32>(owner, pointer, byte_len, rows, cols, row_stride),
+        OutputDType::I64 => typed_array::<i64>(owner, pointer, byte_len, rows, cols, row_stride),
+        OutputDType::U16 => typed_array::<u16>(owner, pointer, byte_len, rows, cols, row_stride),
+        OutputDType::U32 => typed_array::<u32>(owner, pointer, byte_len, rows, cols, row_stride),
+        OutputDType::U64 => typed_array::<u64>(owner, pointer, byte_len, rows, cols, row_stride),
+        OutputDType::F32 => typed_array::<f32>(owner, pointer, byte_len, rows, cols, row_stride),
+        OutputDType::F64 => typed_array::<f64>(owner, pointer, byte_len, rows, cols, row_stride),
     }
 }
 
@@ -472,8 +514,10 @@ fn batch_into_owned_array<'py>(py: Python<'py>, batch: SharedBatch) -> PyResult<
     match batch.dtype() {
         OutputDType::I16 => typed_owned_array::<i16>(py, batch),
         OutputDType::I32 => typed_owned_array::<i32>(py, batch),
+        OutputDType::I64 => typed_owned_array::<i64>(py, batch),
         OutputDType::U16 => typed_owned_array::<u16>(py, batch),
         OutputDType::U32 => typed_owned_array::<u32>(py, batch),
+        OutputDType::U64 => typed_owned_array::<u64>(py, batch),
         OutputDType::F32 => typed_owned_array::<f32>(py, batch),
         OutputDType::F64 => typed_owned_array::<f64>(py, batch),
     }
@@ -538,8 +582,14 @@ fn typed_owned_array<'py, T: Copy + Element>(
     batch: SharedBatch,
 ) -> PyResult<Bound<'py, PyAny>> {
     let layout = compact_copy_layout::<T>(&batch).map_sc()?;
-    // SAFETY: all supported output dtypes are trivially copyable, and every
-    // element is initialized below before the array becomes visible to Python.
+    let allocation_bytes = checked_array_bytes::<T>(layout.rows, layout.cols).map_sc()?;
+    if allocation_bytes != layout.copy_bytes {
+        return Err(from_rust(Error::Invariant(
+            "shared compact byte count does not match the output shape".into(),
+        )));
+    }
+    // SAFETY: the checked shape fits NumPy's signed dimensions, and every
+    // element is initialized below before the array is returned to Python.
     let array = unsafe { PyArray2::<T>::new(py, [layout.rows, layout.cols], false) };
     let destination = array.data().cast::<u8>() as usize;
     if layout.copy_bytes != 0 {
@@ -589,16 +639,47 @@ fn typed_read_array<'py, T: Copy + Element>(
     client: &PySharedClient,
     expected_rows: usize,
 ) -> PyResult<(Bound<'py, PyAny>, usize)> {
-    // SAFETY: all supported output dtypes are trivially copyable. The array is
-    // not exposed to Python until `drain_into` initializes every element.
+    checked_array_bytes::<T>(expected_rows, client.metadata.n_cols).map_sc()?;
+    // SAFETY: the checked shape fits NumPy's signed dimensions. The array is
+    // not exposed until `drain_into` has initialized every element.
     let array = unsafe { PyArray2::<T>::new(py, [expected_rows, client.metadata.n_cols], false) };
     let destination = array.data().cast::<u8>() as usize;
     let batches = match py.allow_threads(|| client.drain_into::<T>(destination, expected_rows)) {
         Ok(batches) => batches,
-        Err(NextError::Rust(error)) => return Err(from_rust(error)),
+        Err(NextError::Rust(error)) => {
+            client.cancellation.cancel_if_incomplete();
+            return Err(from_rust(error));
+        }
         Err(NextError::Closed) => return Err(invalid_argument("shared client is closed")),
     };
     Ok((array.into_any(), batches))
+}
+
+#[cfg(target_endian = "little")]
+fn checked_array_bytes<T>(rows: usize, cols: usize) -> Result<usize, Error> {
+    let element_size = std::mem::size_of::<T>();
+    if element_size == 0 {
+        return Err(Error::Invariant(
+            "shared output dtype has zero-sized elements".into(),
+        ));
+    }
+    if rows > isize::MAX as usize || cols > isize::MAX as usize {
+        return Err(Error::Allocation(
+            "shared NumPy dimension exceeds isize".into(),
+        ));
+    }
+    let count = rows
+        .checked_mul(cols)
+        .ok_or_else(|| Error::Allocation("shared element count overflow".into()))?;
+    let bytes = count
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::Allocation("shared array byte count overflow".into()))?;
+    if bytes > isize::MAX as usize {
+        return Err(Error::Allocation(
+            "shared NumPy allocation exceeds isize".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_endian = "little")]
@@ -636,17 +717,42 @@ unsafe fn copy_compact_rows(
 fn typed_array<'py, T: Element>(
     owner: Bound<'py, PySharedBatch>,
     pointer: *const u8,
+    byte_len: usize,
     rows: usize,
     cols: usize,
     row_stride: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
     let element_size = std::mem::size_of::<T>();
-    if element_size == 0
-        || !row_stride.is_multiple_of(element_size)
-        || pointer.align_offset(std::mem::align_of::<T>()) != 0
-    {
+    if element_size == 0 || !row_stride.is_multiple_of(element_size) {
         return Err(from_rust(Error::Invariant(
             "shared NumPy view has an incompatible element layout".into(),
+        )));
+    }
+    checked_array_bytes::<T>(rows, cols).map_sc()?;
+    let row_bytes = cols
+        .checked_mul(element_size)
+        .ok_or_else(|| from_rust(Error::Allocation("shared row byte count overflow".into())))?;
+    if row_stride < row_bytes {
+        return Err(from_rust(Error::Invariant(format!(
+            "shared row stride {row_stride} is smaller than {row_bytes} payload bytes"
+        ))));
+    }
+    let required = if rows == 0 || cols == 0 {
+        0
+    } else {
+        (rows - 1)
+            .checked_mul(row_stride)
+            .and_then(|offset| offset.checked_add(row_bytes))
+            .ok_or_else(|| from_rust(Error::Allocation("shared view extent overflow".into())))?
+    };
+    if required > byte_len {
+        return Err(from_rust(Error::Invariant(format!(
+            "shared batch exposes {byte_len} bytes, but the NumPy view requires {required}"
+        ))));
+    }
+    if pointer.align_offset(std::mem::align_of::<T>()) != 0 {
+        return Err(from_rust(Error::Invariant(
+            "shared NumPy view has a misaligned data pointer".into(),
         )));
     }
     let shape = (rows, cols).strides((row_stride / element_size, 1));
@@ -718,4 +824,16 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(shared_client_meta, module)?)?;
     module.add_function(wrap_pyfunction!(shared_attach, module)?)?;
     Ok(())
+}
+
+#[cfg(all(test, target_endian = "little"))]
+mod tests {
+    use super::checked_array_bytes;
+
+    #[test]
+    fn numpy_array_size_checks_dimensions_and_bytes() {
+        assert_eq!(checked_array_bytes::<u32>(3, 5).unwrap(), 60);
+        assert!(checked_array_bytes::<u32>(0, usize::MAX).is_err());
+        assert!(checked_array_bytes::<u64>(isize::MAX as usize, 2).is_err());
+    }
 }

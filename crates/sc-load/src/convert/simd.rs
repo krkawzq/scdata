@@ -11,7 +11,11 @@ pub(super) fn dispatch_avx512(src: StorageDType, dst: OutputDType) -> Option<Con
     use StorageDType as S;
     Some(match (src, dst) {
         (S::I16, O::I32 | O::U32) => avx512_i16_i32,
+        (S::I16, O::I64 | O::U64) => avx512_i16_i64,
         (S::U16, O::I32 | O::U32) => avx512_u16_i32,
+        (S::U16, O::I64 | O::U64) => avx512_u16_i64,
+        (S::I32, O::I64 | O::U64) => avx512_i32_i64,
+        (S::U32, O::I64 | O::U64) => avx512_u32_i64,
         (S::I16, O::F32) => avx512_i16_f32,
         (S::U16, O::F32) => avx512_u16_f32,
         (S::I32, O::F32) => avx512_i32_f32,
@@ -21,6 +25,8 @@ pub(super) fn dispatch_avx512(src: StorageDType, dst: OutputDType) -> Option<Con
         (S::I32, O::F64) => avx512_i32_f64,
         (S::U32, O::F64) => avx512_u32_f64,
         (S::F32, O::F64) => avx512_f32_f64,
+        (S::I64, O::F64) if std::arch::is_x86_feature_detected!("avx512dq") => avx512_i64_f64,
+        (S::U64, O::F64) if std::arch::is_x86_feature_detected!("avx512dq") => avx512_u64_f64,
         _ => return None,
     })
 }
@@ -30,7 +36,11 @@ pub(super) fn dispatch_avx2(src: StorageDType, dst: OutputDType) -> Option<Conve
     use StorageDType as S;
     Some(match (src, dst) {
         (S::I16, O::I32 | O::U32) => i16_i32,
+        (S::I16, O::I64 | O::U64) => i16_i64,
         (S::U16, O::I32 | O::U32) => u16_i32,
+        (S::U16, O::I64 | O::U64) => u16_i64,
+        (S::I32, O::I64 | O::U64) => i32_i64,
+        (S::U32, O::I64 | O::U64) => u32_i64,
         (S::I16, O::F32) => i16_f32,
         (S::U16, O::F32) => u16_f32,
         (S::I32, O::F32) => i32_f32,
@@ -348,8 +358,9 @@ pub(super) fn dispatch_validate_avx2(
     use OutputDType as O;
     use StorageDType as S;
     match (src, dst) {
-        (S::I16, O::U16 | O::U32) | (S::U16, O::I16) => Some(validate_sign_i16),
-        (S::I32, O::U32) | (S::U32, O::I32) => Some(validate_sign_i32),
+        (S::I16, O::U16 | O::U32 | O::U64) | (S::U16, O::I16) => Some(validate_sign_i16),
+        (S::I32, O::U32 | O::U64) | (S::U32, O::I32) => Some(validate_sign_i32),
+        (S::I64, O::U64) | (S::U64, O::I64) => Some(validate_sign_i64),
         _ => None,
     }
 }
@@ -361,8 +372,9 @@ pub(super) fn dispatch_validate_avx512(
     use OutputDType as O;
     use StorageDType as S;
     match (src, dst) {
-        (S::I16, O::U16 | O::U32) | (S::U16, O::I16) => Some(validate_sign_i16_avx512),
-        (S::I32, O::U32) | (S::U32, O::I32) => Some(validate_sign_i32_avx512),
+        (S::I16, O::U16 | O::U32 | O::U64) | (S::U16, O::I16) => Some(validate_sign_i16_avx512),
+        (S::I32, O::U32 | O::U64) | (S::U32, O::I32) => Some(validate_sign_i32_avx512),
+        (S::I64, O::U64) | (S::U64, O::I64) => Some(validate_sign_i64_avx512),
         _ => None,
     }
 }
@@ -399,6 +411,25 @@ unsafe fn validate_sign_i32_avx512(input: *const u8, count: usize, op: &ConvertO
             sign_bits = _mm512_or_si512(sign_bits, values);
         }
         if _mm512_cmp_epi32_mask::<_MM_CMPINT_LT>(sign_bits, _mm512_setzero_si512()) != 0 {
+            return false;
+        }
+        scalar_validate_slice_tail(input, vector_count, count, op)
+    }
+}
+
+#[target_feature(enable = "avx512f")]
+unsafe fn validate_sign_i64_avx512(input: *const u8, count: usize, op: &ConvertOp) -> bool {
+    const LANES: usize = 8;
+    let vector_count = count / LANES * LANES;
+    // SAFETY: runtime dispatch checked AVX-512F and the entry wrapper proves
+    // the full input extent. OR reduction preserves every source sign bit.
+    unsafe {
+        let mut sign_bits = _mm512_setzero_si512();
+        for index in (0..vector_count).step_by(LANES) {
+            let values = _mm512_loadu_si512(input.add(index * 8).cast::<__m512i>());
+            sign_bits = _mm512_or_si512(sign_bits, values);
+        }
+        if _mm512_cmp_epi64_mask::<_MM_CMPINT_LT>(sign_bits, _mm512_setzero_si512()) != 0 {
             return false;
         }
         scalar_validate_slice_tail(input, vector_count, count, op)
@@ -445,6 +476,26 @@ unsafe fn validate_sign_i32(input: *const u8, count: usize, op: &ConvertOp) -> b
     }
 }
 
+#[target_feature(enable = "avx2")]
+unsafe fn validate_sign_i64(input: *const u8, count: usize, op: &ConvertOp) -> bool {
+    const LANES: usize = 4;
+    let vector_count = count / LANES * LANES;
+    let mut sign_bits = _mm256_setzero_si256();
+    // SAFETY: runtime dispatch checked AVX2 and the entry wrapper proves the
+    // complete input extent. Checked 64-bit signedness conversions are valid
+    // exactly when bit 63 is clear for every source element.
+    unsafe {
+        for index in (0..vector_count).step_by(LANES) {
+            let values = _mm256_loadu_si256(input.add(index * 8).cast::<__m256i>());
+            sign_bits = _mm256_or_si256(sign_bits, values);
+        }
+        if _mm256_movemask_pd(_mm256_castsi256_pd(sign_bits)) != 0 {
+            return false;
+        }
+        scalar_validate_slice_tail(input, vector_count, count, op)
+    }
+}
+
 #[inline]
 unsafe fn scalar_validate_slice_tail(
     input: *const u8,
@@ -452,22 +503,39 @@ unsafe fn scalar_validate_slice_tail(
     count: usize,
     op: &ConvertOp,
 ) -> bool {
-    if op.src_size == 2 {
-        let mut bits = 0u16;
-        for index in done..count {
-            // SAFETY: the vector prefix consumed `done <= count` complete
-            // elements and this reads one complete two-byte tail element.
-            bits |= u16::from_le(unsafe { input.add(index << 1).cast::<u16>().read_unaligned() });
+    match op.src_size {
+        2 => {
+            let mut bits = 0u16;
+            for index in done..count {
+                // SAFETY: the vector prefix consumed `done <= count` complete
+                // elements and this reads one complete two-byte tail element.
+                bits |=
+                    u16::from_le(unsafe { input.add(index << 1).cast::<u16>().read_unaligned() });
+            }
+            bits & 0x8000 == 0
         }
-        bits & 0x8000 == 0
-    } else {
-        debug_assert_eq!(op.src_size, 4);
-        let mut bits = 0u32;
-        for index in done..count {
-            // SAFETY: the same extent proof covers each four-byte tail read.
-            bits |= u32::from_le(unsafe { input.add(index << 2).cast::<u32>().read_unaligned() });
+        4 => {
+            let mut bits = 0u32;
+            for index in done..count {
+                // SAFETY: the same extent proof covers each four-byte tail read.
+                bits |=
+                    u32::from_le(unsafe { input.add(index << 2).cast::<u32>().read_unaligned() });
+            }
+            bits & 0x8000_0000 == 0
         }
-        bits & 0x8000_0000 == 0
+        8 => {
+            let mut bits = 0u64;
+            for index in done..count {
+                // SAFETY: the same extent proof covers each eight-byte tail read.
+                bits |=
+                    u64::from_le(unsafe { input.add(index << 3).cast::<u64>().read_unaligned() });
+            }
+            bits & 0x8000_0000_0000_0000 == 0
+        }
+        _ => {
+            debug_assert!(false, "checked conversion has unsupported source width");
+            false
+        }
     }
 }
 
@@ -490,6 +558,36 @@ macro_rules! finish_scalar {
         }
     }};
 }
+
+macro_rules! avx512_int_to_i64 {
+    ($name:ident, $src_bytes:expr, $load:ident, $extend:ident) => {
+        #[target_feature(enable = "avx2,avx512f,avx512bw")]
+        unsafe fn $name(
+            input: *const u8,
+            output: *mut u8,
+            count: usize,
+            op: &ConvertOp,
+        ) -> Result<()> {
+            const LANES: usize = 8;
+            let vector_count = count / LANES * LANES;
+            // SAFETY: runtime dispatch proved the required vector features and
+            // the entry contract covers every eight-element load and store.
+            unsafe {
+                for index in (0..vector_count).step_by(LANES) {
+                    let values = $load(input.add(index * $src_bytes).cast());
+                    _mm512_storeu_si512(output.add(index * 8).cast::<__m512i>(), $extend(values));
+                }
+            }
+            finish_scalar!(input, output, vector_count, count, op);
+            Ok(())
+        }
+    };
+}
+
+avx512_int_to_i64!(avx512_i16_i64, 2, _mm_loadu_si128, _mm512_cvtepi16_epi64);
+avx512_int_to_i64!(avx512_u16_i64, 2, _mm_loadu_si128, _mm512_cvtepu16_epi64);
+avx512_int_to_i64!(avx512_i32_i64, 4, _mm256_loadu_si256, _mm512_cvtepi32_epi64);
+avx512_int_to_i64!(avx512_u32_i64, 4, _mm256_loadu_si256, _mm512_cvtepu32_epi64);
 
 macro_rules! avx512_i16_to_i32 {
     ($name:ident, $extend:ident) => {
@@ -794,6 +892,64 @@ unsafe fn avx512_f32_f64(
     }
     Ok(())
 }
+
+macro_rules! avx512_i64_to_f64 {
+    ($name:ident, $convert:ident) => {
+        #[target_feature(enable = "avx512f,avx512dq")]
+        unsafe fn $name(
+            input: *const u8,
+            output: *mut u8,
+            count: usize,
+            op: &ConvertOp,
+        ) -> Result<()> {
+            const LANES: usize = 8;
+            let vector_count = count / LANES * LANES;
+            // SAFETY: runtime dispatch checked AVX-512F/DQ and every vector
+            // load/store lies within the wrapper-validated eight-byte elements.
+            unsafe {
+                for index in (0..vector_count).step_by(LANES) {
+                    let values = _mm512_loadu_si512(input.add(index * 8).cast::<__m512i>());
+                    _mm512_storeu_pd(output.add(index * 8).cast::<f64>(), $convert(values));
+                }
+            }
+            finish_scalar!(input, output, vector_count, count, op);
+            Ok(())
+        }
+    };
+}
+
+avx512_i64_to_f64!(avx512_i64_f64, _mm512_cvtepi64_pd);
+avx512_i64_to_f64!(avx512_u64_f64, _mm512_cvtepu64_pd);
+
+macro_rules! avx2_int_to_i64 {
+    ($name:ident, $src_bytes:expr, $load:ident, $extend:ident) => {
+        #[target_feature(enable = "avx2")]
+        unsafe fn $name(
+            input: *const u8,
+            output: *mut u8,
+            count: usize,
+            op: &ConvertOp,
+        ) -> Result<()> {
+            const LANES: usize = 4;
+            let vector_count = count / LANES * LANES;
+            // SAFETY: runtime dispatch checked AVX2 and the wrapper proves each
+            // four-element source window and four-element i64/u64 destination.
+            unsafe {
+                for index in (0..vector_count).step_by(LANES) {
+                    let values = $load(input.add(index * $src_bytes).cast());
+                    _mm256_storeu_si256(output.add(index * 8).cast::<__m256i>(), $extend(values));
+                }
+            }
+            finish_scalar!(input, output, vector_count, count, op);
+            Ok(())
+        }
+    };
+}
+
+avx2_int_to_i64!(i16_i64, 2, _mm_loadl_epi64, _mm256_cvtepi16_epi64);
+avx2_int_to_i64!(u16_i64, 2, _mm_loadl_epi64, _mm256_cvtepu16_epi64);
+avx2_int_to_i64!(i32_i64, 4, _mm_loadu_si128, _mm256_cvtepi32_epi64);
+avx2_int_to_i64!(u32_i64, 4, _mm_loadu_si128, _mm256_cvtepu32_epi64);
 
 #[target_feature(enable = "avx2")]
 unsafe fn i16_i32(input: *const u8, output: *mut u8, count: usize, op: &ConvertOp) -> Result<()> {

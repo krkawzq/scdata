@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ops::Range;
+use std::os::unix::fs::FileExt;
 use std::sync::{Condvar, Mutex};
 
 use dyn_blosc::{
@@ -12,7 +13,7 @@ use crate::codec::Compressor;
 use crate::error::{Error, Result};
 use crate::limits::ReadLimits;
 use crate::parallel;
-use crate::storage::ByteStore;
+use crate::storage::{ByteStore, PositionedValue};
 
 /// Per-decode admission control for encoded buffers owned by concurrent block
 /// workers.
@@ -144,11 +145,12 @@ struct PreparedChunk {
     key: String,
     decoder: Decoder,
     encoded_len: usize,
+    positioned: Option<PositionedValue>,
     full_encoded: Option<Vec<u8>>,
     schema_resident: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct ScatterPiece {
     source_in_block: usize,
     destination: usize,
@@ -288,8 +290,17 @@ fn prepare_scatter_chunk(
     read_full: bool,
     accumulated_schema: usize,
 ) -> Result<PreparedChunk> {
-    let encoded_len = usize::try_from(context.store.len(&request.key)?)
-        .map_err(|_| Error::corrupt(&request.key, "encoded size exceeds usize"))?;
+    let mut positioned = if read_full {
+        None
+    } else {
+        context.store.open_positioned(&request.key)?
+    };
+    let encoded_len = usize::try_from(if let Some(value) = &positioned {
+        value.len()
+    } else {
+        context.store.len(&request.key)?
+    })
+    .map_err(|_| Error::corrupt(&request.key, "encoded size exceeds usize"))?;
     context.limits.check_encoded(encoded_len, &request.key)?;
     if encoded_len < HEADER_LEN {
         return Err(Error::corrupt(
@@ -318,6 +329,7 @@ fn prepare_scatter_chunk(
         )?;
         Some(read_exact_range(
             context.store,
+            positioned.as_ref(),
             &request.key,
             0,
             HEADER_LEN,
@@ -373,6 +385,7 @@ fn prepare_scatter_chunk(
         )?;
         Some(read_exact_range(
             context.store,
+            positioned.as_ref(),
             &request.key,
             0,
             prefix_len,
@@ -412,11 +425,14 @@ fn prepare_scatter_chunk(
             .and_then(|resident| maximum_scratch.and_then(|scratch| resident.checked_add(scratch)));
         if optional_full_resident.is_some_and(|resident| resident <= context.limits.decoded_size())
         {
-            full_encoded = Some(
-                context
-                    .store
-                    .read_limited(&request.key, context.limits.encoded_size())?,
-            );
+            full_encoded = Some(read_exact_range(
+                context.store,
+                positioned.as_ref(),
+                &request.key,
+                0,
+                encoded_len,
+            )?);
+            positioned = None;
         }
     }
     let schema_resident = decoder_index_resident
@@ -434,6 +450,7 @@ fn prepare_scatter_chunk(
         key: request.key.clone(),
         decoder,
         encoded_len,
+        positioned,
         full_encoded,
         schema_resident,
     })
@@ -547,8 +564,19 @@ fn run_scatter_tasks(
             .checked_add(chunk.schema_resident)
             .ok_or_else(|| Error::corrupt(&chunk.key, "schema resident size overflow"))
     })?;
+    let planner_resident = pieces
+        .capacity()
+        .checked_mul(std::mem::size_of::<ScatterPiece>())
+        .and_then(|resident| {
+            resident.checked_add(
+                tasks
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<BlockTask>())?,
+            )
+        })
+        .ok_or_else(|| Error::corrupt("parallel block scatter", "planner size overflow"))?;
     let base_resident = context.limits.check_decoded_sum(
-        [context.resident_decoded, schema_resident],
+        [context.resident_decoded, schema_resident, planner_resident],
         "parallel block scatter resident output",
     )?;
     let maximum_encoded = tasks
@@ -631,92 +659,65 @@ fn build_scatter_tasks(
     requests: &[BloscScatterRequest],
     chunks: &[PreparedChunk],
 ) -> Result<(Vec<ScatterPiece>, Vec<BlockTask>)> {
-    let mut records = Vec::new();
+    let mut pieces = Vec::new();
+    let mut tasks = Vec::new();
+    const BLOCK_BUCKET_LIMIT: usize = 8192;
     for (chunk_index, (request, chunk)) in requests.iter().zip(chunks).enumerate() {
         if chunk.decoder.header().is_raw() {
             continue;
         }
-        for mapping in &request.mappings {
-            if mapping.source.is_empty() {
-                continue;
-            }
-            let blocks = intersecting_blocks(
-                &chunk.decoder,
-                chunk.decoder.header().block_count(),
-                &mapping.source,
-                &request.key,
-            )?;
-            records.try_reserve(blocks.len())?;
-            for block_index in blocks {
-                let block = chunk
-                    .decoder
-                    .block(block_index)
-                    .ok_or_else(|| Error::corrupt(&request.key, "block index is out of range"))?;
-                let decoded = block.decoded_range();
-                let overlap_start = mapping.source.start.max(decoded.start);
-                let overlap_end = mapping.source.end.min(decoded.end);
-                if overlap_start < overlap_end {
-                    records.push((
-                        chunk_index,
-                        block_index,
-                        ScatterPiece {
-                            source_in_block: overlap_start - decoded.start,
-                            destination: mapping.destination.start
-                                + (overlap_start - mapping.source.start),
-                            len: overlap_end - overlap_start,
-                        },
-                    ));
+        let block_count = chunk.decoder.header().block_count();
+        if block_count > 0 && block_count <= BLOCK_BUCKET_LIMIT {
+            let mut buckets = Vec::new();
+            buckets.try_reserve_exact(block_count)?;
+            buckets.resize_with(block_count, Vec::new);
+            push_compressed_pieces(request, chunk, |block_index, piece| {
+                buckets[block_index].push(piece);
+                Ok(())
+            })?;
+            for (block_index, block_pieces) in buckets.into_iter().enumerate() {
+                if block_pieces.is_empty() {
+                    continue;
                 }
+                push_compressed_block_task(
+                    &mut pieces,
+                    &mut tasks,
+                    chunks,
+                    chunk_index,
+                    block_index,
+                    block_pieces,
+                )?;
             }
+            continue;
         }
-    }
-    records.sort_unstable_by_key(|(chunk, block, piece)| (*chunk, *block, piece.destination));
 
-    let mut pieces = Vec::new();
-    pieces.try_reserve_exact(records.len())?;
-    let mut tasks = Vec::new();
-    let mut records = records.into_iter().peekable();
-    while let Some((chunk_index, block_index, first_piece)) = records.next() {
-        let start = pieces.len();
-        pieces.push(first_piece);
-        while records
-            .peek()
-            .is_some_and(|(chunk, block, _)| *chunk == chunk_index && *block == block_index)
-        {
-            let (_, _, piece) = records
-                .next()
-                .expect("peek confirmed another block scatter record");
-            pieces.push(piece);
+        let mut records = Vec::new();
+        push_compressed_pieces(request, chunk, |block_index, piece| {
+            records.push((block_index, piece));
+            Ok(())
+        })?;
+        records.sort_unstable_by_key(|(block, _)| *block);
+        let mut cursor = 0usize;
+        while cursor < records.len() {
+            let block_index = records[cursor].0;
+            let start = cursor;
+            cursor += 1;
+            while cursor < records.len() && records[cursor].0 == block_index {
+                cursor += 1;
+            }
+            let block_pieces = records[start..cursor]
+                .iter()
+                .map(|(_, piece)| *piece)
+                .collect();
+            push_compressed_block_task(
+                &mut pieces,
+                &mut tasks,
+                chunks,
+                chunk_index,
+                block_index,
+                block_pieces,
+            )?;
         }
-        let end = pieces.len();
-        let chunk = &chunks[chunk_index];
-        let block = chunk
-            .decoder
-            .block(block_index)
-            .ok_or_else(|| Error::corrupt(&chunk.key, "block index is out of range"))?;
-        let encoded_range = block.encoded_range();
-        if encoded_range.end > chunk.encoded_len {
-            return Err(Error::corrupt(
-                &chunk.key,
-                "encoded block range exceeds chunk",
-            ));
-        }
-        let decoded_working_set = block
-            .decoded_len()
-            .checked_mul(shuffle_scratch_buffers(chunk.decoder.header().shuffle()))
-            .ok_or_else(|| Error::corrupt(&chunk.key, "decode scratch size overflow"))?;
-        tasks.try_reserve(1)?;
-        tasks.push(BlockTask {
-            chunk: chunk_index,
-            block: Some(block_index),
-            pieces: start..end,
-            encoded_working_set: if chunk.full_encoded.is_some() {
-                0
-            } else {
-                encoded_range.len()
-            },
-            decoded_working_set,
-        });
     }
 
     for (chunk_index, (request, chunk)) in requests.iter().zip(chunks).enumerate() {
@@ -796,8 +797,13 @@ fn decode_compressed_task(
         full.get(encoded_range.clone())
             .ok_or_else(|| Error::corrupt(&chunk.key, "encoded block range exceeds chunk"))?
     } else {
-        encoded_storage =
-            read_exact_range(store, &chunk.key, encoded_range.start, encoded_range.len())?;
+        encoded_storage = read_exact_range(
+            store,
+            chunk.positioned.as_ref(),
+            &chunk.key,
+            encoded_range.start,
+            encoded_range.len(),
+        )?;
         &encoded_storage
     };
     let DecodeWorker { decoded, workspace } = worker;
@@ -841,7 +847,13 @@ fn decode_raw_task(
         full.get(offset..end)
             .ok_or_else(|| Error::corrupt(&chunk.key, "raw scatter exceeds chunk"))?
     } else {
-        storage = read_exact_range(store, &chunk.key, offset, source_len)?;
+        storage = read_exact_range(
+            store,
+            chunk.positioned.as_ref(),
+            &chunk.key,
+            offset,
+            source_len,
+        )?;
         &storage
     };
     scatter_pieces(source, source_start, pieces, destination)
@@ -916,6 +928,87 @@ const fn shuffle_scratch_buffers(shuffle: BloscShuffle) -> usize {
     }
 }
 
+fn push_compressed_pieces(
+    request: &BloscScatterRequest,
+    chunk: &PreparedChunk,
+    mut emit: impl FnMut(usize, ScatterPiece) -> Result<()>,
+) -> Result<()> {
+    let block_count = chunk.decoder.header().block_count();
+    for mapping in &request.mappings {
+        if mapping.source.is_empty() {
+            continue;
+        }
+        let blocks =
+            intersecting_blocks(&chunk.decoder, block_count, &mapping.source, &request.key)?;
+        for block_index in blocks {
+            let block = chunk
+                .decoder
+                .block(block_index)
+                .ok_or_else(|| Error::corrupt(&request.key, "block index is out of range"))?;
+            let decoded = block.decoded_range();
+            let overlap_start = mapping.source.start.max(decoded.start);
+            let overlap_end = mapping.source.end.min(decoded.end);
+            if overlap_start < overlap_end {
+                emit(
+                    block_index,
+                    ScatterPiece {
+                        source_in_block: overlap_start - decoded.start,
+                        destination: mapping.destination.start
+                            + (overlap_start - mapping.source.start),
+                        len: overlap_end - overlap_start,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_compressed_block_task(
+    pieces: &mut Vec<ScatterPiece>,
+    tasks: &mut Vec<BlockTask>,
+    chunks: &[PreparedChunk],
+    chunk_index: usize,
+    block_index: usize,
+    block_pieces: Vec<ScatterPiece>,
+) -> Result<()> {
+    if block_pieces.is_empty() {
+        return Ok(());
+    }
+    let chunk = &chunks[chunk_index];
+    let block = chunk
+        .decoder
+        .block(block_index)
+        .ok_or_else(|| Error::corrupt(&chunk.key, "block index is out of range"))?;
+    let encoded_range = block.encoded_range();
+    if encoded_range.end > chunk.encoded_len {
+        return Err(Error::corrupt(
+            &chunk.key,
+            "encoded block range exceeds chunk",
+        ));
+    }
+    let decoded_working_set = block
+        .decoded_len()
+        .checked_mul(shuffle_scratch_buffers(chunk.decoder.header().shuffle()))
+        .ok_or_else(|| Error::corrupt(&chunk.key, "decode scratch size overflow"))?;
+    let start = pieces.len();
+    pieces.try_reserve(block_pieces.len())?;
+    pieces.extend(block_pieces);
+    tasks.try_reserve(1)?;
+    tasks.push(BlockTask {
+        chunk: chunk_index,
+        block: Some(block_index),
+        pieces: start..pieces.len(),
+        encoded_working_set: if chunk.full_encoded.is_some() {
+            0
+        } else {
+            encoded_range.len()
+        },
+        decoded_working_set,
+    });
+    Ok(())
+}
+
 fn intersecting_blocks(
     decoder: &Decoder,
     block_count: usize,
@@ -953,13 +1046,40 @@ fn intersecting_blocks(
 
 fn read_exact_range(
     store: &dyn ByteStore,
+    positioned: Option<&PositionedValue>,
     key: &str,
     offset: usize,
     len: usize,
 ) -> Result<Vec<u8>> {
     let offset = u64::try_from(offset)
         .map_err(|_| Error::corrupt(key, "encoded range offset exceeds u64"))?;
-    let bytes = store.read_range(key, offset, len)?;
+    let bytes = if let Some(value) = positioned {
+        let len_u64 = u64::try_from(len)
+            .map_err(|_| Error::corrupt(key, "encoded range length exceeds u64"))?;
+        let end = offset
+            .checked_add(len_u64)
+            .ok_or_else(|| Error::corrupt(key, "encoded range end overflow"))?;
+        if end > value.len() {
+            return Err(Error::corrupt(
+                key,
+                format!(
+                    "encoded range [{offset}, {end}) exceeds positioned value length {}",
+                    value.len()
+                ),
+            ));
+        }
+        let absolute = value
+            .base_offset()
+            .checked_add(offset)
+            .ok_or_else(|| Error::corrupt(key, "positioned range offset overflow"))?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len)?;
+        bytes.resize(len, 0);
+        value.file().read_exact_at(&mut bytes, absolute)?;
+        bytes
+    } else {
+        store.read_range(key, offset, len)?
+    };
     if bytes.len() != len {
         return Err(Error::corrupt(
             key,

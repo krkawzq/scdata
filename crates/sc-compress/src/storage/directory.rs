@@ -1018,9 +1018,13 @@ mod tests {
     fn portable_commit_keeps_the_old_generation_readable() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("matrix");
-        crate::DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
-            .write(&[1u16, 2, 3, 4], [2, 2])
-            .unwrap();
+        crate::DenseWriter::new(
+            &target,
+            Partition::fixed_cells(1024),
+            Partition::fixed_cells(16),
+        )
+        .write(&[1u16, 2, 3, 4], [2, 2])
+        .unwrap();
         let old = DirectoryStore::open(&target).unwrap();
         let old_chunk = old.read("data/0").unwrap();
 
@@ -1060,9 +1064,13 @@ mod tests {
     fn portable_commits_serialize_competing_replacements() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("matrix");
-        crate::DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
-            .write(&[1u16], [1, 1])
-            .unwrap();
+        crate::DenseWriter::new(
+            &target,
+            Partition::fixed_cells(1024),
+            Partition::fixed_cells(16),
+        )
+        .write(&[1u16], [1, 1])
+        .unwrap();
 
         let mut first = DirectoryTransaction::new(&target).unwrap();
         first.store_mut().write("value", b"first").unwrap();
@@ -1096,9 +1104,13 @@ mod tests {
     fn writer_can_replace_store_with_large_valid_metadata() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("matrix");
-        crate::DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
-            .write(&[1u16], [1, 1])
-            .unwrap();
+        crate::DenseWriter::new(
+            &target,
+            Partition::fixed_cells(1024),
+            Partition::fixed_cells(16),
+        )
+        .write(&[1u16], [1, 1])
+        .unwrap();
 
         let metadata_path = target.join("meta.json");
         let mut metadata = fs::OpenOptions::new()
@@ -1114,9 +1126,13 @@ mod tests {
                 > u64::try_from(ReadLimits::default().metadata_size()).unwrap()
         );
 
-        crate::DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
-            .write(&[2u16], [1, 1])
-            .unwrap();
+        crate::DenseWriter::new(
+            &target,
+            Partition::fixed_cells(1024),
+            Partition::fixed_cells(16),
+        )
+        .write(&[2u16], [1, 1])
+        .unwrap();
         assert_eq!(
             crate::open_dense(&target).unwrap().decode_all().unwrap(),
             2u16.to_le_bytes()

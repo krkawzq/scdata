@@ -14,15 +14,15 @@ import numpy as np
 from numpy.typing import NDArray
 
 from scdata import _core
+from scdata.exceptions import CancelledError, UnsupportedError
+from scdata.load._config import DEFAULT_MAX_CONTROL_BYTES, PlanConfig, SessionConfig
+from scdata.load._dataset import Dataset, RowRef
+from scdata.load._output import OutputSpec
+from scdata.load._stats import SessionState
 from scdata.load._validation import as_int, dtype_from_core
-from scdata.load.config import PlanConfig, SessionConfig
-from scdata.load.dataset import Dataset, RowRef
-from scdata.exceptions import CancelledError, UnsupportedError, _call_core
-from scdata.load.output import OutputSpec
-from scdata.load.stats import SessionState
 
 if TYPE_CHECKING:
-    from scdata.load.plan import Plan
+    from scdata.load._plan import Plan
 
 __all__ = ["DistributedIterator", "DistributedSession", "distributed_prefetch"]
 
@@ -37,7 +37,7 @@ class _DistributedMetadata:
     dtype_name: str
 
 
-_DISTRIBUTED_DTYPE_NAMES = frozenset({"i16", "i32", "u16", "u32", "f32", "f64"})
+_DISTRIBUTED_DTYPE_NAMES = frozenset({"i16", "i32", "i64", "u16", "u32", "u64", "f32", "f64"})
 
 
 def _normalize_distributed_metadata(metadata: object) -> _DistributedMetadata:
@@ -82,7 +82,7 @@ class _ProducerRunner:
 
     def run(self) -> None:
         try:
-            _call_core(_core.shared_run, self.inner)
+            _core.shared_run(self.inner)
         except BaseException as error:
             with self.lock:
                 self.error = error
@@ -118,7 +118,7 @@ class DistributedSession:
         world_size: int,
         config: SessionConfig | None = None,
         *,
-        maximum_control_bytes: int | None = None,
+        max_control_bytes: int = DEFAULT_MAX_CONTROL_BYTES,
     ) -> None:
         if not hasattr(_core, "shared_attach") or not hasattr(_core, "plan_open_shared"):
             raise UnsupportedError(
@@ -129,20 +129,18 @@ class DistributedSession:
             config = SessionConfig()
         elif not isinstance(config, SessionConfig):
             raise TypeError("config must be a SessionConfig instance")
-        if maximum_control_bytes is not None:
-            maximum_control_bytes = as_int(
-                maximum_control_bytes,
-                "maximum_control_bytes",
-                minimum=1,
-            )
-        inner = _call_core(
-            _core.plan_open_shared,
+        max_control_bytes = as_int(
+            max_control_bytes,
+            "max_control_bytes",
+            minimum=1,
+        )
+        inner = _core.plan_open_shared(
             plan._inner,
             config._to_core(),
             normalized_world_size,
-            maximum_control_bytes,
+            max_control_bytes,
         )
-        server_meta = _call_core(_core.shared_server_meta, inner)
+        server_meta = _core.shared_server_meta(inner)
         self._plan = plan
         self._metadata = _DistributedMetadata(
             world_size=server_meta["world_size"],
@@ -165,7 +163,7 @@ class DistributedSession:
         try:
             self._thread.start()
         except BaseException:
-            _call_core(_core.shared_cancel, inner)
+            _core.shared_cancel(inner)
             raise
 
     @property
@@ -178,7 +176,7 @@ class DistributedSession:
 
     @property
     def state(self) -> SessionState:
-        return _call_core(_core.shared_server_meta, self._runner.inner)["state"]
+        return _core.shared_server_meta(self._runner.inner)["state"]
 
     @property
     def closed(self) -> bool:
@@ -238,7 +236,7 @@ class DistributedSession:
         return tuple(created)
 
     def _new_iterator(self, rank: int, copy: bool) -> DistributedIterator:
-        descriptor = _call_core(_core.shared_duplicate_fd, self._runner.inner)
+        descriptor = _core.shared_duplicate_fd(self._runner.inner)
         try:
             return DistributedIterator(descriptor, rank, self._metadata, copy=copy)
         except BaseException:
@@ -269,7 +267,7 @@ class DistributedSession:
         self._ensure_owner_process()
         if not self._thread.is_alive():
             return
-        _call_core(_core.shared_cancel, self._runner.inner)
+        _core.shared_cancel(self._runner.inner)
 
     def close(self) -> None:
         """Cancel unfinished work, close parent descriptors, and join producer."""
@@ -502,10 +500,8 @@ class DistributedIterator(Iterator[NDArray[Any]]):
             raise TypeError("copy must be a bool or None")
         client = self._ensure_client()
         try:
-            batch = _call_core(
-                _core.shared_next_copy if resolved_copy else _core.shared_next,
-                client,
-            )
+            next_fn = _core.shared_next_copy if resolved_copy else _core.shared_next
+            batch = next_fn(client)
         except BaseException:
             self.close()
             raise
@@ -538,7 +534,7 @@ class DistributedIterator(Iterator[NDArray[Any]]):
             raise ValueError("distributed iterator is closed")
         client = self._ensure_client()
         try:
-            output, batches = _call_core(_core.shared_read, client, remaining)
+            output, batches = _core.shared_read(client, remaining)
         except BaseException:
             self.close()
             raise
@@ -583,7 +579,7 @@ class DistributedIterator(Iterator[NDArray[Any]]):
         errors: list[BaseException] = []
         if client is not None:
             try:
-                _call_core(_core.shared_close, client)
+                _core.shared_close(client)
             except BaseException as error:
                 errors.append(error)
         if descriptor >= 0:
@@ -610,7 +606,7 @@ class DistributedIterator(Iterator[NDArray[Any]]):
             self._lock_pid = current_pid
 
     def _validate_attached_client(self, client: _core._SharedClient) -> None:
-        meta = _call_core(_core.shared_client_meta, client)
+        meta = _core.shared_client_meta(client)
         actual = (
             meta["rank"],
             meta["world_size"],
@@ -652,7 +648,7 @@ class DistributedIterator(Iterator[NDArray[Any]]):
                 raise ValueError("distributed iterator has no live descriptor")
             self._owner_pid = current_pid
             try:
-                client = _call_core(_core.shared_attach, self._descriptor, self.rank)
+                client = _core.shared_attach(self._descriptor, self.rank)
             except BaseException:
                 self._owner_pid = None
                 raise
@@ -663,7 +659,7 @@ class DistributedIterator(Iterator[NDArray[Any]]):
             except BaseException:
                 self._closed = True
                 try:
-                    _call_core(_core.shared_close, client)
+                    _core.shared_close(client)
                 except BaseException:
                     pass
                 raise
@@ -757,10 +753,10 @@ def distributed_prefetch(
     prefetch_step: int = 8,
     plan_config: PlanConfig | None = None,
     config: SessionConfig | None = None,
-    maximum_control_bytes: int | None = None,
+    max_control_bytes: int = DEFAULT_MAX_CONTROL_BYTES,
 ) -> DistributedSession:
     """Compile a plan and start its explicit multi-rank shared producer."""
-    from scdata.load.plan import compile
+    from scdata.load._plan import compile
 
     plan = compile(
         datasets,
@@ -773,5 +769,5 @@ def distributed_prefetch(
     return plan.open_distributed(
         world_size,
         config,
-        maximum_control_bytes=maximum_control_bytes,
+        max_control_bytes=max_control_bytes,
     )

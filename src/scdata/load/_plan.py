@@ -10,15 +10,15 @@ import numpy as np
 from numpy.typing import NDArray
 
 from scdata import _core
+from scdata.exceptions import InternalError
+from scdata.load._config import DEFAULT_MAX_CONTROL_BYTES, PlanConfig, SessionConfig
+from scdata.load._dataset import Dataset, RowRef
+from scdata.load._output import OutputSpec
+from scdata.load._stats import PlanStats, RuntimeStats, SessionState
 from scdata.load._validation import as_int, normalize_rows
-from scdata.load.config import PlanConfig, SessionConfig
-from scdata.load.dataset import Dataset, RowRef
-from scdata.exceptions import InternalError, _call_core
-from scdata.load.output import OutputSpec
-from scdata.load.stats import PlanStats, RuntimeStats, SessionState
 
 if TYPE_CHECKING:
-    from scdata.load.distributed import DistributedSession
+    from scdata.load._distributed import DistributedSession
 
 __all__ = ["Plan", "Prefetch", "Session", "compile", "prefetch"]
 
@@ -32,9 +32,9 @@ class Plan:
 
     def __init__(self, inner: _core._Plan, output: OutputSpec) -> None:
         self._inner = inner
-        self._meta = _call_core(_core.plan_meta, inner)
+        self._meta = _core.plan_meta(inner)
         self._output = output
-        self._stats = PlanStats._from_mapping(_call_core(_core.plan_stats, inner))
+        self._stats = PlanStats._from_mapping(_core.plan_stats(inner))
 
     @property
     def batch_size(self) -> int:
@@ -88,7 +88,7 @@ class Plan:
     def open(self, config: SessionConfig | None = None) -> Session:
         """Start one independent execution session."""
         resolved = _resolve_session_config(config)
-        inner = _call_core(_core.plan_open, self._inner, resolved._to_core())
+        inner = _core.plan_open(self._inner, resolved._to_core())
         return Session(inner, self)
 
     def open_distributed(
@@ -96,16 +96,16 @@ class Plan:
         world_size: int,
         config: SessionConfig | None = None,
         *,
-        maximum_control_bytes: int | None = None,
+        max_control_bytes: int = DEFAULT_MAX_CONTROL_BYTES,
     ) -> DistributedSession:
         """Start one shared producer with a process-transferable iterator per rank."""
-        from scdata.load.distributed import DistributedSession
+        from scdata.load._distributed import DistributedSession
 
         return DistributedSession(
             self,
             world_size,
             config,
-            maximum_control_bytes=maximum_control_bytes,
+            max_control_bytes=max_control_bytes,
         )
 
     def prefetch(self, config: SessionConfig | None = None) -> Prefetch:
@@ -166,11 +166,11 @@ class Session(Iterator[NDArray[Any]]):
 
     @property
     def closed(self) -> bool:
-        return bool(_call_core(_core.session_meta, self._inner)["closed"])
+        return bool(_core.session_meta(self._inner)["closed"])
 
     @property
     def exhausted(self) -> bool:
-        return bool(_call_core(_core.session_meta, self._inner)["exhausted"])
+        return bool(_core.session_meta(self._inner)["exhausted"])
 
     @property
     def rows_yielded(self) -> int:
@@ -189,17 +189,17 @@ class Session(Iterator[NDArray[Any]]):
 
     @property
     def state(self) -> SessionState:
-        return _call_core(_core.session_meta, self._inner)["state"]
+        return _core.session_meta(self._inner)["state"]
 
     @property
     def stats(self) -> RuntimeStats:
-        return RuntimeStats._from_mapping(_call_core(_core.session_stats, self._inner))
+        return RuntimeStats._from_mapping(_core.session_stats(self._inner))
 
     def next_batch(self) -> NDArray[Any] | None:
         """Wait for and return the next compact batch, or ``None`` at EOF."""
         if self.closed and not self.exhausted:
             raise ValueError("session is closed")
-        batch = _call_core(_core.session_next, self._inner)
+        batch = _core.session_next(self._inner)
         if batch is not None:
             rows_yielded = self._rows_yielded + batch.shape[0]
             if rows_yielded > self._plan.n_rows:
@@ -209,11 +209,11 @@ class Session(Iterator[NDArray[Any]]):
 
     def cancel(self) -> None:
         """Request cooperative cancellation; blocked consumers are woken."""
-        _call_core(_core.session_cancel, self._inner)
+        _core.session_cancel(self._inner)
 
     def close(self) -> None:
         """Cancel unfinished work, join workers, and release the output ring."""
-        _call_core(_core.session_close, self._inner)
+        _core.session_close(self._inner)
 
     def read(self) -> NDArray[Any]:
         """Materialize all remaining batches into one compact matrix."""
@@ -479,10 +479,14 @@ def compile(
     ``datasets`` is a single :class:`Dataset` or a collection. Collection
     order defines ``source_id`` values ``0..n-1``. A single dataset accepts
     ordinary row indices; multiple datasets use :class:`RowRef` or
-    ``(source_id, row)`` pairs. Each dataset's caller-supplied ``feature_map``
-    is forwarded to the Rust compiler as-is.
+    ``(source_id, row)`` pairs. Each dataset's ``feature_map`` is forwarded to
+    the Rust compiler as-is; build one with
+    :func:`~scdata.load.build_feature_map` or
+    :meth:`~scdata.load.Dataset.with_aligned_features`.
     """
     dataset_list = _normalize_datasets(datasets)
+    for dataset in dataset_list:
+        dataset._require_inner()
     source_ids = list(range(len(dataset_list)))
 
     if output is None:
@@ -507,9 +511,8 @@ def compile(
     default_source_id = 0 if len(dataset_list) == 1 else None
     row_source_ids, row_indices = normalize_rows(rows, default_source_id=default_source_id)
     _validate_rows_for_datasets(dataset_list, row_source_ids, row_indices)
-    inner = _call_core(
-        _core.plan_compile,
-        [dataset._inner for dataset in dataset_list],
+    inner = _core.plan_compile(
+        [dataset._require_inner() for dataset in dataset_list],
         source_ids,
         [dataset._feature_map_array for dataset in dataset_list],
         row_source_ids,

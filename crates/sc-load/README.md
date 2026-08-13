@@ -22,12 +22,12 @@ because their request path does not benefit reliably from per-worker rings.
 ## Precision model
 
 - **Storage** payload dtypes match `sc-compress` matrix values:
-  `i16 | i32 | u16 | u32 | f32 | f64`.
+  `i16 | i32 | i64 | u16 | u32 | u64 | f32 | f64`.
 - **Output** is an explicit [`OutputDType`] of the same set.
 - Only **promotions** are allowed at compile time (no width narrowing, no
-  float→int). Integer→float is exact by default: `i16/u16→f32` and every
-  supported integer→`f64` edge are accepted; `i32/u32→f32` requires explicit
-  [`FloatCastPolicy::AllowRounding`].
+  float→int). Integer→float is exact by default: `i16/u16→f32` and
+  `i16/i32/u16/u32→f64` are accepted; `i32/u32→f32` and `i64/u64→f64`
+  require explicit [`FloatCastPolicy::AllowRounding`].
 - Signedness changes (`i↔u`) run optional runtime checks controlled by
   [`OverflowPolicy`]:
   - `Error` (default) — fail the session
@@ -38,8 +38,9 @@ because their request path does not benefit reliably from per-worker rings.
 Unmapped feature columns always receive `fill` (independent of overflow policy).
 On little-endian x86-64, contiguous promotion kernels bind AVX-512, AVX2, or
 the x86-64 SSE2 baseline once when a source plan is compiled. Checked-sign and
-canonical CSR-index validation use AVX2 when available. Other targets retain
-the same scalar semantics, and every vector kernel has an exact scalar tail.
+canonical CSR-index validation bind AVX-512 or AVX2 when available. Other
+targets retain the same scalar semantics, and every vector kernel has an exact
+scalar tail.
 
 ## Example
 

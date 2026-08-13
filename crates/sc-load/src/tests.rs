@@ -968,6 +968,41 @@ fn potentially_rounding_integer_to_float_requires_explicit_policy() {
 }
 
 #[test]
+fn int64_and_uint64_promotion_rules_are_explicit() {
+    use crate::{promote_kind, PromoteKind, StorageDType};
+
+    assert_eq!(
+        promote_kind(StorageDType::I64, OutputDType::I64),
+        Some(PromoteKind::Lossless)
+    );
+    assert_eq!(
+        promote_kind(StorageDType::U64, OutputDType::U64),
+        Some(PromoteKind::Lossless)
+    );
+    assert_eq!(
+        promote_kind(StorageDType::I32, OutputDType::I64),
+        Some(PromoteKind::Lossless)
+    );
+    assert_eq!(
+        promote_kind(StorageDType::U32, OutputDType::I64),
+        Some(PromoteKind::Lossless)
+    );
+    assert_eq!(
+        promote_kind(StorageDType::I64, OutputDType::U64),
+        Some(PromoteKind::CheckedSign)
+    );
+    assert_eq!(
+        promote_kind(StorageDType::U64, OutputDType::I64),
+        Some(PromoteKind::CheckedSign)
+    );
+    assert_eq!(
+        promote_kind(StorageDType::I64, OutputDType::F64),
+        Some(PromoteKind::RoundingToFloat)
+    );
+    assert_eq!(promote_kind(StorageDType::U64, OutputDType::F32), None);
+}
+
+#[test]
 fn padded_batch_storage_is_initialized_and_not_reported_as_compact() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("padded-output");
@@ -1262,8 +1297,10 @@ fn bulk_conversion_kernels_cover_extremes_and_scalar_tails() {
         let fill = match dtype {
             OutputDType::I16 => Fill::I16(0),
             OutputDType::I32 => Fill::I32(0),
+            OutputDType::I64 => Fill::I64(0),
             OutputDType::U16 => Fill::U16(0),
             OutputDType::U32 => Fill::U32(0),
+            OutputDType::U64 => Fill::U64(0),
             OutputDType::F32 => Fill::F32(0.0),
             OutputDType::F64 => Fill::F64(0.0),
         };
@@ -1361,6 +1398,24 @@ fn bulk_conversion_kernels_cover_extremes_and_scalar_tails() {
     );
     check(
         StorageDType::I16,
+        OutputDType::I64,
+        i16_input.clone(),
+        i16_values
+            .iter()
+            .flat_map(|value| i64::from(*value).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::I16,
+        OutputDType::U64,
+        i16_input.clone(),
+        i16_values
+            .iter()
+            .flat_map(|value| (*value as u64).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::I16,
         OutputDType::F32,
         i16_input.clone(),
         i16_values
@@ -1421,6 +1476,24 @@ fn bulk_conversion_kernels_cover_extremes_and_scalar_tails() {
     );
     check(
         StorageDType::U16,
+        OutputDType::I64,
+        u16_input.clone(),
+        u16_values
+            .iter()
+            .flat_map(|value| i64::from(*value).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::U16,
+        OutputDType::U64,
+        u16_input.clone(),
+        u16_values
+            .iter()
+            .flat_map(|value| u64::from(*value).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::U16,
         OutputDType::F32,
         u16_input.clone(),
         u16_values
@@ -1455,6 +1528,24 @@ fn bulk_conversion_kernels_cover_extremes_and_scalar_tails() {
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
+    check(
+        StorageDType::I32,
+        OutputDType::I64,
+        i32_input.clone(),
+        i32_values
+            .iter()
+            .flat_map(|value| i64::from(*value).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::I32,
+        OutputDType::U64,
+        i32_input.clone(),
+        i32_values
+            .iter()
+            .flat_map(|value| (*value as u64).to_le_bytes())
+            .collect(),
+    );
     check(
         StorageDType::I32,
         OutputDType::F32,
@@ -1493,6 +1584,24 @@ fn bulk_conversion_kernels_cover_extremes_and_scalar_tails() {
         .collect::<Vec<_>>();
     check(
         StorageDType::U32,
+        OutputDType::I64,
+        u32_input.clone(),
+        u32_values
+            .iter()
+            .flat_map(|value| i64::from(*value).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::U32,
+        OutputDType::U64,
+        u32_input.clone(),
+        u32_values
+            .iter()
+            .flat_map(|value| u64::from(*value).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::U32,
         OutputDType::F32,
         u32_input.clone(),
         u32_values
@@ -1507,6 +1616,73 @@ fn bulk_conversion_kernels_cover_extremes_and_scalar_tails() {
         u32_values
             .iter()
             .flat_map(|value| f64::from(*value).to_le_bytes())
+            .collect(),
+    );
+
+    let i64_values = [
+        i64::MIN,
+        -(1i64 << 53) - 1,
+        -1,
+        0,
+        1,
+        (1i64 << 53) + 1,
+        i64::MAX,
+        7,
+        42,
+    ];
+    let i64_input = i64_values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    check(
+        StorageDType::I64,
+        OutputDType::U64,
+        i64_input.clone(),
+        i64_values
+            .iter()
+            .flat_map(|value| (*value as u64).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::I64,
+        OutputDType::F64,
+        i64_input,
+        i64_values
+            .iter()
+            .flat_map(|value| (*value as f64).to_le_bytes())
+            .collect(),
+    );
+
+    let u64_values = [
+        0u64,
+        1,
+        (1u64 << 53) + 1,
+        i64::MAX as u64,
+        i64::MAX as u64 + 1,
+        u64::MAX,
+        7,
+        42,
+    ];
+    let u64_input = u64_values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    check(
+        StorageDType::U64,
+        OutputDType::I64,
+        u64_input.clone(),
+        u64_values
+            .iter()
+            .flat_map(|value| (*value as i64).to_le_bytes())
+            .collect(),
+    );
+    check(
+        StorageDType::U64,
+        OutputDType::F64,
+        u64_input,
+        u64_values
+            .iter()
+            .flat_map(|value| (*value as f64).to_le_bytes())
             .collect(),
     );
 
@@ -1642,8 +1818,10 @@ fn bulk_checked_sign_validation_covers_vectors_and_tails() {
         let fill = match dst {
             OutputDType::I16 => Fill::I16(0),
             OutputDType::I32 => Fill::I32(0),
+            OutputDType::I64 => Fill::I64(0),
             OutputDType::U16 => Fill::U16(0),
             OutputDType::U32 => Fill::U32(0),
+            OutputDType::U64 => Fill::U64(0),
             _ => unreachable!(),
         };
         ConvertOp::resolve(src, &OutputSpec::new(1, dst, fill).unwrap()).unwrap()
@@ -1658,6 +1836,10 @@ fn bulk_checked_sign_validation_covers_vectors_and_tails() {
     assert!(i16_u32.validate_slice(&valid_i16).is_ok());
     assert!(i16_u32.validate_slice(&invalid_i16_vector).is_err());
     assert!(i16_u32.validate_slice(&invalid_i16_tail).is_err());
+    let i16_u64 = validator(StorageDType::I16, OutputDType::U64);
+    assert!(i16_u64.validate_slice(&valid_i16).is_ok());
+    assert!(i16_u64.validate_slice(&invalid_i16_vector).is_err());
+    assert!(i16_u64.validate_slice(&invalid_i16_tail).is_err());
 
     let valid_u16 = (0..19u16).flat_map(u16::to_le_bytes).collect::<Vec<_>>();
     let mut invalid_u16 = valid_u16.clone();
@@ -1672,6 +1854,9 @@ fn bulk_checked_sign_validation_covers_vectors_and_tails() {
     let i32_u32 = validator(StorageDType::I32, OutputDType::U32);
     assert!(i32_u32.validate_slice(&valid_i32).is_ok());
     assert!(i32_u32.validate_slice(&invalid_i32).is_err());
+    let i32_u64 = validator(StorageDType::I32, OutputDType::U64);
+    assert!(i32_u64.validate_slice(&valid_i32).is_ok());
+    assert!(i32_u64.validate_slice(&invalid_i32).is_err());
 
     let valid_u32 = (0..11u32).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
     let mut invalid_u32 = valid_u32.clone();
@@ -1679,6 +1864,20 @@ fn bulk_checked_sign_validation_covers_vectors_and_tails() {
     let u32_i32 = validator(StorageDType::U32, OutputDType::I32);
     assert!(u32_i32.validate_slice(&valid_u32).is_ok());
     assert!(u32_i32.validate_slice(&invalid_u32).is_err());
+
+    let valid_i64 = (0..9i64).flat_map(i64::to_le_bytes).collect::<Vec<_>>();
+    let mut invalid_i64 = valid_i64.clone();
+    invalid_i64[8 * 8..9 * 8].copy_from_slice(&(-1i64).to_le_bytes());
+    let i64_u64 = validator(StorageDType::I64, OutputDType::U64);
+    assert!(i64_u64.validate_slice(&valid_i64).is_ok());
+    assert!(i64_u64.validate_slice(&invalid_i64).is_err());
+
+    let valid_u64 = (0..9u64).flat_map(u64::to_le_bytes).collect::<Vec<_>>();
+    let mut invalid_u64 = valid_u64.clone();
+    invalid_u64[3 * 8..4 * 8].copy_from_slice(&(i64::MAX as u64 + 1).to_le_bytes());
+    let u64_i64 = validator(StorageDType::U64, OutputDType::I64);
+    assert!(u64_i64.validate_slice(&valid_u64).is_ok());
+    assert!(u64_i64.validate_slice(&invalid_u64).is_err());
 }
 
 #[test]
@@ -2249,6 +2448,289 @@ fn benchmark_scatter_kernels() {
         csr_checked_time.as_secs_f64() * 1e9 / csr_iterations as f64,
         scalar_index_time.as_secs_f64() / simd_index_time.as_secs_f64(),
         avx2_index_time.as_secs_f64() / simd_index_time.as_secs_f64(),
+    );
+}
+
+#[test]
+#[ignore = "manual release-mode 64-bit kernel benchmark"]
+fn benchmark_int64_uint64_specialized_kernels() {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    use sc_compress::DType as StorageDType;
+
+    use crate::convert::ConvertOp;
+
+    fn best_of(mut run: impl FnMut(), rounds: usize) -> Duration {
+        (0..rounds)
+            .map(|_| {
+                let started = Instant::now();
+                run();
+                started.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    fn gib_per_second(bytes: usize, iterations: usize, elapsed: Duration) -> f64 {
+        bytes as f64 * iterations as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    fn million_values_per_second(values: usize, iterations: usize, elapsed: Duration) -> f64 {
+        values as f64 * iterations as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    }
+
+    let count = 256 * 1024;
+    let iterations = 256;
+    let i32_input = (0..count)
+        .flat_map(|index| {
+            (index as i32)
+                .wrapping_mul(1_000_003)
+                .wrapping_sub(1 << 30)
+                .to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let i64_output = OutputSpec::new(count, OutputDType::I64, Fill::I64(0)).unwrap();
+    let specialized_i32_i64 = ConvertOp::resolve(StorageDType::I32, &i64_output).unwrap();
+    let mut generic_i32_i64 = specialized_i32_i64;
+    generic_i32_i64.force_generic_for_test();
+    let mut i64_destination = vec![0u8; count * 8];
+    let specialized_i32_i64_time = best_of(
+        || {
+            for _ in 0..iterations {
+                specialized_i32_i64
+                    .convert_slice_prevalidated(
+                        black_box(&i32_input),
+                        black_box(&mut i64_destination),
+                    )
+                    .unwrap();
+            }
+        },
+        5,
+    );
+    let generic_i32_i64_time = best_of(
+        || {
+            for _ in 0..iterations {
+                generic_i32_i64
+                    .convert_slice_prevalidated(
+                        black_box(&i32_input),
+                        black_box(&mut i64_destination),
+                    )
+                    .unwrap();
+            }
+        },
+        5,
+    );
+
+    let i64_input = (0..count)
+        .flat_map(|index| {
+            (index as i64)
+                .wrapping_mul(1_000_000_007)
+                .wrapping_sub(1i64 << 54)
+                .to_le_bytes()
+        })
+        .collect::<Vec<_>>();
+    let f64_output = OutputSpec::new(count, OutputDType::F64, Fill::F64(0.0))
+        .unwrap()
+        .float_cast(crate::FloatCastPolicy::AllowRounding);
+    let specialized_i64_f64 = ConvertOp::resolve(StorageDType::I64, &f64_output).unwrap();
+    let mut generic_i64_f64 = specialized_i64_f64;
+    generic_i64_f64.force_generic_for_test();
+    let mut f64_destination = vec![0u8; count * 8];
+    let specialized_i64_f64_time = best_of(
+        || {
+            for _ in 0..iterations {
+                specialized_i64_f64
+                    .convert_slice_prevalidated(
+                        black_box(&i64_input),
+                        black_box(&mut f64_destination),
+                    )
+                    .unwrap();
+            }
+        },
+        5,
+    );
+    let generic_i64_f64_time = best_of(
+        || {
+            for _ in 0..iterations {
+                generic_i64_f64
+                    .convert_slice_prevalidated(
+                        black_box(&i64_input),
+                        black_box(&mut f64_destination),
+                    )
+                    .unwrap();
+            }
+        },
+        5,
+    );
+
+    let mapped_count = count / 4;
+    let mapped_iterations = 512;
+    let packed_map = crate::plan::DenseMap::Packed32 {
+        entries: std::sync::Arc::from(
+            (0..count)
+                .step_by(4)
+                .map(|source| {
+                    let source_byte = u32::try_from(source * 4).unwrap();
+                    let target_byte = u32::try_from(source / 4 * 8).unwrap();
+                    u64::from(source_byte) | (u64::from(target_byte) << 32)
+                })
+                .collect::<Vec<_>>(),
+        ),
+        covers_output: true,
+    };
+    let mut mapped_destination = vec![0u8; mapped_count * 8];
+    let specialized_map_time = best_of(
+        || {
+            for _ in 0..mapped_iterations {
+                // SAFETY: the packed offsets above address complete i32
+                // sources and unique, complete i64 destinations.
+                unsafe {
+                    specialized_i32_i64
+                        .convert_map_prevalidated(
+                            black_box(i32_input.as_ptr()),
+                            black_box(mapped_destination.as_mut_ptr()),
+                            black_box(&packed_map),
+                        )
+                        .unwrap();
+                }
+            }
+        },
+        5,
+    );
+    let generic_map_time = best_of(
+        || {
+            for _ in 0..mapped_iterations {
+                // SAFETY: this uses the same compiler-valid packed mapping and
+                // exact buffers as the specialized measurement.
+                unsafe {
+                    generic_i32_i64
+                        .convert_map_prevalidated(
+                            black_box(i32_input.as_ptr()),
+                            black_box(mapped_destination.as_mut_ptr()),
+                            black_box(&packed_map),
+                        )
+                        .unwrap();
+                }
+            }
+        },
+        5,
+    );
+
+    let csr_count = 64 * 1024;
+    let csr_iterations = 512;
+    let csr_input = i32_input[..csr_count * 4].to_vec();
+    let csr_indices = (0..csr_count as u32)
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let csr_output = OutputSpec::new(csr_count, OutputDType::I64, Fill::I64(0)).unwrap();
+    let specialized_csr_source = crate::plan::SourcePlan {
+        n_cols: csr_count,
+        value_dtype: StorageDType::I32,
+        index: crate::scatter::IndexOp::new(StorageDType::U32),
+        feature_map: None,
+        dense_map: None,
+        convert: ConvertOp::resolve(StorageDType::I32, &csr_output).unwrap(),
+    };
+    let mut generic_csr_source = specialized_csr_source.clone();
+    generic_csr_source.convert.force_generic_for_test();
+    let csr_task = crate::plan::CellTask::new(
+        crate::source::OutputSlot::new(0, true).unwrap(),
+        0..csr_count * 4,
+        Some(0..csr_count * 4),
+    )
+    .unwrap();
+    let mut csr_destination = vec![0u8; csr_count * 8];
+    let zero_i64_fill = crate::scatter::FillOp::new(&[0; 8]);
+    let specialized_csr_time = best_of(
+        || {
+            for _ in 0..csr_iterations {
+                // SAFETY: the monotonic indices cover the complete output and
+                // all benchmark buffers match the prevalidated CSR extents.
+                unsafe {
+                    crate::scatter::scatter_row_prevalidated(
+                        &specialized_csr_source,
+                        &csr_task,
+                        black_box(&csr_input),
+                        black_box(&csr_indices),
+                        black_box(&mut csr_destination),
+                        csr_count * 8,
+                        zero_i64_fill,
+                    )
+                    .unwrap();
+                }
+            }
+        },
+        5,
+    );
+    let generic_csr_time = best_of(
+        || {
+            for _ in 0..csr_iterations {
+                // SAFETY: this uses the same validated CSR structure and
+                // destination extent as the specialized measurement.
+                unsafe {
+                    crate::scatter::scatter_row_prevalidated(
+                        &generic_csr_source,
+                        &csr_task,
+                        black_box(&csr_input),
+                        black_box(&csr_indices),
+                        black_box(&mut csr_destination),
+                        csr_count * 8,
+                        zero_i64_fill,
+                    )
+                    .unwrap();
+                }
+            }
+        },
+        5,
+    );
+
+    let validation_input = (0..count)
+        .flat_map(|index| ((index as i64) * 1_000_000_007).to_le_bytes())
+        .collect::<Vec<_>>();
+    let validation_output = OutputSpec::new(count, OutputDType::U64, Fill::U64(0)).unwrap();
+    let specialized_validation = ConvertOp::resolve(StorageDType::I64, &validation_output).unwrap();
+    let mut generic_validation = specialized_validation;
+    generic_validation.force_generic_for_test();
+    let validation_iterations = 1_024;
+    let specialized_validation_time = best_of(
+        || {
+            for _ in 0..validation_iterations {
+                specialized_validation
+                    .validate_slice(black_box(&validation_input))
+                    .unwrap();
+            }
+        },
+        5,
+    );
+    let generic_validation_time = best_of(
+        || {
+            for _ in 0..validation_iterations {
+                generic_validation
+                    .validate_slice(black_box(&validation_input))
+                    .unwrap();
+            }
+        },
+        5,
+    );
+
+    eprintln!(
+        "64-bit specialized kernels: i32->i64 contiguous specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x; i64->f64 contiguous specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x; i32->i64 packed-map specialized={:.2} Mvalue/s generic={:.2} Mvalue/s speedup={:.2}x; i32->i64 CSR specialized={:.2} Mvalue/s generic={:.2} Mvalue/s speedup={:.2}x; i64 sign validation specialized={:.2} GiB/s generic={:.2} GiB/s speedup={:.2}x",
+        gib_per_second(count * 12, iterations, specialized_i32_i64_time),
+        gib_per_second(count * 12, iterations, generic_i32_i64_time),
+        generic_i32_i64_time.as_secs_f64() / specialized_i32_i64_time.as_secs_f64(),
+        gib_per_second(count * 16, iterations, specialized_i64_f64_time),
+        gib_per_second(count * 16, iterations, generic_i64_f64_time),
+        generic_i64_f64_time.as_secs_f64() / specialized_i64_f64_time.as_secs_f64(),
+        million_values_per_second(mapped_count, mapped_iterations, specialized_map_time),
+        million_values_per_second(mapped_count, mapped_iterations, generic_map_time),
+        generic_map_time.as_secs_f64() / specialized_map_time.as_secs_f64(),
+        million_values_per_second(csr_count, csr_iterations, specialized_csr_time),
+        million_values_per_second(csr_count, csr_iterations, generic_csr_time),
+        generic_csr_time.as_secs_f64() / specialized_csr_time.as_secs_f64(),
+        gib_per_second(count * 8, validation_iterations, specialized_validation_time),
+        gib_per_second(count * 8, validation_iterations, generic_validation_time),
+        generic_validation_time.as_secs_f64() / specialized_validation_time.as_secs_f64(),
     );
 }
 

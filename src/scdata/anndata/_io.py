@@ -41,12 +41,15 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 
 import numpy as np
 
+
+from scdata.compress._csr import ScCsr
+from scdata.compress._dense import ScDense
+from scdata.compress._format import VALUE_DTYPES, is_value_dtype
+from scdata.compress._io import open_store, write as write_matrix
+from scdata.compress._limits import ReadLimits, resolve_read_limits
 from scdata.compress._validate import ensure_path, ensure_writable_path, is_sparse_matrix
-from scdata.exceptions import InvalidMetaError, PerformanceWarning, _invalid_argument
-from scdata.compress.format import VALUE_DTYPES, is_value_dtype
-from scdata.compress.io import write as write_matrix
-from scdata.compress.limits import ReadLimits, resolve_read_limits
-from scdata.compress.write_options import WriteOptions, resolve_write_options
+from scdata.compress._write_options import WriteOptions, resolve_write_options
+from scdata.exceptions import InvalidMetaError, PerformanceWarning
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -87,7 +90,7 @@ def write_scc(
     *,
     store: _Store = "auto",
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     overwrite: bool = True,
     convert_strings_to_categoricals: bool = True,
     progress: ProgressCallback | None = None,
@@ -112,8 +115,8 @@ def write_scc(
         Chunk/block partition knobs applied to every sc-compress matrix.
         ``budget`` is native for CSR; dense budgets are lowered in Python to
         ``fixed_cells`` from each matrix's row width.
-    n_workers
-        Per-matrix chunk workers. Overrides ``options.n_workers`` when provided.
+    num_workers
+        Per-matrix chunk workers. Overrides ``options.num_workers`` when provided.
     overwrite
         When false, refuse to replace an existing ``path``.
     convert_strings_to_categoricals
@@ -125,29 +128,36 @@ def write_scc(
         Optional ``callback(name, index, total)`` invoked after each
         sc-compress matrix is written (``index`` is 1-based).
     """
-    ad = _require_anndata()
-    import zarr
+    try:
+        import anndata as ad
+        import zarr
+    except ModuleNotFoundError as error:
+        if error.name in {"anndata", "zarr"}:
+            raise ImportError(
+                "AnnData support requires anndata and zarr; install with scdata-toolkit[anndata]"
+            ) from None
+        raise
 
     from anndata.experimental import write_dispatched
 
     if not isinstance(adata, ad.AnnData):
-        _invalid_argument(f"adata must be an AnnData, got {type(adata).__name__}")
+        raise TypeError(f"adata must be an AnnData, got {type(adata).__name__}")
     if not isinstance(overwrite, (bool, np.bool_)):
-        _invalid_argument(f"overwrite must be bool, got {type(overwrite).__name__}")
+        raise TypeError(f"overwrite must be bool, got {type(overwrite).__name__}")
     if not isinstance(convert_strings_to_categoricals, (bool, np.bool_)):
-        _invalid_argument(
+        raise TypeError(
             "convert_strings_to_categoricals must be bool, "
             f"got {type(convert_strings_to_categoricals).__name__}"
         )
     if progress is not None and not callable(progress):
-        _invalid_argument(f"progress must be callable or None, got {type(progress).__name__}")
+        raise TypeError(f"progress must be callable or None, got {type(progress).__name__}")
     overwrite = bool(overwrite)
     convert_strings_to_categoricals = bool(convert_strings_to_categoricals)
 
     root = ensure_path(path)
     store_kind = _resolve_store_kind(root, store)
     ensure_writable_path(root, overwrite=overwrite)
-    write_opts = resolve_write_options(options, n_workers=n_workers)
+    write_opts = resolve_write_options(options, num_workers=num_workers)
     n_cells = int(adata.n_obs)
     _preflight_write_adata(adata)
     # Validate partition knobs. Dense budgets are lowered per matrix once the
@@ -250,7 +260,7 @@ def read_scc(
     max_encoded_size: int | None = None,
     max_decoded_size: int | None = None,
     max_block_count: int | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
 ) -> AnnData:
     """Read a ``.scc`` directory or ``.scc.zip`` archive into AnnData.
 
@@ -273,12 +283,18 @@ def read_scc(
     max_metadata_size / max_encoded_size / max_decoded_size / max_block_count
         Per-call overrides applied on top of ``limits``.  These match
         :func:`scdata.open_store` and are useful for large AnnData matrices.
-    n_workers
-        Per-matrix chunk workers. Overrides ``limits.n_workers`` when provided.
+    num_workers
+        Per-matrix chunk workers. Overrides ``limits.num_workers`` when provided.
     """
-    import zarr
-
-    ad = _require_anndata()
+    try:
+        import anndata as ad
+        import zarr
+    except ModuleNotFoundError as error:
+        if error.name in {"anndata", "zarr"}:
+            raise ImportError(
+                "AnnData support requires anndata and zarr; install with scdata-toolkit[anndata]"
+            ) from None
+        raise
     from anndata._io.specs import read_elem
     from anndata._io.utils import _read_legacy_raw
     from anndata._io.zarr import read_dataframe
@@ -293,7 +309,7 @@ def read_scc(
         max_encoded_size=max_encoded_size,
         max_decoded_size=max_decoded_size,
         max_block_count=max_block_count,
-        n_workers=n_workers,
+        num_workers=num_workers,
     )
 
     with _anndata_zarr_context():
@@ -321,7 +337,7 @@ def read_scc(
                         limits=read_limits,
                     )
 
-                if iospec.encoding_type == "anndata" or elem_name.endswith("/"):
+                if iospec.encoding_type == "anndata" or elem_name in {"", "/"}:
                     kwargs: dict[str, Any] = {}
                     for key, child in dict(elem).items():
                         if key.startswith("raw."):
@@ -341,7 +357,10 @@ def read_scc(
                         if key in _LOADABLE_KEYS and key not in load_keys:
                             continue
                         kwargs[key] = read_dispatched(child, callback=callback)
-                    return ad.AnnData(**kwargs)
+                    cleaned, held = _partition_scc_arrays(kwargs)
+                    adata = ad.AnnData(**cleaned)
+                    _inject_scc_arrays(adata, held)
+                    return adata
 
                 if elem_name.startswith("/raw."):
                     return None
@@ -349,14 +368,21 @@ def read_scc(
                 if elem_name in {"/obs", "/var"}:
                     return read_dataframe(elem)
 
-                if elem_name == "/raw" or iospec.encoding_type == "raw":
+                if elem_name.rstrip("/") in {"raw", "/raw"} or iospec.encoding_type == "raw":
                     if any(key.startswith("raw.") for key in f):
                         _invalid_meta(
                             "store contains both a modern 'raw' group and legacy 'raw.*' keys"
                         )
                     if "raw" not in load_keys:
                         return None
-                    return read_func(elem)
+                    raw_kwargs = {
+                        key: read_dispatched(child, callback=callback)
+                        for key, child in dict(elem).items()
+                    }
+                    cleaned, held = _partition_scc_arrays(raw_kwargs)
+                    if ("X",) in held:
+                        cleaned["X"] = held[("X",)]
+                    return cleaned
 
                 return read_func(elem)
 
@@ -385,7 +411,9 @@ def read_scc(
                     read_dataframe,
                     read_legacy_elem,
                 )
-                raw = ad.AnnData(**raw_kwargs)
+                cleaned, held = _partition_scc_arrays(raw_kwargs)
+                raw = ad.AnnData(**cleaned)
+                _inject_scc_arrays(raw, held)
                 raw.obs_names = adata.obs_names
                 adata.raw = raw
 
@@ -404,7 +432,7 @@ def _resolve_load_keys(
     exclude: Collection[str] | None,
 ) -> frozenset[str]:
     if include is not None and exclude is not None:
-        _invalid_argument("pass only one of include= or exclude=")
+        raise ValueError("pass only one of include= or exclude=")
     if include is None and exclude is None:
         return _LOADABLE_KEYS
 
@@ -416,21 +444,21 @@ def _resolve_load_keys(
             values = tuple(requested)  # type: ignore[arg-type]
         except TypeError:
             parameter = "include" if include is not None else "exclude"
-            _invalid_argument(f"{parameter} must be a collection of AnnData slot names")
+            raise TypeError(f"{parameter} must be a collection of AnnData slot names")
     invalid = [value for value in values if not isinstance(value, str)]
     if invalid:
         parameter = "include" if include is not None else "exclude"
         preview = ", ".join(repr(value) for value in invalid[:3])
-        _invalid_argument(f"{parameter} entries must be strings, got {preview}")
+        raise TypeError(f"{parameter} entries must be strings, got {preview}")
     selected = frozenset(cast("tuple[str, ...]", values))
     unknown = selected - _LOADABLE_KEYS
     if unknown:
         preview = ", ".join(repr(name) for name in sorted(unknown))
         allowed = ", ".join(sorted(_LOADABLE_KEYS))
-        _invalid_argument(f"unknown AnnData slot(s): {preview}; expected one of [{allowed}]")
+        raise ValueError(f"unknown AnnData slot(s): {preview}; expected one of [{allowed}]")
     keys = selected if include is not None else _LOADABLE_KEYS - selected
     if "obs" not in keys or "var" not in keys:
-        _invalid_argument("include/exclude must keep both 'obs' and 'var' (required by AnnData)")
+        raise ValueError("include/exclude must keep both 'obs' and 'var' (required by AnnData)")
     return keys
 
 
@@ -495,7 +523,7 @@ def _is_safe_matrix_component(value: object) -> bool:
 
 def _validate_matrix_key(value: object, *, container: str) -> str:
     if not _is_safe_matrix_component(value):
-        _invalid_argument(
+        raise ValueError(
             f"{container} keys must be non-empty path components; '/', '\\', '.', '..', "
             f"and NUL are not allowed; got {value!r}"
         )
@@ -512,7 +540,7 @@ def _validate_uns_keys(
         active = set()
     identity = id(mapping)
     if identity in active:
-        _invalid_argument(f"{context} contains a recursive mapping")
+        raise ValueError(f"{context} contains a recursive mapping")
     active.add(identity)
     try:
         for raw_key, value in mapping.items():
@@ -573,14 +601,14 @@ def _matrix_dtype(elem: Any) -> np.dtype[Any] | None:
 def _resolve_cell_axis(shape: tuple[int, ...], n_cells: int, context: str) -> int:
     """Return ``0`` or ``-1`` for the cell axis; prefer left when both match."""
     if not shape:
-        _invalid_argument(f"{context}: empty shape")
+        raise ValueError(f"{context}: empty shape")
     left = int(shape[0]) == n_cells
     right = int(shape[-1]) == n_cells
     if left:
         return 0
     if right:
         return -1
-    _invalid_argument(
+    raise ValueError(
         f"{context}: cell axis must be leftmost or rightmost (n_cells={n_cells}, shape={shape})"
     )
 
@@ -605,7 +633,7 @@ def _prepare_cell_matrix(
         raw_shape = np.asarray(matrix).shape
     shape = tuple(int(x) for x in raw_shape)
     if len(shape) < 2:
-        _invalid_argument(f"{context}: expected rank ≥ 2, got shape {shape}")
+        raise ValueError(f"{context}: expected rank ≥ 2, got shape {shape}")
     cell_axis = _resolve_cell_axis(shape, n_cells, context)
 
     to_memory = getattr(matrix, "to_memory", None)
@@ -629,14 +657,6 @@ def _prepare_cell_matrix(
 def _restore_cell_matrix(payload: Any, attrs: dict[str, Any]) -> Any:
     """Inverse of :func:`_prepare_cell_matrix` using on-disk attributes."""
     from scipy import sparse as sp
-
-    from scdata.matrix.array import ScCsr, ScDense
-
-    # Materialized store payloads are ScDense / ScCsr; convert for AnnData.
-    if isinstance(payload, ScCsr):
-        payload = payload.to_scipy()
-    elif isinstance(payload, ScDense):
-        payload = payload.to_numpy()
 
     raw_shape = attrs.get(_SCC_SHAPE_ATTR)
     if raw_shape is None:
@@ -768,7 +788,7 @@ def _matrix_path(root: Path, rel: str) -> Path:
     """Resolve a portable matrix path while rejecting traversal components."""
     parts = rel.split("/")
     if rel.startswith("/") or any(not _is_safe_matrix_component(part) for part in parts):
-        _invalid_argument(f"invalid AnnData matrix path: {rel!r}")
+        raise ValueError(f"invalid AnnData matrix path: {rel!r}")
     return root.joinpath(*parts)
 
 
@@ -817,19 +837,20 @@ def _read_scc_matrix(
     attrs: dict[str, Any] | None = None,
     limits: ReadLimits,
 ) -> Any:
-    from scdata.compress.io import open_store
-
     layout_attrs = attrs or {}
     orig_shape, cell_axis = _parse_scc_layout(layout_attrs, rel)
     matrix_path = _matrix_path(root, rel)
     if archive_path is not None:
-        with open_store(archive_path, zip_prefix=rel, limits=limits) as store:
-            _validate_payload_shape(store, orig_shape, cell_axis, context=rel)
-            payload = store.read()
+        store = open_store(archive_path, zip_prefix=rel, limits=limits)
     else:
-        with open_store(matrix_path, limits=limits) as store:
-            _validate_payload_shape(store, orig_shape, cell_axis, context=rel)
-            payload = store.read()
+        store = open_store(matrix_path, limits=limits)
+    _validate_payload_shape(store, orig_shape, cell_axis, context=rel)
+    if len(orig_shape) == 2 and cell_axis == 0:
+        return store
+    try:
+        payload = store.read()
+    finally:
+        store.close()
     return _restore_cell_matrix(
         payload,
         {
@@ -837,6 +858,66 @@ def _read_scc_matrix(
             _SCC_CELL_AXIS_ATTR: cell_axis,
         },
     )
+
+
+def _is_scc_store(value: object) -> bool:
+    return isinstance(value, (ScDense, ScCsr))
+
+
+def _partition_scc_arrays(
+    kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[tuple[Any, ...], Any]]:
+    """Take store objects out of AnnData constructor kwargs so they are not coerced."""
+    held: dict[tuple[Any, ...], Any] = {}
+    out = dict(kwargs)
+
+    if _is_scc_store(out.get("X")):
+        held[("X",)] = out["X"]
+        out["X"] = None
+
+    layers = out.get("layers")
+    if isinstance(layers, dict):
+        cleaned: dict[str, Any] = {}
+        for key, value in layers.items():
+            if _is_scc_store(value):
+                held[("layers", key)] = value
+            else:
+                cleaned[key] = value
+        out["layers"] = cleaned
+
+    for slot in ("obsm", "obsp"):
+        mapping = out.get(slot)
+        if not isinstance(mapping, dict):
+            continue
+        cleaned = {}
+        for key, value in mapping.items():
+            if _is_scc_store(value):
+                held[(slot, key)] = value
+            else:
+                cleaned[key] = value
+        out[slot] = cleaned
+
+    raw = out.get("raw")
+    if _is_scc_store(raw):
+        held[("raw", "X")] = raw
+        out.pop("raw", None)
+
+    return out, held
+
+
+def _inject_scc_arrays(adata: Any, held: dict[tuple[Any, ...], Any]) -> None:
+    """Place store objects into AnnData without going through public setters."""
+    for key, value in held.items():
+        if key == ("X",):
+            adata.layers._data[None] = value
+        elif key[0] == "layers":
+            adata.layers._data[key[1]] = value
+        elif key[0] == "obsm":
+            adata.obsm._data[key[1]] = value
+        elif key[0] == "obsp":
+            adata.obsp._data[key[1]] = value
+        elif key == ("raw", "X") and adata.raw is not None:
+            adata.raw._X = value
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +928,7 @@ def _read_scc_matrix(
 def _preflight_write_adata(adata: AnnData) -> bool:
     """Validate matrices and return whether any sc-compress payload is dense."""
     if adata.n_obs < 0 or adata.n_vars < 0:
-        _invalid_argument(
+        raise ValueError(
             f"AnnData dimensions must be non-negative, got ({adata.n_obs}, {adata.n_vars})"
         )
     n_cells = int(adata.n_obs)
@@ -897,7 +978,7 @@ def _preflight_write_adata(adata: AnnData) -> bool:
     if raw is None:
         return has_dense_matrix
     if raw.n_obs != adata.n_obs:
-        _invalid_argument(f"AnnData.raw has {raw.n_obs} cells, expected {adata.n_obs}")
+        raise ValueError(f"AnnData.raw has {raw.n_obs} cells, expected {adata.n_obs}")
     if raw.X is not None:
         has_dense_matrix |= _validate_expression_matrix(
             raw.X,
@@ -912,25 +993,25 @@ def _preflight_write_adata(adata: AnnData) -> bool:
 
 def _validate_expression_matrix(matrix: Any, n_obs: int, n_var: int, context: str) -> bool:
     if matrix is None:
-        _invalid_argument(f"matrix {context!r} is None")
+        raise ValueError(f"matrix {context!r} is None")
     if not _is_numeric_matrix(matrix):
-        _invalid_argument(f"matrix {context!r} is not a numeric array/sparse matrix")
+        raise TypeError(f"matrix {context!r} is not a numeric array/sparse matrix")
     shape = tuple(int(x) for x in matrix.shape)
     expected = (int(n_obs), int(n_var))
     if shape != expected:
-        _invalid_argument(f"matrix {context!r} has shape {shape}, expected {expected}")
+        raise ValueError(f"matrix {context!r} has shape {shape}, expected {expected}")
     _validate_value_dtype(matrix, context=f"matrix {context!r}")
     return not is_sparse_matrix(matrix)
 
 
 def _validate_cell_aligned_matrix(matrix: Any, n_cells: int, context: str) -> bool:
     if matrix is None:
-        _invalid_argument(f"{context} is None")
+        raise ValueError(f"{context} is None")
     if not _is_numeric_matrix(matrix):
-        _invalid_argument(f"{context} is not a numeric array/sparse matrix")
+        raise TypeError(f"{context} is not a numeric array/sparse matrix")
     shape = tuple(int(x) for x in matrix.shape)
     if len(shape) < 2:
-        _invalid_argument(f"{context}: expected rank ≥ 2, got shape {shape}")
+        raise ValueError(f"{context}: expected rank ≥ 2, got shape {shape}")
     cell_axis = _resolve_cell_axis(shape, n_cells, context)
     _validate_value_dtype(matrix, context=context)
     return not (is_sparse_matrix(matrix) and len(shape) == 2 and cell_axis == 0)
@@ -938,13 +1019,13 @@ def _validate_cell_aligned_matrix(matrix: Any, n_cells: int, context: str) -> bo
 
 def _validate_value_dtype(matrix: Any, *, context: str) -> None:
     if np.ma.isMaskedArray(matrix) and np.ma.getmaskarray(matrix).any():
-        _invalid_argument(f"{context} contains masked values; fill them explicitly before writing")
+        raise ValueError(f"{context} contains masked values; fill them explicitly before writing")
     dtype = _matrix_dtype(matrix)
     if dtype is not None and is_value_dtype(dtype):
         return
     dtype_name = "unknown" if dtype is None else str(dtype)
     allowed = ", ".join(sorted(value.name for value in VALUE_DTYPES))
-    _invalid_argument(
+    raise ValueError(
         f"{context} dtype {dtype_name} is unsupported by sc-compress; "
         f"convert it to one of [{allowed}]"
     )
@@ -957,7 +1038,7 @@ def _validate_value_dtype(matrix: Any, *, context: str) -> None:
 
 def _resolve_store_kind(path: Path, store: _Store) -> Literal["zip", "dir"]:
     if not isinstance(store, str):
-        _invalid_argument(f"store must be 'auto', 'dir', or 'zip', got {type(store).__name__}")
+        raise TypeError(f"store must be 'auto', 'dir', or 'zip', got {type(store).__name__}")
     normalized = store.casefold()
     if normalized == "auto":
         return "zip" if path.name.lower().endswith(".zip") else "dir"
@@ -971,12 +1052,12 @@ def _resolve_store_kind(path: Path, store: _Store) -> Literal["zip", "dir"]:
         return "dir"
     if normalized == "zip":
         return "zip"
-    _invalid_argument(f"store must be 'auto', 'dir', or 'zip', got {store!r}")
+    raise ValueError(f"store must be 'auto', 'dir', or 'zip', got {store!r}")
 
 
 def _prepare_zip_target(root: Path) -> None:
     if root.is_dir():
-        _invalid_argument(f"zip output path is a directory: {root}")
+        raise IsADirectoryError(f"zip output path is a directory: {root}")
     root.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -1008,7 +1089,9 @@ def _zip_directory(source: Path, target: Path, *, overwrite: bool) -> None:
             try:
                 os.link(tmp, target)
             except FileExistsError:
-                _invalid_argument(f"path already exists: {target} (pass overwrite=True to replace)")
+                raise FileExistsError(
+                    f"path already exists: {target} (pass overwrite=True to replace)"
+                )
             tmp.unlink()
     finally:
         try:
@@ -1022,7 +1105,9 @@ def _replace_directory(source: Path, target: Path, *, overwrite: bool) -> None:
     backup: Path | None = None
     if target.exists() or target.is_symlink():
         if not overwrite:
-            _invalid_argument(f"path already exists: {target} (pass overwrite=True to replace)")
+            raise FileExistsError(
+                f"path already exists: {target} (pass overwrite=True to replace)"
+            )
         backup = _make_temp_backup_path(target)
         os.replace(target, backup)
     try:
@@ -1057,12 +1142,19 @@ def _open_store_for_read(path: Path) -> tuple[Any, Path | None]:
     Returns ``(group, archive_path)``.  ``archive_path`` is set for ZIP inputs
     so matrix reads can use :func:`scdata.open_store` with ``zip_prefix``.
     """
-    import zarr
+    try:
+        import zarr
+    except ModuleNotFoundError as error:
+        if error.name == "zarr":
+            raise ImportError(
+                "Zarr support requires zarr; install with scdata-toolkit[anndata]"
+            ) from None
+        raise
     from zarr.storage import ZipStore
 
     if path.is_file():
         if not zipfile.is_zipfile(path):
-            _invalid_argument(f"path is a file but not a ZIP archive: {path}")
+            raise ValueError(f"path is a file but not a ZIP archive: {path}")
         store = ZipStore(str(path), mode="r")
         try:
             return zarr.open_group(store, mode="r"), path
@@ -1071,13 +1163,20 @@ def _open_store_for_read(path: Path) -> tuple[Any, Path | None]:
             raise
     if path.is_dir():
         return zarr.open_group(str(path), mode="r"), None
-    _invalid_argument(f"path does not exist: {path}")
+    raise FileNotFoundError(f"path does not exist: {path}")
 
 
 @contextmanager
 def _write_config() -> Iterator[None]:
     """Disable AnnData auto-sharding for annotation arrays during write."""
-    ad = _require_anndata()
+    try:
+        import anndata as ad
+    except ModuleNotFoundError as error:
+        if error.name in {"anndata", "zarr"}:
+            raise ImportError(
+                "AnnData support requires anndata and zarr; install with scdata-toolkit[anndata]"
+            ) from None
+        raise
 
     override = (
         ad.settings.override(auto_shard_zarr_v3=False)
@@ -1100,18 +1199,6 @@ def _anndata_zarr_context() -> Iterator[None]:
         context = nullcontext() if factory is None else factory()
     with context:
         yield
-
-
-def _require_anndata() -> Any:
-    try:
-        import anndata as ad
-    except ModuleNotFoundError as error:
-        if error.name == "anndata":
-            raise ImportError(
-                "AnnData support is optional; install it with `pip install anndata`"
-            ) from None
-        raise
-    return ad
 
 
 def _invalid_meta(message: str) -> NoReturn:

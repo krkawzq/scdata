@@ -4,16 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from operator import index
-from os import PathLike, fspath
 from pathlib import Path
-from typing import Any, Literal, SupportsIndex
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
-from scdata.exceptions import _invalid_argument
-from scdata.compress.format import VALUE_DTYPES, is_value_dtype
+from scdata._validate import as_int as _as_int
+from scdata._validate import ensure_path as ensure_path
+from scdata.compress._format import VALUE_DTYPES, is_value_dtype
 
 _UINT64_MAX = int(np.iinfo(np.uint64).max)
 _UINTP_MAX = int(np.iinfo(np.uintp).max)
@@ -54,48 +53,18 @@ def as_int(
     maximum: int = _UINT64_MAX,
 ) -> int:
     """Coerce ``value`` to ``int`` with inclusive bounds."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, SupportsIndex):
-        if minimum > 0:
-            kind = "a positive integer"
-        elif minimum == 0:
-            kind = "a non-negative integer"
-        else:
-            kind = "an integer"
-        _invalid_argument(f"{name} must be {kind}, got {value!r}")
-    resolved = index(value)
-    if resolved < minimum:
-        qualifier = "positive" if minimum == 1 else f">= {minimum}"
-        _invalid_argument(f"{name} must be {qualifier}, got {resolved}")
-    if resolved > maximum:
-        if maximum == _UINTP_MAX:
-            _invalid_argument(f"{name} exceeds the platform limit {maximum}")
-        if maximum == _UINT64_MAX:
-            _invalid_argument(f"{name} exceeds uint64 ({maximum})")
-        _invalid_argument(f"{name} exceeds {maximum}")
-    return resolved
-
-
-def ensure_path(path: str | PathLike[str]) -> Path:
-    try:
-        raw_path = fspath(path)
-    except TypeError:
-        _invalid_argument(f"path must be str or PathLike, got {type(path).__name__}")
-    if not isinstance(raw_path, str):
-        _invalid_argument("path must resolve to str, not bytes")
-    if "\0" in raw_path:
-        _invalid_argument("path must not contain NUL characters")
-    return Path(raw_path)
+    return _as_int(value, name, minimum=minimum, maximum=maximum)
 
 
 def normalize_policy(policy: object, *, name: str) -> PartitionPolicy:
     if not isinstance(policy, str):
-        _invalid_argument(f"{name} must be 'cells' or 'budget', got {type(policy).__name__}")
+        raise TypeError(f"{name} must be 'cells' or 'budget', got {type(policy).__name__}")
     normalized = policy.casefold().replace("-", "_")
     if normalized in {"cells", "fixed_cells"}:
         return "cells"
     if normalized in {"budget", "bytes_budget"}:
         return "budget"
-    _invalid_argument(f"{name} must be 'cells' or 'budget', got {policy!r}")
+    raise ValueError(f"{name} must be 'cells' or 'budget', got {policy!r}")
 
 
 def resolve_partition(
@@ -115,7 +84,7 @@ def resolve_partition(
             n=as_int(value, name=f"{name}_cells", minimum=1),
         )
     if budget is None:
-        _invalid_argument(f"{name}_budget is required when {name}_policy='budget'")
+        raise ValueError(f"{name}_budget is required when {name}_policy='budget'")
     return ResolvedPartition(
         policy="budget",
         n=as_int(budget, name=f"{name}_budget", minimum=1),
@@ -159,7 +128,7 @@ def resolve_write_partitions(
 
     if chunk.policy == "budget" or block.policy == "budget":
         if row_bytes is None:
-            _invalid_argument(
+            raise ValueError(
                 "dense budget partitions require row_bytes "
                 "(n_cols * dtype.itemsize) to lower to fixed_cells"
             )
@@ -183,12 +152,14 @@ def resolve_write_partitions(
 def ensure_writable_path(path: Path, *, overwrite: bool) -> None:
     """Refuse to clobber an existing path unless ``overwrite`` is true."""
     if path.name in ("", ".", ".."):
-        _invalid_argument(f"output path must name a file or directory, got {path}")
+        raise ValueError(f"output path must name a file or directory, got {path}")
     if not isinstance(overwrite, (bool, np.bool_)):
-        _invalid_argument(f"overwrite must be bool, got {type(overwrite).__name__}")
+        raise TypeError(f"overwrite must be bool, got {type(overwrite).__name__}")
     if path.exists() or path.is_symlink():
         if not overwrite:
-            _invalid_argument(f"path already exists: {path} (pass overwrite=True to replace)")
+            raise FileExistsError(
+                f"path already exists: {path} (pass overwrite=True to replace)"
+            )
 
 
 def is_sparse_matrix(matrix: Any) -> bool:
@@ -209,7 +180,7 @@ def normalize_row_range(start: int, stop: int, n_rows: int) -> tuple[int, int]:
     start_i = as_int(start, name="start")
     stop_i = as_int(stop, name="stop")
     if start_i < 0 or stop_i < start_i or stop_i > n_rows:
-        _invalid_argument(f"row range [{start_i}, {stop_i}) outside 0..{n_rows}")
+        raise ValueError(f"row range [{start_i}, {stop_i}) outside 0..{n_rows}")
     return start_i, stop_i
 
 
@@ -217,7 +188,7 @@ def _require_value_dtype(array: NDArray[Any], *, what: str) -> NDArray[Any]:
     native_dtype = array.dtype.newbyteorder("=")
     if not is_value_dtype(native_dtype):
         allowed = ", ".join(sorted(dtype.name for dtype in VALUE_DTYPES))
-        _invalid_argument(f"{what} dtype must be one of [{allowed}], got {array.dtype}")
+        raise ValueError(f"{what} dtype must be one of [{allowed}], got {array.dtype}")
     if array.dtype != native_dtype:
         array = array.astype(native_dtype, copy=False)
     if not array.flags.c_contiguous:
@@ -228,17 +199,17 @@ def _require_value_dtype(array: NDArray[Any], *, what: str) -> NDArray[Any]:
 def _as_unmasked_array(value: Any, *, what: str) -> NDArray[Any]:
     try:
         if np.ma.isMaskedArray(value) and np.ma.getmaskarray(value).any():
-            _invalid_argument(f"{what} contains masked values; fill them explicitly before writing")
+            raise ValueError(f"{what} contains masked values; fill them explicitly before writing")
         return np.asarray(value)
     except (TypeError, ValueError, OverflowError) as error:
-        _invalid_argument(f"{what} cannot be converted to a NumPy array: {error}")
+        raise ValueError(f"{what} cannot be converted to a NumPy array: {error}") from error
 
 
 def normalize_dense(values: Any) -> NDArray[Any]:
     """Coerce to a C-contiguous 2D array with a supported value dtype."""
     array = _as_unmasked_array(values, what="dense values")
     if array.ndim != 2:
-        _invalid_argument(f"dense values must be 2-dimensional, got shape {array.shape}")
+        raise ValueError(f"dense values must be 2-dimensional, got shape {array.shape}")
     return _require_value_dtype(array, what="dense values")
 
 
@@ -246,15 +217,15 @@ def promote_u64(array: Any, *, name: str, length: int | None = None) -> NDArray[
     """Promote an integer index/offset array to contiguous ``uint64``."""
     values = _as_unmasked_array(array, what=name)
     if values.ndim != 1:
-        _invalid_argument(f"{name} must be 1-dimensional, got shape {values.shape}")
+        raise ValueError(f"{name} must be 1-dimensional, got shape {values.shape}")
     if length is not None and values.shape[0] != length:
-        _invalid_argument(f"{name} length {values.shape[0]} does not match expected {length}")
+        raise ValueError(f"{name} length {values.shape[0]} does not match expected {length}")
     if values.dtype.kind not in "iu":
-        _invalid_argument(f"{name} must be an integer array, got dtype {values.dtype}")
+        raise TypeError(f"{name} must be an integer array, got dtype {values.dtype}")
     if values.dtype.kind == "i" and values.size and int(values.min()) < 0:
-        _invalid_argument(f"{name} contains negative values")
+        raise ValueError(f"{name} contains negative values")
     if values.dtype.itemsize > 8:
-        _invalid_argument(f"{name} dtype {values.dtype} exceeds uint64")
+        raise ValueError(f"{name} dtype {values.dtype} exceeds uint64")
     return np.ascontiguousarray(values, dtype=np.uint64)
 
 
@@ -268,9 +239,9 @@ def normalize_csr_arrays(
     try:
         shape_values = tuple(shape)
     except TypeError:
-        _invalid_argument(f"shape must be an iterable of two integers, got {shape!r}")
+        raise TypeError(f"shape must be an iterable of two integers, got {shape!r}")
     if len(shape_values) != 2:
-        _invalid_argument(f"shape must have length 2, got {shape!r}")
+        raise ValueError(f"shape must have length 2, got {shape!r}")
     n_rows = as_int(shape_values[0], name="shape[0]")
     n_cols = as_int(shape_values[1], name="shape[1]")
 
@@ -278,21 +249,21 @@ def normalize_csr_arrays(
     indices_u64 = promote_u64(indices, name="indices")
     data_arr = _as_unmasked_array(data, what="CSR data")
     if data_arr.ndim != 1:
-        _invalid_argument(f"data must be 1-dimensional, got shape {data_arr.shape}")
+        raise ValueError(f"data must be 1-dimensional, got shape {data_arr.shape}")
     data_arr = _require_value_dtype(data_arr, what="CSR data")
     if indices_u64.shape[0] != data_arr.shape[0]:
-        _invalid_argument(
+        raise ValueError(
             f"indices length {indices_u64.shape[0]} != data length {data_arr.shape[0]}"
         )
     if int(indptr_u64[0]) != 0:
-        _invalid_argument(f"indptr[0] must be 0, got {int(indptr_u64[0])}")
+        raise ValueError(f"indptr[0] must be 0, got {int(indptr_u64[0])}")
     nnz = int(indptr_u64[-1])
     if nnz != indices_u64.shape[0]:
-        _invalid_argument(f"indptr[-1] ({nnz}) does not match nnz ({indices_u64.shape[0]})")
+        raise ValueError(f"indptr[-1] ({nnz}) does not match nnz ({indices_u64.shape[0]})")
     if nnz and int(indices_u64.max()) >= n_cols:
-        _invalid_argument(f"indices contain column {int(indices_u64.max())} outside 0..{n_cols}")
+        raise ValueError(f"indices contain column {int(indices_u64.max())} outside 0..{n_cols}")
     if not np.all(indptr_u64[1:] >= indptr_u64[:-1]):
-        _invalid_argument("indptr must be monotonically non-decreasing")
+        raise ValueError("indptr must be monotonically non-decreasing")
     return indptr_u64, indices_u64, data_arr, (n_rows, n_cols)
 
 
@@ -307,7 +278,7 @@ def require_scipy_csr(matrix: Any) -> Any:
         converted = matrix.tocsr()
         if getattr(converted, "format", None) == "csr" and sparse.issparse(converted):
             return converted
-    _invalid_argument("csr must be a scipy.sparse matrix (or provide .tocsr() -> csr_matrix)")
+    raise TypeError("csr must be a scipy.sparse matrix (or provide .tocsr() -> csr_matrix)")
 
 
 def csr_matrix_from_decoded(
@@ -321,22 +292,22 @@ def csr_matrix_from_decoded(
     """Build a SciPy CSR matrix from decoded buffers."""
     sparse = _scipy_sparse()
     if n_rows < 0 or n_cols < 0:
-        _invalid_argument(f"CSR shape must be non-negative, got ({n_rows}, {n_cols})")
+        raise ValueError(f"CSR shape must be non-negative, got ({n_rows}, {n_cols})")
     if n_rows > _INT64_MAX or n_cols > _INT64_MAX:
-        _invalid_argument(
+        raise ValueError(
             f"CSR shape ({n_rows}, {n_cols}) exceeds SciPy's signed int64 index range"
         )
 
     indices_array = np.asarray(indices)
     max_index = int(indices_array.max()) if indices_array.size else 0
     if max_index > _INT64_MAX:
-        _invalid_argument("CSR column indices exceed SciPy's signed int64 index range")
+        raise ValueError("CSR column indices exceed SciPy's signed int64 index range")
     use_int64 = n_cols > np.iinfo(np.int32).max or max_index > np.iinfo(np.int32).max
     indices_signed = indices_array.astype(np.int64 if use_int64 else np.int32, copy=False)
 
     indptr_array = np.asarray(indptr)
     if indptr_array.size and int(indptr_array[-1]) > np.iinfo(np.int64).max:
-        _invalid_argument("CSR row offsets exceed SciPy's int64 index range")
+        raise ValueError("CSR row offsets exceed SciPy's int64 index range")
     indptr_signed = indptr_array.astype(np.int64, copy=False)
     return sparse.csr_matrix(
         (np.asarray(data), indices_signed, indptr_signed),

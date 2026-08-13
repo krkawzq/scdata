@@ -8,8 +8,10 @@ use crate::{Error, Result};
 pub enum Fill {
     I16(i16),
     I32(i32),
+    I64(i64),
     U16(u16),
     U32(u32),
+    U64(u64),
     F32(f32),
     F64(f64),
 }
@@ -19,8 +21,10 @@ impl Fill {
         match self {
             Self::I16(_) => OutputDType::I16,
             Self::I32(_) => OutputDType::I32,
+            Self::I64(_) => OutputDType::I64,
             Self::U16(_) => OutputDType::U16,
             Self::U32(_) => OutputDType::U32,
+            Self::U64(_) => OutputDType::U64,
             Self::F32(_) => OutputDType::F32,
             Self::F64(_) => OutputDType::F64,
         }
@@ -30,8 +34,10 @@ impl Fill {
         match self {
             Self::I16(value) => output[..2].copy_from_slice(&value.to_le_bytes()),
             Self::I32(value) => output[..4].copy_from_slice(&value.to_le_bytes()),
+            Self::I64(value) => output[..8].copy_from_slice(&value.to_le_bytes()),
             Self::U16(value) => output[..2].copy_from_slice(&value.to_le_bytes()),
             Self::U32(value) => output[..4].copy_from_slice(&value.to_le_bytes()),
+            Self::U64(value) => output[..8].copy_from_slice(&value.to_le_bytes()),
             Self::F32(value) => output[..4].copy_from_slice(&value.to_le_bytes()),
             Self::F64(value) => output[..8].copy_from_slice(&value.to_le_bytes()),
         }

@@ -14,6 +14,7 @@ pub enum DType {
     U64,
     I16,
     I32,
+    I64,
     F32,
     F64,
 }
@@ -23,7 +24,7 @@ impl DType {
         match self {
             Self::U16 | Self::I16 => 2,
             Self::U32 | Self::I32 | Self::F32 => 4,
-            Self::U64 | Self::F64 => 8,
+            Self::U64 | Self::I64 | Self::F64 => 8,
         }
     }
 
@@ -34,6 +35,7 @@ impl DType {
             Self::U64 => "u64",
             Self::I16 => "i16",
             Self::I32 => "i32",
+            Self::I64 => "i64",
             Self::F32 => "f32",
             Self::F64 => "f64",
         }
@@ -44,7 +46,7 @@ impl DType {
     }
 
     pub const fn is_matrix_value(self) -> bool {
-        !matches!(self, Self::U64)
+        true
     }
 }
 
@@ -64,6 +66,7 @@ impl FromStr for DType {
             "u64" | "uint64" => Ok(Self::U64),
             "i16" | "int16" => Ok(Self::I16),
             "i32" | "int32" => Ok(Self::I32),
+            "i64" | "int64" => Ok(Self::I64),
             "f32" | "float32" => Ok(Self::F32),
             "f64" | "float64" => Ok(Self::F64),
             other => Err(Error::invalid_argument(format!("unknown dtype `{other}`"))),

@@ -22,8 +22,8 @@ class PlanStats:
     indices_io_ops: int
     predicted_physical_bytes: int
     gap_bytes: int
-    maximum_encoded_bytes_per_side: int
-    maximum_decoded_bytes_per_job: int
+    max_encoded_bytes_per_side: int
+    max_decoded_bytes_per_job: int
     arena_bytes: int
     compile_working_set_bytes: int
     retained_whole_key_bytes: int
@@ -46,8 +46,8 @@ class PlanStats:
             "indices_io_ops",
             "predicted_physical_bytes",
             "gap_bytes",
-            "maximum_encoded_bytes_per_side",
-            "maximum_decoded_bytes_per_job",
+            "max_encoded_bytes_per_side",
+            "max_decoded_bytes_per_job",
             "arena_bytes",
             "compile_working_set_bytes",
             "retained_whole_key_bytes",
@@ -77,7 +77,7 @@ class RuntimeStats:
     requested_queue_depth: int
     actual_io_mode: IoMode
     actual_queue_depth: int
-    worker_count: int
+    num_workers: int
     max_inflight_jobs_per_worker: int
     max_inflight_encoded_bytes_per_worker: int
     max_decoded_bytes_per_worker: int
@@ -94,7 +94,7 @@ class RuntimeStats:
             "requested_queue_depth",
             "actual_io_mode",
             "actual_queue_depth",
-            "worker_count",
+            "num_workers",
             "max_inflight_jobs_per_worker",
             "max_inflight_encoded_bytes_per_worker",
             "max_decoded_bytes_per_worker",

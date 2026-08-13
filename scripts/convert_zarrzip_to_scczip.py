@@ -64,7 +64,7 @@ def convert_one(
     src: str,
     *,
     overwrite: bool,
-    n_workers: int | None,
+    num_workers: int | None,
     verify: bool,
 ) -> dict:
     """Worker entry: return a result dict (picklable)."""
@@ -104,7 +104,7 @@ def convert_one(
             dst_path,
             store="zip",
             overwrite=overwrite,
-            n_workers=n_workers,
+            num_workers=num_workers,
         )
         result["dst_bytes"] = dst_path.stat().st_size
 
@@ -158,7 +158,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="process-level parallelism (each job is one file; default 1)",
     )
     p.add_argument(
-        "--n-workers",
+        "--num-workers",
         type=int,
         default=None,
         help="sc-compress matrix write workers per file (default: package default)",
@@ -189,14 +189,14 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"sources={len(sources)} jobs={args.jobs} overwrite={args.overwrite} "
-        f"verify={args.verify} n_workers={args.n_workers}",
+        f"verify={args.verify} num_workers={args.num_workers}",
         flush=True,
     )
 
     ok = skipped = errors = 0
     kwargs = {
         "overwrite": bool(args.overwrite),
-        "n_workers": args.n_workers,
+        "num_workers": args.num_workers,
         "verify": bool(args.verify),
     }
 

@@ -1,6 +1,8 @@
 //! Python session lifecycle and owned NumPy batch conversion.
 
-use numpy::{Element, PyArray1};
+use std::mem::ManuallyDrop;
+
+use numpy::{Element, PyArray1, PyArrayMethods};
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
@@ -20,8 +22,9 @@ struct SessionSlot {
 
 #[pyclass(name = "_Session", module = "scdata._core", frozen)]
 pub(crate) struct PySession {
-    slot: Mutex<SessionSlot>,
-    cancellation: Mutex<Option<CancellationHandle>>,
+    slot: ManuallyDrop<Mutex<SessionSlot>>,
+    cancellation: ManuallyDrop<Mutex<Option<CancellationHandle>>>,
+    process_id: u32,
 }
 
 impl PySession {
@@ -29,18 +32,36 @@ impl PySession {
         let cancellation = session.cancellation_handle();
         let last_state = session.state();
         Self {
-            slot: Mutex::new(SessionSlot {
+            slot: ManuallyDrop::new(Mutex::new(SessionSlot {
                 session: Some(session),
                 last_stats: None,
                 last_state,
                 exhausted: false,
-            }),
-            cancellation: Mutex::new(Some(cancellation)),
+            })),
+            cancellation: ManuallyDrop::new(Mutex::new(Some(cancellation))),
+            process_id: std::process::id(),
         }
+    }
+
+    fn ensure_process(&self) -> PyResult<()> {
+        let current = std::process::id();
+        if current != self.process_id {
+            return Err(invalid_argument(format!(
+                "session was opened in process {}, but is being used in process {current}",
+                self.process_id
+            )));
+        }
+        Ok(())
     }
 
     fn cancellation_handle(&self) -> Option<CancellationHandle> {
         self.cancellation.lock().as_ref().cloned()
+    }
+
+    fn cancel(&self) {
+        if let Some(cancellation) = self.cancellation_handle() {
+            cancellation.cancel();
+        }
     }
 
     fn next_owned(&self) -> Result<Option<OwnedBatch>, NextError> {
@@ -57,8 +78,8 @@ impl PySession {
             }
             return Err(NextError::Closed);
         };
-        let outcome = match session.next_batch().map_err(NextError::Rust)? {
-            Some(batch) => {
+        let outcome = match session.next_batch() {
+            Ok(Some(batch)) => {
                 let copied = OwnedBatch::copy(&batch);
                 drop(batch);
                 match copied {
@@ -66,15 +87,14 @@ impl PySession {
                     Err(error) => Outcome::Error(error),
                 }
             }
-            None => Outcome::End,
+            Ok(None) => Outcome::End,
+            Err(error) => Outcome::Error(error),
         };
         match outcome {
             Outcome::Batch(batch) => Ok(Some(batch)),
             Outcome::Error(error) => {
                 drop(slot);
-                if let Some(cancellation) = self.cancellation_handle() {
-                    cancellation.cancel();
-                }
+                self.cancel();
                 Err(NextError::Rust(error))
             }
             Outcome::End => {
@@ -103,9 +123,16 @@ pub(crate) fn session_next<'py>(
     py: Python<'py>,
     session: &PySession,
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
+    session.ensure_process()?;
     let batch = py.allow_threads(|| session.next_owned());
     match batch {
-        Ok(Some(batch)) => batch.into_python(py).map(Some),
+        Ok(Some(batch)) => match batch.into_python(py) {
+            Ok(batch) => Ok(Some(batch)),
+            Err(error) => {
+                session.cancel();
+                Err(error)
+            }
+        },
         Ok(None) => Ok(None),
         Err(NextError::Rust(error)) => Err(from_rust(error)),
         Err(NextError::Closed) => Err(invalid_argument("session is closed")),
@@ -113,31 +140,35 @@ pub(crate) fn session_next<'py>(
 }
 
 #[pyfunction]
-pub(crate) fn session_cancel(session: &PySession) {
-    if let Some(cancellation) = session.cancellation_handle() {
-        cancellation.cancel();
-    }
+pub(crate) fn session_cancel(session: &PySession) -> PyResult<()> {
+    session.ensure_process()?;
+    session.cancel();
+    Ok(())
 }
 
 #[pyfunction]
-pub(crate) fn session_close(py: Python<'_>, session: &PySession) {
-    let cancellation = session.cancellation.lock().take();
-    if let Some(cancellation) = cancellation.as_ref() {
-        cancellation.cancel();
-    }
-    let dropped = {
-        let mut slot = session.slot.lock();
-        if let Some((stats, state)) = slot
-            .session
-            .as_ref()
-            .map(|session| (session.stats(), session.state()))
-        {
-            slot.last_stats = Some(stats);
-            slot.last_state = state;
+pub(crate) fn session_close(py: Python<'_>, session: &PySession) -> PyResult<()> {
+    session.ensure_process()?;
+    py.allow_threads(|| {
+        let cancellation = session.cancellation.lock().take();
+        if let Some(cancellation) = cancellation.as_ref() {
+            cancellation.cancel();
         }
-        slot.session.take()
-    };
-    py.allow_threads(move || drop((dropped, cancellation)));
+        let dropped = {
+            let mut slot = session.slot.lock();
+            if let Some((stats, state)) = slot
+                .session
+                .as_ref()
+                .map(|session| (session.stats(), session.state()))
+            {
+                slot.last_stats = Some(stats);
+                slot.last_state = state;
+            }
+            slot.session.take()
+        };
+        drop((dropped, cancellation));
+    });
+    Ok(())
 }
 
 #[pyfunction]
@@ -145,15 +176,19 @@ pub(crate) fn session_meta<'py>(
     py: Python<'py>,
     session: &PySession,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let slot = session.slot.lock();
+    session.ensure_process()?;
+    let (closed, exhausted, state) = py.allow_threads(|| {
+        let slot = session.slot.lock();
+        let state = slot
+            .session
+            .as_ref()
+            .map(Session::state)
+            .unwrap_or(slot.last_state);
+        (slot.session.is_none(), slot.exhausted, state)
+    });
     let values = PyDict::new(py);
-    values.set_item("closed", slot.session.is_none())?;
-    values.set_item("exhausted", slot.exhausted)?;
-    let state = slot
-        .session
-        .as_ref()
-        .map(Session::state)
-        .unwrap_or(slot.last_state);
+    values.set_item("closed", closed)?;
+    values.set_item("exhausted", exhausted)?;
     values.set_item("state", session_state_name(state))?;
     Ok(values)
 }
@@ -163,25 +198,36 @@ pub(crate) fn session_stats<'py>(
     py: Python<'py>,
     session: &PySession,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let stats = {
-        let slot = session.slot.lock();
-        slot.session
-            .as_ref()
-            .map(Session::stats)
-            .or_else(|| slot.last_stats.clone())
-    }
-    .ok_or_else(|| invalid_argument("session statistics are unavailable"))?;
+    session.ensure_process()?;
+    let stats = py
+        .allow_threads(|| {
+            let slot = session.slot.lock();
+            slot.session
+                .as_ref()
+                .map(Session::stats)
+                .or_else(|| slot.last_stats.clone())
+        })
+        .ok_or_else(|| invalid_argument("session statistics are unavailable"))?;
     runtime_stats_to_dict(py, &stats)
 }
 
 impl Drop for PySession {
     fn drop(&mut self) {
+        if std::process::id() != self.process_id {
+            return;
+        }
         let cancellation = self.cancellation.get_mut().take();
         if let Some(cancellation) = cancellation.as_ref() {
             cancellation.cancel();
         }
         let session = self.slot.get_mut().session.take();
         drop((session, cancellation));
+        // SAFETY: only the creating process destroys these fields. A post-fork
+        // child leaves the copied thread handles untouched until process exit.
+        unsafe {
+            ManuallyDrop::drop(&mut self.slot);
+            ManuallyDrop::drop(&mut self.cancellation);
+        }
     }
 }
 
@@ -199,8 +245,10 @@ struct OwnedBatch {
 enum BatchValues {
     I16(Vec<i16>),
     I32(Vec<i32>),
+    I64(Vec<i64>),
     U16(Vec<u16>),
     U32(Vec<u32>),
+    U64(Vec<u64>),
     F32(Vec<f32>),
     F64(Vec<f64>),
 }
@@ -212,8 +260,10 @@ impl OwnedBatch {
         let values = match batch.dtype() {
             OutputDType::I16 => BatchValues::I16(copy_values::<i16>(batch)?),
             OutputDType::I32 => BatchValues::I32(copy_values::<i32>(batch)?),
+            OutputDType::I64 => BatchValues::I64(copy_values::<i64>(batch)?),
             OutputDType::U16 => BatchValues::U16(copy_values::<u16>(batch)?),
             OutputDType::U32 => BatchValues::U32(copy_values::<u32>(batch)?),
+            OutputDType::U64 => BatchValues::U64(copy_values::<u64>(batch)?),
             OutputDType::F32 => BatchValues::F32(copy_values::<f32>(batch)?),
             OutputDType::F64 => BatchValues::F64(copy_values::<f64>(batch)?),
         };
@@ -224,8 +274,10 @@ impl OwnedBatch {
         match self.values {
             BatchValues::I16(values) => vec_to_array(py, values, self.rows, self.cols),
             BatchValues::I32(values) => vec_to_array(py, values, self.rows, self.cols),
+            BatchValues::I64(values) => vec_to_array(py, values, self.rows, self.cols),
             BatchValues::U16(values) => vec_to_array(py, values, self.rows, self.cols),
             BatchValues::U32(values) => vec_to_array(py, values, self.rows, self.cols),
+            BatchValues::U64(values) => vec_to_array(py, values, self.rows, self.cols),
             BatchValues::F32(values) => vec_to_array(py, values, self.rows, self.cols),
             BatchValues::F64(values) => vec_to_array(py, values, self.rows, self.cols),
         }
@@ -262,5 +314,7 @@ fn vec_to_array<'py, T: Element>(
     rows: usize,
     cols: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    PyArray1::from_vec(py, values).call_method1("reshape", (rows, cols))
+    PyArray1::from_vec(py, values)
+        .reshape([rows, cols])
+        .map(|array| array.into_any())
 }

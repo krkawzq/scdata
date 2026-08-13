@@ -490,7 +490,7 @@ fn checked_mul(count: u64, size: usize, context: &str) -> Result<usize> {
 fn validate_value_dtype(dtype: DType) -> Result<()> {
     if !dtype.is_matrix_value() {
         return Err(Error::invalid_argument(format!(
-            "matrix value dtype must be u16, u32, i16, i32, f32, or f64, got {dtype}"
+            "matrix value dtype must be u16, u32, u64, i16, i32, i64, f32, or f64, got {dtype}"
         )));
     }
     Ok(())
@@ -551,8 +551,9 @@ mod tests {
     }
 
     #[test]
-    fn arrays_reject_non_value_dtype_and_noncanonical_csr() {
-        assert!(DenseArray::from_bytes([0, 0], DType::U64, vec![]).is_err());
+    fn arrays_accept_64_bit_values_and_reject_noncanonical_csr() {
+        assert!(DenseArray::from_bytes([0, 0], DType::U64, vec![]).is_ok());
+        assert!(DenseArray::from_bytes([0, 0], DType::I64, vec![]).is_ok());
         assert!(CsrArray::from_parts(
             [1, 3],
             DType::U16,

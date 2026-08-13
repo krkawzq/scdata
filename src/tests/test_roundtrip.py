@@ -13,6 +13,8 @@ from scdata.compress._validate import csr_matrix_from_decoded
 def test_public_storage_dtype_constants_are_immutable() -> None:
     assert isinstance(scc.STORAGE_VALUE_DTYPES, tuple)
     assert isinstance(scc.STORAGE_INDEX_DTYPES, tuple)
+    assert {"i64", "u64"}.issubset(scc.STORAGE_VALUE_DTYPES)
+    assert {np.dtype(np.int64), np.dtype(np.uint64)}.issubset(scc.VALUE_DTYPES)
 
 
 def test_dense_roundtrip_and_row_range(tmp_path: Path) -> None:
@@ -52,23 +54,23 @@ def test_dense_roundtrip_and_row_range(tmp_path: Path) -> None:
 
     assert store.closed
     assert "closed=True" in repr(store)
-    with pytest.raises(scc.InvalidArgumentError, match="closed"):
+    with pytest.raises(ValueError, match="closed"):
         store.read()
 
 
 def test_dense_rejects_bad_dtype_and_shape(tmp_path: Path) -> None:
-    with pytest.raises(scc.InvalidArgumentError):
+    with pytest.raises(ValueError):
         scc.write_dense(tmp_path / "bad", np.arange(3, dtype=np.float32))
-    with pytest.raises(scc.InvalidArgumentError):
+    with pytest.raises(ValueError):
         scc.write_dense(tmp_path / "bad", np.arange(4, dtype=np.float16).reshape(2, 2))
-    with pytest.raises(scc.InvalidArgumentError, match="cannot be converted"):
+    with pytest.raises(ValueError, match="cannot be converted"):
         scc.write_dense(tmp_path / "ragged", [[1], [2, 3]])
 
     masked = np.ma.array(
         np.arange(4, dtype=np.float32).reshape(2, 2),
         mask=[[False, True], [False, False]],
     )
-    with pytest.raises(scc.InvalidArgumentError, match="contains masked values"):
+    with pytest.raises(ValueError, match="contains masked values"):
         scc.write_dense(tmp_path / "masked", masked)
 
 
@@ -82,13 +84,69 @@ def test_dense_zero_axes_roundtrip(tmp_path: Path, shape: tuple[int, int]) -> No
     assert result.dtype == values.dtype
 
 
-def test_dense_normalizes_non_native_byte_order(tmp_path: Path) -> None:
-    values = np.arange(6, dtype=">f4").reshape(2, 3)
-    root = tmp_path / "big-endian"
+@pytest.mark.parametrize("dtype", [">f4", ">i8", ">u8"])
+def test_dense_normalizes_non_native_byte_order(tmp_path: Path, dtype: str) -> None:
+    raw_values = {
+        ">f4": [0, 1, 2, 3, 4, 5],
+        ">i8": [
+            np.iinfo(np.int64).min,
+            -(1 << 53) - 1,
+            -1,
+            0,
+            (1 << 53) + 1,
+            np.iinfo(np.int64).max,
+        ],
+        ">u8": [0, 1, (1 << 53) + 1, 1 << 63, (1 << 63) + 1, np.iinfo(np.uint64).max],
+    }
+    values = np.asarray(raw_values[dtype], dtype=dtype).reshape(2, 3)
+    root = tmp_path / f"big-endian-{dtype[-2:]}"
     scc.write(root, values)
     result = scc.open_store(root).read()
-    assert result.dtype == np.dtype(np.float32)
+    assert result.dtype == values.dtype.newbyteorder("=")
     np.testing.assert_array_equal(result, values)
+
+
+def test_dense_and_csr_preserve_int64_and_uint64_values(tmp_path: Path) -> None:
+    sparse = pytest.importorskip("scipy.sparse")
+    matrices = {
+        "i64": np.array(
+            [
+                [np.iinfo(np.int64).min, -(1 << 53) - 1],
+                [(1 << 53) + 1, np.iinfo(np.int64).max],
+            ],
+            dtype=np.int64,
+        ),
+        "u64": np.array(
+            [
+                [0, (1 << 53) + 1],
+                [(1 << 63) + 1, np.iinfo(np.uint64).max],
+            ],
+            dtype=np.uint64,
+        ),
+    }
+
+    for storage_dtype, values in matrices.items():
+        dense_root = tmp_path / f"dense-{storage_dtype}"
+        scc.write_dense(dense_root, values)
+        dense = scc.open_store(dense_root)
+        assert dense.storage_dtype == storage_dtype
+        assert dense.dtype == values.dtype
+        np.testing.assert_array_equal(dense.read(), values)
+        np.testing.assert_array_equal(
+            dense.select([1, 0], [1, 0]),
+            values[[1, 0]][:, [1, 0]],
+        )
+
+        csr_root = tmp_path / f"csr-{storage_dtype}"
+        scc.write_csr(csr_root, sparse.csr_matrix(values))
+        csr = scc.open_store(csr_root)
+        assert csr.storage_dtype == storage_dtype
+        assert csr.dtype == values.dtype
+        np.testing.assert_array_equal(csr.read().toarray(), values)
+        np.testing.assert_array_equal(
+            csr.select([1, 0], [1, 0], csr_output="dense"),
+            values[[1, 0]][:, [1, 0]],
+        )
 
 
 def test_csr_roundtrip_via_scipy(tmp_path: Path) -> None:
@@ -116,22 +174,21 @@ def test_csr_roundtrip_via_scipy(tmp_path: Path) -> None:
 
     store = scc.open_store(root)
     assert store.kind == "csr"
+    assert isinstance(store, scc.ScCsr)
     assert store.nnz == 3
     assert store.storage_index_dtype is not None
     assert store.index_dtype is not None
     full = store.read()
-    assert isinstance(full, scc.ScCsr)
+    assert sparse.issparse(full)
     np.testing.assert_array_equal(full.toarray(), np.array([[0, 0, 20], [0, 10, 0]]))
 
     batch = store.read_rows(1, 2)
-    assert isinstance(batch, scc.ScCsr)
+    assert sparse.issparse(batch)
     assert batch.shape == (1, 3)
     np.testing.assert_array_equal(batch.toarray(), np.array([[0, 10, 0]]))
 
-    # 2-D gene subset densify path.
     dense_genes = store.select([1, 0], [2, 0], csr_output="dense")
-    assert isinstance(dense_genes, scc.ScDense)
-    np.testing.assert_array_equal(dense_genes.to_numpy(), np.array([[0, 0], [20, 0]]))
+    np.testing.assert_array_equal(dense_genes, np.array([[0, 0], [20, 0]]))
 
 
 def test_generic_write_canonicalizes_duplicate_csr_entries(tmp_path: Path) -> None:
@@ -149,7 +206,7 @@ def test_generic_write_canonicalizes_duplicate_csr_entries(tmp_path: Path) -> No
     root = tmp_path / "duplicates"
     scc.write(root, csr)
     result = scc.open_store(root)[0]
-    assert isinstance(result, scc.ScCsr)
+    assert sparse.issparse(result)
     np.testing.assert_array_equal(result.toarray(), np.array([[0.0, 4.0, 0.0]]))
 
 
@@ -188,11 +245,11 @@ def test_read_limits_object_and_python_integer_validation(tmp_path: Path) -> Non
     assert store.limits.max_decoded_size == 64
     assert store.limits.max_block_count == 10
 
-    with pytest.raises(scc.InvalidArgumentError, match="max_decoded_size"):
+    with pytest.raises(TypeError, match="max_decoded_size"):
         scc.ReadLimits(max_decoded_size=True)
-    with pytest.raises(scc.InvalidArgumentError, match="platform limit"):
+    with pytest.raises(ValueError, match="platform limit"):
         scc.ReadLimits(max_decoded_size=1 << 128)
-    with pytest.raises(scc.InvalidArgumentError, match="chunk_cells"):
+    with pytest.raises(TypeError, match="chunk_cells"):
         scc.write_dense(
             tmp_path / "bad-partition",
             np.ones((1, 1), dtype=np.uint16),
@@ -204,7 +261,7 @@ def test_read_limits_object_and_python_integer_validation(tmp_path: Path) -> Non
             ),
         )
     sparse = pytest.importorskip("scipy.sparse")
-    with pytest.raises(scc.InvalidArgumentError, match="chunk_budget is required"):
+    with pytest.raises(ValueError, match="chunk_budget is required"):
         scc.write_csr(
             tmp_path / "missing-budget",
             sparse.csr_matrix(np.ones((2, 2), dtype=np.float32)),
@@ -217,10 +274,9 @@ def test_read_limits_object_and_python_integer_validation(tmp_path: Path) -> Non
         )
 
 
-def test_n_workers_is_configurable_for_writes_and_reads(tmp_path: Path) -> None:
-    assert scc.DEFAULT_N_WORKERS >= 1
-    options = scc.WriteOptions(n_workers=np.int64(2))
-    assert options.n_workers == 2
+def test_num_workers_is_configurable_for_writes_and_reads(tmp_path: Path) -> None:
+    options = scc.WriteOptions(num_workers=np.int64(2))
+    assert options.num_workers == 2
 
     root = tmp_path / "workers"
     values = np.arange(32, dtype=np.float32).reshape(8, 4)
@@ -228,22 +284,22 @@ def test_n_workers_is_configurable_for_writes_and_reads(tmp_path: Path) -> None:
         root,
         values,
         options=options,
-        n_workers=np.int64(3),
+        num_workers=np.int64(3),
     )
 
-    limits = scc.ReadLimits(n_workers=np.int64(2))
-    with scc.open_store(root, limits=limits, n_workers=np.int64(4)) as store:
-        assert store.n_workers == 4
-        assert store.limits.n_workers == 4
-        assert store.info().n_workers == 4
+    limits = scc.ReadLimits(num_workers=np.int64(2))
+    with scc.open_store(root, limits=limits, num_workers=np.int64(4)) as store:
+        assert store.num_workers == 4
+        assert store.limits.num_workers == 4
+        assert store.info().num_workers == 4
         np.testing.assert_array_equal(store.read(), values)
 
-    with pytest.raises(scc.InvalidArgumentError, match="n_workers"):
-        scc.ReadLimits(n_workers=0)
-    with pytest.raises(scc.InvalidArgumentError, match="n_workers"):
-        scc.WriteOptions(n_workers=False)  # type: ignore[arg-type]
-    with pytest.raises(scc.InvalidArgumentError, match="n_workers"):
-        scc.open_store(root, n_workers=0)
+    with pytest.raises(ValueError, match="num_workers"):
+        scc.ReadLimits(num_workers=0)
+    with pytest.raises(TypeError, match="num_workers"):
+        scc.WriteOptions(num_workers=False)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="num_workers"):
+        scc.open_store(root, num_workers=0)
 
 
 def test_csr_bytes_budget_policy_roundtrip(tmp_path: Path) -> None:
@@ -265,7 +321,7 @@ def test_csr_bytes_budget_policy_roundtrip(tmp_path: Path) -> None:
     assert meta["partition"]["block"] == {"strategy": "bytes_budget", "n": 32}
     out = scc.open_store(root).read()
     np.testing.assert_array_equal(out.toarray(), csr.toarray())
-    with pytest.raises(scc.InvalidArgumentError, match=r"shape\[0\]"):
+    with pytest.raises(TypeError, match=r"shape\[0\]"):
         scc.write_csr_arrays(
             tmp_path / "bad-shape",
             np.array([0], dtype=np.int64),
@@ -319,7 +375,7 @@ def test_overwrite_false_refuses_existing_path(tmp_path: Path) -> None:
     root = tmp_path / "exists"
     values = np.ones((2, 2), dtype=np.float32)
     scc.write_dense(root, values)
-    with pytest.raises(scc.InvalidArgumentError, match="already exists"):
+    with pytest.raises(FileExistsError, match="already exists"):
         scc.write_dense(root, values, overwrite=False)
 
 
@@ -328,13 +384,13 @@ def test_write_rejects_output_path_without_leaf(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(scc.InvalidArgumentError, match="must name a file or directory"):
+    with pytest.raises(ValueError, match="must name a file or directory"):
         scc.write_dense(".", np.ones((1, 1), dtype=np.float32))
 
 
 def test_decoded_csr_rejects_shape_outside_scipy_index_range() -> None:
     pytest.importorskip("scipy.sparse")
-    with pytest.raises(scc.InvalidArgumentError, match="shape .* signed int64"):
+    with pytest.raises(ValueError, match="shape .* signed int64"):
         csr_matrix_from_decoded(
             np.array([], dtype=np.uint64),
             np.array([], dtype=np.float32),

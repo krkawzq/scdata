@@ -87,8 +87,24 @@ impl AxisIndex {
                         end: stop as u64,
                     });
                 }
-                let positions = expand_strided(start, stop, step)?;
-                Ok(NormalizedAxis::Gather { positions })
+                let len = strided_len(start, stop, step)?;
+                if len == 0 {
+                    return Ok(NormalizedAxis::Contiguous { start: 0, end: 0 });
+                }
+                let first = u64::try_from(start).map_err(|_| {
+                    Error::invalid_argument("strided slice produced a negative index")
+                })?;
+                if len == 1 {
+                    return Ok(NormalizedAxis::Contiguous {
+                        start: first,
+                        end: first + 1,
+                    });
+                }
+                Ok(NormalizedAxis::Strided {
+                    start: first,
+                    step,
+                    len,
+                })
             }
             Self::Positions(positions) => {
                 for (i, &pos) in positions.iter().enumerate() {
@@ -112,14 +128,62 @@ impl AxisIndex {
 /// Bounds-checked axis selection ready for kernels / planners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizedAxis {
-    Contiguous { start: u64, end: u64 },
-    Gather { positions: Vec<u64> },
+    Contiguous {
+        start: u64,
+        end: u64,
+    },
+    /// Arithmetic sequence `start + i * step` for `i in 0..len`.
+    ///
+    /// `step` is never `0` or `1`; `step == 1` normalizes to [`Self::Contiguous`].
+    Strided {
+        start: u64,
+        step: i64,
+        len: u64,
+    },
+    Gather {
+        positions: Vec<u64>,
+    },
+}
+
+/// One arithmetic run of selected positions: `source + i * source_step` writes
+/// to output slots `destination + i` for `i in 0..count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AxisRun {
+    pub source: u64,
+    pub destination: u64,
+    pub count: u64,
+    pub source_step: i64,
+}
+
+impl AxisRun {
+    pub(crate) fn nth(self, index: u64) -> Result<u64> {
+        strided_nth(self.source, self.source_step, index)
+    }
+
+    /// How many terms of this run, starting at `self.source`, stay inside `[lo, hi)`.
+    pub(crate) fn prefix_in_cell_range(self, lo: u64, hi: u64) -> Result<u64> {
+        if self.count == 0 || self.source < lo || self.source >= hi {
+            return Ok(0);
+        }
+        if self.source_step > 0 {
+            let step = self.source_step as u64;
+            let last = (hi - 1 - self.source) / step;
+            Ok((last + 1).min(self.count))
+        } else if self.source_step < 0 {
+            let step = self.source_step.unsigned_abs();
+            let last = (self.source - lo) / step;
+            Ok((last + 1).min(self.count))
+        } else {
+            Err(Error::invalid_argument("axis run step must not be zero"))
+        }
+    }
 }
 
 impl NormalizedAxis {
     pub fn len(&self) -> u64 {
         match self {
             Self::Contiguous { start, end } => end - start,
+            Self::Strided { len, .. } => *len,
             Self::Gather { positions } => positions.len() as u64,
         }
     }
@@ -138,6 +202,23 @@ impl NormalizedAxis {
                 if start > end || *end > axis_len {
                     return Err(Error::invalid_argument(format!(
                         "normalized axis range [{start}, {end}) outside 0..{axis_len}"
+                    )));
+                }
+            }
+            Self::Strided { start, step, len } => {
+                if *step == 0 {
+                    return Err(Error::invalid_argument(
+                        "strided axis step must not be zero",
+                    ));
+                }
+                if *len == 0 {
+                    return Ok(());
+                }
+                let last = strided_nth(*start, *step, *len - 1)?;
+                if *start >= axis_len || last >= axis_len {
+                    return Err(Error::invalid_argument(format!(
+                        "strided axis [{start} + i*{step}; i<={}] outside 0..{axis_len}",
+                        *len - 1
                     )));
                 }
             }
@@ -160,14 +241,14 @@ impl NormalizedAxis {
     pub fn as_range(&self) -> Option<Range<u64>> {
         match self {
             Self::Contiguous { start, end } => Some(*start..*end),
-            Self::Gather { .. } => None,
+            Self::Strided { .. } | Self::Gather { .. } => None,
         }
     }
 
     pub fn positions(&self) -> Option<&[u64]> {
         match self {
-            Self::Contiguous { .. } => None,
             Self::Gather { positions } => Some(positions),
+            Self::Contiguous { .. } | Self::Strided { .. } => None,
         }
     }
 
@@ -175,6 +256,16 @@ impl NormalizedAxis {
     pub fn bounding_range(&self) -> Range<u64> {
         match self {
             Self::Contiguous { start, end } => *start..*end,
+            Self::Strided { start, step, len } => {
+                if *len == 0 {
+                    0..0
+                } else {
+                    let last = strided_nth(*start, *step, *len - 1).unwrap_or(*start);
+                    let lo = (*start).min(last);
+                    let hi = (*start).max(last);
+                    lo..hi + 1
+                }
+            }
             Self::Gather { positions } => {
                 if positions.is_empty() {
                     0..0
@@ -191,13 +282,123 @@ impl NormalizedAxis {
         }
     }
 
+    pub fn nth(&self, index: u64) -> Result<u64> {
+        match self {
+            Self::Contiguous { start, end } => {
+                let position = start
+                    .checked_add(index)
+                    .ok_or_else(|| Error::invalid_argument("axis position overflow"))?;
+                if position >= *end {
+                    return Err(Error::invalid_argument("axis position is out of bounds"));
+                }
+                Ok(position)
+            }
+            Self::Strided { start, step, len } => {
+                if index >= *len {
+                    return Err(Error::invalid_argument("axis position is out of bounds"));
+                }
+                strided_nth(*start, *step, index)
+            }
+            Self::Gather { positions } => {
+                let index = usize::try_from(index)
+                    .map_err(|_| Error::invalid_argument("axis position exceeds usize"))?;
+                positions
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| Error::invalid_argument("axis position is out of bounds"))
+            }
+        }
+    }
+
     /// Materialize explicit positions (for gather kernels).
     pub fn to_positions(&self) -> Vec<u64> {
         match self {
             Self::Contiguous { start, end } => (*start..*end).collect(),
+            Self::Strided { start, step, len } => (0..*len)
+                .filter_map(|index| strided_nth(*start, *step, index).ok())
+                .collect(),
             Self::Gather { positions } => positions.clone(),
         }
     }
+
+    /// Visit coalesced arithmetic runs covering this axis in output order.
+    pub(crate) fn visit_runs<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(AxisRun) -> Result<()>,
+    {
+        match self {
+            Self::Contiguous { start, end } => {
+                let count = *end - *start;
+                if count > 0 {
+                    visit(AxisRun {
+                        source: *start,
+                        destination: 0,
+                        count,
+                        source_step: 1,
+                    })?;
+                }
+                Ok(())
+            }
+            Self::Strided { start, step, len } => {
+                if *len > 0 {
+                    visit(AxisRun {
+                        source: *start,
+                        destination: 0,
+                        count: *len,
+                        source_step: *step,
+                    })?;
+                }
+                Ok(())
+            }
+            Self::Gather { positions } => visit_gather_runs(positions, visit),
+        }
+    }
+}
+
+/// Split an arithmetic run at chunk-file boundaries.
+pub(crate) fn visit_run_chunks<F>(
+    run: AxisRun,
+    chunk_of: impl Fn(u64) -> Result<usize>,
+    cell_range: impl Fn(usize) -> Result<(u64, u64)>,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(usize, AxisRun) -> Result<()>,
+{
+    let mut done = 0u64;
+    while done < run.count {
+        let source = run.nth(done)?;
+        let chunk = chunk_of(source)?;
+        let (lo, hi) = cell_range(chunk)?;
+        let sub = AxisRun {
+            source,
+            destination: run
+                .destination
+                .checked_add(done)
+                .ok_or_else(|| Error::invalid_argument("axis run destination overflow"))?,
+            count: run.count - done,
+            source_step: run.source_step,
+        };
+        let take = sub.prefix_in_cell_range(lo, hi)?;
+        if take == 0 {
+            return Err(Error::invalid_argument(
+                "axis run did not intersect its owning chunk",
+            ));
+        }
+        visit(
+            chunk,
+            AxisRun {
+                source,
+                destination: sub.destination,
+                count: take,
+                source_step: run.source_step,
+            },
+        )?;
+        done = done
+            .checked_add(take)
+            .ok_or_else(|| Error::invalid_argument("axis run split overflow"))?;
+    }
+    Ok(())
 }
 
 /// Full matrix selection on both axes.
@@ -289,7 +490,7 @@ fn validate_resolved_slice(start: i64, stop: i64, step: i64, axis_len: u64) -> R
     Ok(())
 }
 
-fn expand_strided(start: i64, stop: i64, step: i64) -> Result<Vec<u64>> {
+fn strided_len(start: i64, stop: i64, step: i64) -> Result<u64> {
     let count = if step > 0 && start < stop {
         ((i128::from(stop) - i128::from(start) - 1) / i128::from(step) + 1) as u128
     } else if step < 0 && start > stop {
@@ -298,20 +499,70 @@ fn expand_strided(start: i64, stop: i64, step: i64) -> Result<Vec<u64>> {
     } else {
         0
     };
-    let count = usize::try_from(count)
-        .map_err(|_| Error::invalid_argument("strided slice length exceeds usize"))?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(count)?;
-    let mut current = i128::from(start);
-    let step = i128::from(step);
-    for _ in 0..count {
-        out.push(
-            u64::try_from(current)
-                .map_err(|_| Error::invalid_argument("strided slice produced a negative index"))?,
-        );
-        current += step;
+    u64::try_from(count).map_err(|_| Error::invalid_argument("strided slice length exceeds u64"))
+}
+
+pub(crate) fn strided_nth(start: u64, step: i64, index: u64) -> Result<u64> {
+    try_strided_nth(start, step, index)
+        .ok_or_else(|| Error::invalid_argument("strided slice produced a negative index"))
+}
+
+fn try_strided_nth(start: u64, step: i64, index: u64) -> Option<u64> {
+    let value = i128::from(start).checked_add(i128::from(step).checked_mul(i128::from(index))?)?;
+    u64::try_from(value).ok()
+}
+
+fn visit_gather_runs<F>(positions: &[u64], mut visit: F) -> Result<()>
+where
+    F: FnMut(AxisRun) -> Result<()>,
+{
+    let mut index = 0usize;
+    while index < positions.len() {
+        let source = positions[index];
+        let destination = u64::try_from(index)
+            .map_err(|_| Error::invalid_argument("gather run destination exceeds u64"))?;
+        if index + 1 >= positions.len() {
+            visit(AxisRun {
+                source,
+                destination,
+                count: 1,
+                source_step: 1,
+            })?;
+            break;
+        }
+        let step = i128::from(positions[index + 1]) - i128::from(source);
+        if step == 0 {
+            visit(AxisRun {
+                source,
+                destination,
+                count: 1,
+                source_step: 1,
+            })?;
+            index += 1;
+            continue;
+        }
+        let source_step = i64::try_from(step)
+            .map_err(|_| Error::invalid_argument("gather run step exceeds i64"))?;
+        let mut count = 2u64;
+        while index + (count as usize) < positions.len() {
+            let Some(expected) = try_strided_nth(source, source_step, count) else {
+                break;
+            };
+            if positions[index + (count as usize)] != expected {
+                break;
+            }
+            count += 1;
+        }
+        visit(AxisRun {
+            source,
+            destination,
+            count,
+            source_step,
+        })?;
+        index += usize::try_from(count)
+            .map_err(|_| Error::invalid_argument("gather run length exceeds usize"))?;
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -353,7 +604,7 @@ mod tests {
         let axis = AxisIndex::from_mask(&[false, true, false, true, true]);
         match axis.normalize(5).unwrap() {
             NormalizedAxis::Gather { positions } => assert_eq!(positions, vec![1, 3, 4]),
-            NormalizedAxis::Contiguous { .. } => panic!("expected gather"),
+            other => panic!("expected gather, got {other:?}"),
         }
     }
 
@@ -364,30 +615,68 @@ mod tests {
     }
 
     #[test]
-    fn positive_and_negative_strides_follow_resolved_python_slices() {
+    fn positive_and_negative_strides_stay_compact() {
         assert_eq!(
             AxisIndex::strided(1, 9, 3).normalize(10).unwrap(),
-            NormalizedAxis::Gather {
-                positions: vec![1, 4, 7]
+            NormalizedAxis::Strided {
+                start: 1,
+                step: 3,
+                len: 3
             }
         );
         assert_eq!(
             AxisIndex::strided(9, -1, -2).normalize(10).unwrap(),
-            NormalizedAxis::Gather {
-                positions: vec![9, 7, 5, 3, 1]
+            NormalizedAxis::Strided {
+                start: 9,
+                step: -2,
+                len: 5
             }
         );
         assert_eq!(
             AxisIndex::strided(1, 9, -1).normalize(10).unwrap(),
-            NormalizedAxis::Gather { positions: vec![] }
+            NormalizedAxis::Contiguous { start: 0, end: 0 }
         );
+        let strided = AxisIndex::strided(1, 9, 3).normalize(10).unwrap();
+        assert_eq!(strided.nth(0).unwrap(), 1);
+        assert_eq!(strided.nth(1).unwrap(), 4);
+        assert_eq!(strided.nth(2).unwrap(), 7);
     }
 
     #[test]
     fn minimum_step_is_supported_without_negation_overflow() {
         assert_eq!(
             AxisIndex::strided(4, -1, i64::MIN).normalize(5).unwrap(),
-            NormalizedAxis::Gather { positions: vec![4] }
+            NormalizedAxis::Contiguous { start: 4, end: 5 }
+        );
+    }
+
+    #[test]
+    fn gather_positions_coalesce_into_arithmetic_runs() {
+        let axis = AxisIndex::positions([0, 2, 4, 6, 9, 10])
+            .normalize(12)
+            .unwrap();
+        let mut runs = Vec::new();
+        axis.visit_runs(|run| {
+            runs.push(run);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            runs,
+            vec![
+                AxisRun {
+                    source: 0,
+                    destination: 0,
+                    count: 4,
+                    source_step: 2
+                },
+                AxisRun {
+                    source: 9,
+                    destination: 4,
+                    count: 2,
+                    source_step: 1
+                }
+            ]
         );
     }
 }

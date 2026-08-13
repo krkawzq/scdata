@@ -5,7 +5,9 @@ use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::select::NormalizedAxis;
 
-use super::util::{checked_mul, par_for_row_blocks, usize_from_u64, zeroed};
+use super::util::{
+    assume_init_bytes, checked_mul, par_for_row_blocks, uninit_bytes, usize_from_u64,
+};
 
 /// Select arbitrary rows and columns from a dense row-major buffer.
 pub fn dense_select(
@@ -42,9 +44,11 @@ pub fn dense_select(
     let row_bytes = checked_mul(n_cols, elem, "dense source row")?;
     let out_row_bytes = checked_mul(out_cols, elem, "dense output row")?;
     let out_len = checked_mul(out_rows, out_row_bytes, "dense output")?;
-    let mut output = zeroed(out_len)?;
+    let mut output = uninit_bytes(out_len)?;
 
     if out_rows == 0 || out_cols == 0 {
+        // SAFETY: a zero-sized output contains no uninitialized elements.
+        let output = unsafe { assume_init_bytes(output) };
         return DenseArray::from_bytes([out_rows, out_cols], dtype, output);
     }
 
@@ -59,16 +63,27 @@ pub fn dense_select(
             let src_end = src_start
                 .checked_add(out_len)
                 .ok_or_else(|| Error::invalid_argument("dense full-row copy overflow"))?;
-            output.copy_from_slice(
-                values
-                    .get(src_start..src_end)
-                    .ok_or_else(|| Error::invalid_argument("dense row block out of bounds"))?,
-            );
+            let source = values
+                .get(src_start..src_end)
+                .ok_or_else(|| Error::invalid_argument("dense row block out of bounds"))?;
+            // SAFETY: `source.len() == out_len == output.len()`, the source
+            // matrix and new output allocation do not overlap, and the copy
+            // initializes every destination byte exactly once.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    output.as_mut_ptr().cast::<u8>(),
+                    out_len,
+                );
+            }
+            // SAFETY: the full-row copy above initialized all `out_len` bytes.
+            let output = unsafe { assume_init_bytes(output) };
             return DenseArray::from_bytes([out_rows, out_cols], dtype, output);
         }
 
         let col_bytes = checked_mul(col_end - col_start, elem, "col strip")?;
         let col_byte_start = checked_mul(col_start, elem, "col byte start")?;
+        debug_assert_eq!(col_bytes, out_row_bytes);
         par_for_row_blocks(
             threads,
             out_rows,
@@ -87,11 +102,23 @@ pub fn dense_select(
                         .get(src_off..src_off + col_bytes)
                         .ok_or_else(|| Error::invalid_argument("dense col strip out of bounds"))?;
                     let dst_off = (local_row - job_start) * out_row_bytes;
-                    block[dst_off..dst_off + col_bytes].copy_from_slice(src);
+                    debug_assert!(dst_off + col_bytes <= block.len());
+                    // SAFETY: the checked source range and exact row-block
+                    // partition prove both ranges have `col_bytes` elements.
+                    // Every selected row owns a disjoint destination row.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            block.as_mut_ptr().cast::<u8>().add(dst_off),
+                            col_bytes,
+                        );
+                    }
                 }
                 Ok(())
             },
         )?;
+        // SAFETY: every output row was filled with one complete column strip.
+        let output = unsafe { assume_init_bytes(output) };
         return DenseArray::from_bytes([out_rows, out_cols], dtype, output);
     }
 
@@ -101,6 +128,7 @@ pub fn dense_select(
         let col_end = usize_from_u64(col_range.end, "col end")?;
         let col_bytes = checked_mul(col_end - col_start, elem, "col strip")?;
         let col_byte_start = checked_mul(col_start, elem, "col byte start")?;
+        debug_assert_eq!(col_bytes, out_row_bytes);
         par_for_row_blocks(
             threads,
             out_rows,
@@ -118,26 +146,39 @@ pub fn dense_select(
                         .get(src_off..src_off + col_bytes)
                         .ok_or_else(|| Error::invalid_argument("dense gather row out of bounds"))?;
                     let dst_off = (local_row - job_start) * out_row_bytes;
-                    block[dst_off..dst_off + col_bytes].copy_from_slice(src);
+                    debug_assert!(dst_off + col_bytes <= block.len());
+                    // SAFETY: the normalized row selection and checked source
+                    // range prove `src` is valid; row-block partitioning gives
+                    // this worker the entire disjoint destination row.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            block.as_mut_ptr().cast::<u8>().add(dst_off),
+                            col_bytes,
+                        );
+                    }
                 }
                 Ok(())
             },
         )?;
+        // SAFETY: every gathered row was filled with one complete column strip.
+        let output = unsafe { assume_init_bytes(output) };
         return DenseArray::from_bytes([out_rows, out_cols], dtype, output);
     }
 
-    let col_byte_offsets = cols
-        .positions()
-        .ok_or_else(|| Error::invalid_argument("missing gathered column positions"))?
-        .iter()
-        .map(|&col| {
-            checked_mul(
-                usize_from_u64(col, "col position")?,
-                elem,
-                "gather col byte offset",
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut col_byte_offsets = Vec::new();
+    col_byte_offsets.try_reserve_exact(out_cols)?;
+    for local_col in 0..out_cols {
+        let col = cols.nth(
+            u64::try_from(local_col)
+                .map_err(|_| Error::invalid_argument("selected column index exceeds u64"))?,
+        )?;
+        col_byte_offsets.push(checked_mul(
+            usize_from_u64(col, "col position")?,
+            elem,
+            "gather col byte offset",
+        )?);
+    }
 
     // Element-wise column gather; rows are resolved directly from their normalized form.
     par_for_row_blocks(
@@ -164,7 +205,7 @@ pub fn dense_select(
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             values.as_ptr().add(src_off),
-                            block.as_mut_ptr().add(dst_off),
+                            block.as_mut_ptr().cast::<u8>().add(dst_off),
                             elem,
                         );
                     }
@@ -174,19 +215,18 @@ pub fn dense_select(
         },
     )?;
 
+    // SAFETY: the nested row/column loops initialized every output element,
+    // and `par_for_row_blocks` returned only after all workers completed.
+    let output = unsafe { assume_init_bytes(output) };
     DenseArray::from_bytes([out_rows, out_cols], dtype, output)
 }
 
 #[inline]
 fn axis_position(axis: &NormalizedAxis, local: usize, context: &str) -> Result<usize> {
-    let position = match axis {
-        NormalizedAxis::Contiguous { start, .. } => start
-            .checked_add(local as u64)
-            .ok_or_else(|| Error::invalid_argument(format!("{context} overflow")))?,
-        NormalizedAxis::Gather { positions } => *positions
-            .get(local)
-            .ok_or_else(|| Error::invalid_argument(format!("{context} is out of bounds")))?,
-    };
+    let position = axis.nth(
+        u64::try_from(local)
+            .map_err(|_| Error::invalid_argument(format!("{context} exceeds u64")))?,
+    )?;
     usize_from_u64(position, context)
 }
 
@@ -219,5 +259,21 @@ mod tests {
         let cols = AxisIndex::positions([3, 1]).normalize(4).unwrap();
         let out = dense_select(&bytes, 3, 4, DType::F32, &rows, &cols, 4).unwrap();
         assert_eq!(out.values(), f32_bytes(&[11.0, 9.0, 3.0, 1.0]));
+    }
+
+    #[test]
+    fn strided_rows_match_expanded_positions() {
+        let values: Vec<f32> = (0..20).map(|v| v as f32).collect();
+        let bytes = f32_bytes(&values);
+        let strided = AxisIndex::strided(0, 5, 2).normalize(5).unwrap();
+        let expanded = AxisIndex::positions([0, 2, 4]).normalize(5).unwrap();
+        let cols = AxisIndex::range(1, 3).normalize(4).unwrap();
+        let from_stride = dense_select(&bytes, 5, 4, DType::F32, &strided, &cols, 2).unwrap();
+        let from_gather = dense_select(&bytes, 5, 4, DType::F32, &expanded, &cols, 2).unwrap();
+        assert_eq!(from_stride.values(), from_gather.values());
+        assert_eq!(
+            from_stride.values(),
+            f32_bytes(&[1.0, 2.0, 9.0, 10.0, 17.0, 18.0])
+        );
     }
 }

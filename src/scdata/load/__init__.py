@@ -1,7 +1,6 @@
 """Compile row requests into reusable prefetch plans."""
 
-from scdata import _core
-from scdata.compress.limits import ReadLimits
+from scdata.compress import ReadLimits
 from scdata.exceptions import (
     AllocationError,
     CancelledError,
@@ -20,12 +19,14 @@ from scdata.exceptions import (
     UnsupportedError,
     WorkerPanicError,
 )
-from scdata.load.config import IoMode, PlanConfig, ResourceLimits, SessionConfig
-from scdata.load.dataset import Dataset, DatasetKind, RowRef, register
-from scdata.load.distributed import DistributedIterator, DistributedSession, distributed_prefetch
-from scdata.load.output import OutputSpec, OverflowPolicy
-from scdata.load.plan import Plan, Prefetch, Session, compile, prefetch
-from scdata.load.stats import PlanStats, RuntimeStats, SessionState
+from scdata.load._config import IoMode, PlanConfig, ResourceLimits, SessionConfig
+from scdata.load._dataset import Dataset, DatasetKind, RowRef, register
+from scdata.load._distributed import DistributedIterator, DistributedSession, distributed_prefetch
+from scdata.load._location import list_keys, read_feature_names, read_obs_names
+from scdata.load._names import as_str_tuple, build_feature_map, locate_names
+from scdata.load._output import OutputSpec, OverflowPolicy
+from scdata.load._plan import Plan, Prefetch, Session, compile, prefetch
+from scdata.load._stats import PlanStats, RuntimeStats, SessionState
 
 __all__ = [
     "AllocationError",
@@ -62,9 +63,14 @@ __all__ = [
     "SessionState",
     "UnsupportedError",
     "WorkerPanicError",
-    "_core",
+    "as_str_tuple",
+    "build_feature_map",
     "compile",
     "distributed_prefetch",
+    "list_keys",
+    "locate_names",
     "prefetch",
+    "read_feature_names",
+    "read_obs_names",
     "register",
 ]

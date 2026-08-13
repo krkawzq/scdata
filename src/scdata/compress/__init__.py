@@ -1,8 +1,8 @@
-"""sc-compress store I/O: open, write, and on-demand select."""
+"""SCC store I/O: open, write, and on-demand select."""
 
-from scdata.exceptions import Error, InvalidArgumentError, PerformanceWarning
-from scdata.matrix import ScCsr, ScDense
-from scdata.compress.format import (
+from scdata.compress._csr import ScCsr
+from scdata.compress._dense import ScDense
+from scdata.compress._format import (
     FORMAT_NAME,
     FORMAT_VERSION,
     INDEX_DTYPES,
@@ -12,27 +12,28 @@ from scdata.compress.format import (
     is_index_dtype,
     is_value_dtype,
 )
-from scdata.compress.io import (
+from scdata.compress._io import (
     open_store,
     write,
     write_csr,
     write_csr_arrays,
     write_dense,
 )
-from scdata.compress.limits import DEFAULT_N_WORKERS, DEFAULT_READ_LIMITS, ReadLimits
-from scdata.compress.store import Store, StoreInfo
-from scdata.compress.write_options import (
+from scdata.compress._limits import DEFAULT_READ_LIMITS, ReadLimits
+from scdata.compress._write_options import (
     DEFAULT_BLOCK_BUDGET,
     DEFAULT_CHUNK_BUDGET,
     DEFAULT_WRITE_OPTIONS,
     WriteOptions,
 )
-from scdata.compress import zip
+from scdata.compress import _zip as zip
+from scdata.exceptions import Error, InvalidArgumentError, PerformanceWarning
+
+open = open_store
 
 __all__ = [
     "DEFAULT_BLOCK_BUDGET",
     "DEFAULT_CHUNK_BUDGET",
-    "DEFAULT_N_WORKERS",
     "DEFAULT_READ_LIMITS",
     "DEFAULT_WRITE_OPTIONS",
     "FORMAT_NAME",
@@ -47,8 +48,6 @@ __all__ = [
     "ReadLimits",
     "ScCsr",
     "ScDense",
-    "Store",
-    "StoreInfo",
     "WriteOptions",
     "is_index_dtype",
     "is_value_dtype",
@@ -60,5 +59,3 @@ __all__ = [
     "write_dense",
     "zip",
 ]
-
-open = open_store

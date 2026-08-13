@@ -102,7 +102,7 @@ def run_once(
     args: argparse.Namespace,
     executor: ThreadPoolExecutor,
 ) -> None:
-    config = sc_load.SessionConfig(worker_count=args.world_size, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=args.world_size, io_mode="blocking")
     with plan.open_distributed(args.world_size, config) as distributed:
         iterators = distributed.ranks(
             copy=not (args.zero_copy or args.legacy_copy or args.legacy_read)

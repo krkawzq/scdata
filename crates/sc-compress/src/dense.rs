@@ -14,7 +14,7 @@ use crate::partition::{dense_blosc1_block_size, visit_dense_chunks, Partition};
 use crate::range_decode::{
     decode_blosc_scatter_into, BloscScatterRequest, RangeDecodeContext, ScatterMapping,
 };
-use crate::select::NormalizedAxis;
+use crate::select::{visit_run_chunks, AxisRun, NormalizedAxis};
 use crate::storage::{chunk_key, ByteStore, DirectoryTransaction, StoreLocation};
 
 const DATA_DIR: &str = "data";
@@ -43,7 +43,7 @@ impl DenseWriter {
     }
 
     /// Sets Blosc1 codec options. Any configured `block_size` is ignored and
-    /// recomputed from [`Self::block`] when writing.
+    /// recomputed from the writer's block partition when writing.
     pub fn compressor(mut self, compressor: Compressor) -> Self {
         self.compressor = compressor;
         self
@@ -309,99 +309,137 @@ fn plan_dense_scatter_requests(
     element_size: usize,
 ) -> Result<Vec<BloscScatterRequest>> {
     let column_runs = dense_column_runs(cols, element_size)?;
-    match rows {
-        NormalizedAxis::Contiguous { start, end } => {
-            let mut requests = Vec::new();
-            for chunk_id in matrix.meta.chunks.overlapping_chunks(*start, *end) {
-                let (chunk_start, chunk_end) =
-                    matrix.meta.chunks.cell_range(chunk_id, matrix.n_rows())?;
-                let overlap_start = (*start).max(chunk_start);
-                let overlap_end = (*end).min(chunk_end);
-                if overlap_start >= overlap_end {
-                    continue;
-                }
-                let expected = checked_byte_len(chunk_end - chunk_start, row_bytes, "dense chunk")?;
-                let mut mappings = Vec::new();
-                if is_full_dense_row(&column_runs, row_bytes) {
-                    mappings.try_reserve_exact(1)?;
-                    let source_start = checked_byte_len(
-                        overlap_start - chunk_start,
-                        row_bytes,
-                        "dense source rows",
-                    )?;
-                    let destination_start = checked_byte_len(
-                        overlap_start - *start,
-                        output_row_bytes,
-                        "dense destination rows",
-                    )?;
-                    let len = checked_byte_len(
-                        overlap_end - overlap_start,
-                        row_bytes,
-                        "dense selected rows",
-                    )?;
-                    mappings.push(ScatterMapping {
-                        source: source_start..source_start + len,
-                        destination: destination_start..destination_start + len,
-                    });
-                } else {
-                    for source_row in overlap_start..overlap_end {
-                        append_dense_row_mappings(
-                            &mut mappings,
-                            source_row - chunk_start,
-                            source_row - *start,
-                            row_bytes,
-                            output_row_bytes,
-                            &column_runs,
-                        )?;
-                    }
-                }
-                requests.try_reserve(1)?;
-                requests.push(BloscScatterRequest {
-                    key: chunk_key(&matrix.meta.data.path, chunk_id as u64),
-                    expected,
-                    mappings,
-                });
-            }
-            Ok(requests)
-        }
-        NormalizedAxis::Gather { positions } => {
-            let mut items = Vec::new();
-            items.try_reserve_exact(positions.len())?;
-            for (destination, &source) in positions.iter().enumerate() {
-                items.push((matrix.meta.chunks.chunk_of(source)?, source, destination));
-            }
-            items.sort_unstable();
-            let mut requests = Vec::new();
-            let mut cursor = 0usize;
-            while cursor < items.len() {
-                let chunk_id = items[cursor].0;
-                let (chunk_start, chunk_end) =
-                    matrix.meta.chunks.cell_range(chunk_id, matrix.n_rows())?;
-                let mut mappings = Vec::new();
-                while cursor < items.len() && items[cursor].0 == chunk_id {
-                    let (_, source, destination) = items[cursor];
-                    append_dense_row_mappings(
-                        &mut mappings,
-                        source - chunk_start,
-                        u64::try_from(destination).map_err(|_| {
-                            Error::invalid_argument("dense destination row exceeds u64")
-                        })?,
-                        row_bytes,
-                        output_row_bytes,
-                        &column_runs,
-                    )?;
-                    cursor += 1;
-                }
-                requests.try_reserve(1)?;
-                requests.push(BloscScatterRequest {
-                    key: chunk_key(&matrix.meta.data.path, chunk_id as u64),
-                    expected: checked_byte_len(chunk_end - chunk_start, row_bytes, "dense chunk")?,
-                    mappings,
-                });
-            }
-            Ok(requests)
-        }
+    if let NormalizedAxis::Contiguous { start, end } = rows {
+        return plan_contiguous_dense_requests(
+            matrix,
+            *start,
+            *end,
+            &column_runs,
+            row_bytes,
+            output_row_bytes,
+        );
     }
+
+    let n_chunks = matrix.meta.chunks.n_chunks();
+    let mut mappings_by_chunk = Vec::new();
+    mappings_by_chunk.try_reserve_exact(n_chunks)?;
+    mappings_by_chunk.resize_with(n_chunks, Vec::new);
+    rows.visit_runs(|run| {
+        visit_run_chunks(
+            run,
+            |row| matrix.meta.chunks.chunk_of(row),
+            |chunk| matrix.meta.chunks.cell_range(chunk, matrix.n_rows()),
+            |chunk_id, subrun| {
+                let (chunk_start, _) = matrix.meta.chunks.cell_range(chunk_id, matrix.n_rows())?;
+                append_dense_run_mappings(
+                    &mut mappings_by_chunk[chunk_id],
+                    subrun,
+                    chunk_start,
+                    &column_runs,
+                    row_bytes,
+                    output_row_bytes,
+                )
+            },
+        )
+    })?;
+
+    let mut requests = Vec::new();
+    for (chunk_id, mappings) in mappings_by_chunk.into_iter().enumerate() {
+        if mappings.is_empty() {
+            continue;
+        }
+        let (chunk_start, chunk_end) = matrix.meta.chunks.cell_range(chunk_id, matrix.n_rows())?;
+        requests.try_reserve(1)?;
+        requests.push(BloscScatterRequest {
+            key: chunk_key(&matrix.meta.data.path, chunk_id as u64),
+            expected: checked_byte_len(chunk_end - chunk_start, row_bytes, "dense chunk")?,
+            mappings,
+        });
+    }
+    Ok(requests)
+}
+
+fn plan_contiguous_dense_requests(
+    matrix: &DenseMatrix,
+    start: u64,
+    end: u64,
+    column_runs: &[DenseColumnRun],
+    row_bytes: usize,
+    output_row_bytes: usize,
+) -> Result<Vec<BloscScatterRequest>> {
+    let mut requests = Vec::new();
+    for chunk_id in matrix.meta.chunks.overlapping_chunks(start, end) {
+        let (chunk_start, chunk_end) = matrix.meta.chunks.cell_range(chunk_id, matrix.n_rows())?;
+        let overlap_start = start.max(chunk_start);
+        let overlap_end = end.min(chunk_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let expected = checked_byte_len(chunk_end - chunk_start, row_bytes, "dense chunk")?;
+        let mut mappings = Vec::new();
+        append_dense_run_mappings(
+            &mut mappings,
+            AxisRun {
+                source: overlap_start,
+                destination: overlap_start - start,
+                count: overlap_end - overlap_start,
+                source_step: 1,
+            },
+            chunk_start,
+            column_runs,
+            row_bytes,
+            output_row_bytes,
+        )?;
+        requests.try_reserve(1)?;
+        requests.push(BloscScatterRequest {
+            key: chunk_key(&matrix.meta.data.path, chunk_id as u64),
+            expected,
+            mappings,
+        });
+    }
+    Ok(requests)
+}
+
+fn append_dense_run_mappings(
+    mappings: &mut Vec<ScatterMapping>,
+    run: AxisRun,
+    chunk_start: u64,
+    column_runs: &[DenseColumnRun],
+    row_bytes: usize,
+    output_row_bytes: usize,
+) -> Result<()> {
+    if run.count == 0 {
+        return Ok(());
+    }
+    if run.source_step == 1 && is_full_dense_row(column_runs, row_bytes) {
+        let source_start =
+            checked_byte_len(run.source - chunk_start, row_bytes, "dense source rows")?;
+        let destination_start =
+            checked_byte_len(run.destination, output_row_bytes, "dense destination rows")?;
+        let len = checked_byte_len(run.count, row_bytes, "dense selected rows")?;
+        push_scatter_mapping(
+            mappings,
+            source_start..source_start + len,
+            destination_start..destination_start + len,
+        );
+        return Ok(());
+    }
+    for index in 0..run.count {
+        let source = run.nth(index)?;
+        let destination = run
+            .destination
+            .checked_add(index)
+            .ok_or_else(|| Error::invalid_argument("dense destination row overflow"))?;
+        append_dense_row_mappings(
+            mappings,
+            source - chunk_start,
+            destination,
+            row_bytes,
+            output_row_bytes,
+            column_runs,
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -423,40 +461,57 @@ fn is_full_dense_row(runs: &[DenseColumnRun], row_bytes: usize) -> bool {
 }
 
 fn dense_column_runs(cols: &NormalizedAxis, element_size: usize) -> Result<Vec<DenseColumnRun>> {
-    match cols {
-        NormalizedAxis::Contiguous { start, end } => Ok(vec![DenseColumnRun {
-            source: checked_byte_len(*start, element_size, "dense source columns")?,
-            destination: 0,
-            len: checked_byte_len(end - start, element_size, "dense selected columns")?,
-        }]),
-        NormalizedAxis::Gather { positions } => {
-            let mut runs: Vec<DenseColumnRun> = Vec::new();
-            runs.try_reserve_exact(positions.len())?;
-            for (destination, &source) in positions.iter().enumerate() {
-                let source = checked_byte_len(source, element_size, "dense source column")?;
-                let destination = destination
-                    .checked_mul(element_size)
-                    .ok_or_else(|| Error::invalid_argument("dense destination column overflow"))?;
-                if let Some(previous) = runs.last_mut() {
-                    if previous.source.checked_add(previous.len) == Some(source)
-                        && previous.destination.checked_add(previous.len) == Some(destination)
-                    {
-                        previous.len = previous
-                            .len
-                            .checked_add(element_size)
-                            .ok_or_else(|| Error::invalid_argument("dense column run overflow"))?;
-                        continue;
-                    }
-                }
-                runs.push(DenseColumnRun {
-                    source,
-                    destination,
-                    len: element_size,
-                });
-            }
-            Ok(runs)
+    let mut runs = Vec::new();
+    cols.visit_runs(|run| {
+        if run.source_step == 1 {
+            let source = checked_byte_len(run.source, element_size, "dense source columns")?;
+            let destination =
+                checked_byte_len(run.destination, element_size, "dense destination columns")?;
+            let len = checked_byte_len(run.count, element_size, "dense selected columns")?;
+            push_dense_column_run(&mut runs, source, destination, len)?;
+            return Ok(());
+        }
+        runs.try_reserve(
+            usize::try_from(run.count)
+                .map_err(|_| Error::invalid_argument("dense column run count exceeds usize"))?,
+        )?;
+        for index in 0..run.count {
+            let source = checked_byte_len(run.nth(index)?, element_size, "dense source column")?;
+            let destination = checked_byte_len(
+                run.destination + index,
+                element_size,
+                "dense destination column",
+            )?;
+            push_dense_column_run(&mut runs, source, destination, element_size)?;
+        }
+        Ok(())
+    })?;
+    Ok(runs)
+}
+
+fn push_dense_column_run(
+    runs: &mut Vec<DenseColumnRun>,
+    source: usize,
+    destination: usize,
+    len: usize,
+) -> Result<()> {
+    if let Some(previous) = runs.last_mut() {
+        if previous.source.checked_add(previous.len) == Some(source)
+            && previous.destination.checked_add(previous.len) == Some(destination)
+        {
+            previous.len = previous
+                .len
+                .checked_add(len)
+                .ok_or_else(|| Error::invalid_argument("dense column run overflow"))?;
+            return Ok(());
         }
     }
+    runs.push(DenseColumnRun {
+        source,
+        destination,
+        len,
+    });
+    Ok(())
 }
 
 fn append_dense_row_mappings(

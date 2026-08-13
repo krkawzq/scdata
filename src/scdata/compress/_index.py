@@ -7,9 +7,9 @@ from typing import Any
 
 import numpy as np
 
-from scdata.exceptions import _invalid_argument
 
-__all__ = ["AxisSpec", "normalize_axis", "normalize_key"]
+
+__all__ = ["AxisSpec", "normalize_axis", "normalize_key", "rust_payload"]
 
 
 class AxisSpec:
@@ -28,13 +28,7 @@ def normalize_key(
     n_rows: int,
     n_cols: int,
 ) -> tuple[AxisSpec, AxisSpec, bool]:
-    """Normalize ``obj[key]`` into ``(rows, cols, drop_row_dim)``.
-
-    Supports:
-    - ``obj[i]`` / ``obj[i:j]`` / fancy rows  → columns = all
-    - ``obj[rows, cols]`` 2-D indexing
-    - bool masks, integer arrays, slices (incl. step), ``:``, ``...``
-    """
+    """Normalize ``obj[key]`` into ``(rows, cols, drop_row_dim)``."""
     if isinstance(key, tuple):
         if len(key) == 0:
             return (
@@ -61,7 +55,6 @@ def normalize_axis(key: Any, axis_len: int, *, name: str = "axis") -> AxisSpec:
 
 
 def _normalize_one(key: Any, axis_len: int, *, name: str) -> tuple[AxisSpec, bool]:
-    """Return ``(spec, is_scalar)``."""
     if key is Ellipsis or key is None:
         return AxisSpec("all", None, axis_len), False
 
@@ -75,32 +68,36 @@ def _normalize_one(key: Any, axis_len: int, *, name: str) -> tuple[AxisSpec, boo
     if isinstance(key, (bool, np.bool_)):
         raise TypeError(f"{name} index must not be a bare bool")
 
-    # Boolean mask
     if isinstance(key, np.ndarray) and key.dtype == np.bool_:
         if key.ndim != 1:
-            _invalid_argument(f"{name} boolean mask must be 1-D, got shape {key.shape}")
+            raise IndexError(f"{name} boolean mask must be 1-D, got shape {key.shape}")
         if key.shape[0] != axis_len:
-            _invalid_argument(
+            raise IndexError(
                 f"{name} boolean mask length {key.shape[0]} does not match axis {axis_len}"
             )
         positions = np.flatnonzero(key).astype(np.uint64, copy=False)
         return AxisSpec("positions", np.ascontiguousarray(positions), int(positions.size)), False
 
-    # Integer array / sequence
     if isinstance(key, np.ndarray) or isinstance(key, (list, tuple)):
-        arr = np.asarray(key)
+        try:
+            arr = np.asarray(key)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise TypeError(f"{name} fancy index cannot be converted to an array: {error}") from error
         if arr.dtype == np.bool_:
             return _normalize_one(arr, axis_len, name=name)
         if arr.ndim == 0:
             return _normalize_scalar(int(arr), axis_len, name=name)
+        if arr.ndim == 2 and 1 in arr.shape:
+            arr = arr.reshape(-1)
         if arr.ndim != 1:
-            _invalid_argument(f"{name} fancy index must be 1-D, got shape {arr.shape}")
+            raise IndexError(f"{name} fancy index must be 1-D, got shape {arr.shape}")
         if arr.size == 0:
             return AxisSpec("positions", np.empty(0, dtype=np.uint64), 0), False
         if arr.dtype.kind not in "iu":
-            _invalid_argument(f"{name} fancy index must be integer, got dtype {arr.dtype}")
+            raise IndexError(f"{name} fancy index must be integer, got dtype {arr.dtype}")
+        if arr.dtype.kind == "u" and int(arr.max()) > np.iinfo(np.int64).max:
+            raise IndexError(f"{name} index exceeds signed platform range")
         positions = arr.astype(np.int64, copy=False)
-        # Resolve negatives.
         neg = positions < 0
         if neg.any():
             positions = positions.copy()
@@ -111,7 +108,6 @@ def _normalize_one(key: Any, axis_len: int, *, name: str) -> tuple[AxisSpec, boo
         out = np.ascontiguousarray(positions.astype(np.uint64, copy=False))
         return AxisSpec("positions", out, int(out.size)), False
 
-    # Scalar integer
     try:
         scalar = index(key)
     except TypeError as exc:

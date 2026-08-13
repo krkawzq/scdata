@@ -13,4 +13,4 @@ pub use csr::{
 };
 pub(crate) use csr::{csr_filter_cols, output_index_dtype, GatherColumns};
 pub use dense::dense_select;
-pub(crate) use util::{read_index_unchecked, write_index};
+pub(crate) use util::{read_index_unchecked, write_index_unchecked};

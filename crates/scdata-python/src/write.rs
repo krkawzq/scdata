@@ -7,7 +7,7 @@ use sc_compress::{CsrWriter, DenseWriter, Partition};
 
 use crate::convert::{copy_u64_1d, dispatch_csr_data, dispatch_dense, CsrData, DenseValues};
 use crate::error::{invalid_argument, ResultExt};
-use crate::validate_n_workers;
+use crate::validate_num_workers;
 
 fn parse_partition(policy: &str, n: u64, what: &str) -> PyResult<Partition> {
     if n == 0 {
@@ -44,7 +44,7 @@ fn partitions(
     chunk_n,
     block_policy,
     block_n,
-    n_workers,
+    num_workers,
 ))]
 #[expect(
     clippy::too_many_arguments,
@@ -58,12 +58,12 @@ pub fn write_dense(
     chunk_n: u64,
     block_policy: &str,
     block_n: u64,
-    n_workers: usize,
+    num_workers: usize,
 ) -> PyResult<()> {
-    validate_n_workers(n_workers)?;
+    validate_num_workers(num_workers)?;
     let (chunk, block) = partitions(chunk_policy, chunk_n, block_policy, block_n)?;
     dispatch_dense(values, |values, shape| {
-        let writer = DenseWriter::new(&path, chunk, block).threads(n_workers);
+        let writer = DenseWriter::new(&path, chunk, block).threads(num_workers);
         match values {
             DenseValues::U16(values) => {
                 py.allow_threads(|| writer.write(values, shape)).map_sc()?
@@ -71,10 +71,16 @@ pub fn write_dense(
             DenseValues::U32(values) => {
                 py.allow_threads(|| writer.write(values, shape)).map_sc()?
             }
+            DenseValues::U64(values) => {
+                py.allow_threads(|| writer.write(values, shape)).map_sc()?
+            }
             DenseValues::I16(values) => {
                 py.allow_threads(|| writer.write(values, shape)).map_sc()?
             }
             DenseValues::I32(values) => {
+                py.allow_threads(|| writer.write(values, shape)).map_sc()?
+            }
+            DenseValues::I64(values) => {
                 py.allow_threads(|| writer.write(values, shape)).map_sc()?
             }
             DenseValues::F32(values) => {
@@ -102,7 +108,7 @@ pub fn write_dense(
     chunk_n,
     block_policy,
     block_n,
-    n_workers,
+    num_workers,
 ))]
 #[expect(
     clippy::too_many_arguments,
@@ -120,20 +126,22 @@ pub fn write_csr(
     chunk_n: u64,
     block_policy: &str,
     block_n: u64,
-    n_workers: usize,
+    num_workers: usize,
 ) -> PyResult<()> {
-    validate_n_workers(n_workers)?;
+    validate_num_workers(num_workers)?;
     let (chunk, block) = partitions(chunk_policy, chunk_n, block_policy, block_n)?;
     let indptr = copy_u64_1d(indptr, "indptr")?;
     let indices = copy_u64_1d(indices, "indices")?;
     let shape = [n_rows, n_cols];
     dispatch_csr_data(data, |data| {
-        let writer = CsrWriter::new(&path, chunk, block).threads(n_workers);
+        let writer = CsrWriter::new(&path, chunk, block).threads(num_workers);
         py.allow_threads(move || match data {
             CsrData::U16(data) => writer.write_promoted(indptr, indices, data, shape),
             CsrData::U32(data) => writer.write_promoted(indptr, indices, data, shape),
+            CsrData::U64(data) => writer.write_promoted(indptr, indices, data, shape),
             CsrData::I16(data) => writer.write_promoted(indptr, indices, data, shape),
             CsrData::I32(data) => writer.write_promoted(indptr, indices, data, shape),
+            CsrData::I64(data) => writer.write_promoted(indptr, indices, data, shape),
             CsrData::F32(data) => writer.write_promoted(indptr, indices, data, shape),
             CsrData::F64(data) => writer.write_promoted(indptr, indices, data, shape),
         })

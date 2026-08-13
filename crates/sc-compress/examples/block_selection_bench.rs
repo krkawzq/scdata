@@ -35,10 +35,14 @@ fn main() {
     let dense_values = (0..rows * cols)
         .map(|value| u16::try_from(value % 251).unwrap())
         .collect::<Vec<_>>();
-    DenseWriter::new(&dense_root, Partition::fixed_cells(4_096), Partition::fixed_cells(8))
-        .threads(4)
-        .write(&dense_values, [rows as u64, cols as u64])
-        .unwrap();
+    DenseWriter::new(
+        &dense_root,
+        Partition::fixed_cells(4_096),
+        Partition::fixed_cells(8),
+    )
+    .threads(4)
+    .write(&dense_values, [rows as u64, cols as u64])
+    .unwrap();
     let dense = open_dense_with_limits(&dense_root, limits).unwrap();
     let selection = Selection::rows_only(AxisIndex::positions(selected_rows.clone()));
     let direct_dense = measure(|| {
@@ -98,10 +102,14 @@ fn main() {
             values.push(((row + col) % 251) as u16);
         }
     }
-    CsrWriter::new(&csr_root, Partition::fixed_cells(4_096), Partition::fixed_cells(8))
-        .threads(4)
-        .write(&indptr, &indices, &values, [rows as u64, cols as u64])
-        .unwrap();
+    CsrWriter::new(
+        &csr_root,
+        Partition::fixed_cells(4_096),
+        Partition::fixed_cells(8),
+    )
+    .threads(4)
+    .write(&indptr, &indices, &values, [rows as u64, cols as u64])
+    .unwrap();
     let csr = open_csr_with_limits(&csr_root, limits).unwrap();
     let selection = Selection::rows_only(AxisIndex::positions(selected_rows.clone()));
     let direct_csr = measure(|| {
@@ -131,6 +139,15 @@ fn main() {
     println!("csr_block_scatter median={direct_csr:?}");
     println!("csr_bounding_window median={bounding_csr:?}");
 
+    let wide_column_selection = Selection::new(AxisIndex::All, AxisIndex::range(8, 56));
+    let direct_csr_wide_columns = measure(|| {
+        black_box(
+            csr.select(wide_column_selection.clone(), CsrOutput::Sparse)
+                .unwrap(),
+        );
+    });
+    println!("csr_wide_column_range median={direct_csr_wide_columns:?}");
+
     let sparse_cols_root = temp.path().join("csr-sparse-columns");
     let sparse_col_indptr = (0..=rows)
         .map(|row| (row * nnz_per_row) as u64)
@@ -144,15 +161,19 @@ fn main() {
             sparse_col_values.push((row * nnz_per_row + offset) as f64);
         }
     }
-    CsrWriter::new(&sparse_cols_root, Partition::fixed_cells(rows as u64), Partition::fixed_cells(1))
-        .threads(4)
-        .write(
-            &sparse_col_indptr,
-            &sparse_col_indices,
-            &sparse_col_values,
-            [rows as u64, cols as u64],
-        )
-        .unwrap();
+    CsrWriter::new(
+        &sparse_cols_root,
+        Partition::fixed_cells(rows as u64),
+        Partition::fixed_cells(1),
+    )
+    .threads(4)
+    .write(
+        &sparse_col_indptr,
+        &sparse_col_indices,
+        &sparse_col_values,
+        [rows as u64, cols as u64],
+    )
+    .unwrap();
     let sparse_cols = open_csr_with_limits(&sparse_cols_root, limits).unwrap();
     let sparse_col_selection = Selection::new(AxisIndex::All, AxisIndex::range(0, 1));
     let direct_sparse_cols = measure(|| {

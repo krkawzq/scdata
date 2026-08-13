@@ -154,3 +154,128 @@ fn compiled_plan_pins_generation_while_new_plans_see_replacement() {
         vec![vec![11, 12], vec![13, 14]]
     );
 }
+
+#[test]
+fn int64_and_uint64_storage_preserve_full_precision() {
+    let temporary = tempfile::tempdir().unwrap();
+
+    let dense_path = temporary.path().join("dense-i64");
+    let dense_values = [i64::MIN + 1, -(1i64 << 53) - 1, (1i64 << 53) + 1, i64::MAX];
+    DenseWriter::new(
+        &dense_path,
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(1),
+    )
+    .write(&dense_values, [2, 2])
+    .unwrap();
+    let dense_dataset = Dataset::open(&dense_path).unwrap();
+    assert_eq!(dense_dataset.dtype(), StorageDType::I64);
+    let dense_source = SourceId::new(0);
+    let dense_plan = compile(PlanSpec::new(
+        vec![Source::new(dense_source, dense_dataset)],
+        vec![RowRef::new(dense_source, 0), RowRef::new(dense_source, 1)],
+        OutputSpec::new(2, OutputDType::I64, Fill::I64(0)).unwrap(),
+        1,
+        2,
+    ))
+    .unwrap();
+    assert_eq!(
+        drain_rows::<i64>(&dense_plan, 1).0,
+        dense_values
+            .chunks_exact(2)
+            .map(<[i64]>::to_vec)
+            .collect::<Vec<_>>()
+    );
+
+    let csr_path = temporary.path().join("csr-u64");
+    let csr_values = [0u64, (1u64 << 53) + 1, (1u64 << 63) + 1, u64::MAX];
+    CsrWriter::new(
+        &csr_path,
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(1),
+    )
+    .write(&[0u64, 2, 4], &[0u32, 1, 0, 1], &csr_values, [2, 2])
+    .unwrap();
+    let csr_dataset = Dataset::open(&csr_path).unwrap();
+    assert_eq!(csr_dataset.dtype(), StorageDType::U64);
+    let csr_source = SourceId::new(0);
+    let csr_plan = compile(PlanSpec::new(
+        vec![Source::new(csr_source, csr_dataset)],
+        vec![RowRef::new(csr_source, 0), RowRef::new(csr_source, 1)],
+        OutputSpec::new(2, OutputDType::U64, Fill::U64(0)).unwrap(),
+        1,
+        2,
+    ))
+    .unwrap();
+    assert_eq!(
+        drain_rows::<u64>(&csr_plan, 1).0,
+        csr_values
+            .chunks_exact(2)
+            .map(<[u64]>::to_vec)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn widening_to_64_bit_outputs_handles_dense_maps_and_csr_scatter() {
+    let temporary = tempfile::tempdir().unwrap();
+
+    let dense_path = temporary.path().join("dense-i32-map");
+    let dense_values = [i32::MIN, -1, i32::MAX, 7, -9, 1 << 30];
+    DenseWriter::new(
+        &dense_path,
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(1),
+    )
+    .write(&dense_values, [2, 3])
+    .unwrap();
+    let dense_source_id = SourceId::new(21);
+    let dense_source = Source::new(dense_source_id, Dataset::open(&dense_path).unwrap())
+        .feature_map(FeatureMap::new([Some(2), Some(0), Some(3)]).unwrap());
+    let dense_plan = compile(PlanSpec::new(
+        vec![dense_source],
+        vec![
+            RowRef::new(dense_source_id, 1),
+            RowRef::new(dense_source_id, 0),
+        ],
+        OutputSpec::new(5, OutputDType::I64, Fill::I64(-17)).unwrap(),
+        1,
+        2,
+    ))
+    .unwrap();
+    assert_eq!(
+        drain_rows::<i64>(&dense_plan, 1).0,
+        vec![
+            vec![-9, -17, 7, 1 << 30, -17],
+            vec![-1, -17, i64::from(i32::MIN), i64::from(i32::MAX), -17],
+        ]
+    );
+
+    let csr_path = temporary.path().join("csr-u32-map");
+    let csr_values = [0u32, 3, u32::MAX, (1u32 << 31) + 1, 17];
+    CsrWriter::new(
+        &csr_path,
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(1),
+    )
+    .write(&[0u64, 3, 5], &[0u32, 2, 3, 1, 3], &csr_values, [2, 4])
+    .unwrap();
+    let csr_source_id = SourceId::new(22);
+    let csr_source = Source::new(csr_source_id, Dataset::open(&csr_path).unwrap())
+        .feature_map(FeatureMap::new([Some(3), Some(1), None, Some(0)]).unwrap());
+    let csr_plan = compile(PlanSpec::new(
+        vec![csr_source],
+        vec![RowRef::new(csr_source_id, 0), RowRef::new(csr_source_id, 1)],
+        OutputSpec::new(5, OutputDType::U64, Fill::U64(99)).unwrap(),
+        1,
+        2,
+    ))
+    .unwrap();
+    assert_eq!(
+        drain_rows::<u64>(&csr_plan, 1).0,
+        vec![
+            vec![u64::from(u32::MAX), 99, 99, 0, 99],
+            vec![17, u64::from((1u32 << 31) + 1), 99, 99, 99],
+        ]
+    );
+}

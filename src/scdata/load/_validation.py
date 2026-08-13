@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 import operator
-import sys
 from collections.abc import Iterable
 from numbers import Real
-from typing import Any, SupportsIndex, cast
+from typing import Any, cast
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
+
+from scdata._validate import as_int
 
 _U32_MAX = (1 << 32) - 1
 _U64_MAX = (1 << 64) - 1
@@ -19,49 +20,15 @@ _I64_MAX = (1 << 63) - 1
 _DTYPE_NAMES = {
     np.dtype(np.int16): "i16",
     np.dtype(np.int32): "i32",
+    np.dtype(np.int64): "i64",
     np.dtype(np.uint16): "u16",
     np.dtype(np.uint32): "u32",
+    np.dtype(np.uint64): "u64",
     np.dtype(np.float32): "f32",
     np.dtype(np.float64): "f64",
 }
 _CORE_OUTPUT_DTYPES = {name: dtype for dtype, name in _DTYPE_NAMES.items()}
-_CORE_STORAGE_DTYPES = {
-    **_CORE_OUTPUT_DTYPES,
-    "u64": np.dtype(np.uint64),
-}
-
-
-def as_int(
-    value: object,
-    name: str,
-    *,
-    minimum: int = 0,
-    maximum: int = sys.maxsize,
-) -> int:
-    """Return an exact integer, rejecting booleans and lossy coercions."""
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be an integer, not bool")
-    try:
-        parsed = operator.index(cast(SupportsIndex, value))
-    except TypeError as error:
-        raise TypeError(f"{name} must be an integer") from error
-    if parsed < minimum or parsed > maximum:
-        raise ValueError(f"{name} must be in [{minimum}, {maximum}], got {parsed}")
-    return parsed
-
-
-def as_float(value: object, name: str, *, positive: bool = False) -> float:
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
-        raise TypeError(f"{name} must be a real number")
-    try:
-        parsed = float(value)
-    except (OverflowError, ValueError) as error:
-        raise ValueError(f"{name} must be a finite floating-point value") from error
-    if not math.isfinite(parsed):
-        raise ValueError(f"{name} must be finite")
-    if positive and parsed <= 0.0:
-        raise ValueError(f"{name} must be positive")
-    return parsed
+_CORE_STORAGE_DTYPES = _CORE_OUTPUT_DTYPES
 
 
 def normalize_dtype(value: DTypeLike) -> tuple[np.dtype[Any], str]:

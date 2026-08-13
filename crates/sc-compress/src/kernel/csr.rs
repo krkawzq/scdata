@@ -4,6 +4,8 @@
     reason = "low-level CSR kernels keep independent layout buffers and dtypes explicit"
 )]
 
+use std::mem::MaybeUninit;
+
 use crate::array::{CsrArray, DenseArray};
 use crate::dtype::DType;
 use crate::error::{Error, Result};
@@ -12,8 +14,8 @@ use crate::parallel;
 use crate::select::NormalizedAxis;
 
 use super::util::{
-    checked_mul, copy_elem, par_for_row_blocks, read_index_unchecked, usize_from_u64, write_index,
-    zeroed, ROW_JOB,
+    assume_init_bytes, checked_mul, copy_elem_unchecked, par_for_row_blocks, read_index_unchecked,
+    uninit_bytes, usize_from_u64, write_index_unchecked, zeroed, ROW_JOB,
 };
 
 /// Column remap: `src_col -> Some(dst_col)` or drop.
@@ -55,10 +57,93 @@ impl CsrColMap {
                 .map(|index| map[index].1),
         }
     }
+
+    /// Map a source column already validated against the map's source width.
+    ///
+    /// # Safety
+    ///
+    /// `src_col` must be smaller than the `n_cols` used to construct this map.
+    #[inline(always)]
+    unsafe fn map_unchecked(&self, src_col: u64) -> Option<u32> {
+        match &self.storage {
+            CsrColMapStorage::Affine { start, end } => {
+                if src_col < *start || src_col >= *end {
+                    None
+                } else {
+                    u32::try_from(src_col - start).ok()
+                }
+            }
+            CsrColMapStorage::Dense(map) => {
+                debug_assert!((src_col as usize) < map.len());
+                // SAFETY: the caller guarantees `src_col` is inside the source
+                // width, which is exactly the dense map length.
+                let destination = unsafe { *map.get_unchecked(src_col as usize) };
+                (destination != u32::MAX).then_some(destination)
+            }
+            CsrColMapStorage::Sparse(map) => map
+                .binary_search_by_key(&src_col, |&(source, _)| source)
+                .ok()
+                .map(|index| {
+                    // SAFETY: `binary_search_by_key` returned an index into the
+                    // same immutable slice.
+                    unsafe { map.get_unchecked(index).1 }
+                }),
+        }
+    }
+
+    /// Visit mapped entries from one canonical CSR row.
+    ///
+    /// # Safety
+    ///
+    /// `start..end` must delimit a validated, strictly increasing packed CSR
+    /// row in `indices`, and `index_size` must match its u16/u32 representation.
+    #[inline]
+    unsafe fn visit_row_unchecked(
+        &self,
+        indices: &[u8],
+        start: usize,
+        end: usize,
+        index_size: usize,
+        mut visit: impl FnMut(usize, u32),
+    ) {
+        if let CsrColMapStorage::Sparse(map) = &self.storage {
+            let mut position = start;
+            let mut selected = 0usize;
+            while position < end && selected < map.len() {
+                // SAFETY: the caller guarantees `position` remains inside one
+                // complete packed CSR row.
+                let source = unsafe { read_index_unchecked(indices, position, index_size) };
+                let candidate = map[selected].0;
+                if source < candidate {
+                    position += 1;
+                } else if source > candidate {
+                    selected += 1;
+                } else {
+                    visit(position, map[selected].1);
+                    position += 1;
+                    selected += 1;
+                }
+            }
+            return;
+        }
+
+        for position in start..end {
+            // SAFETY: the caller guarantees this is a complete packed row and
+            // every source column is inside the map's source width.
+            let source = unsafe { read_index_unchecked(indices, position, index_size) };
+            // SAFETY: source-column validity is part of the same caller
+            // invariant stated above.
+            if let Some(destination) = unsafe { self.map_unchecked(source) } {
+                visit(position, destination);
+            }
+        }
+    }
 }
 
 pub(crate) struct GatherColumns {
     by_source: Vec<(u64, u32)>,
+    unique_sources: usize,
+    destinations_are_ordered: bool,
 }
 
 impl GatherColumns {
@@ -76,7 +161,20 @@ impl GatherColumns {
             ));
         }
         by_source.sort_unstable();
-        Ok(Self { by_source })
+        let unique_sources = if by_source.is_empty() {
+            0
+        } else {
+            1 + by_source
+                .windows(2)
+                .filter(|pair| pair[0].0 != pair[1].0)
+                .count()
+        };
+        let destinations_are_ordered = by_source.windows(2).all(|pair| pair[0].1 < pair[1].1);
+        Ok(Self {
+            by_source,
+            unique_sources,
+            destinations_are_ordered,
+        })
     }
 
     #[inline]
@@ -87,6 +185,124 @@ impl GatherColumns {
         let end =
             self.by_source[start..].partition_point(|&(candidate, _)| candidate == source) + start;
         &self.by_source[start..end]
+    }
+
+    pub(crate) fn unique_sources(&self) -> usize {
+        self.unique_sources
+    }
+
+    pub(crate) fn destinations_are_ordered(&self) -> bool {
+        self.destinations_are_ordered
+    }
+
+    pub(crate) fn prefer_binary_search(&self, row_nnz: usize) -> bool {
+        prefer_index_binary_search(self.unique_sources(), row_nnz)
+    }
+
+    pub(crate) fn count_hits(
+        &self,
+        indices: &[u8],
+        start: usize,
+        end: usize,
+        index_size: usize,
+    ) -> Result<usize> {
+        let nnz = end.saturating_sub(start);
+        if self.prefer_binary_search(nnz) {
+            let mut kept = 0usize;
+            let mut index = 0usize;
+            while index < self.by_source.len() {
+                let source = self.by_source[index].0;
+                let found = equal_index(indices, start, end, index_size, source);
+                let mut copies = 0usize;
+                while index < self.by_source.len() && self.by_source[index].0 == source {
+                    copies += 1;
+                    index += 1;
+                }
+                if found.is_some() {
+                    kept = kept
+                        .checked_add(copies)
+                        .ok_or_else(|| Error::invalid_argument("CSR selected nnz overflow"))?;
+                }
+            }
+            Ok(kept)
+        } else {
+            let mut kept = 0usize;
+            let mut position = start;
+            let mut query = 0usize;
+            while position < end && query < self.by_source.len() {
+                // SAFETY: callers validate that `start..end` is one canonical
+                // packed CSR row, so `position` addresses a complete index.
+                let source = unsafe { read_index_unchecked(indices, position, index_size) };
+                let selected = self.by_source[query].0;
+                if source < selected {
+                    position += 1;
+                } else if source > selected {
+                    query += 1;
+                } else {
+                    let mut group_end = query + 1;
+                    while group_end < self.by_source.len() && self.by_source[group_end].0 == source
+                    {
+                        group_end += 1;
+                    }
+                    kept = kept
+                        .checked_add(group_end - query)
+                        .ok_or_else(|| Error::invalid_argument("CSR selected nnz overflow"))?;
+                    position += 1;
+                    query = group_end;
+                }
+            }
+            Ok(kept)
+        }
+    }
+
+    pub(crate) fn collect_hits(
+        &self,
+        indices: &[u8],
+        start: usize,
+        end: usize,
+        index_size: usize,
+        out: &mut Vec<(u32, usize)>,
+    ) -> Result<()> {
+        let nnz = end.saturating_sub(start);
+        if self.prefer_binary_search(nnz) {
+            let mut index = 0usize;
+            while index < self.by_source.len() {
+                let source = self.by_source[index].0;
+                let found = equal_index(indices, start, end, index_size, source);
+                while index < self.by_source.len() && self.by_source[index].0 == source {
+                    if let Some(position) = found {
+                        out.push((self.by_source[index].1, position));
+                    }
+                    index += 1;
+                }
+            }
+        } else {
+            let mut position = start;
+            let mut query = 0usize;
+            while position < end && query < self.by_source.len() {
+                // SAFETY: callers validate that `start..end` is one canonical
+                // packed CSR row, so `position` addresses a complete index.
+                let source = unsafe { read_index_unchecked(indices, position, index_size) };
+                let selected = self.by_source[query].0;
+                if source < selected {
+                    position += 1;
+                } else if source > selected {
+                    query += 1;
+                } else {
+                    let mut group_end = query + 1;
+                    while group_end < self.by_source.len() && self.by_source[group_end].0 == source
+                    {
+                        group_end += 1;
+                    }
+                    for &(_, destination) in &self.by_source[query..group_end] {
+                        out.push((destination, position));
+                    }
+                    position += 1;
+                    query = group_end;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn resident_bytes(&self) -> Result<usize> {
@@ -114,7 +330,18 @@ pub fn build_col_map(n_cols: usize, cols: &NormalizedAxis) -> Result<CsrColMap> 
                 n_out_cols: end - start,
             })
         }
-        NormalizedAxis::Gather { positions } => {
+        NormalizedAxis::Gather { .. } | NormalizedAxis::Strided { .. } => {
+            let owned = match cols {
+                NormalizedAxis::Strided { .. } => Some(cols.to_positions()),
+                _ => None,
+            };
+            let positions = match cols {
+                NormalizedAxis::Gather { positions } => positions.as_slice(),
+                NormalizedAxis::Strided { .. } => owned.as_ref().map_or(&[][..], Vec::as_slice),
+                NormalizedAxis::Contiguous { .. } => {
+                    unreachable!("contiguous columns use affine map")
+                }
+            };
             let mut pairs = Vec::new();
             pairs.try_reserve_exact(positions.len())?;
             for (destination, &source) in positions.iter().enumerate() {
@@ -182,10 +409,7 @@ pub fn csr_select_rows(
         );
     }
 
-    let positions = rows
-        .positions()
-        .ok_or_else(|| Error::invalid_argument("missing gathered row positions"))?;
-    let out_rows = positions.len();
+    let out_rows = usize_from_u64(rows.len(), "selected row count")?;
     if out_rows == 0 {
         return CsrArray::empty([0, n_cols], index_dtype, value_dtype);
     }
@@ -193,7 +417,7 @@ pub fn csr_select_rows(
     // Pass 1: nnz per selected row with disjoint mutable count blocks.
     let mut row_nnz = zeroed_u64(out_rows)?;
     count_row_nnz(threads, out_rows, &mut row_nnz, |local| {
-        let src_row = usize_from_u64(positions[local], "row position")?;
+        let src_row = usize_from_u64(rows.nth(local as u64)?, "row position")?;
         if src_row >= n_rows {
             return Err(Error::invalid_argument("row position out of bounds"));
         }
@@ -212,12 +436,12 @@ pub fn csr_select_rows(
         out_indptr.push(next);
     }
     let total_nnz = *out_indptr.last().unwrap();
-    let mut out_indices = zeroed(checked_mul(
+    let mut out_indices = uninit_bytes(checked_mul(
         usize_from_u64(total_nnz, "nnz")?,
         index_size,
         "gather indices",
     )?)?;
-    let mut out_data = zeroed(checked_mul(
+    let mut out_data = uninit_bytes(checked_mul(
         usize_from_u64(total_nnz, "nnz")?,
         value_size,
         "gather data",
@@ -233,18 +457,44 @@ pub fn csr_select_rows(
         index_size,
         value_size,
         |local, dst_i, dst_d| {
-            let src_row = usize_from_u64(positions[local], "row position")?;
+            let src_row = usize_from_u64(rows.nth(local as u64)?, "row position")?;
             let a = usize_from_u64(indptr[src_row], "indptr")?;
             let b = usize_from_u64(indptr[src_row + 1], "indptr")?;
             let n = b - a;
+            let index_bytes = n * index_size;
+            let data_bytes = n * value_size;
+            if dst_i.len() != index_bytes || dst_d.len() != data_bytes {
+                return Err(Error::invalid_argument(
+                    "CSR gathered row output length mismatch",
+                ));
+            }
             if n == 0 {
                 return Ok(());
             }
-            dst_i.copy_from_slice(&indices[a * index_size..(a + n) * index_size]);
-            dst_d.copy_from_slice(&data[a * value_size..(a + n) * value_size]);
+            // SAFETY: validated `indptr` bounds make both source ranges valid;
+            // the output prefix sum produced exact destination row lengths.
+            // Inputs and newly allocated outputs cannot overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    indices.as_ptr().add(a * index_size),
+                    dst_i.as_mut_ptr().cast::<u8>(),
+                    index_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(a * value_size),
+                    dst_d.as_mut_ptr().cast::<u8>(),
+                    data_bytes,
+                );
+            }
             Ok(())
         },
     )?;
+
+    // SAFETY: every row callback checked its exact destination lengths and
+    // initialized both disjoint payload slices before the workers joined.
+    let out_indices = unsafe { assume_init_bytes(out_indices) };
+    // SAFETY: the same row coverage proof applies to the data allocation.
+    let out_data = unsafe { assume_init_bytes(out_data) };
 
     Ok(CsrArray::from_parts_validated(
         [out_rows, n_cols],
@@ -332,12 +582,10 @@ pub(crate) fn csr_filter_cols(
 
     let gather = match cols {
         NormalizedAxis::Gather { positions } => Some(GatherColumns::new(n_cols, positions)?),
+        NormalizedAxis::Strided { .. } => Some(GatherColumns::new(n_cols, &cols.to_positions())?),
         NormalizedAxis::Contiguous { .. } => None,
     };
-    let col_range = match cols {
-        NormalizedAxis::Contiguous { start, end } => Some((*start, *end)),
-        NormalizedAxis::Gather { .. } => None,
-    };
+    let col_range = cols.as_range().map(|range| (range.start, range.end));
 
     let mut row_nnz = zeroed_u64(n_rows)?;
     count_row_nnz(threads, n_rows, &mut row_nnz, |row| {
@@ -349,21 +597,11 @@ pub(crate) fn csr_filter_cols(
                 lower_bound_index(indices, first, end, source_index_size, past_last_col);
             return Ok((past_last - first) as u64);
         }
-        let mut kept = 0u64;
-        for position in start..end {
-            // SAFETY: `validate_csr_layout` proved every indptr-delimited
-            // position has one complete packed source index.
-            let source = unsafe { read_index_unchecked(indices, position, source_index_size) };
-            let multiplicity = gather
-                .as_ref()
-                .expect("non-contiguous selection has gather lookup")
-                .destinations(source)
-                .len();
-            kept = kept
-                .checked_add(multiplicity as u64)
-                .ok_or_else(|| Error::invalid_argument("CSR selected nnz overflow"))?;
-        }
-        Ok(kept)
+        let gather = gather
+            .as_ref()
+            .expect("non-contiguous selection has gather lookup");
+        u64::try_from(gather.count_hits(indices, start, end, source_index_size)?)
+            .map_err(|_| Error::invalid_argument("CSR selected nnz overflow"))
     })?;
 
     let mut out_indptr = indptr_buffer(n_rows)?;
@@ -396,58 +634,125 @@ pub(crate) fn csr_filter_cols(
         out_data_len,
         threads,
     )?;
-    let mut out_indices = zeroed(out_indices_len)?;
-    let mut out_data = zeroed(out_data_len)?;
+    let mut out_indices = uninit_bytes(out_indices_len)?;
+    let mut out_data = uninit_bytes(out_data_len)?;
 
-    copy_csr_rows_parallel(
-        threads,
-        n_rows,
-        &out_indptr,
-        &mut out_indices,
-        &mut out_data,
-        out_index_size,
-        value_size,
-        |row, dst_i, dst_d| {
-            let start = usize_from_u64(indptr[row], "indptr")?;
-            let end = usize_from_u64(indptr[row + 1], "indptr")?;
-            if let Some((first_col, past_last_col)) = col_range {
+    if let Some((first_col, past_last_col)) = col_range {
+        copy_csr_rows_parallel(
+            threads,
+            n_rows,
+            &out_indptr,
+            &mut out_indices,
+            &mut out_data,
+            out_index_size,
+            value_size,
+            |row, dst_i, dst_d| {
+                let start = usize_from_u64(indptr[row], "indptr")?;
+                let end = usize_from_u64(indptr[row + 1], "indptr")?;
                 let first = lower_bound_index(indices, start, end, source_index_size, first_col);
                 let past_last =
                     lower_bound_index(indices, first, end, source_index_size, past_last_col);
+                let selected = past_last - first;
+                let expected_indices = selected * out_index_size;
+                let expected_data = selected * value_size;
+                if dst_i.len() != expected_indices || dst_d.len() != expected_data {
+                    return Err(Error::invalid_argument(
+                        "CSR range-filter output length mismatch",
+                    ));
+                }
                 for (cursor, position) in (first..past_last).enumerate() {
                     // SAFETY: both binary-search results stay inside this
-                    // validated CSR row's packed index range.
-                    let source =
-                        unsafe { read_index_unchecked(indices, position, source_index_size) };
-                    write_index(dst_i, cursor, out_index_size, source - first_col)?;
-                }
-                dst_d.copy_from_slice(&data[first * value_size..past_last * value_size]);
-            } else if let Some(gather) = &gather {
-                let mut entries = Vec::new();
-                entries.try_reserve_exact(dst_i.len() / out_index_size)?;
-                for position in start..end {
-                    // SAFETY: `start..end` is a validated indptr-delimited row.
-                    let source =
-                        unsafe { read_index_unchecked(indices, position, source_index_size) };
-                    for &(_, destination) in gather.destinations(source) {
-                        entries.push((destination, position));
+                    // validated CSR row's packed index range. The count pass
+                    // sized `dst_i` for exactly these entries, and subtracting
+                    // `first_col` yields an index representable by the selected
+                    // output dtype.
+                    unsafe {
+                        let source = read_index_unchecked(indices, position, source_index_size);
+                        write_index_unchecked(
+                            dst_i.as_mut_ptr().cast::<u8>(),
+                            cursor,
+                            out_index_size,
+                            source - first_col,
+                        );
                     }
                 }
-                entries.sort_unstable_by_key(|&(destination, _)| destination);
-                for (cursor, &(destination, source_position)) in entries.iter().enumerate() {
-                    write_index(dst_i, cursor, out_index_size, u64::from(destination))?;
-                    let src =
-                        &data[source_position * value_size..(source_position + 1) * value_size];
-                    copy_elem(
-                        &mut dst_d[cursor * value_size..(cursor + 1) * value_size],
-                        src,
-                        value_size,
+                // SAFETY: the exact-length check above matches the validated
+                // contiguous source range, and the buffers do not overlap.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(first * value_size),
+                        dst_d.as_mut_ptr().cast::<u8>(),
+                        expected_data,
                     );
                 }
-            }
-            Ok(())
-        },
-    )?;
+                Ok(())
+            },
+        )?;
+    } else {
+        let gather = gather
+            .as_ref()
+            .expect("non-contiguous selection has gather lookup");
+        copy_csr_rows_parallel_init(
+            threads,
+            n_rows,
+            &out_indptr,
+            &mut out_indices,
+            &mut out_data,
+            out_index_size,
+            value_size,
+            Vec::<(u32, usize)>::new,
+            |row, dst_i, dst_d, entries| {
+                let start = usize_from_u64(indptr[row], "indptr")?;
+                let end = usize_from_u64(indptr[row + 1], "indptr")?;
+                let required = dst_i.len() / out_index_size;
+                entries.clear();
+                if entries.capacity() < required {
+                    entries.try_reserve_exact(required)?;
+                }
+                gather.collect_hits(indices, start, end, source_index_size, entries)?;
+                if !gather.destinations_are_ordered() {
+                    entries.sort_unstable_by_key(|&(destination, _)| destination);
+                }
+                if entries.len() != required || dst_d.len() != required * value_size {
+                    return Err(Error::invalid_argument(
+                        "CSR gather-filter output length mismatch",
+                    ));
+                }
+                for (cursor, &(destination, source_position)) in entries.iter().enumerate() {
+                    let src_offset = source_position * value_size;
+                    let dst_offset = cursor * value_size;
+                    debug_assert!(src_offset + value_size <= data.len());
+                    debug_assert!(dst_offset + value_size <= dst_d.len());
+                    // SAFETY: `destination` came from a validated output
+                    // position and therefore fits `out_index_size`. The count
+                    // pass made `dst_i`/`dst_d` exact, `source_position` lies in
+                    // this validated row, and input/output allocations do not
+                    // overlap.
+                    unsafe {
+                        write_index_unchecked(
+                            dst_i.as_mut_ptr().cast::<u8>(),
+                            cursor,
+                            out_index_size,
+                            u64::from(destination),
+                        );
+                        copy_elem_unchecked(
+                            dst_d.as_mut_ptr().cast::<u8>().add(dst_offset),
+                            data.as_ptr().add(src_offset),
+                            value_size,
+                        );
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    }
+
+    // SAFETY: the count pass partitioned both allocations into exact row
+    // slices; every successful range/gather callback checked and initialized
+    // its complete slices before the worker pool joined.
+    let out_indices = unsafe { assume_init_bytes(out_indices) };
+    // SAFETY: the same exact row coverage applies to every data byte.
+    let out_data = unsafe { assume_init_bytes(out_data) };
 
     Ok(CsrArray::from_parts_validated(
         [n_rows, n_out_cols],
@@ -595,19 +900,29 @@ pub fn csr_to_dense_selected_cols(
                         let a = usize_from_u64(indptr[row], "indptr")?;
                         let b = usize_from_u64(indptr[row + 1], "indptr")?;
                         let dst_row_off = (row - job_start) * row_bytes;
-                        let dst_row = &mut block[dst_row_off..dst_row_off + row_bytes];
-                        for pos in a..b {
-                            // SAFETY: `a..b` is a validated CSR row and the
-                            // packed index width matches `index_size`.
-                            let col =
-                                unsafe { read_index_unchecked(indices, pos, index_size) } as usize;
-                            if col >= start && col < end {
-                                let dst_col = col - start;
-                                let dst_off = dst_col * value_size;
-                                let src = &data[pos * value_size..(pos + 1) * value_size];
-                                copy_elem(
-                                    &mut dst_row[dst_off..dst_off + value_size],
-                                    src,
+                        debug_assert!(dst_row_off + row_bytes <= block.len());
+                        let first = if start == 0 {
+                            a
+                        } else {
+                            lower_bound_index(indices, a, b, index_size, start as u64)
+                        };
+                        let past_last = if end == n_cols {
+                            b
+                        } else {
+                            lower_bound_index(indices, first, b, index_size, end as u64)
+                        };
+                        for pos in first..past_last {
+                            // SAFETY: the lower bounds constrain `pos` to
+                            // this validated row and `col` to `[start, end)`.
+                            // Thus both byte offsets address complete,
+                            // non-overlapping source/destination elements.
+                            unsafe {
+                                let col = read_index_unchecked(indices, pos, index_size) as usize;
+                                let dst_offset = dst_row_off + (col - start) * value_size;
+                                let src_offset = pos * value_size;
+                                copy_elem_unchecked(
+                                    block.as_mut_ptr().add(dst_offset),
+                                    data.as_ptr().add(src_offset),
                                     value_size,
                                 );
                             }
@@ -618,7 +933,18 @@ pub fn csr_to_dense_selected_cols(
             )?;
             DenseArray::from_bytes([n_rows, out_cols], value_dtype, output)
         }
-        NormalizedAxis::Gather { positions } => {
+        NormalizedAxis::Gather { .. } | NormalizedAxis::Strided { .. } => {
+            let owned = match cols {
+                NormalizedAxis::Strided { .. } => Some(cols.to_positions()),
+                _ => None,
+            };
+            let positions = match cols {
+                NormalizedAxis::Gather { positions } => positions.as_slice(),
+                NormalizedAxis::Strided { .. } => owned.as_ref().map_or(&[][..], Vec::as_slice),
+                NormalizedAxis::Contiguous { .. } => {
+                    unreachable!("contiguous columns densify via range scan")
+                }
+            };
             let unique = {
                 let mut sorted = Vec::new();
                 sorted.try_reserve_exact(positions.len())?;
@@ -638,20 +964,28 @@ pub fn csr_to_dense_selected_cols(
                             let a = usize_from_u64(indptr[row], "indptr")?;
                             let b = usize_from_u64(indptr[row + 1], "indptr")?;
                             let dst_row_off = (row - job_start) * row_bytes;
-                            let dst_row = &mut block[dst_row_off..dst_row_off + row_bytes];
-                            for pos in a..b {
-                                // SAFETY: `a..b` is a validated CSR row and the
-                                // packed index width matches `index_size`.
-                                let col = unsafe { read_index_unchecked(indices, pos, index_size) };
-                                if let Some(dst_col) = col_map.map(col) {
-                                    let dst_off = dst_col as usize * value_size;
-                                    let src = &data[pos * value_size..(pos + 1) * value_size];
-                                    copy_elem(
-                                        &mut dst_row[dst_off..dst_off + value_size],
-                                        src,
+                            debug_assert!(dst_row_off + row_bytes <= block.len());
+                            let copy_mapped = |pos: usize, dst_col: u32| {
+                                let dst_offset = dst_row_off + dst_col as usize * value_size;
+                                let src_offset = pos * value_size;
+                                // SAFETY: the validated CSR layout proves
+                                // `src_offset` is a full source element;
+                                // `col_map` returns only output columns and
+                                // row-block partitioning makes `dst_offset`
+                                // exclusive to this worker.
+                                unsafe {
+                                    copy_elem_unchecked(
+                                        block.as_mut_ptr().add(dst_offset),
+                                        data.as_ptr().add(src_offset),
                                         value_size,
                                     );
                                 }
+                            };
+                            // SAFETY: `validate_csr_layout` and the owning
+                            // `CsrArray` contract establish that `a..b` is one
+                            // strictly increasing packed row.
+                            unsafe {
+                                col_map.visit_row_unchecked(indices, a, b, index_size, copy_mapped);
                             }
                         }
                         Ok(())
@@ -669,19 +1003,24 @@ pub fn csr_to_dense_selected_cols(
                             let a = usize_from_u64(indptr[row], "indptr")?;
                             let b = usize_from_u64(indptr[row + 1], "indptr")?;
                             let dst_row_off = (row - job_start) * row_bytes;
-                            let dst_row = &mut block[dst_row_off..dst_row_off + row_bytes];
+                            debug_assert!(dst_row_off + row_bytes <= block.len());
                             for pos in a..b {
                                 // SAFETY: `a..b` is a validated CSR row and the
                                 // packed index width matches `index_size`.
                                 let col = unsafe { read_index_unchecked(indices, pos, index_size) };
-                                let src = &data[pos * value_size..(pos + 1) * value_size];
                                 for &(_, dst_col) in gather.destinations(col) {
-                                    let dst_off = dst_col as usize * value_size;
-                                    copy_elem(
-                                        &mut dst_row[dst_off..dst_off + value_size],
-                                        src,
-                                        value_size,
-                                    );
+                                    let dst_offset = dst_row_off + dst_col as usize * value_size;
+                                    let src_offset = pos * value_size;
+                                    // SAFETY: the validated source position and
+                                    // gathered destination column each address
+                                    // one complete element in distinct buffers.
+                                    unsafe {
+                                        copy_elem_unchecked(
+                                            block.as_mut_ptr().add(dst_offset),
+                                            data.as_ptr().add(src_offset),
+                                            value_size,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -735,14 +1074,44 @@ fn copy_csr_rows_parallel<F>(
     threads: usize,
     n_rows: usize,
     out_indptr: &[u64],
-    out_indices: &mut [u8],
-    out_data: &mut [u8],
+    out_indices: &mut [MaybeUninit<u8>],
+    out_data: &mut [MaybeUninit<u8>],
     index_size: usize,
     value_size: usize,
     fill: F,
 ) -> Result<()>
 where
-    F: Fn(usize, &mut [u8], &mut [u8]) -> Result<()> + Sync,
+    F: Fn(usize, &mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>]) -> Result<()> + Sync,
+{
+    copy_csr_rows_parallel_init(
+        threads,
+        n_rows,
+        out_indptr,
+        out_indices,
+        out_data,
+        index_size,
+        value_size,
+        || (),
+        |row, dst_i, dst_d, ()| fill(row, dst_i, dst_d),
+    )
+}
+
+/// Variant of [`copy_csr_rows_parallel`] with reusable worker-local scratch.
+fn copy_csr_rows_parallel_init<S, I, F>(
+    threads: usize,
+    n_rows: usize,
+    out_indptr: &[u64],
+    out_indices: &mut [MaybeUninit<u8>],
+    out_data: &mut [MaybeUninit<u8>],
+    index_size: usize,
+    value_size: usize,
+    initialize: I,
+    fill: F,
+) -> Result<()>
+where
+    S: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(usize, &mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>], &mut S) -> Result<()> + Sync,
 {
     if n_rows == 0 {
         return Ok(());
@@ -752,7 +1121,7 @@ where
     let mut data_remaining = out_data;
     let mut row_start = 0usize;
 
-    parallel::try_for_each_stream(
+    parallel::try_for_each_stream_init(
         threads.max(1),
         job_count,
         |emit| {
@@ -782,7 +1151,8 @@ where
             }
             Ok(())
         },
-        |(job_start, job_end, i_block, d_block)| {
+        initialize,
+        |(job_start, job_end, i_block, d_block), state| {
             let mut i_rest = i_block;
             let mut d_rest = d_block;
             for row in job_start..job_end {
@@ -793,7 +1163,7 @@ where
                 let (dst_d, d_tail) = d_rest.split_at_mut(d_bytes);
                 i_rest = i_tail;
                 d_rest = d_tail;
-                fill(row, dst_i, dst_d)?;
+                fill(row, dst_i, dst_d, state)?;
             }
             Ok(())
         },
@@ -858,6 +1228,32 @@ fn lower_bound_index(
         }
     }
     start
+}
+
+fn equal_index(
+    indices: &[u8],
+    start: usize,
+    end: usize,
+    index_size: usize,
+    target: u64,
+) -> Option<usize> {
+    let found = lower_bound_index(indices, start, end, index_size, target);
+    if found < end {
+        // SAFETY: `found` is inside the validated packed row passed to lower_bound.
+        let value = unsafe { read_index_unchecked(indices, found, index_size) };
+        if value == target {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn prefer_index_binary_search(n_queries: usize, haystack: usize) -> bool {
+    if haystack < 32 || n_queries == 0 {
+        return false;
+    }
+    let log2 = (usize::BITS - haystack.leading_zeros()) as usize;
+    n_queries.saturating_mul(log2.saturating_mul(3).saturating_add(8)) < haystack
 }
 
 fn zeroed_u64(len: usize) -> Result<Vec<u64>> {
@@ -937,6 +1333,42 @@ mod tests {
     }
 
     #[test]
+    fn strided_rows_match_expanded_positions() {
+        let indptr = vec![0, 2, 3, 4];
+        let indices = u16_idx(&[0, 2, 1, 3]);
+        let data = f32_data(&[1.0, 3.0, 2.0, 4.0]);
+        let strided = AxisIndex::strided(0, 3, 2).normalize(3).unwrap();
+        let expanded = AxisIndex::positions([0, 2]).normalize(3).unwrap();
+        let from_stride = csr_select_rows(
+            &indptr,
+            &indices,
+            &data,
+            3,
+            4,
+            DType::U16,
+            DType::F32,
+            &strided,
+            2,
+        )
+        .unwrap();
+        let from_gather = csr_select_rows(
+            &indptr,
+            &indices,
+            &data,
+            3,
+            4,
+            DType::U16,
+            DType::F32,
+            &expanded,
+            2,
+        )
+        .unwrap();
+        assert_eq!(from_stride.indptr(), from_gather.indptr());
+        assert_eq!(from_stride.indices(), from_gather.indices());
+        assert_eq!(from_stride.data(), from_gather.data());
+    }
+
+    #[test]
     fn densify_selected() {
         let indptr = vec![0, 2, 3];
         let indices = u16_idx(&[0, 2, 1]);
@@ -956,6 +1388,28 @@ mod tests {
         .unwrap();
         assert_eq!(dense.shape(), [2, 3]);
         assert_eq!(dense.values(), f32_data(&[1.0, 0.0, 3.0, 0.0, 2.0, 0.0]));
+    }
+
+    #[test]
+    fn densify_sparse_column_map_preserves_requested_order() {
+        let indptr = vec![0, 3];
+        let indices = u16_idx(&[0, 2_048, 4_095]);
+        let data = f32_data(&[1.0, 2.0, 3.0]);
+        let cols = AxisIndex::positions([4_095, 0]).normalize(4_096).unwrap();
+        let dense = csr_to_dense_selected_cols(
+            &indptr,
+            &indices,
+            &data,
+            1,
+            4_096,
+            DType::U16,
+            DType::F32,
+            &cols,
+            2,
+        )
+        .unwrap();
+        assert_eq!(dense.shape(), [1, 2]);
+        assert_eq!(dense.values(), f32_data(&[3.0, 1.0]));
     }
 
     #[test]

@@ -6,16 +6,6 @@ use sc_load::{IoMode, PlanConfig, ResourceLimits, SessionConfig};
 
 use crate::error::invalid_input as invalid_argument;
 
-#[pyfunction]
-pub(crate) fn plan_config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    plan_config_to_dict(py, &PlanConfig::default())
-}
-
-#[pyfunction]
-pub(crate) fn session_config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    session_config_to_dict(py, &SessionConfig::default())
-}
-
 pub(crate) fn plan_config_from_dict(values: &Bound<'_, PyDict>) -> PyResult<PlanConfig> {
     Ok(PlanConfig {
         compile_io_concurrency: required(values, "compile_io_concurrency")?.extract()?,
@@ -47,7 +37,7 @@ pub(crate) fn session_config_from_dict(values: &Bound<'_, PyDict>) -> PyResult<S
     let mode = required(values, "io_mode")?.extract::<String>()?;
     let queue_depth = required(values, "queue_depth")?.extract()?;
     Ok(SessionConfig {
-        worker_count: required(values, "worker_count")?.extract()?,
+        worker_count: required(values, "num_workers")?.extract()?,
         io_mode: parse_io_mode(&mode, queue_depth)?,
         max_inflight_jobs_per_worker: required(values, "max_inflight_jobs_per_worker")?
             .extract()?,
@@ -63,82 +53,6 @@ pub(crate) fn session_config_from_dict(values: &Bound<'_, PyDict>) -> PyResult<S
             .extract()?,
         max_total_decoded_bytes: required(values, "max_total_decoded_bytes")?.extract()?,
     })
-}
-
-fn plan_config_to_dict<'py>(py: Python<'py>, config: &PlanConfig) -> PyResult<Bound<'py, PyDict>> {
-    let values = PyDict::new(py);
-    values.set_item("compile_io_concurrency", config.compile_io_concurrency)?;
-    values.set_item(
-        "io_bandwidth_bytes_per_second",
-        config.io_bandwidth_bytes_per_second,
-    )?;
-    values.set_item("io_operations_per_second", config.io_operations_per_second)?;
-    values.set_item("coalescing_distance", config.coalescing_distance)?;
-    values.set_item("max_coalesced_io_bytes", config.max_coalesced_io_bytes)?;
-    values.set_item(
-        "target_decoded_bytes_per_job",
-        config.target_decoded_bytes_per_job,
-    )?;
-    values.set_item("delta_bytes", config.delta_bytes)?;
-    values.set_item(
-        "max_output_buffer_bytes",
-        config.limits.max_output_buffer_bytes,
-    )?;
-    values.set_item(
-        "max_compile_arena_bytes",
-        config.limits.max_compile_arena_bytes,
-    )?;
-    values.set_item(
-        "max_compile_working_set_bytes",
-        config.limits.max_compile_working_set_bytes,
-    )?;
-    values.set_item(
-        "max_retained_whole_key_bytes",
-        config.limits.max_retained_whole_key_bytes,
-    )?;
-    values.set_item("max_blocks_per_job", config.limits.max_blocks_per_job)?;
-    values.set_item("max_cells_per_job", config.limits.max_cells_per_job)?;
-    values.set_item(
-        "max_encoded_bytes_per_side",
-        config.limits.max_encoded_bytes_per_side,
-    )?;
-    values.set_item(
-        "max_decoded_bytes_per_job",
-        config.limits.max_decoded_bytes_per_job,
-    )?;
-    Ok(values)
-}
-
-fn session_config_to_dict<'py>(
-    py: Python<'py>,
-    config: &SessionConfig,
-) -> PyResult<Bound<'py, PyDict>> {
-    let values = PyDict::new(py);
-    values.set_item("worker_count", config.worker_count)?;
-    values.set_item("io_mode", io_mode_name(config.io_mode))?;
-    values.set_item("queue_depth", io_mode_queue_depth(config.io_mode))?;
-    values.set_item(
-        "max_inflight_jobs_per_worker",
-        config.max_inflight_jobs_per_worker,
-    )?;
-    values.set_item(
-        "max_inflight_encoded_bytes_per_worker",
-        config.max_inflight_encoded_bytes_per_worker,
-    )?;
-    values.set_item(
-        "max_decoded_bytes_per_worker",
-        config.max_decoded_bytes_per_worker,
-    )?;
-    values.set_item(
-        "max_total_inflight_io_ops",
-        config.max_total_inflight_io_ops,
-    )?;
-    values.set_item(
-        "max_total_inflight_encoded_bytes",
-        config.max_total_inflight_encoded_bytes,
-    )?;
-    values.set_item("max_total_decoded_bytes", config.max_total_decoded_bytes)?;
-    Ok(values)
 }
 
 fn required<'py>(values: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {

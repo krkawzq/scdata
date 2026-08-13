@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use sc_compress::{
     open_csr, open_dense, open_dense_with_limits, AxisIndex, BloscOptions, ByteStore, ByteStoreMut,
     Compressor, CsrMatrix, CsrWriter, DenseMatrix, DenseWriter, DirectoryStore, Error, Partition,
-    ReadLimits, Result, Selection, ShuffleMode,
+    PositionedValue, ReadLimits, Result, Selection, ShuffleMode,
 };
 use serde_json::{json, Value};
 
@@ -85,14 +85,22 @@ fn opened_reader_remains_on_one_generation() {
     let matrix_dir = temp.path().join("matrix");
     let original = vec![1u16, 2, 3, 4];
     let replacement = vec![11u16, 12, 13, 14];
-    DenseWriter::new(&matrix_dir, Partition::fixed_cells(1), Partition::fixed_cells(16))
-        .write(&original, [2, 2])
-        .unwrap();
+    DenseWriter::new(
+        &matrix_dir,
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(16),
+    )
+    .write(&original, [2, 2])
+    .unwrap();
 
     let opened = open_dense(&matrix_dir).unwrap();
-    DenseWriter::new(&matrix_dir, Partition::fixed_cells(1), Partition::fixed_cells(16))
-        .write(&replacement, [2, 2])
-        .unwrap();
+    DenseWriter::new(
+        &matrix_dir,
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(16),
+    )
+    .write(&replacement, [2, 2])
+    .unwrap();
 
     assert_eq!(opened.decode_all().unwrap(), values_as_bytes(&original));
     assert_eq!(
@@ -126,9 +134,13 @@ fn cross_process_reader_survives_replacement() {
     let matrix_dir = temp.path().join("matrix");
     let ready = temp.path().join("ready");
     let release = temp.path().join("release");
-    DenseWriter::new(&matrix_dir, Partition::fixed_cells(1), Partition::fixed_cells(16))
-        .write(&[1u16, 2, 3, 4], [2, 2])
-        .unwrap();
+    DenseWriter::new(
+        &matrix_dir,
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(16),
+    )
+    .write(&[1u16, 2, 3, 4], [2, 2])
+    .unwrap();
 
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
@@ -141,9 +153,13 @@ fn cross_process_reader_survives_replacement() {
         .unwrap();
     wait_for_path(&ready);
 
-    DenseWriter::new(&matrix_dir, Partition::fixed_cells(1), Partition::fixed_cells(16))
-        .write(&[11u16, 12, 13, 14], [2, 2])
-        .unwrap();
+    DenseWriter::new(
+        &matrix_dir,
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(16),
+    )
+    .write(&[11u16, 12, 13, 14], [2, 2])
+    .unwrap();
     assert!(has_retired_generation(temp.path()));
     std::fs::write(&release, b"release").unwrap();
     assert!(child.wait().unwrap().success());
@@ -217,7 +233,13 @@ fn writer_preserves_unrelated_nonempty_directory() {
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("sentinel"), b"keep").unwrap();
 
-    assert!(DenseWriter::new(&root, Partition::fixed_cells(1024), Partition::fixed_cells(16)).write(&[1u16], [1, 1]).is_err());
+    assert!(DenseWriter::new(
+        &root,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16)
+    )
+    .write(&[1u16], [1, 1])
+    .is_err());
     assert_eq!(std::fs::read(root.join("sentinel")).unwrap(), b"keep");
 }
 
@@ -227,14 +249,22 @@ fn invalid_worker_counts_do_not_touch_writer_targets() {
     let target = temp.path().join("sentinel");
     std::fs::write(&target, b"keep").unwrap();
 
-    assert!(DenseWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
-        .threads(0)
-        .write(&[1u16], [1, 1])
-        .is_err());
-    assert!(CsrWriter::new(&target, Partition::fixed_cells(1024), Partition::fixed_cells(16))
-        .threads(0)
-        .write(&[0u64, 1], &[0u32], &[1f32], [1, 1])
-        .is_err());
+    assert!(DenseWriter::new(
+        &target,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16)
+    )
+    .threads(0)
+    .write(&[1u16], [1, 1])
+    .is_err());
+    assert!(CsrWriter::new(
+        &target,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16)
+    )
+    .threads(0)
+    .write(&[0u64, 1], &[0u32], &[1f32], [1, 1])
+    .is_err());
     assert_eq!(std::fs::read(&target).unwrap(), b"keep");
 }
 
@@ -257,7 +287,13 @@ fn configured_limits_bound_metadata_and_decoded_working_set() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("matrix");
     let values = vec![1u16; 8];
-    DenseWriter::new(&root, Partition::fixed_cells(1024), Partition::fixed_cells(16)).write(&values, [4, 2]).unwrap();
+    DenseWriter::new(
+        &root,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16),
+    )
+    .write(&values, [4, 2])
+    .unwrap();
 
     assert!(
         open_dense_with_limits(&root, ReadLimits::default().maximum_metadata_size(1),).is_err()
@@ -297,10 +333,14 @@ fn csr_decode_limit_counts_resident_indptr() {
     let options = BloscOptions::default()
         .compression_level(0)
         .shuffle(ShuffleMode::None);
-    CsrWriter::new(&root, Partition::fixed_cells(1024), Partition::fixed_cells(16))
-        .compressor(Compressor::dyn_blosc(options))
-        .write(&indptr, &indices, &data, [16, 32])
-        .unwrap();
+    CsrWriter::new(
+        &root,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16),
+    )
+    .compressor(Compressor::dyn_blosc(options))
+    .write(&indptr, &indices, &data, [16, 32])
+    .unwrap();
 
     let matrix = CsrMatrix::from_store_with_limits(
         Arc::new(DirectoryStore::open(&root).unwrap()),
@@ -336,10 +376,14 @@ fn decoded_csr_indices_are_checked_against_shape() {
     let options = BloscOptions::default()
         .compression_level(0)
         .shuffle(ShuffleMode::None);
-    CsrWriter::new(&root, Partition::fixed_cells(1024), Partition::fixed_cells(16))
-        .compressor(Compressor::dyn_blosc(options))
-        .write(&[0u64, 1], &[1u32], &[1f32], [1, 3])
-        .unwrap();
+    CsrWriter::new(
+        &root,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16),
+    )
+    .compressor(Compressor::dyn_blosc(options))
+    .write(&[0u64, 1], &[1u32], &[1f32], [1, 3])
+    .unwrap();
 
     let mut store = DirectoryStore::open(&root).unwrap();
     let mut encoded = store.read("indices/0").unwrap();
@@ -377,17 +421,81 @@ fn decoded_csr_indices_are_checked_against_shape() {
 }
 
 #[test]
+fn decoded_csr_indices_must_remain_canonical_before_data_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("noncanonical-csr");
+    let options = BloscOptions::default()
+        .compression_level(0)
+        .shuffle(ShuffleMode::None);
+    CsrWriter::new(
+        &root,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16),
+    )
+    .compressor(Compressor::dyn_blosc(options))
+    .write(&[0u64, 2], &[0u32, 1], &[1f32, 2.0], [1, 3])
+    .unwrap();
+
+    let mut store = DirectoryStore::open(&root).unwrap();
+    let mut encoded = store.read("indices/0").unwrap();
+    let raw = encoded
+        .get_mut(dyn_blosc::HEADER_LEN..dyn_blosc::HEADER_LEN + 4)
+        .expect("compression level zero must use the raw representation");
+    raw[2..4].copy_from_slice(&0u16.to_le_bytes());
+    store.write("indices/0", &encoded).unwrap();
+
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let matrix = CsrMatrix::from_store(Arc::new(CountingStore {
+        inner: DirectoryStore::open(&root).unwrap(),
+        ranges: Arc::clone(&ranges),
+    }))
+    .unwrap();
+    ranges.lock().unwrap().clear();
+    assert!(matrix.decode_all().is_err());
+    assert!(ranges
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(key, _, _)| key != "data/0"));
+
+    ranges.lock().unwrap().clear();
+    assert!(matrix
+        .select(
+            Selection::new(AxisIndex::All, AxisIndex::range(0, 1)),
+            sc_compress::CsrOutput::Sparse,
+        )
+        .is_err());
+    assert!(ranges
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(key, _, _)| key != "data/0"));
+}
+
+#[test]
 fn public_partition_parameters_return_errors_instead_of_panicking() {
     let temp = tempfile::tempdir().unwrap();
-    assert!(DenseWriter::new(temp.path().join("dense-zero"), Partition::fixed_cells(0), Partition::fixed_cells(16))
-        .write(&[1u16], [1, 1])
-        .is_err());
-    assert!(DenseWriter::new(temp.path().join("dense-huge"), Partition::fixed_cells(1), Partition::fixed_cells(16))
-        .write::<u16>(&[], [u64::MAX, 0])
-        .is_err());
-    assert!(CsrWriter::new(temp.path().join("csr-zero"), Partition::fixed_cells(0), Partition::fixed_cells(16))
-        .write(&[0u64, 0], &[] as &[u32], &[] as &[f32], [1, 1])
-        .is_err());
+    assert!(DenseWriter::new(
+        temp.path().join("dense-zero"),
+        Partition::fixed_cells(0),
+        Partition::fixed_cells(16)
+    )
+    .write(&[1u16], [1, 1])
+    .is_err());
+    assert!(DenseWriter::new(
+        temp.path().join("dense-huge"),
+        Partition::fixed_cells(1),
+        Partition::fixed_cells(16)
+    )
+    .write::<u16>(&[], [u64::MAX, 0])
+    .is_err());
+    assert!(CsrWriter::new(
+        temp.path().join("csr-zero"),
+        Partition::fixed_cells(0),
+        Partition::fixed_cells(16)
+    )
+    .write(&[0u64, 0], &[] as &[u32], &[] as &[f32], [1, 1])
+    .is_err());
 }
 
 #[derive(Clone)]
@@ -416,6 +524,84 @@ impl ByteStore for CountingStore {
     fn supports_efficient_range_reads(&self, key: &str) -> Result<bool> {
         self.inner.supports_efficient_range_reads(key)
     }
+}
+
+#[derive(Clone)]
+struct PositionedCountingStore {
+    inner: DirectoryStore,
+    range_reads: Arc<AtomicUsize>,
+    positioned_opens: Arc<AtomicUsize>,
+}
+
+impl ByteStore for PositionedCountingStore {
+    fn len(&self, key: &str) -> Result<u64> {
+        self.inner.len(key)
+    }
+
+    fn read_range(&self, key: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.range_reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_range(key, offset, len)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key)
+    }
+
+    fn supports_efficient_range_reads(&self, key: &str) -> Result<bool> {
+        self.inner.supports_efficient_range_reads(key)
+    }
+
+    fn open_positioned(&self, key: &str) -> Result<Option<PositionedValue>> {
+        self.positioned_opens.fetch_add(1, Ordering::SeqCst);
+        self.inner.open_positioned(key)
+    }
+}
+
+#[test]
+fn positioned_store_opens_each_selected_chunk_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("positioned-range-reads");
+    let rows = 64usize;
+    let cols = 64usize;
+    let values = (0..rows * cols)
+        .map(|value| u16::try_from(value).unwrap())
+        .collect::<Vec<_>>();
+    DenseWriter::new(
+        &root,
+        Partition::fixed_cells(rows as u64),
+        Partition::fixed_cells(1),
+    )
+    .write(&values, [rows as u64, cols as u64])
+    .unwrap();
+
+    let range_reads = Arc::new(AtomicUsize::new(0));
+    let positioned_opens = Arc::new(AtomicUsize::new(0));
+    let matrix = DenseMatrix::from_store(Arc::new(PositionedCountingStore {
+        inner: DirectoryStore::open(&root).unwrap(),
+        range_reads: Arc::clone(&range_reads),
+        positioned_opens: Arc::clone(&positioned_opens),
+    }))
+    .unwrap();
+    range_reads.store(0, Ordering::SeqCst);
+    positioned_opens.store(0, Ordering::SeqCst);
+
+    let selected = matrix
+        .select(Selection::rows_only(AxisIndex::positions([1, 63])))
+        .unwrap();
+    let expected = [1usize, 63]
+        .into_iter()
+        .flat_map(|row| values[row * cols..(row + 1) * cols].iter())
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(selected.values(), expected);
+    assert_eq!(positioned_opens.load(Ordering::SeqCst), 1);
+    assert_eq!(range_reads.load(Ordering::SeqCst), 0);
+
+    range_reads.store(0, Ordering::SeqCst);
+    positioned_opens.store(0, Ordering::SeqCst);
+    assert_eq!(matrix.decode_all().unwrap(), values_as_bytes(&values));
+    assert_eq!(positioned_opens.load(Ordering::SeqCst), 1);
+    assert_eq!(range_reads.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -465,10 +651,14 @@ fn raw_dense_2d_selection_coalesces_small_ranges() {
     let options = BloscOptions::default()
         .compression_level(0)
         .shuffle(ShuffleMode::None);
-    DenseWriter::new(&root, Partition::fixed_cells(rows as u64), Partition::fixed_cells(1))
-        .compressor(Compressor::blosc1(options, 1))
-        .write(&values, [rows as u64, cols as u64])
-        .unwrap();
+    DenseWriter::new(
+        &root,
+        Partition::fixed_cells(rows as u64),
+        Partition::fixed_cells(1),
+    )
+    .compressor(Compressor::blosc1(options, 1))
+    .write(&values, [rows as u64, cols as u64])
+    .unwrap();
     let encoded_len = std::fs::metadata(root.join("data/0")).unwrap().len() as usize;
     let ranges = Arc::new(Mutex::new(Vec::new()));
     let matrix = DenseMatrix::from_store(Arc::new(CountingStore {
@@ -545,10 +735,14 @@ fn parallel_dense_decode_obeys_the_aggregate_memory_budget() {
     let values = (0..rows * cols)
         .map(|value| u16::try_from(value % 251).unwrap())
         .collect::<Vec<_>>();
-    DenseWriter::new(&root, Partition::fixed_cells(chunk_rows as u64), Partition::fixed_cells(1))
-        .threads(4)
-        .write(&values, [rows as u64, cols as u64])
-        .unwrap();
+    DenseWriter::new(
+        &root,
+        Partition::fixed_cells(chunk_rows as u64),
+        Partition::fixed_cells(1),
+    )
+    .threads(4)
+    .write(&values, [rows as u64, cols as u64])
+    .unwrap();
 
     let chunk_bytes = chunk_rows * cols * std::mem::size_of::<u16>();
     let selected_rows = rows - 1;
@@ -604,10 +798,14 @@ fn parallel_csr_decode_obeys_the_aggregate_memory_budget() {
     let indptr = (0..=rows as u64).collect::<Vec<_>>();
     let indices = (0..rows as u32).collect::<Vec<_>>();
     let values = (0..rows as u16).collect::<Vec<_>>();
-    CsrWriter::new(&root, Partition::fixed_cells(chunk_rows as u64), Partition::fixed_cells(1))
-        .threads(4)
-        .write(&indptr, &indices, &values, [rows as u64, rows as u64])
-        .unwrap();
+    CsrWriter::new(
+        &root,
+        Partition::fixed_cells(chunk_rows as u64),
+        Partition::fixed_cells(1),
+    )
+    .threads(4)
+    .write(&indptr, &indices, &values, [rows as u64, rows as u64])
+    .unwrap();
 
     let selected_rows = rows - 1;
     let chunk_array_bytes = chunk_rows * std::mem::size_of::<u16>();
@@ -624,9 +822,13 @@ fn parallel_csr_decode_obeys_the_aggregate_memory_budget() {
             bounds.push((encoded * 4).max(encoded * 3 + chunk_array_bytes * 3));
         }
     }
+    // Keep task/piece planner metadata in the resident side of the budget so
+    // this test isolates admission of encoded buffers and decode scratch.
+    let block_planner_resident = rows * 64;
     let resident = indptr.len() * std::mem::size_of::<u64>()
         + (selected_rows + 1) * std::mem::size_of::<u64>()
-        + selected_rows * std::mem::size_of::<u16>() * 2;
+        + selected_rows * std::mem::size_of::<u16>() * 2
+        + block_planner_resident;
 
     let run = |capacity: usize| {
         let active = Arc::new(AtomicUsize::new(0));
@@ -691,9 +893,13 @@ fn dense_row_selection_reads_only_intersecting_blocks() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("matrix");
     let values = vec![7u16; 256 * 256];
-    DenseWriter::new(&root, Partition::fixed_cells(256), Partition::fixed_cells(2))
-        .write(&values, [256, 256])
-        .unwrap();
+    DenseWriter::new(
+        &root,
+        Partition::fixed_cells(256),
+        Partition::fixed_cells(2),
+    )
+    .write(&values, [256, 256])
+    .unwrap();
 
     let inner = DirectoryStore::open(&root).unwrap();
     let encoded_len = usize::try_from(inner.len("data/0").unwrap()).unwrap();
@@ -791,9 +997,13 @@ fn full_dense_chunk_is_staged_once_instead_of_reading_each_block() {
     let values = (0..rows * cols)
         .map(|value| u16::try_from(value % 251).unwrap())
         .collect::<Vec<_>>();
-    DenseWriter::new(&root, Partition::fixed_cells(rows as u64), Partition::fixed_cells(1))
-        .write(&values, [rows as u64, cols as u64])
-        .unwrap();
+    DenseWriter::new(
+        &root,
+        Partition::fixed_cells(rows as u64),
+        Partition::fixed_cells(1),
+    )
+    .write(&values, [rows as u64, cols as u64])
+    .unwrap();
     let encoded_len = std::fs::metadata(root.join("data/0")).unwrap().len() as usize;
     let ranges = Arc::new(Mutex::new(Vec::new()));
     let matrix = DenseMatrix::from_store(Arc::new(CountingStore {
@@ -882,9 +1092,13 @@ fn csr_column_selection_reads_only_data_blocks_with_matches() {
     let indptr = (0..=rows as u64).collect::<Vec<_>>();
     let indices = (0..rows as u32).collect::<Vec<_>>();
     let data = (0..rows as u16).map(|value| value + 7).collect::<Vec<_>>();
-    CsrWriter::new(&root, Partition::fixed_cells(rows as u64), Partition::fixed_cells(1))
-        .write(&indptr, &indices, &data, [rows as u64, rows as u64])
-        .unwrap();
+    CsrWriter::new(
+        &root,
+        Partition::fixed_cells(rows as u64),
+        Partition::fixed_cells(1),
+    )
+    .write(&indptr, &indices, &data, [rows as u64, rows as u64])
+    .unwrap();
 
     let ranges = Arc::new(Mutex::new(Vec::new()));
     let matrix = CsrMatrix::from_store(Arc::new(CountingStore {

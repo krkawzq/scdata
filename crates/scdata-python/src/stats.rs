@@ -23,11 +23,11 @@ pub(crate) fn plan_stats_to_dict<'py>(
     values.set_item("predicted_physical_bytes", stats.predicted_physical_bytes)?;
     values.set_item("gap_bytes", stats.gap_bytes)?;
     values.set_item(
-        "maximum_encoded_bytes_per_side",
+        "max_encoded_bytes_per_side",
         stats.maximum_encoded_bytes_per_side,
     )?;
     values.set_item(
-        "maximum_decoded_bytes_per_job",
+        "max_decoded_bytes_per_job",
         stats.maximum_decoded_bytes_per_job,
     )?;
     values.set_item("arena_bytes", stats.arena_bytes)?;
@@ -62,7 +62,7 @@ pub(crate) fn runtime_stats_to_dict<'py>(
         "actual_queue_depth",
         io_mode_queue_depth(stats.actual_io_mode),
     )?;
-    values.set_item("worker_count", stats.worker_count)?;
+    values.set_item("num_workers", stats.worker_count)?;
     values.set_item(
         "max_inflight_jobs_per_worker",
         stats.max_inflight_jobs_per_worker,

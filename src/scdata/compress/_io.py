@@ -10,6 +10,10 @@ from typing import Any
 import numpy as np
 
 from scdata import _core
+from scdata.compress._base import open_matrix
+from scdata.compress._csr import ScCsr
+from scdata.compress._dense import ScDense
+from scdata.compress._limits import ReadLimits, resolve_read_limits
 from scdata.compress._validate import (
     ensure_path,
     ensure_writable_path,
@@ -18,10 +22,8 @@ from scdata.compress._validate import (
     normalize_dense,
     require_scipy_csr,
 )
-from scdata.exceptions import _call_core, _invalid_argument
-from scdata.compress.limits import ReadLimits, resolve_read_limits
-from scdata.compress.store import Store
-from scdata.compress.write_options import WriteOptions, resolve_write_options
+from scdata.compress._write_options import WriteOptions, resolve_write_options
+
 
 __all__ = [
     "open_store",
@@ -37,7 +39,7 @@ def write(
     matrix: Any,
     *,
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     overwrite: bool = True,
 ) -> None:
     """Write a dense array-like or SciPy sparse matrix.
@@ -54,7 +56,7 @@ def write(
             path,
             matrix,
             options=options,
-            n_workers=n_workers,
+            num_workers=num_workers,
             overwrite=overwrite,
         )
         return
@@ -62,7 +64,7 @@ def write(
         path,
         matrix,
         options=options,
-        n_workers=n_workers,
+        num_workers=num_workers,
         overwrite=overwrite,
     )
 
@@ -72,25 +74,24 @@ def write_dense(
     values: Any,
     *,
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     overwrite: bool = True,
 ) -> None:
     """Write a dense matrix after NumPy dtype/layout normalization."""
     path_obj = ensure_path(path)
     ensure_writable_path(path_obj, overwrite=overwrite)
-    opts = resolve_write_options(options, n_workers=n_workers)
+    opts = resolve_write_options(options, num_workers=num_workers)
     array = normalize_dense(values)
     row_bytes = int(array.shape[1]) * int(array.dtype.itemsize)
     chunk, block = opts.resolve(dense=True, row_bytes=row_bytes)
-    _call_core(
-        _core.write_dense,
+    _core.write_dense(
         str(path_obj),
         array,
         chunk_policy=chunk.policy,
         chunk_n=chunk.n,
         block_policy=block.policy,
         block_n=block.n,
-        n_workers=opts.n_workers,
+        num_workers=opts.num_workers,
     )
 
 
@@ -102,13 +103,13 @@ def write_csr_arrays(
     shape: tuple[int, int] | list[int],
     *,
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     overwrite: bool = True,
 ) -> None:
     """Write explicit CSR buffers after structural and precision checks."""
     path_obj = ensure_path(path)
     ensure_writable_path(path_obj, overwrite=overwrite)
-    opts = resolve_write_options(options, n_workers=n_workers)
+    opts = resolve_write_options(options, num_workers=num_workers)
     chunk, block = opts.resolve(dense=False)
     indptr_u64, indices_u64, data_array, (n_rows, n_cols) = normalize_csr_arrays(
         indptr,
@@ -116,8 +117,7 @@ def write_csr_arrays(
         data,
         shape,
     )
-    _call_core(
-        _core.write_csr,
+    _core.write_csr(
         str(path_obj),
         indptr_u64,
         indices_u64,
@@ -128,7 +128,7 @@ def write_csr_arrays(
         chunk_n=chunk.n,
         block_policy=block.policy,
         block_n=block.n,
-        n_workers=opts.n_workers,
+        num_workers=opts.num_workers,
     )
 
 
@@ -137,7 +137,7 @@ def write_csr(
     matrix: Any,
     *,
     options: WriteOptions | None = None,
-    n_workers: int | None = None,
+    num_workers: int | None = None,
     overwrite: bool = True,
 ) -> None:
     """Write a SciPy sparse matrix as canonical CSR.
@@ -147,7 +147,7 @@ def write_csr(
     """
     path_obj = ensure_path(path)
     ensure_writable_path(path_obj, overwrite=overwrite)
-    opts = resolve_write_options(options, n_workers=n_workers)
+    opts = resolve_write_options(options, num_workers=num_workers)
     opts.resolve(dense=False)
     csr = require_scipy_csr(matrix)
     if not getattr(csr, "has_canonical_format", False):
@@ -174,8 +174,8 @@ def open_store(
     max_encoded_size: int | None = None,
     max_decoded_size: int | None = None,
     max_block_count: int | None = None,
-    n_workers: int | None = None,
-) -> Store:
+    num_workers: int | None = None,
+) -> ScDense | ScCsr:
     """Open a directory store or a store inside a ZIP archive.
 
     A ZIP containing exactly one sc-compress prefix opens without
@@ -183,7 +183,7 @@ def open_store(
     available prefixes. Resource keyword overrides apply on top of ``limits``
     or :data:`scdata.DEFAULT_READ_LIMITS`.
     """
-    from scdata.compress import zip as zip_api
+    from scdata.compress import _zip as zip_api
 
     read_limits = resolve_read_limits(
         limits,
@@ -191,20 +191,19 @@ def open_store(
         max_encoded_size=max_encoded_size,
         max_decoded_size=max_decoded_size,
         max_block_count=max_block_count,
-        n_workers=n_workers,
+        num_workers=num_workers,
     )
     path_obj, resolved_prefix = _resolve_location(path, zip_prefix, zip_api)
-    handle = _call_core(
-        _core.store_open,
+    handle = _core.store_open(
         str(path_obj),
         zip_prefix=resolved_prefix,
-        maximum_metadata_size=read_limits.max_metadata_size,
-        maximum_encoded_size=read_limits.max_encoded_size,
-        maximum_decoded_size=read_limits.max_decoded_size,
-        maximum_block_count=read_limits.max_block_count,
-        n_workers=read_limits.n_workers,
+        max_metadata_size=read_limits.max_metadata_size,
+        max_encoded_size=read_limits.max_encoded_size,
+        max_decoded_size=read_limits.max_decoded_size,
+        max_block_count=read_limits.max_block_count,
+        num_workers=read_limits.num_workers,
     )
-    return Store(handle, path_obj, resolved_prefix)
+    return open_matrix(handle, path_obj, resolved_prefix)
 
 
 def _resolve_location(
@@ -213,11 +212,11 @@ def _resolve_location(
     zip_api: Any,
 ) -> tuple[Path, str | None]:
     if zip_prefix is not None and not isinstance(zip_prefix, str):
-        _invalid_argument(f"zip_prefix must be str or None, got {type(zip_prefix).__name__}")
+        raise TypeError(f"zip_prefix must be str or None, got {type(zip_prefix).__name__}")
 
     if isinstance(source, zipfile.ZipFile):
         if source.mode != "r" and source.fp is not None:
-            _invalid_argument("ZipFile passed to open_store() must be opened in mode 'r' or closed")
+            raise ValueError("ZipFile passed to open_store() must be opened in mode 'r' or closed")
         path = zip_api.archive_path(source)
         archive = True
     else:
@@ -230,7 +229,7 @@ def _resolve_location(
 
     if not archive:
         if path.exists() and not path.is_dir():
-            _invalid_argument(f"path is neither a directory nor a ZIP archive: {path}")
+            raise ValueError(f"path is neither a directory nor a ZIP archive: {path}")
         return path, None
 
     if zip_prefix is not None:
@@ -243,9 +242,9 @@ def _resolve_location(
     if len(prefixes) == 1:
         return path, prefixes[0]
     if not prefixes:
-        _invalid_argument(f"ZIP archive contains no sc-compress stores: {path}")
+        raise ValueError(f"ZIP archive contains no sc-compress stores: {path}")
     choices = ", ".join(repr(prefix) for prefix in prefixes)
-    _invalid_argument(
+    raise ValueError(
         f"ZIP archive contains multiple sc-compress stores; "
         f"pass zip_prefix=... (available: {choices})"
     )

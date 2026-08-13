@@ -54,8 +54,10 @@ fn extract_fill(dtype: OutputDType, value: &Bound<'_, PyAny>) -> PyResult<Fill> 
     match dtype {
         OutputDType::I16 => value.extract().map(Fill::I16),
         OutputDType::I32 => value.extract().map(Fill::I32),
+        OutputDType::I64 => value.extract().map(Fill::I64),
         OutputDType::U16 => value.extract().map(Fill::U16),
         OutputDType::U32 => value.extract().map(Fill::U32),
+        OutputDType::U64 => value.extract().map(Fill::U64),
         OutputDType::F32 => value.extract().map(Fill::F32),
         OutputDType::F64 => value.extract().map(Fill::F64),
     }

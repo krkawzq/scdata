@@ -38,12 +38,12 @@ def test_write_dense_zip_deflated_and_root_prefix(tmp_path: Path) -> None:
             archive,
             "",
             values,
-            n_workers=2,
+            num_workers=2,
             compression=zipfile.ZIP_DEFLATED,
         )
     assert scc.zip.list_stores(archive) == [""]
-    store = scc.open_store(archive, zip_prefix="", n_workers=2)
-    assert store.n_workers == 2
+    store = scc.open_store(archive, zip_prefix="", num_workers=2)
+    assert store.num_workers == 2
     np.testing.assert_array_equal(store.read(), values)
 
 
@@ -70,7 +70,7 @@ def test_pack_rejects_duplicate_prefix(tmp_path: Path) -> None:
     scc.write_dense(store_dir, np.zeros((2, 2), dtype=np.float32))
     archive = tmp_path / "dup.zip"
     scc.zip.pack(archive, "a", store_dir)
-    with pytest.raises(scc.InvalidArgumentError):
+    with pytest.raises(ValueError):
         scc.zip.pack(archive, "a", store_dir)
 
 
@@ -83,7 +83,7 @@ def test_open_lists_prefixes_when_archive_is_ambiguous(tmp_path: Path) -> None:
     scc.zip.pack(archive, "a", first)
     scc.zip.pack(archive, "b", second)
 
-    with pytest.raises(scc.InvalidArgumentError, match="available: 'a', 'b'"):
+    with pytest.raises(ValueError, match="available: 'a', 'b'"):
         scc.open_store(archive)
     np.testing.assert_array_equal(scc.open_store(archive, zip_prefix="b").read(), [[0]])
 
@@ -108,7 +108,7 @@ def test_pack_preflights_all_collisions_before_writing(tmp_path: Path) -> None:
     with zipfile.ZipFile(archive) as zf:
         before = zf.namelist()
 
-    with pytest.raises(scc.InvalidArgumentError, match="target member"):
+    with pytest.raises(ValueError, match="target member"):
         scc.zip.pack(archive, "x", store_dir)
 
     with zipfile.ZipFile(archive) as zf:
@@ -133,7 +133,7 @@ def test_pack_rejects_existing_descendant_before_writing(tmp_path: Path) -> None
     with zipfile.ZipFile(archive) as zf:
         before = zf.namelist()
 
-    with pytest.raises(scc.InvalidArgumentError, match="target member"):
+    with pytest.raises(ValueError, match="target member"):
         scc.zip.pack(archive, "x", store_dir)
 
     with zipfile.ZipFile(archive) as zf:
@@ -154,7 +154,7 @@ def test_pack_validates_compression_before_creating_archive(
     scc.write_dense(store_dir, np.ones((1, 1), dtype=np.float32))
     archive = tmp_path / "invalid.zip"
 
-    with pytest.raises(scc.InvalidArgumentError, match=message):
+    with pytest.raises(ValueError, match=message):
         scc.zip.pack(
             archive,
             "x",
@@ -172,12 +172,12 @@ def test_zip_writer_validates_archive_options_before_materializing_matrix(tmp_pa
             raise AssertionError("matrix must not be materialized")
 
     archive = tmp_path / "invalid-writer.zip"
-    with pytest.raises(scc.InvalidArgumentError, match="unsupported ZIP compression"):
+    with pytest.raises(ValueError, match="unsupported ZIP compression"):
         scc.zip.write_dense(archive, "x", UnreadableMatrix(), compression=999)
     assert not archive.exists()
 
     archive.write_text("not a zip", encoding="utf-8")
-    with pytest.raises(scc.InvalidArgumentError, match="not a ZIP file"):
+    with pytest.raises(ValueError, match="not a ZIP file"):
         scc.zip.write_dense(archive, "x", UnreadableMatrix())
     assert archive.read_text(encoding="utf-8") == "not a zip"
 
@@ -189,7 +189,7 @@ def test_open_store_rejects_zipfile_still_open_for_append(tmp_path: Path) -> Non
     scc.zip.pack(archive, "x", store_dir)
 
     with zipfile.ZipFile(archive, mode="a") as zf:
-        with pytest.raises(scc.InvalidArgumentError, match="mode 'r'"):
+        with pytest.raises(ValueError, match="mode 'r'"):
             scc.open_store(zf)
 
 
@@ -200,7 +200,7 @@ def test_pack_rejects_non_regular_store_files(tmp_path: Path) -> None:
     scc.write_dense(store_dir, np.ones((1, 1), dtype=np.float32))
     os.mkfifo(store_dir / "pipe")
 
-    with pytest.raises(scc.InvalidArgumentError, match="non-regular file"):
+    with pytest.raises(ValueError, match="non-regular file"):
         scc.zip.pack(tmp_path / "fifo.zip", "x", store_dir)
 
 
@@ -209,6 +209,6 @@ def test_pack_rejects_oversized_member_names_before_creating_archive(tmp_path: P
     scc.write_dense(store_dir, np.ones((1, 1), dtype=np.float32))
     archive = tmp_path / "long-name.zip"
 
-    with pytest.raises(scc.InvalidArgumentError, match="maximum is 65535"):
+    with pytest.raises(ValueError, match="maximum is 65535"):
         scc.zip.pack(archive, "x" * 65_536, store_dir)
     assert not archive.exists()

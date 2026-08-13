@@ -6,13 +6,6 @@ from typing import Any
 
 import numpy as np
 
-from scdata._core import (
-    FORMAT_NAME,
-    FORMAT_VERSION,
-    INDEX_DTYPES as _STORAGE_INDEX_DTYPES,
-    VALUE_DTYPES as _STORAGE_VALUE_DTYPES,
-)
-
 __all__ = [
     "FORMAT_NAME",
     "FORMAT_VERSION",
@@ -25,19 +18,31 @@ __all__ = [
     "is_value_dtype",
 ]
 
-STORAGE_VALUE_DTYPES: tuple[str, ...] = tuple(_STORAGE_VALUE_DTYPES)
-STORAGE_INDEX_DTYPES: tuple[str, ...] = tuple(_STORAGE_INDEX_DTYPES)
+FORMAT_NAME = "sc-compress"
+FORMAT_VERSION = 1
+STORAGE_VALUE_DTYPES: tuple[str, ...] = (
+    "u16",
+    "u32",
+    "u64",
+    "i16",
+    "i32",
+    "i64",
+    "f32",
+    "f64",
+)
+STORAGE_INDEX_DTYPES: tuple[str, ...] = ("u16", "u32")
 
 _DTYPE_BY_NAME = {
     "u16": np.dtype(np.uint16),
     "u32": np.dtype(np.uint32),
+    "u64": np.dtype(np.uint64),
     "i16": np.dtype(np.int16),
     "i32": np.dtype(np.int32),
+    "i64": np.dtype(np.int64),
     "f32": np.dtype(np.float32),
     "f64": np.dtype(np.float64),
 }
 
-# NumPy dtypes accepted for matrix values / CSR indices.
 VALUE_DTYPES: frozenset[np.dtype[np.generic]] = frozenset(
     _DTYPE_BY_NAME[name] for name in STORAGE_VALUE_DTYPES
 )

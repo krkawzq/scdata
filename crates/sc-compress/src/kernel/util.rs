@@ -3,6 +3,8 @@
 use crate::error::{Error, Result};
 use crate::parallel;
 
+use std::mem::{ManuallyDrop, MaybeUninit};
+
 /// Default rows per parallel job — small enough for dynamic balance, large
 /// enough to amortize dispatch cost.
 pub(crate) const ROW_JOB: usize = 64;
@@ -20,6 +22,35 @@ pub(crate) fn zeroed(len: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Allocate byte storage without paying to initialize bytes that a kernel will
+/// overwrite completely.
+pub(crate) fn uninit_bytes(len: usize) -> Result<Vec<MaybeUninit<u8>>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len)?;
+    // SAFETY: every bit pattern, including uninitialized storage, is valid for
+    // `MaybeUninit<u8>`. Callers still cannot observe the bytes as `u8` until
+    // they have initialized the complete allocation.
+    unsafe { out.set_len(len) };
+    Ok(out)
+}
+
+/// Convert a fully initialized byte allocation to its ordinary `Vec<u8>` form.
+///
+/// # Safety
+///
+/// Every element in `bytes` must have been initialized. The allocation must
+/// still have the length and capacity produced by [`uninit_bytes`].
+pub(crate) unsafe fn assume_init_bytes(bytes: Vec<MaybeUninit<u8>>) -> Vec<u8> {
+    let mut bytes = ManuallyDrop::new(bytes);
+    let pointer = bytes.as_mut_ptr().cast::<u8>();
+    let len = bytes.len();
+    let capacity = bytes.capacity();
+    // SAFETY: the caller guarantees all `len` bytes are initialized. `u8` and
+    // `MaybeUninit<u8>` have identical size/alignment, and `ManuallyDrop`
+    // transfers the original allocation to this `Vec` exactly once.
+    unsafe { Vec::from_raw_parts(pointer, len, capacity) }
+}
+
 pub(crate) fn usize_from_u64(value: u64, context: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::invalid_argument(format!("{context} exceeds usize")))
 }
@@ -28,20 +59,21 @@ pub(crate) fn usize_from_u64(value: u64, context: &str) -> Result<usize> {
 ///
 /// Each job receives a half-open row range plus an exclusive mutable destination
 /// buffer for those rows (safe disjoint writes without `unsafe`).
-pub(crate) fn par_for_row_blocks<F>(
+pub(crate) fn par_for_row_blocks<T, F>(
     threads: usize,
     n_rows: usize,
-    row_bytes: usize,
-    output: &mut [u8],
+    row_len: usize,
+    output: &mut [T],
     work: F,
 ) -> Result<()>
 where
-    F: Fn(usize, usize, &mut [u8]) -> Result<()> + Sync,
+    T: Send,
+    F: Fn(usize, usize, &mut [T]) -> Result<()> + Sync,
 {
     if n_rows == 0 {
         return Ok(());
     }
-    let expected = checked_mul(n_rows, row_bytes, "par row blocks")?;
+    let expected = checked_mul(n_rows, row_len, "par row blocks")?;
     if output.len() != expected {
         return Err(Error::invalid_argument(
             "output length does not match n_rows × row_bytes",
@@ -56,9 +88,9 @@ where
         |emit| {
             while row_start < n_rows {
                 let row_end = (row_start + ROW_JOB).min(n_rows);
-                let block_bytes = (row_end - row_start) * row_bytes;
+                let block_len = (row_end - row_start) * row_len;
                 let tail = std::mem::take(&mut remaining);
-                let (block, tail) = tail.split_at_mut(block_bytes);
+                let (block, tail) = tail.split_at_mut(block_len);
                 remaining = tail;
                 emit((row_start, row_end, block))?;
                 row_start = row_end;
@@ -74,17 +106,17 @@ where
     )
 }
 
-/// Copy `elem_size` bytes at `src` into `dst`.
+/// Copy one matrix element without slice construction or bounds checks.
+///
+/// # Safety
+///
+/// `src` and `dst` must each be valid for `elem_size` initialized/readable or
+/// writable bytes respectively, and the two ranges must not overlap.
 #[inline(always)]
-pub(crate) fn copy_elem(dst: &mut [u8], src: &[u8], elem_size: usize) {
-    assert_eq!(dst.len(), elem_size, "destination element size mismatch");
-    assert_eq!(src.len(), elem_size, "source element size mismatch");
-    // SAFETY: the exact-length assertions prove both pointers are valid for
-    // `elem_size` bytes. The slices are distinct inputs to this kernel helper,
-    // so their ranges do not overlap.
-    unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), elem_size);
-    }
+pub(crate) unsafe fn copy_elem_unchecked(dst: *mut u8, src: *const u8, elem_size: usize) {
+    // SAFETY: the caller provides the complete pointer validity, length, and
+    // non-overlap invariants required by `copy_nonoverlapping`.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, elem_size) };
 }
 
 /// Read a CSR column index (u16/u32 LE) at element position `pos` without a
@@ -119,48 +151,43 @@ pub(crate) unsafe fn read_index_unchecked(indices: &[u8], pos: usize, index_size
     }
 }
 
-/// Write a CSR column index as u16/u32 LE.
+/// Write a CSR column index after the output layout and value width have been
+/// validated at the kernel boundary.
+///
+/// # Safety
+///
+/// `index_size` must be 2 or 4, `out.add(pos * index_size)` must be valid for a
+/// complete index, and `value` must fit the selected integer width.
 #[inline(always)]
-pub(crate) fn write_index(out: &mut [u8], pos: usize, index_size: usize, value: u64) -> Result<()> {
-    let offset = pos
-        .checked_mul(index_size)
-        .ok_or_else(|| Error::invalid_argument("CSR output index offset overflow"))?;
-    let end = offset
-        .checked_add(index_size)
-        .ok_or_else(|| Error::invalid_argument("CSR output index end overflow"))?;
-    if end > out.len() {
-        return Err(Error::invalid_argument(
-            "CSR output index position is out of bounds",
-        ));
-    }
+pub(crate) unsafe fn write_index_unchecked(
+    out: *mut u8,
+    pos: usize,
+    index_size: usize,
+    value: u64,
+) {
+    debug_assert!(matches!(index_size, 2 | 4));
+    debug_assert!(index_size == 4 || value <= u64::from(u16::MAX));
+    debug_assert!(value <= u64::from(u32::MAX));
+    let offset = pos * index_size;
     match index_size {
         2 => {
-            let value = u16::try_from(value)
-                .map_err(|_| Error::invalid_argument("CSR index does not fit u16"))?
-                .to_le();
-            // SAFETY: the `end <= out.len()` check proves two writable bytes;
-            // `write_unaligned` imposes no alignment requirement.
+            // SAFETY: the caller guarantees a complete writable u16 slot at
+            // `offset`; unaligned output is explicitly supported.
             unsafe {
-                out.as_mut_ptr()
-                    .add(offset)
+                out.add(offset)
                     .cast::<u16>()
-                    .write_unaligned(value);
+                    .write_unaligned((value as u16).to_le());
             }
         }
         4 => {
-            let value = u32::try_from(value)
-                .map_err(|_| Error::invalid_argument("CSR index does not fit u32"))?
-                .to_le();
-            // SAFETY: the `end <= out.len()` check proves four writable bytes;
-            // `write_unaligned` imposes no alignment requirement.
+            // SAFETY: the caller guarantees a complete writable u32 slot at
+            // `offset`; unaligned output is explicitly supported.
             unsafe {
-                out.as_mut_ptr()
-                    .add(offset)
+                out.add(offset)
                     .cast::<u32>()
-                    .write_unaligned(value);
+                    .write_unaligned((value as u32).to_le());
             }
         }
         _ => unreachable!("CSR index size is 2 or 4"),
     }
-    Ok(())
 }

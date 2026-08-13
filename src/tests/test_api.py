@@ -31,6 +31,7 @@ def test_register_feature_map_plan_and_owned_batches(tmp_path: Path) -> None:
     assert dataset.kind in {"dense", "csr"}
     assert dataset.shape == (4, 3)
     assert dataset.feature_names == ("g0", "g1", "g2")
+    assert dataset.obs_names == ("c0", "c1", "c2", "c3")
     assert "key='X'" in repr(dataset)
 
     output = sc_load.OutputSpec(4, np.float32, fill=-1)
@@ -48,7 +49,7 @@ def test_register_feature_map_plan_and_owned_batches(tmp_path: Path) -> None:
     assert plan.stats.output_ring_bytes > 0
     assert plan.stats.as_dict()["input_rows"] == 3
 
-    with plan.open(sc_load.SessionConfig(worker_count=1, io_mode="blocking")) as session:
+    with plan.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
         first = session.next_batch()
         second = session.next_batch()
         assert first is not None
@@ -65,6 +66,7 @@ def test_register_feature_map_plan_and_owned_batches(tmp_path: Path) -> None:
         assert session.next_batch() is None
         assert session.exhausted
         assert session.stats.state == "finished"
+        assert session.stats.num_workers == 1
         assert session.stats.as_dict()["state"] == "finished"
 
 
@@ -78,7 +80,7 @@ def test_prefetch_is_reusable_via_plan_and_preserves_row_order(tmp_path: Path) -
         prefetch_step=2,
     )
     expected = values[[4, 0, 2]]
-    config = sc_load.SessionConfig(worker_count=1, io_mode="blocking")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     np.testing.assert_array_equal(plan.read(config), expected)
     result = np.concatenate(
         list(sc_load.prefetch(dataset, [4, 0, 2], batch_size=1, prefetch_step=2, config=config))
@@ -100,7 +102,7 @@ def test_cancel_is_structured_and_close_is_idempotent(tmp_path: Path) -> None:
         batch_size=2,
         prefetch_step=3,
     )
-    session = plan.open(sc_load.SessionConfig(worker_count=1, io_mode="blocking"))
+    session = plan.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking"))
     session.cancel()
     with pytest.raises(sc_load.CancelledError) as raised:
         session.next_batch()
@@ -120,7 +122,7 @@ def test_empty_plan_finishes_without_batches() -> None:
         prefetch_step=2,
     )
     assert plan.is_empty
-    with plan.open(sc_load.SessionConfig(worker_count=1, io_mode="blocking")) as session:
+    with plan.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
         result = session.read()
         assert result.shape == (0, 3)
         assert result.dtype == np.dtype(np.float32)
@@ -143,7 +145,7 @@ def test_checked_conversion_policies(tmp_path: Path) -> None:
         batch_size=1,
         prefetch_step=2,
     )
-    with failing.open(sc_load.SessionConfig(worker_count=1, io_mode="blocking")) as session:
+    with failing.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
         with pytest.raises(sc_load.SessionError):
             session.next_batch()
 
@@ -154,7 +156,7 @@ def test_checked_conversion_policies(tmp_path: Path) -> None:
         batch_size=1,
         prefetch_step=2,
     )
-    with filled.open(sc_load.SessionConfig(worker_count=1, io_mode="blocking")) as session:
+    with filled.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
         np.testing.assert_array_equal(session.read(), np.array([[99, 4]], dtype=np.uint16))
 
 
@@ -173,8 +175,85 @@ def test_rounding_conversion_requires_opt_in(tmp_path: Path) -> None:
         **common,
         output=sc_load.OutputSpec(1, np.float32, allow_float_rounding=True),
     )
-    with plan.open(sc_load.SessionConfig(worker_count=1, io_mode="blocking")) as session:
+    with plan.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
         np.testing.assert_array_equal(session.read(), np.array([[16_777_216]], dtype=np.float32))
+
+
+def test_loader_preserves_int64_and_uint64_precision(tmp_path: Path) -> None:
+    matrices = {
+        "i64": np.array(
+            [
+                [np.iinfo(np.int64).min, -(1 << 53) - 1],
+                [(1 << 53) + 1, np.iinfo(np.int64).max],
+            ],
+            dtype=np.int64,
+        ),
+        "u64": np.array(
+            [
+                [0, (1 << 53) + 1],
+                [(1 << 63) + 1, np.iinfo(np.uint64).max],
+            ],
+            dtype=np.uint64,
+        ),
+    }
+    config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
+
+    for name, values in matrices.items():
+        dataset = sc_load.register(write_scc_x(tmp_path, values, f"{name}.scc"))
+        assert dataset.dtype == values.dtype
+        plan = sc_load.compile(dataset, range(2), batch_size=1, prefetch_step=2)
+        assert plan.dtype == values.dtype
+        with plan.open(config) as session:
+            result = session.read()
+        assert result.dtype == values.dtype
+        np.testing.assert_array_equal(result, values)
+
+
+def test_int64_uint64_conversion_policies(tmp_path: Path) -> None:
+    values = np.array([[-1, (1 << 53) + 1]], dtype=np.int64)
+    dataset = sc_load.register(write_scc_x(tmp_path, values, "i64-conversion.scc"))
+    common = dict(datasets=dataset, rows=[0], batch_size=1, prefetch_step=2)
+
+    filled = sc_load.compile(
+        **common,
+        output=sc_load.OutputSpec(
+            2,
+            np.uint64,
+            fill=np.iinfo(np.uint64).max,
+            overflow="use_fill",
+        ),
+    )
+    with filled.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
+        np.testing.assert_array_equal(
+            session.read(),
+            np.array([[np.iinfo(np.uint64).max, (1 << 53) + 1]], dtype=np.uint64),
+        )
+
+    with pytest.raises(sc_load.PromotionError):
+        sc_load.compile(**common, output=sc_load.OutputSpec(2, np.float64))
+    rounded = sc_load.compile(
+        **common,
+        output=sc_load.OutputSpec(2, np.float64, allow_float_rounding=True),
+    )
+    with rounded.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
+        np.testing.assert_array_equal(session.read(), values.astype(np.float64))
+
+    unsigned_values = np.array([[0, (1 << 63) + 1]], dtype=np.uint64)
+    unsigned_dataset = sc_load.register(
+        write_scc_x(tmp_path, unsigned_values, "u64-conversion.scc")
+    )
+    signed = sc_load.compile(
+        unsigned_dataset,
+        [0],
+        output=sc_load.OutputSpec(2, np.int64, fill=-99, overflow="use_fill"),
+        batch_size=1,
+        prefetch_step=2,
+    )
+    with signed.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
+        np.testing.assert_array_equal(
+            session.read(),
+            np.array([[0, -99]], dtype=np.int64),
+        )
 
 
 def test_scc_zip_and_layer_key(tmp_path: Path) -> None:
@@ -195,7 +274,7 @@ def test_scc_zip_and_layer_key(tmp_path: Path) -> None:
     counts = sc_load.register(archive, key="layers/counts")
     assert counts.zip_prefix == "layers/counts"
 
-    config = sc_load.SessionConfig(worker_count=1, io_mode="auto")
+    config = sc_load.SessionConfig(num_workers=1, io_mode="auto")
     np.testing.assert_array_equal(
         sc_load.compile(x, [1], batch_size=1, prefetch_step=2).read(config),
         values[1:2],
@@ -216,6 +295,7 @@ def test_obsm_has_no_feature_names_and_identity_prefetch(tmp_path: Path) -> None
     path = write_scc(adata, tmp_path / "emb.scc", store="dir")
     pca = sc_load.register(path, key="obsm/X_pca")
     assert pca.feature_names is None
+    assert pca.obs_names == ("c0", "c1", "c2")
     assert pca.shape == (3, 2)
     result = list(sc_load.prefetch(pca, [2, 0], batch_size=1, prefetch_step=2))
     np.testing.assert_array_equal(np.concatenate(result), adata.obsm["X_pca"][[2, 0]])
@@ -249,7 +329,7 @@ def test_dense_and_csr_sources_can_be_interleaved(tmp_path: Path) -> None:
         batch_size=2,
         prefetch_step=3,
     )
-    with plan.open(sc_load.SessionConfig(worker_count=2, io_mode="blocking")) as session:
+    with plan.open(sc_load.SessionConfig(num_workers=2, io_mode="blocking")) as session:
         np.testing.assert_array_equal(
             session.read(),
             np.array([[0, 20, 30, 0], [1, 2, 3, 4], [10, 0, 0, 40]], dtype=np.float32),
@@ -261,8 +341,14 @@ def test_register_accepts_sc_compress_read_limits(tmp_path: Path) -> None:
 
     values = np.arange(6, dtype=np.float32).reshape(2, 3)
     path = write_scc_x(tmp_path, values)
-    dataset = sc_load.register(path, limits=scc.ReadLimits(max_block_count=10_000))
+    dataset = sc_load.register(
+        path,
+        limits=scc.ReadLimits(max_block_count=10_000),
+        num_workers=2,
+    )
     assert dataset.limits.max_block_count == 10_000
+    assert dataset.num_workers == 2
+    assert dataset.info()["num_workers"] == 2
     assert dataset.feature_names == ("g0", "g1", "g2")
 
 
@@ -274,3 +360,4 @@ def test_with_feature_map_returns_new_handle(tmp_path: Path) -> None:
     assert mapped.feature_map == (1, None, 0)
     assert mapped.path == base.path
     assert mapped.key == base.key
+    assert mapped.obs_names == base.obs_names

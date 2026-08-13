@@ -450,6 +450,8 @@ fn dtype_code(dtype: OutputDType) -> u32 {
         OutputDType::U32 => 3,
         OutputDType::F32 => 4,
         OutputDType::F64 => 5,
+        OutputDType::I64 => 6,
+        OutputDType::U64 => 7,
     }
 }
 
@@ -461,6 +463,8 @@ fn dtype_from_code(code: u32) -> Result<OutputDType> {
         3 => Ok(OutputDType::U32),
         4 => Ok(OutputDType::F32),
         5 => Ok(OutputDType::F64),
+        6 => Ok(OutputDType::I64),
+        7 => Ok(OutputDType::U64),
         _ => Err(Error::InvalidDataset(format!(
             "shared ring dtype code {code} is unsupported"
         ))),
