@@ -23,9 +23,14 @@ mod source;
 mod share;
 
 #[cfg(test)]
-mod real_scatter_bench;
-#[cfg(test)]
 mod tests;
+
+/// Run the optional decoded-scatter profiler selected by environment variables.
+#[cfg(feature = "profile")]
+#[doc(hidden)]
+pub fn run_scatter_profile_from_env() {
+    scatter::profile::run_from_env();
+}
 
 pub use compiler::{compile, PlanSpec};
 pub use config::{

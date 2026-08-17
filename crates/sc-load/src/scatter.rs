@@ -2,7 +2,10 @@
 
 use sc_compress::DType as StorageDType;
 
-use crate::plan::{CsrMap, DenseMap, SourcePlan, UNMAPPED_TARGET, UNMAPPED_TARGET_U32};
+use crate::plan::{
+    csr_sparse_binary_is_cheaper, CsrMap, CsrSparseMap, CsrSparseMapEntry, DenseMap, SourcePlan,
+    UNMAPPED_TARGET, UNMAPPED_TARGET_U32,
+};
 use crate::{Error, Result};
 
 type FillFn = unsafe fn(output: *mut u8, len: usize, word: u64);
@@ -16,6 +19,9 @@ pub(crate) struct IndexOp {
     validate: IndexValidatorFn,
     read: IndexReaderFn,
 }
+
+#[cfg(feature = "profile")]
+pub(crate) mod profile;
 
 impl IndexOp {
     pub(crate) fn new(dtype: StorageDType) -> Option<Self> {
@@ -230,6 +236,169 @@ unsafe fn validate_mapped_csr_values<const MAP_KIND: u8>(
     Ok(())
 }
 
+#[inline(always)]
+fn unpack_sparse_packed(entry: u64) -> (usize, usize) {
+    (entry as u32 as usize, (entry >> 32) as u32 as usize)
+}
+
+unsafe fn find_csr_column<const INDEX_BYTES: usize>(
+    indices: *const u8,
+    count: usize,
+    target: usize,
+) -> Option<usize> {
+    let mut start = 0usize;
+    let mut end = count;
+    while start < end {
+        let middle = start + (end - start) / 2;
+        // SAFETY: `middle < count` addresses one complete validated index.
+        let value = unsafe { read_sparse_index::<INDEX_BYTES>(indices, middle) };
+        if value < target {
+            start = middle + 1;
+        } else {
+            end = middle;
+        }
+    }
+    if start < count {
+        // SAFETY: `start < count` addresses one complete validated index.
+        let value = unsafe { read_sparse_index::<INDEX_BYTES>(indices, start) };
+        if value == target {
+            return Some(start);
+        }
+    }
+    None
+}
+
+#[inline(always)]
+unsafe fn read_sparse_index<const INDEX_BYTES: usize>(indices: *const u8, element: usize) -> usize {
+    if INDEX_BYTES == 2 {
+        // SAFETY: caller proves one complete possibly unaligned u16 index.
+        usize::from(u16::from_le(unsafe {
+            indices.add(element * 2).cast::<u16>().read_unaligned()
+        }))
+    } else {
+        debug_assert_eq!(INDEX_BYTES, 4);
+        // SAFETY: caller proves one complete possibly unaligned u32 index.
+        u32::from_le(unsafe { indices.add(element * 4).cast::<u32>().read_unaligned() }) as usize
+    }
+}
+
+#[inline(always)]
+unsafe fn find_bound_csr_column(
+    index: IndexOp,
+    indices: *const u8,
+    count: usize,
+    target: usize,
+) -> Option<usize> {
+    if index.size == 2 {
+        // SAFETY: caller validated `count` complete u16 indices.
+        unsafe { find_csr_column::<2>(indices, count, target) }
+    } else {
+        debug_assert_eq!(index.size, 4);
+        // SAFETY: caller validated `count` complete u32 indices.
+        unsafe { find_csr_column::<4>(indices, count, target) }
+    }
+}
+
+unsafe fn validate_sparse_packed_csr_values(
+    index: IndexOp,
+    convert: &crate::convert::ConvertOp,
+    values: *const u8,
+    indices: *const u8,
+    count: usize,
+    entries: &[u64],
+) -> Result<()> {
+    let value_size = usize::from(convert.src_size);
+    for &entry in entries {
+        let (source_column, _) = unpack_sparse_packed(entry);
+        // SAFETY: canonical indices and `count` were validated by the caller.
+        let position = unsafe { find_bound_csr_column(index, indices, count, source_column) };
+        if let Some(position) = position {
+            // SAFETY: the found position addresses one complete source value.
+            let value = unsafe {
+                std::slice::from_raw_parts(values.add(position << convert.src_shift), value_size)
+            };
+            convert.validate_one(value)?;
+        }
+    }
+    Ok(())
+}
+
+unsafe fn validate_sparse_wide_csr_values(
+    index: IndexOp,
+    convert: &crate::convert::ConvertOp,
+    values: *const u8,
+    indices: *const u8,
+    count: usize,
+    entries: &[CsrSparseMapEntry],
+) -> Result<()> {
+    let value_size = usize::from(convert.src_size);
+    for entry in entries {
+        // SAFETY: canonical indices and `count` were validated by the caller.
+        let position = unsafe { find_bound_csr_column(index, indices, count, entry.source_column) };
+        if let Some(position) = position {
+            // SAFETY: the found position addresses one complete source value.
+            let value = unsafe {
+                std::slice::from_raw_parts(values.add(position << convert.src_shift), value_size)
+            };
+            convert.validate_one(value)?;
+        }
+    }
+    Ok(())
+}
+
+unsafe fn scatter_sparse_packed_csr(
+    index: IndexOp,
+    convert: &crate::convert::ConvertOp,
+    values: *const u8,
+    indices: *const u8,
+    output: *mut u8,
+    count: usize,
+    entries: &[u64],
+) -> Result<()> {
+    for &entry in entries {
+        let (source_column, target_byte) = unpack_sparse_packed(entry);
+        // SAFETY: canonical indices and `count` were validated by the caller.
+        let position = unsafe { find_bound_csr_column(index, indices, count, source_column) };
+        if let Some(position) = position {
+            // SAFETY: validation covers the found value and compiler-built
+            // target; mapped targets are unique and output is row-exclusive.
+            unsafe {
+                convert.convert_one_prevalidated(
+                    values.add(position << convert.src_shift),
+                    output.add(target_byte),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn scatter_sparse_wide_csr(
+    index: IndexOp,
+    convert: &crate::convert::ConvertOp,
+    values: *const u8,
+    indices: *const u8,
+    output: *mut u8,
+    count: usize,
+    entries: &[CsrSparseMapEntry],
+) -> Result<()> {
+    for entry in entries {
+        // SAFETY: canonical indices and `count` were validated by the caller.
+        let position = unsafe { find_bound_csr_column(index, indices, count, entry.source_column) };
+        if let Some(position) = position {
+            // SAFETY: validation covers the found value and compiler-built
+            // target; mapped targets are unique and output is row-exclusive.
+            unsafe {
+                convert.convert_one_prevalidated(
+                    values.add(position << convert.src_shift),
+                    output.add(entry.target_byte),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 unsafe fn scatter_csr_scalar<const MAP_KIND: u8>(
     index: IndexOp,
     convert: &crate::convert::ConvertOp,
@@ -389,41 +558,79 @@ pub(crate) fn validate_row(
         ));
     }
     if source.convert.can_fail() {
-        match map {
-            Some(CsrMap::Packed32(entries)) => {
-                // SAFETY: the structural checks above cover both complete
-                // arrays, every source column, and the packed map extent.
+        let sparse_validated = match source.csr_sparse_map.as_ref() {
+            Some(CsrSparseMap::Packed32(entries))
+                if csr_sparse_binary_is_cheaper(entries.len(), count) =>
+            {
+                // SAFETY: structural validation covers both arrays and the
+                // compiler-built sparse entries are ordered and in range.
                 unsafe {
-                    validate_mapped_csr_values::<CSR_MAP_PACKED>(
+                    validate_sparse_packed_csr_values(
                         index,
                         &source.convert,
                         values.as_ptr(),
                         index_bytes.as_ptr(),
                         count,
-                        CsrMapPointers {
-                            packed: entries.as_ptr(),
-                            wide: std::ptr::null(),
-                        },
+                        entries,
                     )?;
                 }
+                true
             }
-            Some(CsrMap::Wide(entries)) => {
-                // SAFETY: the same proof covers the wide map representation.
+            Some(CsrSparseMap::Wide(entries))
+                if csr_sparse_binary_is_cheaper(entries.len(), count) =>
+            {
+                // SAFETY: the same proof covers wide sparse entries.
                 unsafe {
-                    validate_mapped_csr_values::<CSR_MAP_WIDE>(
+                    validate_sparse_wide_csr_values(
                         index,
                         &source.convert,
                         values.as_ptr(),
                         index_bytes.as_ptr(),
                         count,
-                        CsrMapPointers {
-                            packed: std::ptr::null(),
-                            wide: entries.as_ptr(),
-                        },
+                        entries,
                     )?;
                 }
+                true
             }
-            None => source.convert.validate_slice(values)?,
+            _ => false,
+        };
+        if !sparse_validated {
+            match map {
+                Some(CsrMap::Packed32(entries)) => {
+                    // SAFETY: the structural checks above cover both complete
+                    // arrays, every source column, and the packed map extent.
+                    unsafe {
+                        validate_mapped_csr_values::<CSR_MAP_PACKED>(
+                            index,
+                            &source.convert,
+                            values.as_ptr(),
+                            index_bytes.as_ptr(),
+                            count,
+                            CsrMapPointers {
+                                packed: entries.as_ptr(),
+                                wide: std::ptr::null(),
+                            },
+                        )?;
+                    }
+                }
+                Some(CsrMap::Wide(entries)) => {
+                    // SAFETY: the same proof covers the wide map representation.
+                    unsafe {
+                        validate_mapped_csr_values::<CSR_MAP_WIDE>(
+                            index,
+                            &source.convert,
+                            values.as_ptr(),
+                            index_bytes.as_ptr(),
+                            count,
+                            CsrMapPointers {
+                                packed: std::ptr::null(),
+                                wide: entries.as_ptr(),
+                            },
+                        )?;
+                    }
+                }
+                None => source.convert.validate_slice(values)?,
+            }
         }
     }
     Ok(())
@@ -557,6 +764,44 @@ unsafe fn scatter_row_prevalidated_inner(
         // strict index ordering, column bounds, and conversion policy.
         let index_bytes = unsafe { indices.get_unchecked(index_range) };
         let count = values.len() >> convert.src_shift;
+        match source.csr_sparse_map.as_ref() {
+            Some(CsrSparseMap::Packed32(entries))
+                if csr_sparse_binary_is_cheaper(entries.len(), count) =>
+            {
+                // SAFETY: validation covered the canonical row, every sparse
+                // entry, mapped conversion, and unique output target.
+                unsafe {
+                    scatter_sparse_packed_csr(
+                        index,
+                        convert,
+                        values.as_ptr(),
+                        index_bytes.as_ptr(),
+                        row.as_mut_ptr(),
+                        count,
+                        entries,
+                    )?;
+                }
+                return Ok(());
+            }
+            Some(CsrSparseMap::Wide(entries))
+                if csr_sparse_binary_is_cheaper(entries.len(), count) =>
+            {
+                // SAFETY: the same proof covers wide sparse targets.
+                unsafe {
+                    scatter_sparse_wide_csr(
+                        index,
+                        convert,
+                        values.as_ptr(),
+                        index_bytes.as_ptr(),
+                        row.as_mut_ptr(),
+                        count,
+                        entries,
+                    )?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         // SAFETY: validation proved both CSR arrays contain `count` complete
         // elements, every index/map target is in range, and this row is unique.
         if unsafe {
@@ -1258,5 +1503,727 @@ mod simd_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod systematic_tests {
+    use std::sync::Arc;
+
+    use sc_compress::{CsrWriter, DType as StorageDType, Partition};
+
+    use crate::compiler::build_default_ranges;
+    use crate::convert::ConvertOp;
+    use crate::dtype::{promote_kind, OutputDType, PromoteKind};
+    use crate::output::{Fill, FloatCastPolicy, OutputSpec, OverflowPolicy};
+    use crate::plan::{
+        csr_sparse_binary_is_cheaper, CellTask, CsrMap, CsrSparseMap, CsrSparseMapEntry, DenseMap,
+        DenseMapEntry, DenseMapRun, SourcePlan, UNMAPPED_TARGET, UNMAPPED_TARGET_U32,
+    };
+    use crate::scatter::{scatter_row_prevalidated, validate_row, FillOp, IndexOp};
+    use crate::source::OutputSlot;
+    use crate::{
+        compile, Dataset, FeatureMap, IoMode, PlanSpec, RowRef, SessionConfig, Source, SourceId,
+    };
+
+    const STORAGE_DTYPES: [StorageDType; 8] = [
+        StorageDType::I16,
+        StorageDType::I32,
+        StorageDType::I64,
+        StorageDType::U16,
+        StorageDType::U32,
+        StorageDType::U64,
+        StorageDType::F32,
+        StorageDType::F64,
+    ];
+    const OUTPUT_DTYPES: [OutputDType; 8] = [
+        OutputDType::I16,
+        OutputDType::I32,
+        OutputDType::I64,
+        OutputDType::U16,
+        OutputDType::U32,
+        OutputDType::U64,
+        OutputDType::F32,
+        OutputDType::F64,
+    ];
+    const LENGTHS: [usize; 12] = [0, 1, 3, 7, 8, 15, 16, 17, 31, 32, 33, 65];
+
+    #[test]
+    fn every_conversion_matches_generic_across_all_scatter_representations() {
+        let mut cases = 0usize;
+        for src in STORAGE_DTYPES {
+            for dst in OUTPUT_DTYPES {
+                let Some(kind) = promote_kind(src, dst) else {
+                    continue;
+                };
+                let policies: &[OverflowPolicy] = if kind == PromoteKind::CheckedSign {
+                    &[
+                        OverflowPolicy::Error,
+                        OverflowPolicy::UseFill,
+                        OverflowPolicy::UseValue(sentinel(dst)),
+                        OverflowPolicy::Unchecked,
+                    ]
+                } else {
+                    &[OverflowPolicy::Error]
+                };
+                for policy in policies {
+                    for len in LENGTHS {
+                        check_edge(src, dst, kind, policy.clone(), len);
+                        cases += 1;
+                    }
+                    check_sparse_edge(src, dst, kind, policy.clone());
+                }
+            }
+        }
+        assert_eq!(cases, 768);
+    }
+
+    fn check_sparse_edge(
+        src: StorageDType,
+        dst: OutputDType,
+        kind: PromoteKind,
+        policy: OverflowPolicy,
+    ) {
+        const N_COLS: usize = 1024;
+        const NNZ: usize = 512;
+        let output = output_spec(1, dst, policy.clone(), kind);
+        let invalid = kind == PromoteKind::CheckedSign && !matches!(policy, OverflowPolicy::Error);
+        let data = values(src, NNZ, invalid);
+        let fill = FillOp::new(&output.fill().encode()[..dst.size()]);
+        let convert = ConvertOp::resolve(src, &output).unwrap();
+        let mut dense_targets = vec![UNMAPPED_TARGET_U32; N_COLS];
+        dense_targets[0] = 0;
+        for index_dtype in [StorageDType::U16, StorageDType::U32] {
+            let columns = (0..NNZ)
+                .map(|index| index * N_COLS / NNZ)
+                .collect::<Vec<_>>();
+            let indices = encode_indices(&columns, index_dtype);
+            let task = task(0..data.len(), Some(0..indices.len()));
+            let dense: Arc<[u32]> = Arc::from(dense_targets.clone());
+            let dense_source = SourcePlan {
+                feature_map: Some(CsrMap::Packed32(Arc::clone(&dense))),
+                ..source(
+                    N_COLS,
+                    src,
+                    IndexOp::new(index_dtype),
+                    None,
+                    false,
+                    Default::default(),
+                    convert,
+                )
+            };
+            let sparse_source = SourcePlan {
+                feature_map: Some(CsrMap::Packed32(dense)),
+                csr_sparse_map: Some(CsrSparseMap::Packed32(Arc::from([0u64]))),
+                ..dense_source.clone()
+            };
+            assert!(csr_sparse_binary_is_cheaper(1, NNZ));
+            assert_same(
+                &sparse_source,
+                &dense_source,
+                &task,
+                &data,
+                &indices,
+                dst.size(),
+                fill,
+            );
+        }
+    }
+
+    fn check_edge(
+        src: StorageDType,
+        dst: OutputDType,
+        kind: PromoteKind,
+        policy: OverflowPolicy,
+        len: usize,
+    ) {
+        let output = output_spec(len.saturating_add(3), dst, policy.clone(), kind);
+        let invalid = kind == PromoteKind::CheckedSign && !matches!(policy, OverflowPolicy::Error);
+        let input = values(src, len, invalid);
+        let specialized = ConvertOp::resolve(src, &output).unwrap();
+        let mut generic = specialized;
+        generic.force_generic_for_test();
+        let fill = FillOp::new(&output.fill().encode()[..dst.size()]);
+
+        check_dense_identity(src, dst, len, &input, specialized, generic, fill);
+        check_dense_maps(src, dst, len, &input, specialized, generic, fill);
+        check_csr(
+            src,
+            dst,
+            len,
+            &input,
+            specialized,
+            generic,
+            fill,
+            StorageDType::U16,
+        );
+        check_csr(
+            src,
+            dst,
+            len,
+            &input,
+            specialized,
+            generic,
+            fill,
+            StorageDType::U32,
+        );
+    }
+
+    fn check_dense_identity(
+        src: StorageDType,
+        dst: OutputDType,
+        len: usize,
+        input: &[u8],
+        specialized: ConvertOp,
+        generic: ConvertOp,
+        fill: FillOp,
+    ) {
+        let task = task(0..input.len(), None);
+        let specialized = source(len, src, None, None, false, Default::default(), specialized);
+        let generic = SourcePlan {
+            convert: generic,
+            ..specialized.clone()
+        };
+        assert_same(
+            &specialized,
+            &generic,
+            &task,
+            input,
+            &[],
+            len * dst.size(),
+            fill,
+        );
+    }
+
+    fn check_dense_maps(
+        src: StorageDType,
+        dst: OutputDType,
+        len: usize,
+        input: &[u8],
+        specialized: ConvertOp,
+        generic: ConvertOp,
+        fill: FillOp,
+    ) {
+        let src_size = src.size();
+        let dst_size = dst.size();
+        let mapped = len.div_ceil(2);
+        let output_cols = mapped.saturating_add(3);
+        let targets = (0..len)
+            .map(|column| (column % 2 == 0).then_some(column / 2))
+            .collect::<Vec<_>>();
+        let defaults = build_default_ranges(Some(&targets), output_cols, dst_size).unwrap();
+        let packed = DenseMap::Packed32 {
+            entries: Arc::from(
+                targets
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(column, target)| {
+                        target.map(|target| {
+                            u64::from((column * src_size) as u32)
+                                | (u64::from((target * dst_size) as u32) << 32)
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            covers_output: false,
+        };
+        let wide = DenseMap::Wide {
+            entries: Arc::from(
+                targets
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(column, target)| {
+                        target.map(|target| DenseMapEntry {
+                            source_byte: column * src_size,
+                            target_byte: target * dst_size,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            covers_output: false,
+        };
+        let gather = DenseMap::Gather32 {
+            source_offsets: Arc::from(
+                (0..len)
+                    .step_by(2)
+                    .map(|column| i32::try_from(column * src_size).unwrap())
+                    .collect::<Vec<_>>(),
+            ),
+            target_byte: 0,
+            covers_output: true,
+        };
+        let run_count = len / 2;
+        let runs = DenseMap::Runs {
+            entries: if run_count == 0 {
+                Default::default()
+            } else {
+                Arc::from([DenseMapRun {
+                    source_byte: 0,
+                    target_byte: 0,
+                    count: run_count,
+                }])
+            },
+            covers_output: run_count == mapped,
+        };
+        let task = task(0..input.len(), None);
+        for (map, columns, ranges) in [
+            (packed, output_cols, Arc::clone(&defaults)),
+            (wide, output_cols, Arc::clone(&defaults)),
+            (gather, mapped, Default::default()),
+            (runs, run_count, Default::default()),
+        ] {
+            let specialized_source = source(len, src, None, Some(map), false, ranges, specialized);
+            let generic_source = SourcePlan {
+                convert: generic,
+                ..specialized_source.clone()
+            };
+            assert_same(
+                &specialized_source,
+                &generic_source,
+                &task,
+                input,
+                &[],
+                columns * dst_size,
+                fill,
+            );
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test matrix dimensions are explicit"
+    )]
+    fn check_csr(
+        src: StorageDType,
+        dst: OutputDType,
+        len: usize,
+        input: &[u8],
+        specialized: ConvertOp,
+        generic: ConvertOp,
+        fill: FillOp,
+        index_dtype: StorageDType,
+    ) {
+        let src_size = src.size();
+        let dst_size = dst.size();
+        let count = len.div_ceil(2);
+        let data = input[..count * src_size].to_vec();
+        let columns = (0..len).step_by(2).collect::<Vec<_>>();
+        let indices = encode_indices(&columns, index_dtype);
+        let task = task(0..data.len(), Some(0..indices.len()));
+        let identity = source(
+            len,
+            src,
+            IndexOp::new(index_dtype),
+            None,
+            false,
+            Default::default(),
+            specialized,
+        );
+        let generic_identity = SourcePlan {
+            convert: generic,
+            ..identity.clone()
+        };
+        assert_same(
+            &identity,
+            &generic_identity,
+            &task,
+            &data,
+            &indices,
+            len * dst_size,
+            fill,
+        );
+
+        let mapped_cols = len.div_ceil(3);
+        let output_cols = mapped_cols.saturating_add(3);
+        let mut targets = vec![UNMAPPED_TARGET_U32; len];
+        for (target, column) in (0..len).step_by(3).enumerate() {
+            targets[column] = u32::try_from(target * dst_size).unwrap();
+        }
+        let logical_targets = targets
+            .iter()
+            .map(|target| (*target != UNMAPPED_TARGET_U32).then_some(*target as usize / dst_size))
+            .collect::<Vec<_>>();
+        let defaults = build_default_ranges(Some(&logical_targets), output_cols, dst_size).unwrap();
+        let mapped = source(
+            len,
+            src,
+            IndexOp::new(index_dtype),
+            None,
+            false,
+            defaults,
+            specialized,
+        );
+        let mapped = SourcePlan {
+            feature_map: Some(CsrMap::Packed32(Arc::from(targets))),
+            ..mapped
+        };
+        let generic_mapped = SourcePlan {
+            convert: generic,
+            ..mapped.clone()
+        };
+        assert_same(
+            &mapped,
+            &generic_mapped,
+            &task,
+            &data,
+            &indices,
+            output_cols * dst_size,
+            fill,
+        );
+
+        let mut hybrid_dense = vec![UNMAPPED_TARGET_U32; len];
+        if len != 0 {
+            hybrid_dense[0] = 0;
+        }
+        let sparse_packed: Arc<[u64]> = if len == 0 {
+            Default::default()
+        } else {
+            Arc::from([0u64])
+        };
+        let hybrid_packed = SourcePlan {
+            feature_map: Some(CsrMap::Packed32(Arc::from(hybrid_dense.clone()))),
+            csr_sparse_map: Some(CsrSparseMap::Packed32(sparse_packed)),
+            default_ranges: Default::default(),
+            ..identity.clone()
+        };
+        let dense_packed = SourcePlan {
+            feature_map: Some(CsrMap::Packed32(Arc::from(hybrid_dense))),
+            ..identity.clone()
+        };
+        assert_same(
+            &hybrid_packed,
+            &dense_packed,
+            &task,
+            &data,
+            &indices,
+            dst_size,
+            fill,
+        );
+
+        let mut hybrid_wide = vec![UNMAPPED_TARGET; len];
+        if len != 0 {
+            hybrid_wide[0] = 0;
+        }
+        let sparse_wide: Arc<[CsrSparseMapEntry]> = if len == 0 {
+            Default::default()
+        } else {
+            Arc::from([CsrSparseMapEntry {
+                source_column: 0,
+                target_byte: 0,
+            }])
+        };
+        let hybrid_wide_source = SourcePlan {
+            feature_map: Some(CsrMap::Wide(Arc::from(hybrid_wide.clone()))),
+            csr_sparse_map: Some(CsrSparseMap::Wide(sparse_wide)),
+            default_ranges: Default::default(),
+            ..identity.clone()
+        };
+        let dense_wide = SourcePlan {
+            feature_map: Some(CsrMap::Wide(Arc::from(hybrid_wide))),
+            ..identity
+        };
+        assert_same(
+            &hybrid_wide_source,
+            &dense_wide,
+            &task,
+            &data,
+            &indices,
+            dst_size,
+            fill,
+        );
+    }
+
+    #[test]
+    fn csr_sparse_cost_model_covers_measured_boundaries() {
+        assert!(!csr_sparse_binary_is_cheaper(328, 16_384));
+        assert!(!csr_sparse_binary_is_cheaper(328, 6_554));
+        assert!(csr_sparse_binary_is_cheaper(66, 16_384));
+        assert!(!csr_sparse_binary_is_cheaper(66, 6_554));
+        assert!(!csr_sparse_binary_is_cheaper(66, 3_277));
+        assert!(!csr_sparse_binary_is_cheaper(66, 1_639));
+        assert!(!csr_sparse_binary_is_cheaper(66, 328));
+        assert!(csr_sparse_binary_is_cheaper(33, 3_277));
+        assert!(!csr_sparse_binary_is_cheaper(33, 1_639));
+        assert!(!csr_sparse_binary_is_cheaper(33, 328));
+    }
+
+    #[test]
+    fn compiler_builds_sparse_csr_sidecar_only_when_it_can_win() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("csr-sparse-sidecar");
+        CsrWriter::new(&path, Partition::fixed_cells(1), Partition::fixed_cells(1))
+            .write(&[0u64, 1], &[0u32], &[3f32], [1, 32_768])
+            .unwrap();
+
+        let mut sparse_targets = vec![None; 32_768];
+        for (target, source) in (0..32_768).step_by(1_000).enumerate() {
+            sparse_targets[source] = Some(target);
+        }
+        let sparse_plan = compile(PlanSpec::new(
+            vec![Source::new(0, Dataset::open(&path).unwrap())
+                .feature_map(FeatureMap::new(sparse_targets).unwrap())],
+            vec![RowRef::new(SourceId::new(0), 0)],
+            OutputSpec::new(33, OutputDType::F32, Fill::F32(0.0)).unwrap(),
+            1,
+            1,
+        ))
+        .unwrap();
+        assert!(matches!(
+            sparse_plan.inner.source_plans[0].csr_sparse_map,
+            Some(CsrSparseMap::Packed32(ref entries)) if entries.len() == 33
+        ));
+
+        let dense_targets = (0..32_768)
+            .map(|source| (source % 2 == 0).then_some(source / 2))
+            .collect::<Vec<_>>();
+        let dense_plan = compile(PlanSpec::new(
+            vec![Source::new(0, Dataset::open(&path).unwrap())
+                .feature_map(FeatureMap::new(dense_targets).unwrap())],
+            vec![RowRef::new(SourceId::new(0), 0)],
+            OutputSpec::new(16_384, OutputDType::F32, Fill::F32(0.0)).unwrap(),
+            1,
+            1,
+        ))
+        .unwrap();
+        assert!(dense_plan.inner.source_plans[0].csr_sparse_map.is_none());
+
+        let mut session = sparse_plan
+            .open(SessionConfig {
+                worker_count: 1,
+                initialize_workers: 1,
+                initialize_inflight_io_ops: 1,
+                io_mode: IoMode::Blocking,
+                ..SessionConfig::default()
+            })
+            .unwrap();
+        let batch = session.next_batch().unwrap().unwrap();
+        let row = batch.row_as::<f32>(0).unwrap();
+        assert_eq!(row[0], 3.0);
+        assert!(row[1..].iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn compiler_folds_explicit_identity_maps_into_none_fastpaths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dense_path = temporary.path().join("dense-identity-map");
+        sc_compress::DenseWriter::new(
+            &dense_path,
+            Partition::fixed_cells(1),
+            Partition::fixed_cells(1),
+        )
+        .write(&[1u16, 2, 3, 4], [1, 4])
+        .unwrap();
+        let identity = FeatureMap::new((0..4).map(Some)).unwrap();
+        let dense = compile(PlanSpec::new(
+            vec![Source::new(0, Dataset::open(&dense_path).unwrap()).feature_map(identity.clone())],
+            vec![RowRef::new(SourceId::new(0), 0)],
+            OutputSpec::new(4, OutputDType::U16, Fill::U16(0)).unwrap(),
+            1,
+            1,
+        ))
+        .unwrap();
+        let dense_source = &dense.inner.source_plans[0];
+        assert!(dense_source.feature_map.is_none());
+        assert!(dense_source.csr_sparse_map.is_none());
+        assert!(dense_source.dense_map.is_none());
+
+        let csr_path = temporary.path().join("csr-identity-map");
+        CsrWriter::new(
+            &csr_path,
+            Partition::fixed_cells(1),
+            Partition::fixed_cells(1),
+        )
+        .write(&[0u64, 2], &[0u32, 3], &[1u16, 4], [1, 4])
+        .unwrap();
+        let csr = compile(PlanSpec::new(
+            vec![Source::new(0, Dataset::open(&csr_path).unwrap()).feature_map(identity)],
+            vec![RowRef::new(SourceId::new(0), 0)],
+            OutputSpec::new(4, OutputDType::U16, Fill::U16(0)).unwrap(),
+            1,
+            1,
+        ))
+        .unwrap();
+        let csr_source = &csr.inner.source_plans[0];
+        assert!(csr_source.feature_map.is_none());
+        assert!(csr_source.csr_sparse_map.is_none());
+        assert!(csr_source.dense_map.is_none());
+    }
+
+    fn source(
+        n_cols: usize,
+        dtype: StorageDType,
+        index: Option<IndexOp>,
+        dense_map: Option<DenseMap>,
+        dense_fill_whole: bool,
+        default_ranges: Arc<[crate::plan::OutputRange]>,
+        convert: ConvertOp,
+    ) -> SourcePlan {
+        SourcePlan {
+            n_cols,
+            value_dtype: dtype,
+            index,
+            feature_map: None,
+            csr_sparse_map: None,
+            dense_map,
+            dense_fill_whole,
+            default_ranges,
+            convert,
+        }
+    }
+
+    fn assert_same(
+        specialized: &SourcePlan,
+        generic: &SourcePlan,
+        task: &CellTask,
+        data: &[u8],
+        indices: &[u8],
+        row_bytes: usize,
+        fill: FillOp,
+    ) {
+        if specialized.requires_runtime_validation() {
+            validate_row(specialized, task, data, indices).unwrap();
+            validate_row(generic, task, data, indices).unwrap();
+        }
+        let mut actual = vec![0xA5; row_bytes];
+        let mut expected = vec![0x5A; row_bytes];
+        unsafe {
+            // SAFETY: validation above or compiler-style infallible extents cover
+            // these immutable inputs and distinct uniquely owned outputs.
+            scatter_row_prevalidated(
+                specialized,
+                task,
+                data,
+                indices,
+                &mut actual,
+                row_bytes,
+                fill,
+            )
+            .unwrap();
+            // SAFETY: the generic operator uses the same validated extents.
+            scatter_row_prevalidated(generic, task, data, indices, &mut expected, row_bytes, fill)
+                .unwrap();
+        }
+        assert_eq!(actual, expected);
+    }
+
+    fn task(data: std::ops::Range<usize>, indices: Option<std::ops::Range<usize>>) -> CellTask {
+        CellTask::new(OutputSlot::new(0).unwrap(), data, indices).unwrap()
+    }
+
+    fn output_spec(
+        n_cols: usize,
+        dtype: OutputDType,
+        overflow: OverflowPolicy,
+        kind: PromoteKind,
+    ) -> OutputSpec {
+        let mut output = OutputSpec::new(n_cols, dtype, zero(dtype))
+            .unwrap()
+            .overflow(overflow)
+            .unwrap();
+        if kind == PromoteKind::RoundingToFloat {
+            output = output.float_cast(FloatCastPolicy::AllowRounding);
+        }
+        output
+    }
+
+    fn zero(dtype: OutputDType) -> Fill {
+        match dtype {
+            OutputDType::I16 => Fill::I16(0),
+            OutputDType::I32 => Fill::I32(0),
+            OutputDType::I64 => Fill::I64(0),
+            OutputDType::U16 => Fill::U16(0),
+            OutputDType::U32 => Fill::U32(0),
+            OutputDType::U64 => Fill::U64(0),
+            OutputDType::F32 => Fill::F32(0.0),
+            OutputDType::F64 => Fill::F64(0.0),
+        }
+    }
+
+    fn sentinel(dtype: OutputDType) -> Fill {
+        match dtype {
+            OutputDType::I16 => Fill::I16(7),
+            OutputDType::I32 => Fill::I32(7),
+            OutputDType::I64 => Fill::I64(7),
+            OutputDType::U16 => Fill::U16(7),
+            OutputDType::U32 => Fill::U32(7),
+            OutputDType::U64 => Fill::U64(7),
+            OutputDType::F32 => Fill::F32(7.0),
+            OutputDType::F64 => Fill::F64(7.0),
+        }
+    }
+
+    fn values(dtype: StorageDType, count: usize, invalid: bool) -> Vec<u8> {
+        let mut output = Vec::with_capacity(count * dtype.size());
+        for index in 0..count {
+            match dtype {
+                StorageDType::I16 => output.extend_from_slice(
+                    &(if invalid && index % 5 == 0 {
+                        -3i16
+                    } else {
+                        index as i16 % 251
+                    })
+                    .to_le_bytes(),
+                ),
+                StorageDType::I32 => output.extend_from_slice(
+                    &(if invalid && index % 5 == 0 {
+                        -3i32
+                    } else {
+                        index as i32 % 65_521
+                    })
+                    .to_le_bytes(),
+                ),
+                StorageDType::I64 => output.extend_from_slice(
+                    &(if invalid && index % 5 == 0 {
+                        -3i64
+                    } else {
+                        index as i64 * 17
+                    })
+                    .to_le_bytes(),
+                ),
+                StorageDType::U16 => output.extend_from_slice(
+                    &(if invalid && index % 5 == 0 {
+                        u16::MAX
+                    } else {
+                        index as u16 % 251
+                    })
+                    .to_le_bytes(),
+                ),
+                StorageDType::U32 => output.extend_from_slice(
+                    &(if invalid && index % 5 == 0 {
+                        u32::MAX
+                    } else {
+                        index as u32 * 17
+                    })
+                    .to_le_bytes(),
+                ),
+                StorageDType::U64 => output.extend_from_slice(
+                    &(if invalid && index % 5 == 0 {
+                        u64::MAX
+                    } else {
+                        index as u64 * 17
+                    })
+                    .to_le_bytes(),
+                ),
+                StorageDType::F32 => {
+                    output.extend_from_slice(&((index as f32 - 17.0) * 0.25).to_le_bytes())
+                }
+                StorageDType::F64 => {
+                    output.extend_from_slice(&((index as f64 - 17.0) * 0.25).to_le_bytes())
+                }
+            }
+        }
+        output
+    }
+
+    fn encode_indices(columns: &[usize], dtype: StorageDType) -> Vec<u8> {
+        let mut output = Vec::with_capacity(columns.len() * dtype.size());
+        for &column in columns {
+            match dtype {
+                StorageDType::U16 => output.extend_from_slice(&(column as u16).to_le_bytes()),
+                StorageDType::U32 => output.extend_from_slice(&(column as u32).to_le_bytes()),
+                _ => unreachable!(),
+            }
+        }
+        output
     }
 }

@@ -12,10 +12,11 @@ use sc_compress::chunk_key;
 use crate::config::{IoMergePolicy, PlanConfig};
 use crate::convert::ConvertOp;
 use crate::plan::{
-    CacheSlice, CellTask, CsrMap, CsrScatterTask, DecodeOp, DenseMap, DenseMapEntry, DenseMapRun,
-    DenseScatterTask, DependencyGraph, InitializeJob, IoDecodeLoadTask, OutputRange, OutputSlice,
-    Plan, PlanData, PlanStats, ReadSource, ReleasePlan, SourcePlan, StaticJob, StaticPlanData,
-    UNMAPPED_TARGET, UNMAPPED_TARGET_U32,
+    csr_sparse_binary_is_cheaper, CacheSlice, CellTask, CsrMap, CsrScatterTask, CsrSparseMap,
+    CsrSparseMapEntry, DecodeOp, DenseMap, DenseMapEntry, DenseMapRun, DenseScatterTask,
+    DependencyGraph, InitializeJob, IoDecodeLoadTask, OutputRange, OutputSlice, Plan, PlanData,
+    PlanStats, ReadSource, ReleasePlan, SourcePlan, StaticJob, StaticPlanData, UNMAPPED_TARGET,
+    UNMAPPED_TARGET_U32,
 };
 use crate::scatter::{FillOp, IndexOp};
 use crate::source::{DatasetKind, OutputSlot};
@@ -23,7 +24,9 @@ use crate::{Error, OutputSpec, Result, RowRef, Source, SourceId};
 
 const MAX_DENSE_CHUNK_TABLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_NESTED_BUCKET_HEADER_BYTES: usize = 4 * 1024 * 1024;
-const MIN_DENSE_OVERWRITE_BYTES_PER_GAP: usize = 256;
+const MIN_PACKED_ZERO_OVERWRITE_BYTES_PER_GAP: usize = 256;
+const MIN_PACKED_NONZERO_OVERWRITE_BYTES_PER_GAP: usize = 64;
+const MIN_RUN_OVERWRITE_BYTES_PER_GAP: usize = 64;
 
 fn use_nested_buckets(count: usize) -> bool {
     count
@@ -839,24 +842,16 @@ impl Builder {
                 request.output.n_cols,
                 request.output.dtype.size(),
             )?;
-            let dense_fill_whole = if index_dtype.is_none() {
-                choose_dense_whole_fill(
-                    feature_targets.as_deref(),
-                    request.output.dtype.size(),
-                    default_ranges.len(),
-                )?
-            } else {
-                false
-            };
-            if dense_fill_whole {
-                default_ranges = Arc::from([]);
-            }
-            let (feature_map, dense_map) = match (feature_targets, index_dtype) {
-                (None, _) => (None, None),
+            let dense_mapped = feature_targets
+                .as_ref()
+                .map(|targets| targets.iter().filter(|target| target.is_some()).count());
+            let (feature_map, csr_sparse_map, dense_map) = match (feature_targets, index_dtype) {
+                (None, _) => (None, None, None),
                 (Some(targets), None) => {
                     let source_size = value_dtype.size();
                     let target_size = request.output.dtype.size();
                     (
+                        None,
                         None,
                         Some(build_dense_map(
                             targets,
@@ -869,6 +864,8 @@ impl Builder {
                 }
                 (Some(targets), Some(_)) => {
                     let target_size = request.output.dtype.size();
+                    let mapped = targets.iter().filter(|target| target.is_some()).count();
+                    let hybrid = csr_sparse_binary_is_cheaper(mapped, n_cols);
                     let packed = request
                         .output
                         .n_cols
@@ -877,37 +874,93 @@ impl Builder {
                     if packed {
                         let mut compact = Vec::new();
                         compact.try_reserve_exact(targets.len())?;
-                        for target in targets {
+                        let mut sparse = Vec::new();
+                        if hybrid {
+                            sparse.try_reserve_exact(mapped)?;
+                        }
+                        for (source_column, target) in targets.into_iter().enumerate() {
                             compact.push(match target {
-                                Some(target) => (target * target_size) as u32,
+                                Some(target) => {
+                                    let target_byte = target
+                                        .checked_mul(target_size)
+                                        .and_then(|target| u32::try_from(target).ok())
+                                        .ok_or_else(|| {
+                                            Error::ResourceLimit(
+                                                "CSR map target byte offset exceeds u32".into(),
+                                            )
+                                        })?;
+                                    if hybrid {
+                                        let source_column =
+                                            u32::try_from(source_column).map_err(|_| {
+                                                Error::ResourceLimit(
+                                                    "CSR sparse source column exceeds u32".into(),
+                                                )
+                                            })?;
+                                        sparse.push(
+                                            u64::from(source_column)
+                                                | (u64::from(target_byte) << 32),
+                                        );
+                                    }
+                                    target_byte
+                                }
                                 None => UNMAPPED_TARGET_U32,
                             });
                         }
-                        (Some(CsrMap::Packed32(Arc::from(compact))), None)
+                        let sparse = hybrid.then(|| CsrSparseMap::Packed32(Arc::from(sparse)));
+                        (Some(CsrMap::Packed32(Arc::from(compact))), sparse, None)
                     } else {
                         let mut compact = Vec::new();
                         compact.try_reserve_exact(targets.len())?;
-                        for target in targets {
+                        let mut sparse = Vec::new();
+                        if hybrid {
+                            sparse.try_reserve_exact(mapped)?;
+                        }
+                        for (source_column, target) in targets.into_iter().enumerate() {
                             compact.push(match target {
                                 Some(target) => {
-                                    target.checked_mul(target_size).ok_or_else(|| {
-                                        Error::ResourceLimit(
-                                            "CSR map target byte offset overflow".into(),
-                                        )
-                                    })?
+                                    let target_byte =
+                                        target.checked_mul(target_size).ok_or_else(|| {
+                                            Error::ResourceLimit(
+                                                "CSR map target byte offset overflow".into(),
+                                            )
+                                        })?;
+                                    if hybrid {
+                                        sparse.push(CsrSparseMapEntry {
+                                            source_column,
+                                            target_byte,
+                                        });
+                                    }
+                                    target_byte
                                 }
                                 None => UNMAPPED_TARGET,
                             });
                         }
-                        (Some(CsrMap::Wide(Arc::from(compact))), None)
+                        let sparse = hybrid.then(|| CsrSparseMap::Wide(Arc::from(sparse)));
+                        (Some(CsrMap::Wide(Arc::from(compact))), sparse, None)
                     }
                 }
             };
+            let fill_bytes = request.output.fill.encode();
+            let dense_fill_whole = if index_dtype.is_none() {
+                choose_dense_whole_fill(
+                    dense_mapped,
+                    request.output.dtype.size(),
+                    default_ranges.len(),
+                    dense_map.as_ref(),
+                    &fill_bytes[..request.output.dtype.size()],
+                )?
+            } else {
+                false
+            };
+            if dense_fill_whole {
+                default_ranges = Arc::from([]);
+            }
             source_plans.push(SourcePlan {
                 n_cols,
                 value_dtype,
                 index,
                 feature_map,
+                csr_sparse_map,
                 dense_map,
                 dense_fill_whole,
                 default_ranges,
@@ -3267,24 +3320,38 @@ pub(crate) fn build_default_ranges(
 }
 
 pub(crate) fn choose_dense_whole_fill(
-    targets: Option<&[Option<usize>]>,
+    mapped: Option<usize>,
     target_size: usize,
     gap_count: usize,
+    map: Option<&DenseMap>,
+    fill: &[u8],
 ) -> Result<bool> {
-    let Some(targets) = targets else {
+    let Some(mapped) = mapped else {
         return Ok(false);
     };
     if gap_count == 0 {
         return Ok(false);
     }
-    let mapped = targets.iter().filter(|target| target.is_some()).count();
     let mapped_bytes = mapped
         .checked_mul(target_size)
         .ok_or_else(|| Error::ResourceLimit("dense mapped byte count overflow".into()))?;
-    let minimum_savings = gap_count.saturating_mul(MIN_DENSE_OVERWRITE_BYTES_PER_GAP);
+    let fill_is_zero = fill.iter().all(|byte| *byte == 0);
+    let minimum_per_gap = match map {
+        Some(DenseMap::Runs { .. }) => MIN_RUN_OVERWRITE_BYTES_PER_GAP,
+        Some(DenseMap::Gather32 { .. }) => 0,
+        Some(DenseMap::Packed32 { .. } | DenseMap::Wide { .. }) | None if fill_is_zero => {
+            MIN_PACKED_ZERO_OVERWRITE_BYTES_PER_GAP
+        }
+        Some(DenseMap::Packed32 { .. } | DenseMap::Wide { .. }) | None => {
+            MIN_PACKED_NONZERO_OVERWRITE_BYTES_PER_GAP
+        }
+    };
+    let minimum_savings = gap_count.saturating_mul(minimum_per_gap);
     // Range-only initialization saves `mapped_bytes` of repeated stores, but
-    // each gap adds a scattered fill operation. Below this ratio one streaming
-    // fill is cheaper and also avoids retaining a fragmented range table.
+    // each gap adds a scattered fill operation. Runs amortize that operation,
+    // Gather32 benefits from avoiding a target pre-pass, and non-zero packed
+    // fills use a different store kernel from zeroing. Below the map-specific
+    // ratio one streaming fill is cheaper and avoids a fragmented range table.
     Ok(mapped_bytes != 0 && mapped_bytes < minimum_savings)
 }
 

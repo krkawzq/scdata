@@ -124,6 +124,20 @@ feature. Fallible conversions are validated before batch publication.
 Cache/output pointer lowering validates every extent; raw pointers never enter
 reusable Plan state.
 
+### Adaptive scatter paths
+
+- `FeatureMap=None`, or an explicit identity map folded by the compiler, uses
+  contiguous Dense conversion or CSR index-to-same-column scatter directly.
+- Dense mapped rows select `Runs`, `Gather32`, `Packed32`, or `Wide` first.
+  Default initialization then chooses range-only writes or one whole-row fill
+  from the map representation, fill bit pattern, and avoided bytes per gap.
+- Eight 64-bit widening slice edges use scalar conversion below 8 elements and
+  their bound specialized kernel from 8 elements onward.
+- Very sparse CSR mappings may retain an additional ordered source/target
+  sidecar. A row uses binary lookup only when
+  `8 * mapped * ceil(log2(nnz)) < nnz`; all other rows retain the dense map
+  lookup kernel. CSR indices are still fully validated before either path.
+
 ## Shared ring
 
 On Linux with lock-free 64-bit atomics, `Plan::open_shared` runs the same

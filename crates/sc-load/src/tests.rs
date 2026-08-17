@@ -1329,6 +1329,7 @@ fn csr_indices_must_be_strictly_increasing() {
         value_dtype: sc_compress::DType::U16,
         index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),
@@ -1368,6 +1369,7 @@ fn wide_mapping_fallback_preserves_dense_and_csr_semantics() {
         value_dtype: sc_compress::DType::U16,
         index: None,
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: Some(DenseMap::Wide {
             entries: Arc::from([
                 DenseMapEntry {
@@ -1422,6 +1424,7 @@ fn wide_mapping_fallback_preserves_dense_and_csr_semantics() {
         value_dtype: sc_compress::DType::U16,
         index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
         feature_map: Some(CsrMap::Wide(Arc::from([2, UNMAPPED_TARGET, 0]))),
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),
@@ -1466,6 +1469,7 @@ fn mapped_validation_only_checks_values_with_a_destination() {
         value_dtype: sc_compress::DType::U16,
         index: None,
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: Some(DenseMap::Wide {
             entries: Arc::from([
                 DenseMapEntry {
@@ -1495,6 +1499,7 @@ fn mapped_validation_only_checks_values_with_a_destination() {
         value_dtype: sc_compress::DType::U16,
         index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
         feature_map: Some(CsrMap::Wide(Arc::from([0, UNMAPPED_TARGET, 2]))),
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),
@@ -1536,6 +1541,7 @@ fn packed_csr_fallback_conversion_selects_map_once_per_row() {
         value_dtype: sc_compress::DType::U16,
         index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
         feature_map: Some(CsrMap::Packed32(Arc::from([2, 0, UNMAPPED_TARGET_U32]))),
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),
@@ -2303,6 +2309,7 @@ fn benchmark_scatter_kernels() {
         value_dtype: sc_compress::DType::F32,
         index: None,
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),
@@ -2346,6 +2353,7 @@ fn benchmark_scatter_kernels() {
         value_dtype: sc_compress::DType::I16,
         index: None,
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),
@@ -2420,6 +2428,7 @@ fn benchmark_scatter_kernels() {
         value_dtype: sc_compress::DType::F32,
         index: None,
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),
@@ -2466,6 +2475,7 @@ fn benchmark_scatter_kernels() {
         value_dtype: sc_compress::DType::F32,
         index: None,
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: Some(crate::plan::DenseMap::Packed32 {
             entries: std::sync::Arc::from(mapped_targets),
             covers_output: true,
@@ -2573,6 +2583,7 @@ fn benchmark_scatter_kernels() {
         value_dtype: sc_compress::DType::I32,
         index: None,
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: Some(crate::plan::DenseMap::Packed32 {
             entries: std::sync::Arc::from(
                 (0..columns)
@@ -2660,6 +2671,7 @@ fn benchmark_scatter_kernels() {
         value_dtype: sc_compress::DType::F32,
         index: crate::scatter::IndexOp::new(sc_compress::DType::U32),
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),
@@ -2837,6 +2849,7 @@ fn benchmark_dense_default_range_overwrite() {
         value_dtype: sc_compress::DType::F32,
         index: None,
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: Some(crate::plan::DenseMap::Packed32 {
             entries: Arc::from((0..mapped).map(packed_entry).collect::<Vec<_>>()),
             covers_output: false,
@@ -3252,6 +3265,7 @@ fn benchmark_int64_uint64_specialized_kernels() {
         value_dtype: StorageDType::I32,
         index: crate::scatter::IndexOp::new(StorageDType::U32),
         feature_map: None,
+        csr_sparse_map: None,
         dense_map: None,
         dense_fill_whole: false,
         default_ranges: Default::default(),

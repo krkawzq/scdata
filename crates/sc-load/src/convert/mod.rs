@@ -25,6 +25,7 @@ pub(crate) struct ConvertOp {
     pub(crate) dst_size: u8,
     pub(crate) src_shift: u8,
     pub(crate) dst_shift: u8,
+    min_specialized_slice_count: u8,
     convert_1: Convert1Fn,
     convert_slice: ConvertSliceFn,
     convert_map_wide: ConvertMapFn,
@@ -96,6 +97,7 @@ impl ConvertOp {
         let convert_csr_u16 = dispatch_csr_fn::<2>(src, output.dtype, write_fallback);
         let convert_csr_u32 = dispatch_csr_fn::<4>(src, output.dtype, write_fallback);
         let validate_slice = dispatch_validate_slice_fn(src, output.dtype, fail_on_overflow);
+        let min_specialized_slice_count = min_specialized_slice_count(src, output.dtype);
         let src_size = src.size() as u8;
         let dst_size = output.dtype.size() as u8;
         Ok(Self {
@@ -109,6 +111,7 @@ impl ConvertOp {
             dst_size,
             src_shift: src_size.trailing_zeros() as u8,
             dst_shift: dst_size.trailing_zeros() as u8,
+            min_specialized_slice_count,
             convert_1,
             convert_slice,
             convert_map_wide,
@@ -123,11 +126,13 @@ impl ConvertOp {
     #[cfg(test)]
     pub(crate) fn force_scalar_for_test(&mut self) {
         self.convert_slice = scalar_slice;
+        self.min_specialized_slice_count = 0;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "profile"))]
     pub(crate) fn force_generic_for_test(&mut self) {
         self.convert_slice = scalar_slice;
+        self.min_specialized_slice_count = 0;
         self.convert_map_wide = scalar_map;
         self.convert_map_packed = scalar_packed_map;
         self.convert_map_gather32 = scalar_gather32;
@@ -140,6 +145,7 @@ impl ConvertOp {
     pub(crate) fn force_sse2_for_test(&mut self) {
         if let Some(kernel) = simd::dispatch_sse2(self.src, self.dst) {
             self.convert_slice = kernel;
+            self.min_specialized_slice_count = 0;
         }
     }
 
@@ -147,6 +153,7 @@ impl ConvertOp {
     pub(crate) fn force_avx2_for_test(&mut self) {
         if let Some(kernel) = simd::dispatch_avx2(self.src, self.dst) {
             self.convert_slice = kernel;
+            self.min_specialized_slice_count = 0;
         }
     }
 
@@ -157,6 +164,7 @@ impl ConvertOp {
         {
             if let Some(kernel) = simd::dispatch_avx512(self.src, self.dst) {
                 self.convert_slice = kernel;
+                self.min_specialized_slice_count = 0;
             }
         }
     }
@@ -287,7 +295,7 @@ impl ConvertOp {
         // kernel can access `count` source and destination elements. The
         // buffers are distinct decoded/output allocations, so they do not
         // overlap. Checked-sign inputs were validated before commit.
-        unsafe { (self.convert_slice)(input.as_ptr(), output.as_mut_ptr(), count, self) }
+        unsafe { self.convert_slice_unchecked(input.as_ptr(), output.as_mut_ptr(), count) }
     }
 
     #[inline(always)]
@@ -300,7 +308,14 @@ impl ConvertOp {
         // SAFETY: caller proves the raw buffers contain `count` complete,
         // non-overlapping source/destination elements and conversion policy was
         // validated before commit.
-        unsafe { (self.convert_slice)(input, output, count, self) }
+        let kernel = if count < usize::from(self.min_specialized_slice_count) {
+            scalar_slice
+        } else {
+            self.convert_slice
+        };
+        // SAFETY: caller proves the complete non-overlapping source/output
+        // extents and prevalidation contract for the selected bound kernel.
+        unsafe { kernel(input, output, count, self) }
     }
 
     #[inline(always)]
@@ -359,11 +374,10 @@ impl ConvertOp {
                     // SAFETY: compiler-built runs contain contiguous, complete,
                     // non-overlapping source and destination element ranges.
                     unsafe {
-                        (self.convert_slice)(
+                        self.convert_slice_unchecked(
                             input.add(run.source_byte),
                             output.add(run.target_byte),
                             run.count,
-                            self,
                         )?;
                     }
                 }
@@ -657,6 +671,21 @@ fn dispatch_validate_slice_fn(
         }
     }
     scalar_validate_slice
+}
+
+fn min_specialized_slice_count(src: StorageDType, dst: OutputDType) -> u8 {
+    use OutputDType as O;
+    use StorageDType as S;
+    if matches!(
+        (src, dst),
+        (S::I16 | S::I32 | S::U16 | S::U32, O::I64)
+            | (S::U16 | S::U32, O::U64)
+            | (S::I64 | S::U64, O::F64)
+    ) {
+        8
+    } else {
+        0
+    }
 }
 
 fn dispatch_slice_fn(src: StorageDType, dst: OutputDType, write_fallback: bool) -> ConvertSliceFn {

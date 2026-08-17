@@ -235,6 +235,8 @@ pub(crate) struct SourcePlan {
     pub index: Option<IndexOp>,
     /// CSR source-column target byte offsets; a width-specific sentinel drops a column.
     pub feature_map: Option<CsrMap>,
+    /// Optional sparse source/target list for binary lookup on high-nnz rows.
+    pub csr_sparse_map: Option<CsrSparseMap>,
     /// Dense mapped path, compacted to only the source columns that survive.
     pub dense_map: Option<DenseMap>,
     /// Dense maps with highly fragmented gaps use one streaming whole-row fill.
@@ -267,6 +269,31 @@ pub(crate) struct OutputRange {
 pub(crate) enum CsrMap {
     Packed32(Arc<[u32]>),
     Wide(Arc<[usize]>),
+}
+
+#[derive(Clone)]
+pub(crate) enum CsrSparseMap {
+    /// Low 32 bits are source column; high 32 bits are target byte offset.
+    Packed32(Arc<[u64]>),
+    Wide(Arc<[CsrSparseMapEntry]>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CsrSparseMapEntry {
+    pub(crate) source_column: usize,
+    pub(crate) target_byte: usize,
+}
+
+#[inline]
+pub(crate) fn csr_sparse_binary_is_cheaper(mapped: usize, nnz: usize) -> bool {
+    if mapped == 0 || nnz == 0 {
+        return false;
+    }
+    let comparisons = usize::BITS as usize - (nnz - 1).leading_zeros() as usize;
+    // One binary-search comparison is a random index read, while the dense
+    // path performs one predictable sequential map lookup per nnz. The factor
+    // keeps sparse lookup for cases with a clear cost margin on real CSR rows.
+    mapped.saturating_mul(comparisons.max(1)).saturating_mul(8) < nnz
 }
 
 #[derive(Clone)]
