@@ -13,7 +13,7 @@ SessionState = Literal["running", "failed", "cancelled", "finished"]
 __all__ = ["PlanStats", "RuntimeStats", "SessionState"]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class PlanStats:
     input_rows: int
     block_jobs: int
@@ -71,7 +71,7 @@ class PlanStats:
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class RuntimeStats:
     requested_io_mode: IoMode
     requested_queue_depth: int

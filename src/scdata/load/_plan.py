@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 from types import TracebackType
-from typing import Any, Literal, Self, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -18,6 +18,8 @@ from scdata.load._stats import PlanStats, RuntimeStats, SessionState
 from scdata.load._validation import as_int, normalize_rows
 
 if TYPE_CHECKING:
+    from typing_extensions import Self
+
     from scdata.load._distributed import DistributedSession
 
 __all__ = ["Plan", "Prefetch", "Session", "compile", "prefetch"]

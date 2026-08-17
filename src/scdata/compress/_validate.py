@@ -22,10 +22,10 @@ PartitionPolicy = Literal["cells", "budget"]
 DEFAULT_CHUNK_CELLS = 1024
 DEFAULT_BLOCK_CELLS = 16
 DEFAULT_CHUNK_BUDGET = 100 << 20  # 100 MiB
-DEFAULT_BLOCK_BUDGET = 400 << 10  # 400 KiB
+DEFAULT_BLOCK_BUDGET = 64 << 10  # 64 KiB
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ResolvedPartition:
     """Normalized partition forwarded to ``scdata._core`` writers."""
 

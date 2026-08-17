@@ -25,7 +25,7 @@ __all__ = [
 PartitionPolicy = Literal["cells", "budget"]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class WriteOptions:
     """Chunk/block partition knobs shared by all sc-compress writers.
 

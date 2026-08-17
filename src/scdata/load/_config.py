@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Literal
 
 from scdata._validate import as_float, as_int
@@ -27,7 +27,7 @@ def _default_compile_io_concurrency() -> int:
     return min(_cpu_count(), 32)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ResourceLimits:
     """Hard limits for compiler arenas, output rings, and individual jobs."""
 
@@ -41,7 +41,8 @@ class ResourceLimits:
     max_decoded_bytes_per_job: int = 2 * _GIB
 
     def __post_init__(self) -> None:
-        for name in self.__slots__:
+        for item in fields(self):
+            name = item.name
             minimum = 0 if name == "max_retained_whole_key_bytes" else 1
             value = as_int(getattr(self, name), name, minimum=minimum)
             object.__setattr__(self, name, value)
@@ -59,7 +60,7 @@ class ResourceLimits:
             raise ValueError("max_decoded_bytes_per_job must not exceed uint32 capacity")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class PlanConfig:
     """Static compiler cost model and resource limits."""
 
@@ -154,7 +155,7 @@ class PlanConfig:
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SessionConfig:
     """Worker backend and aggregate resident-buffer limits for one session."""
 

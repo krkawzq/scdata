@@ -14,7 +14,7 @@ _DEFAULT_MAXIMUM_DECODED_SIZE = 1024 * 1024 * 1024
 _DEFAULT_MAXIMUM_BLOCK_COUNT = 1_000_000
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ReadLimits:
     """Upper bounds applied while opening and decoding a store.
 

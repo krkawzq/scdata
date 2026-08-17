@@ -189,6 +189,7 @@ def convert_one(
             store="zip",
             overwrite=overwrite,
             num_workers=num_workers,
+            options=scc.WriteOptions(block_budget=64 << 10),
         )
         result["dst_bytes"] = dst_path.stat().st_size
 
@@ -269,7 +270,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"sources={len(sources)} jobs={args.jobs} overwrite={args.overwrite} "
-        f"verify={args.verify} num_workers={args.num_workers}",
+        f"verify={args.verify} num_workers={args.num_workers} "
+        f"block_budget={64 << 10}",
         flush=True,
     )
 

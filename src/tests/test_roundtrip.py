@@ -353,7 +353,7 @@ def test_dense_bytes_budget_lowers_to_fixed_cells(tmp_path: Path) -> None:
 
 def test_default_write_options_use_byte_budgets() -> None:
     assert scc.DEFAULT_CHUNK_BUDGET == 100 << 20
-    assert scc.DEFAULT_BLOCK_BUDGET == 400 << 10
+    assert scc.DEFAULT_BLOCK_BUDGET == 64 << 10
     opts = scc.DEFAULT_WRITE_OPTIONS
     assert opts.chunk_policy == "budget"
     assert opts.block_policy == "budget"

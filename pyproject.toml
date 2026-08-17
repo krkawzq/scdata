@@ -8,12 +8,15 @@ version = "0.2.0"
 description = "Compress, AnnData, and prefetch loading for single-cell matrices"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.12,<3.16"
+requires-python = ">=3.9,<3.16"
 dependencies = [
-    "numpy>=2.2.6",
+    "numpy>=2.0",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -26,15 +29,15 @@ classifiers = [
 
 [project.optional-dependencies]
 scipy = ["scipy>=1.13"]
-anndata = ["anndata>=0.11", "zarr>=3"]
+anndata = ["anndata>=0.10", "zarr>=2.16"]
 dev = [
     "maturin>=1.8,<2",
     "pytest>=8.0",
     "ruff>=0.12",
     "scipy>=1.13",
     "pandas>=2",
-    "anndata>=0.11",
-    "zarr>=3",
+    "anndata>=0.10",
+    "zarr>=2.16",
 ]
 
 [tool.maturin]
@@ -50,4 +53,4 @@ pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py39"

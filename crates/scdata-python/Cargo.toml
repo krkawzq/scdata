@@ -19,6 +19,6 @@ profile = ["sc-load/profile"]
 [dependencies]
 numpy = "0.23"
 parking_lot = "0.12"
-pyo3 = { version = "0.23.5", features = ["abi3-py312"] }
+pyo3 = { version = "0.23.5", features = ["abi3-py39"] }
 sc-compress = { path = "../sc-compress" }
 sc-load = { path = "../sc-load" }

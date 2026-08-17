@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from operator import index
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Self, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,12 +17,14 @@ from scdata.compress._index import AxisSpec, rust_payload
 from scdata.exceptions import InternalError
 
 if TYPE_CHECKING:
+    from typing_extensions import Self
+
     from scdata.compress._csr import ScCsr
     from scdata.compress._dense import ScDense
     from scdata.compress._limits import ReadLimits
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class StoreInfo:
     """Immutable metadata for an opened SCC matrix."""
 

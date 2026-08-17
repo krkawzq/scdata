@@ -14,7 +14,7 @@ uv sync --extra dev
 uv run maturin develop --release --strip --locked
 ```
 
-Python 3.12 or newer and NumPy 2.2 or newer are required.
+Python 3.9 or newer and NumPy 2.0 or newer are required.
 
 ## Example
 

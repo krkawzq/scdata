@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -24,6 +24,9 @@ from scdata.load._location import (
 )
 from scdata.load._names import NameSequence, build_feature_map, locate_names
 from scdata.load._validation import as_int, dtype_from_core, normalize_feature_map
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 DatasetKind = Literal["dense", "csr"]
 _PICKLE_VERSION = 1
@@ -394,7 +397,7 @@ class Dataset:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class RowRef:
     """One ordered ``(source_id, row)`` request."""
 
