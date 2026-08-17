@@ -14,6 +14,13 @@ uv sync --extra dev
 uv run maturin develop --release --strip --locked
 ```
 
+For runtime stage counters, build both PyO3 and loader profiling features:
+
+```sh
+uv run maturin develop --release --strip --locked \
+  --features extension-module,profile
+```
+
 Python 3.9 or newer and NumPy 2.0 or newer are required.
 
 ## Example
@@ -39,9 +46,10 @@ for batch in scdata.prefetch(
     prefetch_step=8,
     config=scdata.SessionConfig(io_mode="auto"),
 ):
-    # `batch` is compact, NumPy-owned, and remains valid after the Rust ring
-    # slot has been released and reused.
+    # `batch` is a read-only NumPy view. Its base owns the shared-ring
+    # generation lease, so Rust cannot reuse that slot while the view lives.
     consume(batch)
+    del batch
 
 # For smaller results, compile once and materialize.
 plan = scdata.compile(dataset, rows, output=output)
@@ -132,12 +140,12 @@ if __name__ == "__main__":
         distributed.wait()
 ```
 
-The default `copy=True` yields compact, writable, NumPy-owned arrays and is the
-safe choice for training loops. `distributed.rank(rank, copy=False)` is an
-explicit read-only zero-copy mode: every retained array keeps one physical ring
-generation leased, so release or drop views promptly. Holding enough views to
-block the caller's own next batch raises `InvalidInputError` instead of
-deadlocking. A rank iterator attaches lazily in its final process, may be
+`Plan.open()` and distributed ranks return read-only zero-copy views by default.
+Every retained array keeps one physical ring generation leased, so release or
+drop views promptly. Pass `copy=True` to `open()`, `prefetch()`, `rank()`, or
+`ranks()` for compact writable copies made by NumPy in Python. Holding enough
+views to block the caller's own next batch raises `InvalidInputError` instead
+of deadlocking. A rank iterator attaches lazily in its final process, may be
 transferred only before consumption starts, and is the sole live owner of that
 rank. Closing an incomplete attached iterator cancels the whole distributed
 session so the producer and other ranks do not hang. `ranks()` creates its
@@ -150,12 +158,14 @@ output overflow policy: `error`, `use_fill`, `use_value`, or `unchecked`.
 
 ## Ownership and cancellation
 
-`Plan` is immutable and reusable. `Plan.open()` creates a fresh `Session`.
-`prefetch()` returns a `Prefetch` iterator that opens a session on first use.
+`Plan` is immutable and reusable. `Plan.open()` creates a fresh zero-copy
+`Session`. `prefetch()` returns a `Prefetch` iterator that opens a session on
+first use.
 Blocking dataset open, plan compilation, batch waiting, and worker shutdown all
-release the Python GIL. Standard-session batches are copied once into compact
-NumPy storage and never alias a reusable ring slot; the distributed path's
-explicit `copy=False` exception follows the lease rules described above.
+release the Python GIL. NumPy arrays own generation leases through their base
+objects; Rust writes only unpublished generations and reuses a slot only after
+its last view is released. Explicit copies are a Python policy decision rather
+than an unconditional binding cost.
 
 Sessions and prefetch handles are context managers; `cancel()` wakes blocked
 consumers, while `close()` cancels unfinished work, joins workers, and releases

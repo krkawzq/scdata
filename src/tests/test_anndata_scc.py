@@ -5,13 +5,19 @@ from __future__ import annotations
 import json
 import zipfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
-ad = pytest.importorskip("anndata")
-pd = pytest.importorskip("pandas")
-sp = pytest.importorskip("scipy.sparse")
+if TYPE_CHECKING:
+    import anndata as ad
+    import pandas as pd
+    import scipy.sparse as sp
+else:
+    ad = pytest.importorskip("anndata")
+    pd = pytest.importorskip("pandas")
+    sp = pytest.importorskip("scipy.sparse")
 pytest.importorskip("zarr")
 
 from scdata.anndata import read_scc, write_scc  # noqa: E402
@@ -27,6 +33,13 @@ from scdata.exceptions import (  # noqa: E402
     CorruptDataError,
     InvalidMetaError,
 )
+
+
+def _as_dense(matrix: object) -> np.ndarray:
+    toarray = getattr(matrix, "toarray", None)
+    if callable(toarray):
+        return np.asarray(toarray())
+    return np.asarray(matrix)
 
 
 @pytest.fixture
@@ -112,12 +125,13 @@ def test_roundtrip_64_bit_integer_expression_matrices(tmp_path: Path) -> None:
     target = write_scc(adata, tmp_path / "integer64.scc", store="dir")
     out = read_scc(target)
 
+    unsigned_layer = out.layers["unsigned"]
     assert isinstance(out.X, ScDense)
-    assert isinstance(out.layers["unsigned"], ScCsr)
+    assert isinstance(unsigned_layer, ScCsr)
     assert np.asarray(out.X).dtype == np.dtype(np.int64)
-    assert out.layers["unsigned"].dtype == np.dtype(np.uint64)
+    assert unsigned_layer.dtype == np.dtype(np.uint64)
     np.testing.assert_array_equal(np.asarray(out.X), signed)
-    np.testing.assert_array_equal(out.layers["unsigned"].toarray(), unsigned)
+    np.testing.assert_array_equal(unsigned_layer.toarray(), unsigned)
 
 
 def test_roundtrip_sparse_zip_and_obsm_raw(tmp_path: Path, sparse_adata: ad.AnnData) -> None:
@@ -126,11 +140,12 @@ def test_roundtrip_sparse_zip_and_obsm_raw(tmp_path: Path, sparse_adata: ad.AnnD
     out = read_scc(target)
 
     assert isinstance(out.X, ScCsr)
-    np.testing.assert_array_equal(out.X.toarray(), sparse_adata.X.toarray())
+    np.testing.assert_array_equal(_as_dense(out.X), _as_dense(sparse_adata.X))
     np.testing.assert_array_equal(np.asarray(out.obsm["X_pca"]), sparse_adata.obsm["X_pca"])
     assert out.raw is not None
+    assert sparse_adata.raw is not None
     assert isinstance(out.raw.X, ScCsr)
-    np.testing.assert_array_equal(out.raw.X.toarray(), sparse_adata.raw.X.toarray())
+    np.testing.assert_array_equal(_as_dense(out.raw.X), _as_dense(sparse_adata.raw.X))
     assert zipfile.is_zipfile(target)
 
 

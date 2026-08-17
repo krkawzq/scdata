@@ -241,8 +241,8 @@ def test_read_limits_reject_tiny_decoded(tmp_path: Path) -> None:
 def test_read_limits_object_and_python_integer_validation(tmp_path: Path) -> None:
     root = tmp_path / "limits"
     scc.write_dense(root, np.ones((2, 2), dtype=np.uint16))
-    limits = scc.ReadLimits(max_decoded_size=np.int64(64))
-    store = scc.open_store(root, limits=limits, max_block_count=np.int64(10))
+    limits = scc.ReadLimits(max_decoded_size=np.int64(64))  # type: ignore[arg-type]
+    store = scc.open_store(root, limits=limits, max_block_count=np.int64(10))  # type: ignore[arg-type]
     assert store.limits.max_decoded_size == 64
     assert store.limits.max_block_count == 10
 
@@ -292,7 +292,7 @@ def test_write_workers_fall_back_to_process_cpu_count(monkeypatch: pytest.Monkey
 
 
 def test_num_workers_is_configurable_for_writes_and_reads(tmp_path: Path) -> None:
-    options = scc.WriteOptions(num_workers=np.int64(2))
+    options = scc.WriteOptions(num_workers=np.int64(2))  # type: ignore[arg-type]
     assert options.num_workers == 2
 
     root = tmp_path / "workers"
@@ -301,11 +301,11 @@ def test_num_workers_is_configurable_for_writes_and_reads(tmp_path: Path) -> Non
         root,
         values,
         options=options,
-        num_workers=np.int64(3),
+        num_workers=np.int64(3),  # type: ignore[arg-type]
     )
 
-    limits = scc.ReadLimits(num_workers=np.int64(2))
-    with scc.open_store(root, limits=limits, num_workers=np.int64(4)) as store:
+    limits = scc.ReadLimits(num_workers=np.int64(2))  # type: ignore[arg-type]
+    with scc.open_store(root, limits=limits, num_workers=np.int64(4)) as store:  # type: ignore[arg-type]
         assert store.num_workers == 4
         assert store.limits.num_workers == 4
         assert store.info().num_workers == 4
@@ -344,7 +344,7 @@ def test_csr_bytes_budget_policy_roundtrip(tmp_path: Path) -> None:
             np.array([0], dtype=np.int64),
             np.array([], dtype=np.int64),
             np.array([], dtype=np.float32),
-            (0.5, 1),
+            (0.5, 1),  # type: ignore[arg-type]
         )
 
 

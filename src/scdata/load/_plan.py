@@ -9,23 +9,28 @@ import struct
 import tempfile
 import threading
 import zipfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Mapping, SupportsIndex
+from typing import TYPE_CHECKING, Any, Literal, SupportsIndex
 
 import numpy as np
 from numpy.typing import NDArray
 
 from scdata import _core
-from scdata.exceptions import InternalError
-from scdata.load._config import DEFAULT_MAX_CONTROL_BYTES, IoMergeConfig, PlanConfig, SessionConfig
-from scdata.load._config import ResourceLimits
-from scdata.load._dataset import Dataset, RowRef
 from scdata.compress._limits import ReadLimits
-from scdata.load._output import OutputSpec
+from scdata.exceptions import InternalError
+from scdata.load._config import (
+    DEFAULT_MAX_CONTROL_BYTES,
+    IoMergeConfig,
+    PlanConfig,
+    ResourceLimits,
+    SessionConfig,
+)
+from scdata.load._dataset import Dataset, RowRef
 from scdata.load._location import resolve_matrix_location
+from scdata.load._output import OutputSpec
 from scdata.load._stats import PlanStats, RuntimeStats, SessionState
 from scdata.load._validation import as_int, normalize_rows
 
@@ -125,11 +130,19 @@ class Plan:
     def stats(self) -> PlanStats:
         return self._stats
 
-    def open(self, config: SessionConfig | None = None) -> Session:
-        """Start one independent execution session."""
+    def open(
+        self,
+        config: SessionConfig | None = None,
+        *,
+        copy: bool = False,
+    ) -> Session:
+        """Start one zero-copy shared-ring session.
+
+        Batches are leased read-only NumPy views by default. ``copy=True``
+        requests compact writable copies made by NumPy in Python.
+        """
         resolved = _resolve_session_config(config)
-        inner = _core.plan_open(self._require_inner(), resolved._to_core())
-        return Session(inner, self)
+        return Session(self, resolved, copy=copy)
 
     def open_distributed(
         self,
@@ -148,13 +161,23 @@ class Plan:
             max_control_bytes=max_control_bytes,
         )
 
-    def prefetch(self, config: SessionConfig | None = None) -> Prefetch:
+    def prefetch(
+        self,
+        config: SessionConfig | None = None,
+        *,
+        copy: bool = False,
+    ) -> Prefetch:
         """Return an inspectable lazy iterator for this compiled plan."""
-        return Prefetch(self, config)
+        return Prefetch(self, config, copy=copy)
 
-    def iter_batches(self, config: SessionConfig | None = None) -> Iterator[NDArray[Any]]:
-        """Execute the plan and yield compact NumPy-owned batches."""
-        with self.open(config) as session:
+    def iter_batches(
+        self,
+        config: SessionConfig | None = None,
+        *,
+        copy: bool = False,
+    ) -> Iterator[NDArray[Any]]:
+        """Execute the plan and yield leased views or explicit copies."""
+        with self.open(config, copy=copy) as session:
             yield from session
 
     def read(self, config: SessionConfig | None = None) -> NDArray[Any]:
@@ -258,9 +281,7 @@ class Plan:
         del protocol
         return _restore_plan_v1, (self.dumps(),)
 
-    def _apply_source_overrides(
-        self, sources: Mapping[int, str | os.PathLike[str]]
-    ) -> None:
+    def _apply_source_overrides(self, sources: Mapping[int, str | os.PathLike[str]]) -> None:
         if self._inner is not None:
             raise ValueError("cannot override sources after Plan binding")
         if not isinstance(sources, Mapping):
@@ -347,18 +368,32 @@ class Plan:
 
 
 class Session(Iterator[NDArray[Any]]):
-    """One independent execution of a plan.
+    """One process-local consumer of a leased shared output ring."""
 
-    Each returned array owns compact NumPy storage and remains stable after the
-    underlying output-ring slot is reused.
-    """
+    __slots__ = ("_closed", "_copy", "_distributed", "_iterator", "_plan")
 
-    __slots__ = ("_inner", "_plan", "_rows_yielded")
+    def __init__(
+        self,
+        plan: Plan,
+        config: SessionConfig,
+        *,
+        copy: bool = False,
+    ) -> None:
+        if not isinstance(copy, bool):
+            raise TypeError("copy must be bool")
+        from scdata.load._distributed import DistributedSession
 
-    def __init__(self, inner: _core._Session, plan: Plan) -> None:
-        self._inner = inner
+        distributed = DistributedSession(plan, 1, config)
+        try:
+            iterator = distributed.rank(0, copy=False)
+        except BaseException:
+            distributed.close()
+            raise
         self._plan = plan
-        self._rows_yielded = 0
+        self._distributed = distributed
+        self._iterator = iterator
+        self._copy = copy
+        self._closed = False
 
     @property
     def plan(self) -> Plan:
@@ -366,79 +401,85 @@ class Session(Iterator[NDArray[Any]]):
 
     @property
     def closed(self) -> bool:
-        return bool(_core.session_meta(self._inner)["closed"])
+        return self._closed
 
     @property
     def exhausted(self) -> bool:
-        return bool(_core.session_meta(self._inner)["exhausted"])
+        return self._iterator.exhausted
+
+    @property
+    def copy(self) -> bool:
+        return self._copy
 
     @property
     def rows_yielded(self) -> int:
-        return self._rows_yielded
+        return self._iterator.rows_yielded
 
     @property
     def rows_remaining(self) -> int:
-        return self._plan.n_rows - self._rows_yielded
+        return self._iterator.rows_remaining
 
     @property
     def progress(self) -> float:
         """Fraction of planned rows already returned, in the range ``0..1``."""
-        if self._plan.n_rows == 0:
-            return 1.0 if self.exhausted else 0.0
-        return self._rows_yielded / self._plan.n_rows
+        return self._iterator.progress
 
     @property
     def state(self) -> SessionState:
-        return _core.session_meta(self._inner)["state"]
+        return self._distributed.state
 
     @property
-    def stats(self) -> RuntimeStats:
-        return RuntimeStats._from_mapping(_core.session_stats(self._inner))
+    def stats(self) -> RuntimeStats | None:
+        return self._distributed.stats
 
-    def next_batch(self) -> NDArray[Any] | None:
-        """Wait for and return the next compact batch, or ``None`` at EOF."""
+    def next_batch(self, *, copy: bool | None = None) -> NDArray[Any] | None:
+        """Return the next leased view or an explicit Python-side copy."""
         if self.closed and not self.exhausted:
             raise ValueError("session is closed")
-        batch = _core.session_next(self._inner)
-        if batch is not None:
-            rows_yielded = self._rows_yielded + batch.shape[0]
-            if rows_yielded > self._plan.n_rows:
-                raise InternalError("core returned more rows than the compiled plan")
-            self._rows_yielded = rows_yielded
-        return batch
+        if copy is None:
+            resolved_copy = self._copy
+        elif isinstance(copy, bool):
+            resolved_copy = copy
+        else:
+            raise TypeError("copy must be bool or None")
+        try:
+            return self._iterator.next_batch(copy=resolved_copy)
+        except BaseException:
+            self.close()
+            raise
 
     def cancel(self) -> None:
         """Request cooperative cancellation; blocked consumers are woken."""
-        _core.session_cancel(self._inner)
+        if not self._closed:
+            self._distributed.cancel()
+
+    def wait(self, timeout: float | None = None) -> None:
+        """Wait until every returned ring generation has been released."""
+        self._distributed.wait(timeout)
 
     def close(self) -> None:
-        """Cancel unfinished work, join workers, and release the output ring."""
-        _core.session_close(self._inner)
+        """Cancel unfinished work and release session-owned ring handles."""
+        if self._closed:
+            return
+        self._closed = True
+        self._distributed.close()
 
     def read(self) -> NDArray[Any]:
         """Materialize all remaining batches into one compact matrix."""
-        remaining = self._plan.n_rows - self._rows_yielded
-        first = self.next_batch()
-        if first is None:
-            if remaining != 0:
-                raise InternalError(
-                    f"core returned {self._rows_yielded} rows for a {self._plan.n_rows}-row plan"
-                )
-            return np.empty((0, self._plan.n_cols), dtype=self._plan.dtype)
-        if first.shape[0] == remaining:
-            if self.next_batch() is not None:
-                raise InternalError("core returned more rows than the compiled plan")
-            return first
-
+        remaining = self.rows_remaining
         output = np.empty((remaining, self._plan.n_cols), dtype=self._plan.dtype)
-        offset = first.shape[0]
-        output[:offset] = first
-        for batch in self:
+        offset = 0
+        while True:
+            batch = self.next_batch(copy=False)
+            if batch is None:
+                break
             stop = offset + batch.shape[0]
             output[offset:stop] = batch
             offset = stop
+            del batch
         if offset != remaining:
             raise InternalError(f"core returned {offset} remaining rows, expected {remaining}")
+        self.wait()
         return output
 
     def info(self) -> dict[str, object]:
@@ -450,6 +491,7 @@ class Session(Iterator[NDArray[Any]]):
             "rows_yielded": self.rows_yielded,
             "rows_remaining": self.rows_remaining,
             "progress": self.progress,
+            "copy": self.copy,
         }
 
     def __iter__(self) -> Self:
@@ -477,7 +519,7 @@ class Session(Iterator[NDArray[Any]]):
     def __repr__(self) -> str:
         return (
             f"Session(state={self.state!r}, rows={self.rows_yielded}/{self._plan.n_rows}, "
-            f"closed={self.closed}, exhausted={self.exhausted})"
+            f"copy={self.copy}, closed={self.closed}, exhausted={self.exhausted})"
         )
 
 
@@ -492,15 +534,25 @@ class Prefetch(Iterator[NDArray[Any]]):
         "_cancelled",
         "_closed",
         "_config",
+        "_copy",
         "_exhausted",
         "_opening",
         "_plan",
         "_session",
     )
 
-    def __init__(self, plan: Plan, config: SessionConfig | None = None) -> None:
+    def __init__(
+        self,
+        plan: Plan,
+        config: SessionConfig | None = None,
+        *,
+        copy: bool = False,
+    ) -> None:
+        if not isinstance(copy, bool):
+            raise TypeError("copy must be bool")
         self._plan = plan
         self._config = _resolve_session_config(config)
+        self._copy = copy
         self._session: Session | None = None
         self._cancelled = False
         self._closed = False
@@ -514,6 +566,10 @@ class Prefetch(Iterator[NDArray[Any]]):
     @property
     def config(self) -> SessionConfig:
         return self._config
+
+    @property
+    def copy(self) -> bool:
+        return self._copy
 
     @property
     def closed(self) -> bool:
@@ -556,12 +612,12 @@ class Prefetch(Iterator[NDArray[Any]]):
             return None
         return self._session.stats
 
-    def next_batch(self) -> NDArray[Any] | None:
+    def next_batch(self, *, copy: bool | None = None) -> NDArray[Any] | None:
         if self.exhausted:
             return None
         session = self._ensure_session()
         try:
-            batch = session.next_batch()
+            batch = session.next_batch(copy=copy)
         except BaseException:
             self._close_after_failure()
             raise
@@ -607,7 +663,7 @@ class Prefetch(Iterator[NDArray[Any]]):
                 raise RuntimeError("prefetch is already opening a session in another thread")
             self._opening = True
             try:
-                session = self._plan.open(self._config)
+                session = self._plan.open(self._config, copy=self._copy)
             finally:
                 self._opening = False
             self._session = session
@@ -635,6 +691,7 @@ class Prefetch(Iterator[NDArray[Any]]):
             "rows_yielded": self.rows_yielded,
             "rows_remaining": self.rows_remaining,
             "progress": self.progress,
+            "copy": self.copy,
         }
 
     def __iter__(self) -> Self:
@@ -661,7 +718,8 @@ class Prefetch(Iterator[NDArray[Any]]):
     def __repr__(self) -> str:
         return (
             f"Prefetch(state={self.state!r}, rows={self.rows_yielded}/{self._plan.n_rows}, "
-            f"closed={self.closed}, exhausted={self.exhausted}, plan={self._plan!r})"
+            f"copy={self.copy}, closed={self.closed}, exhausted={self.exhausted}, "
+            f"plan={self._plan!r})"
         )
 
 
@@ -723,8 +781,7 @@ def compile(
     )
     template = {
         "sources": [
-            _source_spec(source_id, dataset)
-            for source_id, dataset in enumerate(dataset_list)
+            _source_spec(source_id, dataset) for source_id, dataset in enumerate(dataset_list)
         ],
         "row_source_ids": None if row_source_ids is None else row_source_ids.copy(),
         "row_indices": row_indices.copy(),
@@ -742,6 +799,7 @@ def prefetch(
     prefetch_step: int = 8,
     plan_config: PlanConfig | None = None,
     config: SessionConfig | None = None,
+    copy: bool = False,
 ) -> Prefetch:
     """Compile ``datasets``/``rows`` and return a lazy batch iterator."""
     plan = compile(
@@ -752,7 +810,7 @@ def prefetch(
         prefetch_step=prefetch_step,
         config=plan_config,
     )
-    return plan.prefetch(config)
+    return plan.prefetch(config, copy=copy)
 
 
 def _source_spec(source_id: int, dataset: Dataset) -> dict[str, Any]:
@@ -840,9 +898,7 @@ def _encode_plan_image(
 ) -> bytes:
     source_ids = template["row_source_ids"]
     source_bytes = (
-        b""
-        if source_ids is None
-        else np.asarray(source_ids, dtype="<u4", order="C").tobytes()
+        b"" if source_ids is None else np.asarray(source_ids, dtype="<u4", order="C").tobytes()
     )
     row_bytes = np.asarray(template["row_indices"], dtype="<u8", order="C").tobytes()
     stats_values = stats.as_dict()
@@ -921,9 +977,9 @@ def _decode_plan_image(
     if has_source_ids:
         if source_len % 4:
             raise ValueError("row-source section is not aligned to uint32")
-        row_source_ids = np.frombuffer(
-            body[metadata_end:source_end], dtype="<u4"
-        ).astype(np.uint32, copy=True)
+        row_source_ids = np.frombuffer(body[metadata_end:source_end], dtype="<u4").astype(
+            np.uint32, copy=True
+        )
         if row_source_ids.size != row_indices.size:
             raise ValueError("row-source and row-index sections have different lengths")
     elif source_len != 0:

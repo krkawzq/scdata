@@ -12,7 +12,6 @@ from scdata.compress._base import csr_from_raw, dense_from_raw, scalar_axes
 from scdata.compress._index import normalize_key, rust_payload
 
 
-
 class _SliceDense:
     __slots__ = ("_num_workers", "_values")
 

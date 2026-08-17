@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping as MappingABC
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 
 IoMode = Literal["auto", "blocking", "uring"]
 SessionState = Literal["running", "failed", "cancelled", "finished"]
@@ -168,7 +168,7 @@ def _freeze_mapping(values: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _freeze(value: Any) -> Any:
-    if isinstance(value, MappingABC):
+    if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
@@ -176,7 +176,7 @@ def _freeze(value: Any) -> Any:
 
 
 def _to_plain(value: Any) -> Any:
-    if isinstance(value, MappingABC):
+    if isinstance(value, Mapping):
         return {key: _to_plain(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_to_plain(item) for item in value]

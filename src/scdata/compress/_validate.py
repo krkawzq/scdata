@@ -157,9 +157,7 @@ def ensure_writable_path(path: Path, *, overwrite: bool) -> None:
         raise TypeError(f"overwrite must be bool, got {type(overwrite).__name__}")
     if path.exists() or path.is_symlink():
         if not overwrite:
-            raise FileExistsError(
-                f"path already exists: {path} (pass overwrite=True to replace)"
-            )
+            raise FileExistsError(f"path already exists: {path} (pass overwrite=True to replace)")
 
 
 def is_sparse_matrix(matrix: Any) -> bool:
@@ -294,9 +292,7 @@ def csr_matrix_from_decoded(
     if n_rows < 0 or n_cols < 0:
         raise ValueError(f"CSR shape must be non-negative, got ({n_rows}, {n_cols})")
     if n_rows > _INT64_MAX or n_cols > _INT64_MAX:
-        raise ValueError(
-            f"CSR shape ({n_rows}, {n_cols}) exceeds SciPy's signed int64 index range"
-        )
+        raise ValueError(f"CSR shape ({n_rows}, {n_cols}) exceeds SciPy's signed int64 index range")
 
     indices_array = np.asarray(indices)
     max_index = int(indices_array.max()) if indices_array.size else 0

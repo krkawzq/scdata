@@ -9,8 +9,8 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from scdata.anndata import write_scc
 import scdata.load as sc_load
+from scdata.anndata import write_scc
 
 
 def write_scc_x(tmp_path: Path, values: np.ndarray, name: str = "sample.scc") -> Path:
@@ -25,7 +25,7 @@ def write_scc_x(tmp_path: Path, values: np.ndarray, name: str = "sample.scc") ->
     return target
 
 
-def test_register_feature_map_plan_and_owned_batches(tmp_path: Path) -> None:
+def test_register_feature_map_plan_and_leased_batches(tmp_path: Path) -> None:
     values = np.arange(12, dtype=np.uint16).reshape(4, 3).astype(np.float32)
     path = write_scc_x(tmp_path, values)
     dataset = sc_load.register(path, key="X", feature_map=[2, None, 0])
@@ -55,6 +55,10 @@ def test_register_feature_map_plan_and_owned_batches(tmp_path: Path) -> None:
         second = session.next_batch()
         assert first is not None
         assert second is not None
+        assert not first.flags.owndata
+        assert not first.flags.writeable
+        assert not second.flags.owndata
+        assert not second.flags.writeable
         first_snapshot = first.copy()
         np.testing.assert_array_equal(
             first,
@@ -66,9 +70,22 @@ def test_register_feature_map_plan_and_owned_batches(tmp_path: Path) -> None:
         assert session.rows_remaining == 0
         assert session.next_batch() is None
         assert session.exhausted
-        assert session.stats.state == "finished"
-        assert session.stats.num_workers == 1
-        assert session.stats.as_dict()["state"] == "finished"
+        del first, second
+        session.wait()
+        stats = session.stats
+        assert stats is not None
+        assert stats.state == "finished"
+        assert stats.num_workers == 1
+        assert stats.as_dict()["state"] == "finished"
+
+    with plan.open(
+        sc_load.SessionConfig(num_workers=1, io_mode="blocking"),
+        copy=True,
+    ) as session:
+        owned = session.next_batch()
+        assert owned is not None
+        assert owned.flags.owndata
+        assert owned.flags.writeable
 
 
 def test_prefetch_is_reusable_via_plan_and_preserves_row_order(tmp_path: Path) -> None:
@@ -84,12 +101,23 @@ def test_prefetch_is_reusable_via_plan_and_preserves_row_order(tmp_path: Path) -
     config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     np.testing.assert_array_equal(plan.read(config), expected)
     result = np.concatenate(
-        list(sc_load.prefetch(dataset, [4, 0, 2], batch_size=1, prefetch_step=2, config=config))
+        list(
+            sc_load.prefetch(
+                dataset,
+                [4, 0, 2],
+                batch_size=1,
+                prefetch_step=2,
+                config=config,
+                copy=True,
+            )
+        )
     )
     np.testing.assert_array_equal(result, expected)
     assert result.flags.c_contiguous
     with plan.open(config) as session:
-        np.testing.assert_array_equal(session.next_batch(), expected[:1])
+        first = session.next_batch()
+        np.testing.assert_array_equal(first, expected[:1])
+        del first
         np.testing.assert_array_equal(session.read(), expected[1:])
 
 
@@ -168,14 +196,20 @@ def test_rounding_conversion_requires_opt_in(tmp_path: Path) -> None:
         var=pd.DataFrame(index=["g0"]),
     )
     dataset = sc_load.register(write_scc(adata, tmp_path / "int32.scc", store="dir"))
-    common = dict(datasets=dataset, rows=[0], batch_size=1, prefetch_step=2)
-    with pytest.raises(sc_load.PromotionError):
-        sc_load.compile(**common, output=sc_load.OutputSpec(1, np.float32))
 
-    plan = sc_load.compile(
-        **common,
-        output=sc_load.OutputSpec(1, np.float32, allow_float_rounding=True),
-    )
+    def compile_plan(output: sc_load.OutputSpec) -> sc_load.Plan:
+        return sc_load.compile(
+            dataset,
+            [0],
+            output=output,
+            batch_size=1,
+            prefetch_step=2,
+        )
+
+    with pytest.raises(sc_load.PromotionError):
+        compile_plan(sc_load.OutputSpec(1, np.float32))
+
+    plan = compile_plan(sc_load.OutputSpec(1, np.float32, allow_float_rounding=True))
     with plan.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
         np.testing.assert_array_equal(session.read(), np.array([[16_777_216]], dtype=np.float32))
 
@@ -213,10 +247,17 @@ def test_loader_preserves_int64_and_uint64_precision(tmp_path: Path) -> None:
 def test_int64_uint64_conversion_policies(tmp_path: Path) -> None:
     values = np.array([[-1, (1 << 53) + 1]], dtype=np.int64)
     dataset = sc_load.register(write_scc_x(tmp_path, values, "i64-conversion.scc"))
-    common = dict(datasets=dataset, rows=[0], batch_size=1, prefetch_step=2)
 
-    filled = sc_load.compile(
-        **common,
+    def compile_plan(output: sc_load.OutputSpec) -> sc_load.Plan:
+        return sc_load.compile(
+            dataset,
+            [0],
+            output=output,
+            batch_size=1,
+            prefetch_step=2,
+        )
+
+    filled = compile_plan(
         output=sc_load.OutputSpec(
             2,
             np.uint64,
@@ -231,11 +272,8 @@ def test_int64_uint64_conversion_policies(tmp_path: Path) -> None:
         )
 
     with pytest.raises(sc_load.PromotionError):
-        sc_load.compile(**common, output=sc_load.OutputSpec(2, np.float64))
-    rounded = sc_load.compile(
-        **common,
-        output=sc_load.OutputSpec(2, np.float64, allow_float_rounding=True),
-    )
+        compile_plan(sc_load.OutputSpec(2, np.float64))
+    rounded = compile_plan(sc_load.OutputSpec(2, np.float64, allow_float_rounding=True))
     with rounded.open(sc_load.SessionConfig(num_workers=1, io_mode="blocking")) as session:
         np.testing.assert_array_equal(session.read(), values.astype(np.float64))
 

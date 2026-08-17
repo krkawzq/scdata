@@ -30,7 +30,7 @@ def test_config_defaults_are_python_owned_and_immutable() -> None:
     assert session.queue_depth == 64
     assert sc_load.ReadLimits().max_metadata_size == 1024 * 1024
     with pytest.raises(AttributeError):
-        plan.cache_capacity_bytes = 4
+        plan.cache_capacity_bytes = 4  # type: ignore[misc]
 
 
 def test_config_rejects_invalid_values_before_ffi() -> None:

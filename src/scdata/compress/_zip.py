@@ -390,9 +390,7 @@ def _validate_compression(
     if isinstance(compression, bool):
         raise TypeError("compression must be a zipfile compression constant, not bool")
     if not isinstance(compression, SupportsIndex):
-        raise TypeError(
-            f"compression must be a zipfile compression constant, got {compression!r}"
-        )
+        raise TypeError(f"compression must be a zipfile compression constant, got {compression!r}")
     method = index(compression)
 
     supported = {

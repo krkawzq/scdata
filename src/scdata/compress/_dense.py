@@ -11,7 +11,6 @@ from scdata.compress._base import MatrixStore, dense_from_raw, scalar_axes
 from scdata.compress._index import normalize_axis, normalize_key
 
 
-
 class ScDense(MatrixStore):
     """Read-only dense matrix backed by an SCC store.
 

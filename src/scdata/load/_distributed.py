@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
 import multiprocessing.reduction
 import os
 import threading
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -18,7 +18,7 @@ from scdata.exceptions import CancelledError, UnsupportedError
 from scdata.load._config import DEFAULT_MAX_CONTROL_BYTES, PlanConfig, SessionConfig
 from scdata.load._dataset import Dataset, RowRef
 from scdata.load._output import OutputSpec
-from scdata.load._stats import SessionState
+from scdata.load._stats import RuntimeStats, SessionState
 from scdata.load._validation import as_int, dtype_from_core
 
 if TYPE_CHECKING:
@@ -188,13 +188,18 @@ class DistributedSession:
     def finished(self) -> bool:
         return not self._thread.is_alive() and self._runner.get_error() is None
 
-    def rank(self, rank: int, *, copy: bool = True) -> DistributedIterator:
+    @property
+    def stats(self) -> RuntimeStats | None:
+        """Return final producer counters, or ``None`` while it is still running."""
+        if self._thread.is_alive():
+            return None
+        return RuntimeStats._from_mapping(_core.shared_server_stats(self._runner.inner))
+
+    def rank(self, rank: int, *, copy: bool = False) -> DistributedIterator:
         """Create the sole iterator for ``rank``.
 
-        ``copy=True`` (the default) yields compact writable NumPy-owned arrays
-        and cannot stall on Python reference lifetimes. ``copy=False`` yields
-        read-only zero-copy shared-ring views; retaining such a view keeps its
-        ring generation leased and intentionally applies backpressure.
+        The default returns read-only zero-copy shared-ring views. ``copy=True``
+        requests compact writable copies made by NumPy in Python.
         """
         self._ensure_owner_process()
         if self._closed:
@@ -214,7 +219,7 @@ class DistributedSession:
         self._handles.append(handle)
         return handle
 
-    def ranks(self, *, copy: bool = True) -> tuple[DistributedIterator, ...]:
+    def ranks(self, *, copy: bool = False) -> tuple[DistributedIterator, ...]:
         """Create one iterator for every not-yet-issued rank atomically."""
         self._ensure_owner_process()
         if self._closed:
@@ -502,8 +507,7 @@ class DistributedIterator(Iterator[NDArray[Any]]):
             raise TypeError("copy must be a bool or None")
         client = self._ensure_client()
         try:
-            next_fn = _core.shared_next_copy if resolved_copy else _core.shared_next
-            batch = next_fn(client)
+            batch = _core.shared_next(client)
         except BaseException:
             self.close()
             raise
@@ -519,7 +523,11 @@ class DistributedIterator(Iterator[NDArray[Any]]):
             raise RuntimeError("shared core returned a batch outside the rank-local plan")
         self._batches_yielded += 1
         self._rows_yielded = next_rows
-        return batch
+        if not resolved_copy:
+            return batch
+        owned = np.array(batch, dtype=self._dtype, order="C", copy=True, subok=False)
+        del batch
+        return owned
 
     def read(self) -> NDArray[Any]:
         """Materialize all remaining rank-local rows into compact owned memory."""
@@ -534,28 +542,21 @@ class DistributedIterator(Iterator[NDArray[Any]]):
             return np.empty((0, self.n_cols), dtype=self._dtype)
         if self._closed:
             raise ValueError("distributed iterator is closed")
-        client = self._ensure_client()
-        try:
-            output, batches = _core.shared_read(client, remaining)
-        except BaseException:
+        output = np.empty((remaining, self.n_cols), dtype=self._dtype)
+        offset = 0
+        while True:
+            batch = self._next_batch(copy=False)
+            if batch is None:
+                break
+            stop = offset + batch.shape[0]
+            output[offset:stop] = batch
+            offset = stop
+            del batch
+        if offset != remaining:
             self.close()
-            raise
-        expected_batches = self._batch_count - self._batches_yielded
-        if (
-            output.shape != (remaining, self.n_cols)
-            or output.dtype != self._dtype
-            or not output.flags.owndata
-            or not output.flags.c_contiguous
-            or not output.flags.writeable
-            or batches != expected_batches
-        ):
-            self.close()
-            raise RuntimeError("shared core returned output outside the rank-local plan")
-        self._batches_yielded = self._batch_count
-        self._rows_yielded = self._n_rows
-        self._exhausted = True
-        self._closed = True
-        self._close_resources()
+            raise RuntimeError(
+                f"shared rank returned {offset} remaining rows, expected {remaining}"
+            )
         return output
 
     def close(self) -> None:

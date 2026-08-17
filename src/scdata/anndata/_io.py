@@ -1092,9 +1092,7 @@ def _replace_directory(source: Path, target: Path, *, overwrite: bool) -> None:
     backup: Path | None = None
     if target.exists() or target.is_symlink():
         if not overwrite:
-            raise FileExistsError(
-                f"path already exists: {target} (pass overwrite=True to replace)"
-            )
+            raise FileExistsError(f"path already exists: {target} (pass overwrite=True to replace)")
         backup = _make_temp_backup_path(target)
         os.replace(target, backup)
     try:

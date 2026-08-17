@@ -12,7 +12,6 @@ from scdata.compress._base import MatrixStore, csr_from_raw, dense_from_raw, sca
 from scdata.compress._index import normalize_axis, normalize_key
 
 
-
 class ScCsr(MatrixStore):
     """Read-only CSR matrix backed by an SCC store.
 

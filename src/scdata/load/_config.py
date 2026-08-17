@@ -127,8 +127,7 @@ class IoMergeConfig:
             )
         if self.max_coalesced_io_bytes > self.max_encoded_staging_bytes_per_task:
             raise ValueError(
-                "max_coalesced_io_bytes must not exceed "
-                "max_encoded_staging_bytes_per_task"
+                "max_coalesced_io_bytes must not exceed max_encoded_staging_bytes_per_task"
             )
 
     def _to_core(self) -> _core.IoMergeConfigDict:
@@ -232,13 +231,19 @@ class SessionConfig:
             "num_workers",
             as_int(self.num_workers, "num_workers", minimum=1),
         )
-        initialize_workers = self.num_workers if self.initialize_workers is None else as_int(
-            self.initialize_workers, "initialize_workers", minimum=1
+        initialize_workers = (
+            self.num_workers
+            if self.initialize_workers is None
+            else as_int(self.initialize_workers, "initialize_workers", minimum=1)
         )
-        initialize_ops = initialize_workers if self.initialize_inflight_io_ops is None else as_int(
-            self.initialize_inflight_io_ops,
-            "initialize_inflight_io_ops",
-            minimum=1,
+        initialize_ops = (
+            initialize_workers
+            if self.initialize_inflight_io_ops is None
+            else as_int(
+                self.initialize_inflight_io_ops,
+                "initialize_inflight_io_ops",
+                minimum=1,
+            )
         )
         object.__setattr__(self, "initialize_workers", initialize_workers)
         object.__setattr__(self, "initialize_inflight_io_ops", initialize_ops)
@@ -282,9 +287,7 @@ class SessionConfig:
         if initialize_workers is None or initialize_inflight_io_ops is None:
             raise RuntimeError("SessionConfig normalization did not initialize worker limits")
         io_ops_per_worker = self.queue_depth if self.io_mode != "blocking" else 1
-        regular_io_ops = _checked_product(
-            self.num_workers, io_ops_per_worker, "in-flight I/O ops"
-        )
+        regular_io_ops = _checked_product(self.num_workers, io_ops_per_worker, "in-flight I/O ops")
         required_io_ops = max(regular_io_ops, initialize_inflight_io_ops)
         regular_encoded = _checked_product(
             self.num_workers,

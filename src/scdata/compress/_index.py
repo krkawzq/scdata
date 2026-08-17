@@ -8,7 +8,6 @@ from typing import Any
 import numpy as np
 
 
-
 __all__ = ["AxisSpec", "normalize_axis", "normalize_key", "rust_payload"]
 
 
@@ -82,7 +81,9 @@ def _normalize_one(key: Any, axis_len: int, *, name: str) -> tuple[AxisSpec, boo
         try:
             arr = np.asarray(key)
         except (TypeError, ValueError, OverflowError) as error:
-            raise TypeError(f"{name} fancy index cannot be converted to an array: {error}") from error
+            raise TypeError(
+                f"{name} fancy index cannot be converted to an array: {error}"
+            ) from error
         if arr.dtype == np.bool_:
             return _normalize_one(arr, axis_len, name=name)
         if arr.ndim == 0:

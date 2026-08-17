@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
-from pathlib import Path
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import anndata as ad
@@ -190,7 +190,7 @@ def test_distributed_copy_returns_compact_numpy_owned_batches(
     )
     config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     with plan.open_distributed(1, config) as distributed:
-        iterator = distributed.rank(0)
+        iterator = distributed.rank(0, copy=True)
         batch = iterator.next_batch()
         assert batch is not None
         assert batch.flags.owndata
@@ -227,7 +227,7 @@ def test_distributed_copy_supports_zero_width_output(tmp_path: Path) -> None:
     )
     config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
     with plan.open_distributed(1, config) as distributed:
-        iterator = distributed.rank(0)
+        iterator = distributed.rank(0, copy=True)
         batch = iterator.next_batch()
         assert batch is not None
         assert batch.shape == (2, 0)
@@ -237,7 +237,7 @@ def test_distributed_copy_supports_zero_width_output(tmp_path: Path) -> None:
         assert iterator.next_batch() is None
         distributed.wait(timeout=5)
     with plan.open_distributed(1, config) as distributed:
-        output = distributed.rank(0).read()
+        output = distributed.rank(0, copy=True).read()
         assert output.shape == (2, 0)
         assert output.flags.owndata
         assert output.flags.c_contiguous
@@ -464,6 +464,7 @@ def test_distributed_iterator_serializes_concurrent_first_consumers(
         combined = np.concatenate(batches)
         combined = combined[np.argsort(combined[:, 0])]
         np.testing.assert_array_equal(combined, values[:4])
+        batches.clear()
         np.testing.assert_array_equal(iterator.read(), values[4:])
         distributed.wait(timeout=5)
 
@@ -474,7 +475,7 @@ def test_distributed_iterator_serializes_read_and_next_batch(
 ) -> None:
     plan, values = _plan(tmp_path, rows=16)
     config = sc_load.SessionConfig(num_workers=1, io_mode="blocking")
-    original = _core.shared_read
+    original = _core.shared_next
     read_entered = threading.Event()
     allow_read = threading.Event()
 
@@ -482,13 +483,13 @@ def test_distributed_iterator_serializes_read_and_next_batch(
         iterator = distributed.rank(0)
         iterator.__enter__()
 
-        def delayed_read(client: Any, remaining: int) -> Any:
+        def delayed_next(client: Any) -> Any:
             read_entered.set()
             if not allow_read.wait(timeout=5):
                 raise TimeoutError("read was not released")
-            return original(client, remaining)
+            return original(client)
 
-        monkeypatch.setattr(_core, "shared_read", delayed_read)
+        monkeypatch.setattr(_core, "shared_next", delayed_next)
         results: dict[str, Any] = {}
         errors: list[BaseException] = []
 

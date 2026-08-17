@@ -73,9 +73,7 @@ def _resolve_names(
     try:
         return tuple(str(name) for name in value)
     except TypeError as error:
-        raise TypeError(
-            f"{argument} must be 'auto', None, or an iterable of names"
-        ) from error
+        raise TypeError(f"{argument} must be 'auto', None, or an iterable of names") from error
 
 
 class Dataset:
@@ -178,8 +176,7 @@ class Dataset:
             )
         if resolved_obs_names is not None and len(resolved_obs_names) != n_rows:
             raise ValueError(
-                f"obs_names has length {len(resolved_obs_names)}, "
-                f"but the matrix has {n_rows} rows"
+                f"obs_names has length {len(resolved_obs_names)}, but the matrix has {n_rows} rows"
             )
 
         self._inner: _core._Dataset | None = inner
@@ -383,9 +380,7 @@ class Dataset:
 
     def __repr__(self) -> str:
         if self.closed:
-            return (
-                f"Dataset(path={str(self._path)!r}, key={self._key!r}, closed=True)"
-            )
+            return f"Dataset(path={str(self._path)!r}, key={self._key!r}, closed=True)"
         mapped = (
             "identity"
             if self._feature_map is None

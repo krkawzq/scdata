@@ -23,9 +23,7 @@ def as_str_tuple(names: NameSequence, *, argument: str = "names") -> tuple[str, 
     if names is None:
         raise TypeError(f"{argument} must be a 1-D sequence of names")
     if isinstance(names, (str, bytes)):
-        raise TypeError(
-            f"{argument} must be a 1-D sequence of names; wrap a single name in a list"
-        )
+        raise TypeError(f"{argument} must be a 1-D sequence of names; wrap a single name in a list")
     if isinstance(names, np.ndarray):
         if names.ndim != 1:
             raise ValueError(f"{argument} must be 1-D, got shape {names.shape}")

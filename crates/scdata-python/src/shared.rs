@@ -10,12 +10,12 @@ use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use sc_load::{
-    Error, OutputDType, SessionState, SharedBatch, SharedCancellationHandle, SharedClient,
-    SharedClientCancellationHandle, SharedServer,
+    Error, OutputDType, RuntimeStats, SessionState, SharedBatch, SharedCancellationHandle,
+    SharedClient, SharedClientCancellationHandle, SharedServer,
 };
 
 use crate::error::{from_rust, invalid_input as invalid_argument, ResultExt};
-use crate::stats::session_state_name;
+use crate::stats::{runtime_stats_to_dict, session_state_name};
 
 const RUNNING: u8 = 0;
 const FAILED: u8 = 1;
@@ -40,6 +40,7 @@ pub(crate) struct PySharedServer {
     cancellation: Mutex<Option<SharedCancellationHandle>>,
     descriptor: OwnedFd,
     metadata: SharedMetadata,
+    last_stats: Mutex<Option<RuntimeStats>>,
     final_state: AtomicU8,
     process_id: u32,
 }
@@ -63,6 +64,7 @@ impl PySharedServer {
             cancellation: Mutex::new(Some(cancellation)),
             descriptor,
             metadata,
+            last_stats: Mutex::new(None),
             final_state: AtomicU8::new(final_state),
             process_id: std::process::id(),
         })
@@ -92,7 +94,8 @@ pub(crate) fn shared_run(py: Python<'_>, server: &PySharedServer) -> PyResult<()
         .lock()
         .take()
         .ok_or_else(|| invalid_argument("shared producer has already been run"))?;
-    let result = py.allow_threads(move || inner.run());
+    let (result, stats) = py.allow_threads(move || inner.run_with_stats());
+    *server.last_stats.lock() = Some(stats);
     let state = match &result {
         Ok(()) => SessionState::Finished,
         Err(Error::Cancelled) => SessionState::Cancelled,
@@ -149,6 +152,20 @@ pub(crate) fn shared_server_meta<'py>(
     };
     values.set_item("state", state)?;
     Ok(values)
+}
+
+#[pyfunction]
+pub(crate) fn shared_server_stats<'py>(
+    py: Python<'py>,
+    server: &PySharedServer,
+) -> PyResult<Bound<'py, PyDict>> {
+    server.ensure_process()?;
+    let stats = server
+        .last_stats
+        .lock()
+        .clone()
+        .ok_or_else(|| invalid_argument("shared producer statistics are unavailable"))?;
+    runtime_stats_to_dict(py, &stats)
 }
 
 impl Drop for PySharedServer {
@@ -817,6 +834,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(shared_cancel, module)?)?;
     module.add_function(wrap_pyfunction!(shared_duplicate_fd, module)?)?;
     module.add_function(wrap_pyfunction!(shared_server_meta, module)?)?;
+    module.add_function(wrap_pyfunction!(shared_server_stats, module)?)?;
     module.add_function(wrap_pyfunction!(shared_next, module)?)?;
     module.add_function(wrap_pyfunction!(shared_next_copy, module)?)?;
     module.add_function(wrap_pyfunction!(shared_read, module)?)?;

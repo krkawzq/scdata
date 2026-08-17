@@ -18,8 +18,9 @@ Shared-ring exports (``plan_open_shared``, ``_Shared*``, ``shared_*``,
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from os import PathLike
-from typing import Any, ClassVar, Final, Literal, Mapping, TypedDict, final
+from typing import Any, ClassVar, Final, Literal, TypedDict, final
 
 import numpy as np
 from numpy.typing import NDArray
@@ -948,6 +949,9 @@ def shared_cancel(server: _SharedServer) -> None:
 
 def shared_server_meta(server: _SharedServer) -> SharedServerMeta:
     """Return world size, batch geometry, dtype, and producer state."""
+
+def shared_server_stats(server: _SharedServer) -> RuntimeStatsDict:
+    """Return final producer counters after :func:`shared_run` completes."""
 
 def shared_duplicate_fd(server: _SharedServer) -> int:
     """Duplicate the attachable memfd and return a raw file descriptor.

@@ -19,7 +19,7 @@ use rustix::thread::futex;
 
 use crate::dtype::OutputDType;
 use crate::plan::Plan;
-use crate::session::{AlignedBuffer, CancellationHandle, Session, SessionState};
+use crate::session::{AlignedBuffer, CancellationHandle, RuntimeStats, Session, SessionState};
 use crate::{Error, Result, SessionConfig};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"SCSHARE6");
@@ -1133,32 +1133,37 @@ impl SharedServer {
     }
 
     /// Drive the producer until every published generation is released.
-    pub fn run(mut self) -> Result<()> {
-        self.ensure_process()?;
-        let result = self.run_inner();
-        match &result {
-            Ok(()) => {
-                if !self.mapping.set_terminal(STATE_FINISHED, 0) {
-                    let (state, code) = self.mapping.terminal();
-                    return match state {
-                        STATE_FINISHED => Ok(()),
-                        STATE_CANCELLED => Err(Error::Cancelled),
-                        STATE_FAILED => Err(producer_error(code)),
-                        _ => Err(Error::Invariant(format!(
-                            "shared producer ended with unknown state {state}"
-                        ))),
-                    };
-                }
-            }
-            Err(Error::Cancelled) => {
-                self.mapping.set_terminal(STATE_CANCELLED, 0);
-            }
-            Err(error) => {
-                self.mapping
-                    .set_terminal(STATE_FAILED, shared_error_code(error));
-            }
+    pub fn run(self) -> Result<()> {
+        self.run_with_stats().0
+    }
+
+    /// Drive the producer and retain its final runtime counters for frontends.
+    pub fn run_with_stats(mut self) -> (Result<()>, RuntimeStats) {
+        if let Err(error) = self.ensure_process() {
+            let stats = self.session.stats();
+            return (Err(error), stats);
         }
-        result
+        let mut result = self.run_inner();
+        if result.is_ok() {
+            if !self.mapping.set_terminal(STATE_FINISHED, 0) {
+                let (state, code) = self.mapping.terminal();
+                result = match state {
+                    STATE_FINISHED => Ok(()),
+                    STATE_CANCELLED => Err(Error::Cancelled),
+                    STATE_FAILED => Err(producer_error(code)),
+                    _ => Err(Error::Invariant(format!(
+                        "shared producer ended with unknown state {state}"
+                    ))),
+                };
+            }
+        } else if matches!(result, Err(Error::Cancelled)) {
+            self.mapping.set_terminal(STATE_CANCELLED, 0);
+        } else if let Err(error) = &result {
+            self.mapping
+                .set_terminal(STATE_FAILED, shared_error_code(error));
+        }
+        let stats = self.session.stats();
+        (result, stats)
     }
 
     fn ensure_process(&self) -> Result<()> {
