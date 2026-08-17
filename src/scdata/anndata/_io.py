@@ -1149,9 +1149,10 @@ def _write_config() -> Iterator[None]:
     """Disable AnnData auto-sharding for annotation arrays during write."""
     import anndata as ad
 
+    settings = getattr(ad, "settings", None)
     override = (
-        ad.settings.override(auto_shard_zarr_v3=False)
-        if hasattr(ad.settings, "auto_shard_zarr_v3")
+        settings.override(auto_shard_zarr_v3=False)
+        if settings is not None and hasattr(settings, "auto_shard_zarr_v3")
         else nullcontext()
     )
     with override:

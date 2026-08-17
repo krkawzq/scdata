@@ -337,7 +337,7 @@ def _iter_store_files(root: Path) -> Iterable[tuple[str, Path]]:
             if filename.startswith("."):
                 continue
             absolute = base / filename
-            metadata = absolute.stat(follow_symlinks=False)
+            metadata = absolute.lstat()
             if stat.S_ISLNK(metadata.st_mode):
                 raise ValueError(f"store contains a symbolic-link file: {absolute}")
             if not stat.S_ISREG(metadata.st_mode):
@@ -438,7 +438,7 @@ def _write_member(
     compression: int,
     compresslevel: int | None,
 ) -> None:
-    metadata = absolute.stat(follow_symlinks=False)
+    metadata = absolute.lstat()
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"store file changed while packing: {absolute}")
 

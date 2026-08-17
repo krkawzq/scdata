@@ -2,12 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import anndata as ad
 import numpy as np
-import pandas as pd
 import pytest
 
-from scdata.anndata import write_scc
 import scdata.load as sc_load
 
 
@@ -67,6 +64,11 @@ def test_register_rejects_missing_or_invalid_scc(tmp_path: Path) -> None:
 
 
 def test_feature_map_length_is_validated(tmp_path: Path) -> None:
+    import anndata as ad
+    import pandas as pd
+
+    from scdata.anndata import write_scc
+
     adata = ad.AnnData(
         X=np.arange(6, dtype=np.float32).reshape(2, 3),
         obs=pd.DataFrame(index=["c0", "c1"]),
