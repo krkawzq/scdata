@@ -7,6 +7,7 @@ from typing import Any, Literal, cast
 import numpy as np
 from numpy.typing import DTypeLike
 
+from scdata import _core
 from scdata.load._validation import as_int, normalize_dtype, normalize_fill
 
 OverflowPolicy = Literal["error", "use_fill", "use_value", "unchecked"]
@@ -42,9 +43,10 @@ class OutputSpec:
         normalized_fill = normalize_fill(fill, normalized_dtype, "fill")
         if not isinstance(overflow, str):
             raise TypeError("overflow must be a string")
-        normalized_overflow = overflow.strip().lower()
-        if normalized_overflow not in {"error", "use_fill", "use_value", "unchecked"}:
+        normalized_overflow_name = overflow.strip().lower()
+        if normalized_overflow_name not in {"error", "use_fill", "use_value", "unchecked"}:
             raise ValueError("overflow must be 'error', 'use_fill', 'use_value', or 'unchecked'")
+        normalized_overflow = cast(OverflowPolicy, normalized_overflow_name)
         if normalized_overflow == "use_value":
             if overflow_value is None:
                 raise ValueError("overflow_value is required when overflow='use_value'")
@@ -59,9 +61,9 @@ class OutputSpec:
             raise TypeError("allow_float_rounding must be bool")
         self._n_cols = normalized_cols
         self._dtype = normalized_dtype
-        self._dtype_name = dtype_name
+        self._dtype_name: _core.StorageDTypeName = dtype_name
         self._fill = normalized_fill
-        self._overflow = normalized_overflow
+        self._overflow: OverflowPolicy = normalized_overflow
         self._overflow_value = normalized_overflow_value
         self._allow_float_rounding = allow_float_rounding
 
@@ -79,7 +81,7 @@ class OutputSpec:
 
     @property
     def overflow(self) -> OverflowPolicy:
-        return cast(OverflowPolicy, self._overflow)
+        return self._overflow
 
     @property
     def overflow_value(self) -> int | float | None:
@@ -105,7 +107,7 @@ class OutputSpec:
             "allow_float_rounding": self._allow_float_rounding,
         }
 
-    def _to_core(self) -> dict[str, object]:
+    def _to_core(self) -> _core.OutputSpecDict:
         return {
             "n_cols": self._n_cols,
             "dtype": self._dtype_name,

@@ -234,7 +234,6 @@ class PlanConfigDict(TypedDict):
     compile_io_concurrency: int
     io_merge: IoMergeConfigDict
     cache_capacity_bytes: int
-    output_ring_slots: int
     cache_alignment: int
     cache_fragmentation_slack_bytes: int
     max_output_buffer_bytes: int

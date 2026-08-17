@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from operator import index
 from os import PathLike
@@ -73,12 +73,14 @@ class MatrixStore:
         zip_prefix: str | None,
         /,
         *,
-        _meta: dict[str, Any] | None = None,
+        _meta: Mapping[str, Any] | None = None,
     ) -> None:
         if not isinstance(handle, _core._Store):
             raise TypeError("handle must be scdata._core._Store")
         self._handle: _core._Store | None = handle
-        self._meta = _core.store_meta(handle) if _meta is None else _meta
+        self._meta: dict[str, Any] | None = dict(
+            _core.store_meta(handle) if _meta is None else _meta
+        )
         self._path = Path(path)
         self._zip_prefix = zip_prefix
 

@@ -3,6 +3,8 @@ use sc_load::{IoMode, OutputValue, Plan, RuntimeStats, SessionConfig, SessionSta
 pub fn session_config(worker_count: usize, io_mode: IoMode) -> SessionConfig {
     let mut config = SessionConfig::default();
     config.worker_count = worker_count;
+    config.initialize_workers = worker_count;
+    config.initialize_inflight_io_ops = worker_count;
     config.io_mode = io_mode;
     config.max_total_inflight_encoded_bytes = config
         .max_inflight_encoded_bytes_per_worker

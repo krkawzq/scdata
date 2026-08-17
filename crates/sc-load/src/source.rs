@@ -248,26 +248,18 @@ impl Source {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct OutputSlot {
-    row_offset_and_fresh: usize,
+    row_offset: usize,
 }
 
 impl OutputSlot {
-    const FRESH: usize = 1;
-
-    pub(crate) fn new(row_offset: usize, fresh: bool) -> Option<Self> {
-        if row_offset & Self::FRESH != 0 {
+    pub(crate) fn new(row_offset: usize) -> Option<Self> {
+        if row_offset & 1 != 0 {
             return None;
         }
-        Some(Self {
-            row_offset_and_fresh: row_offset | (usize::from(fresh) * Self::FRESH),
-        })
+        Some(Self { row_offset })
     }
 
     pub(crate) fn row_offset(self) -> usize {
-        self.row_offset_and_fresh & !Self::FRESH
-    }
-
-    pub(crate) fn is_fresh(self) -> bool {
-        self.row_offset_and_fresh & Self::FRESH != 0
+        self.row_offset
     }
 }

@@ -1,4 +1,4 @@
-//! Dense / CSR scatter into a filled output row using bound convert kernels.
+//! Dense / CSR initialization and scatter using pre-bound output kernels.
 
 use sc_compress::DType as StorageDType;
 
@@ -110,8 +110,8 @@ impl IndexOp {
     }
 }
 
-/// Pre-bound row-fill kernel. The compiler resolves the byte-pattern class
-/// once; scatter workers only perform one indirect call per sparse row.
+/// Pre-bound fill kernel. The compiler resolves the byte-pattern class once,
+/// so scatter workers do not branch on output dtype or fill representation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FillOp {
     word: u64,
@@ -149,6 +149,24 @@ impl FillOp {
     #[inline(always)]
     fn is_zero(self) -> bool {
         self.word == 0
+    }
+
+    #[inline(always)]
+    unsafe fn apply_default_ranges(self, source: &SourcePlan, row: *mut u8) {
+        for range in source.default_ranges.iter() {
+            // SAFETY: the compiler built disjoint ranges inside the logical
+            // output row, and the caller owns that complete row. Short gaps use
+            // direct stores so fragmented feature maps do not make one indirect
+            // memset-style call per missing output column.
+            unsafe {
+                let output = row.add(range.offset);
+                if range.len < 64 {
+                    fill_repeated_scalar(output, range.len, self.word);
+                } else {
+                    self.apply(output, range.len);
+                }
+            }
+        }
     }
 }
 
@@ -411,7 +429,7 @@ pub(crate) fn validate_row(
     Ok(())
 }
 
-/// Fill and scatter a row whose structure and fallible conversions were checked.
+/// Initialize and scatter a row whose structure and fallible conversions were checked.
 ///
 /// # Safety
 ///
@@ -429,6 +447,73 @@ pub(crate) unsafe fn scatter_row_prevalidated(
     row_bytes: usize,
     fill: FillOp,
 ) -> Result<()> {
+    // SAFETY: this forwards the caller's full validation and ownership proof;
+    // a general destination may contain bytes from an older generation.
+    unsafe {
+        scatter_row_prevalidated_inner(
+            source,
+            task,
+            data,
+            indices,
+            row,
+            row_bytes,
+            RowInitialization {
+                fill,
+                is_zeroed: false,
+            },
+        )
+    }
+}
+
+/// Scatter into a row whose complete logical prefix is already zero.
+///
+/// # Safety
+///
+/// The safety contract of [`scatter_row_prevalidated`] applies, and every byte
+/// in `row[..row_bytes]` must contain zero before this call.
+pub(crate) unsafe fn scatter_row_prevalidated_zeroed(
+    source: &SourcePlan,
+    task: &crate::plan::CellTask,
+    data: &[u8],
+    indices: &[u8],
+    row: &mut [u8],
+    row_bytes: usize,
+    fill: FillOp,
+) -> Result<()> {
+    // SAFETY: the caller supplies the base scatter proof plus the stronger
+    // zeroed-destination invariant required by the final argument.
+    unsafe {
+        scatter_row_prevalidated_inner(
+            source,
+            task,
+            data,
+            indices,
+            row,
+            row_bytes,
+            RowInitialization {
+                fill,
+                is_zeroed: true,
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RowInitialization {
+    fill: FillOp,
+    is_zeroed: bool,
+}
+
+unsafe fn scatter_row_prevalidated_inner(
+    source: &SourcePlan,
+    task: &crate::plan::CellTask,
+    data: &[u8],
+    indices: &[u8],
+    row: &mut [u8],
+    row_bytes: usize,
+    initialization: RowInitialization,
+) -> Result<()> {
+    let RowInitialization { fill, is_zeroed } = initialization;
     let dst_size = source.convert.dst_size as usize;
     debug_assert!(row.len() >= row_bytes);
     debug_assert_eq!(row_bytes & (dst_size - 1), 0);
@@ -450,15 +535,22 @@ pub(crate) unsafe fn scatter_row_prevalidated(
         };
     }
 
-    // SAFETY: the function contract proves this unique output row covers the
-    // plan-validated logical width and full aligned stride.
-    if !(dense_map.is_some_and(DenseMap::covers_output) || task.output_is_fresh() && fill.is_zero())
-    {
-        // SAFETY: the function contract proves the logical row prefix writable.
-        unsafe { fill.apply(row.as_mut_ptr(), row_bytes) };
-    }
-
     if let Some(index) = source.index {
+        // sc-compress canonicalizes every CSR row before writing. validate_row
+        // repeats that boundary check for corrupt or externally modified
+        // stores, so the commit phase can rely on unique, increasing indices.
+        // FeatureMap also rejects duplicate destinations; together these
+        // invariants give every mapped output element at most one nnz writer.
+        // CSR absence is a structural zero; OutputSpec::fill applies only to
+        // output columns that have no source feature mapping.
+        if !is_zeroed {
+            // SAFETY: the function contract proves the logical row prefix writable.
+            unsafe { row.as_mut_ptr().write_bytes(0, row_bytes) };
+        }
+        if !fill.is_zero() {
+            // SAFETY: compiler-built default ranges are disjoint and bounded.
+            unsafe { fill.apply_default_ranges(source, row.as_mut_ptr()) };
+        }
         let index_range = task.indices_range();
         let index_size = usize::from(index.size);
         // SAFETY: validation proved the range, element alignment, equal nnz,
@@ -538,6 +630,23 @@ pub(crate) unsafe fn scatter_row_prevalidated(
     } else {
         let entries = dense_map
             .ok_or_else(|| Error::Invariant("dense mapped path has no compact mapping".into()))?;
+        debug_assert!(
+            !entries.covers_output()
+                || !source.dense_fill_whole && source.default_ranges.is_empty()
+        );
+        if !(is_zeroed && fill.is_zero()) {
+            if source.dense_fill_whole {
+                // Highly fragmented gaps favor one streaming fill even though
+                // mapped positions are overwritten by the conversion kernel.
+                // SAFETY: the function contract proves the logical row writable.
+                unsafe { fill.apply(row.as_mut_ptr(), row_bytes) };
+            } else {
+                // Mapped values and default ranges partition the logical row,
+                // so low-fragmentation outputs write every byte exactly once.
+                // SAFETY: compiler-built default ranges are disjoint and bounded.
+                unsafe { fill.apply_default_ranges(source, row.as_mut_ptr()) };
+            }
+        }
         // SAFETY: compiler-built offsets point at complete source/destination
         // elements and the caller prevalidated every mapped conversion.
         unsafe {
@@ -545,6 +654,65 @@ pub(crate) unsafe fn scatter_row_prevalidated(
         }
     }
     Ok(())
+}
+
+/// Initialize an empty source row without reading decoded buffers.
+///
+/// # Safety
+///
+/// `row` must uniquely own at least `row_bytes` writable bytes for `source`.
+pub(crate) unsafe fn initialize_empty_row(
+    source: &SourcePlan,
+    row: *mut u8,
+    row_bytes: usize,
+    fill: FillOp,
+) {
+    // SAFETY: this forwards the caller's ownership proof; the destination may
+    // contain bytes from an older output generation.
+    unsafe { initialize_empty_row_inner(source, row, row_bytes, fill, false) };
+}
+
+/// Initialize an empty source row whose logical output prefix is already zero.
+///
+/// # Safety
+///
+/// The safety contract of [`initialize_empty_row`] applies, and
+/// `row[..row_bytes]` must already contain zero.
+pub(crate) unsafe fn initialize_empty_row_zeroed(
+    source: &SourcePlan,
+    row: *mut u8,
+    row_bytes: usize,
+    fill: FillOp,
+) {
+    // SAFETY: the caller supplies the base ownership proof plus a zeroed row.
+    unsafe { initialize_empty_row_inner(source, row, row_bytes, fill, true) };
+}
+
+unsafe fn initialize_empty_row_inner(
+    source: &SourcePlan,
+    row: *mut u8,
+    row_bytes: usize,
+    fill: FillOp,
+    row_is_zeroed: bool,
+) {
+    if source.index.is_some() {
+        // An empty CSR row contains structural zeros in every mapped column.
+        if !row_is_zeroed {
+            // SAFETY: the caller proves the complete logical prefix writable.
+            unsafe { row.write_bytes(0, row_bytes) };
+        }
+        if !fill.is_zero() {
+            // SAFETY: compiler-built default ranges are disjoint and bounded.
+            unsafe { fill.apply_default_ranges(source, row) };
+        }
+    } else {
+        // A dense row reaches this path only when its stored width is zero;
+        // every logical output column therefore belongs to a default range.
+        if !(row_is_zeroed && fill.is_zero()) {
+            // SAFETY: compiler-built default ranges are disjoint and bounded.
+            unsafe { fill.apply_default_ranges(source, row) };
+        }
+    }
 }
 
 unsafe fn fill_zero(output: *mut u8, len: usize, _word: u64) {
@@ -558,6 +726,7 @@ unsafe fn fill_uniform(output: *mut u8, len: usize, word: u64) {
 }
 
 #[cfg(target_endian = "little")]
+#[inline(always)]
 unsafe fn fill_repeated_scalar(output: *mut u8, len: usize, word: u64) {
     let word_bytes = len & !7;
     // SAFETY: `word_bytes <= len`; each unaligned word store is disjoint and
@@ -578,6 +747,7 @@ unsafe fn fill_repeated_scalar(output: *mut u8, len: usize, word: u64) {
 }
 
 #[cfg(target_endian = "big")]
+#[inline(always)]
 unsafe fn fill_repeated_scalar(output: *mut u8, len: usize, word: u64) {
     let bytes = word.to_le_bytes();
     // SAFETY: FillOp::apply proves the full destination prefix; every chunk is

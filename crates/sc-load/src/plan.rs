@@ -237,6 +237,10 @@ pub(crate) struct SourcePlan {
     pub feature_map: Option<CsrMap>,
     /// Dense mapped path, compacted to only the source columns that survive.
     pub dense_map: Option<DenseMap>,
+    /// Dense maps with highly fragmented gaps use one streaming whole-row fill.
+    pub dense_fill_whole: bool,
+    /// Contiguous unmapped byte ranges for CSR and low-fragmentation Dense maps.
+    pub default_ranges: Arc<[OutputRange]>,
     pub convert: ConvertOp,
 }
 
@@ -252,6 +256,12 @@ impl SourcePlan {
 
 pub(crate) const UNMAPPED_TARGET: usize = usize::MAX;
 pub(crate) const UNMAPPED_TARGET_U32: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputRange {
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+}
 
 #[derive(Clone)]
 pub(crate) enum CsrMap {
@@ -329,11 +339,10 @@ pub(crate) enum ReadSource {
 }
 
 #[derive(Debug, Clone, Copy)]
-/// cache lines; unlike counters, they cannot create false sharing. Output rows
-/// are 64-byte aligned, so the two low offset bits carry immutable task flags.
+/// Compact row-local input ranges plus a 64-byte-aligned output offset.
 #[repr(C)]
 pub(crate) struct CellTask {
-    row_offset_and_flags: usize,
+    row_offset: usize,
     data_start: u32,
     data_end: u32,
     indices_start: u32,
@@ -341,17 +350,13 @@ pub(crate) struct CellTask {
 }
 
 impl CellTask {
-    const FRESH_OUTPUT: usize = 1;
-
-    const FLAGS: usize = Self::FRESH_OUTPUT;
-
     pub(crate) fn new(
         output: OutputSlot,
         data: Range<usize>,
         indices: Option<Range<usize>>,
     ) -> Option<Self> {
         let row_offset = output.row_offset();
-        if data.start > data.end || row_offset & Self::FLAGS != 0 {
+        if data.start > data.end || row_offset & 1 != 0 {
             return None;
         }
         let indices = indices.unwrap_or(0..0);
@@ -359,8 +364,7 @@ impl CellTask {
             return None;
         }
         Some(Self {
-            row_offset_and_flags: row_offset
-                | (usize::from(output.is_fresh()) * Self::FRESH_OUTPUT),
+            row_offset,
             data_start: u32::try_from(data.start).ok()?,
             data_end: u32::try_from(data.end).ok()?,
             indices_start: u32::try_from(indices.start).ok()?,
@@ -370,7 +374,7 @@ impl CellTask {
 
     #[inline(always)]
     pub(crate) fn row_offset(self) -> usize {
-        self.row_offset_and_flags & !Self::FLAGS
+        self.row_offset
     }
 
     #[inline(always)]
@@ -381,10 +385,5 @@ impl CellTask {
     #[inline(always)]
     pub(crate) fn indices_range(self) -> Range<usize> {
         self.indices_start as usize..self.indices_end as usize
-    }
-
-    #[inline(always)]
-    pub(crate) fn output_is_fresh(self) -> bool {
-        self.row_offset_and_flags & Self::FRESH_OUTPUT != 0
     }
 }

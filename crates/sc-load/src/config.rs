@@ -330,42 +330,44 @@ impl SessionConfig {
         }
         let depth = match self.io_mode {
             IoMode::Blocking => 0,
-            IoMode::Uring { queue_depth } | IoMode::Auto { queue_depth } => queue_depth,
-        };
-        if depth == 1 {
-            return Err(Error::InvalidConfig(
-                "io_uring queue depth must be at least 2".into(),
-            ));
-        }
-        if depth > 0 {
-            let total_ops = self
-                .worker_count
-                .checked_mul(depth as usize)
-                .ok_or_else(|| Error::InvalidConfig("total io_uring depth overflow".into()))?;
-            if total_ops > self.max_total_inflight_io_ops {
-                return Err(Error::ResourceLimit(format!(
-                    "worker_count * queue_depth is {total_ops}, limit is {}",
-                    self.max_total_inflight_io_ops
-                )));
+            IoMode::Uring { queue_depth } | IoMode::Auto { queue_depth } => {
+                if queue_depth < 2 {
+                    return Err(Error::InvalidConfig(
+                        "io_uring queue depth must be at least 2".into(),
+                    ));
+                }
+                queue_depth
             }
+        };
+        let regular_ops = self
+            .worker_count
+            .checked_mul((depth as usize).max(1))
+            .ok_or_else(|| Error::InvalidConfig("total I/O depth overflow".into()))?;
+        let required_ops = regular_ops.max(self.initialize_inflight_io_ops);
+        if required_ops > self.max_total_inflight_io_ops {
+            return Err(Error::ResourceLimit(format!(
+                "session requires up to {required_ops} in-flight I/O operations, limit is {}",
+                self.max_total_inflight_io_ops
+            )));
         }
-        let total_bytes = self
+        let regular_bytes = self
             .worker_count
             .checked_mul(self.max_inflight_encoded_bytes_per_worker)
             .ok_or_else(|| Error::InvalidConfig("total in-flight byte limit overflow".into()))?;
-        if total_bytes > self.max_total_inflight_encoded_bytes {
+        let required_bytes = regular_bytes.max(self.initialize_inflight_encoded_bytes);
+        if required_bytes > self.max_total_inflight_encoded_bytes {
             return Err(Error::ResourceLimit(format!(
-                "worker_count * per-worker encoded cap is {total_bytes}, limit is {}",
+                "session requires up to {required_bytes} in-flight encoded bytes, limit is {}",
                 self.max_total_inflight_encoded_bytes
             )));
         }
-        let total_decoded = self
-            .worker_count
+        let decoded_workers = self.worker_count.max(self.initialize_workers);
+        let total_decoded = decoded_workers
             .checked_mul(self.max_decoded_bytes_per_worker)
             .ok_or_else(|| Error::InvalidConfig("total decoded byte limit overflow".into()))?;
         if total_decoded > self.max_total_decoded_bytes {
             return Err(Error::ResourceLimit(format!(
-                "worker_count * per-worker decoded cap is {total_decoded}, limit is {}",
+                "session requires up to {total_decoded} decoded workspace bytes, limit is {}",
                 self.max_total_decoded_bytes
             )));
         }

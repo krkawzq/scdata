@@ -11,13 +11,14 @@ from typing import Any, cast
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
 
+from scdata import _core
 from scdata._validate import as_int
 
 _U32_MAX = (1 << 32) - 1
 _U64_MAX = (1 << 64) - 1
 _I64_MAX = (1 << 63) - 1
 
-_DTYPE_NAMES = {
+_DTYPE_NAMES: dict[np.dtype[Any], _core.StorageDTypeName] = {
     np.dtype(np.int16): "i16",
     np.dtype(np.int32): "i32",
     np.dtype(np.int64): "i64",
@@ -31,11 +32,11 @@ _CORE_OUTPUT_DTYPES = {name: dtype for dtype, name in _DTYPE_NAMES.items()}
 _CORE_STORAGE_DTYPES = _CORE_OUTPUT_DTYPES
 
 
-def normalize_dtype(value: DTypeLike) -> tuple[np.dtype[Any], str]:
+def normalize_dtype(value: DTypeLike) -> tuple[np.dtype[Any], _core.StorageDTypeName]:
     if isinstance(value, str):
         normalized = value.strip().lower()
         if normalized in _CORE_OUTPUT_DTYPES:
-            return _CORE_OUTPUT_DTYPES[normalized], normalized
+            return _CORE_OUTPUT_DTYPES[normalized], cast("_core.StorageDTypeName", normalized)
         value = normalized
     try:
         dtype = np.dtype(value)

@@ -3,7 +3,10 @@
 use crate::dtype::OutputDType;
 use crate::{Error, Result};
 
-/// Default fill / unmapped-position value written into each output row.
+/// Default value for output columns that have no mapped source feature.
+///
+/// CSR structural absence remains zero; it is distinct from an unmapped
+/// output column.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Fill {
     I16(i16),
@@ -82,7 +85,8 @@ pub enum FloatCastPolicy {
 pub struct OutputSpec {
     pub(crate) n_cols: usize,
     pub(crate) dtype: OutputDType,
-    /// Value written for every column that has no mapped source contribution.
+    /// Value written for every column that has no mapped source feature.
+    /// CSR structural absence within a mapped feature remains zero.
     pub(crate) fill: Fill,
     pub(crate) overflow: OverflowPolicy,
     pub(crate) float_cast: FloatCastPolicy,

@@ -26,12 +26,14 @@ python scripts/convert_zarrzip_to_scczip.py /data/dataset --jobs 4
 from __future__ import annotations
 
 import argparse
+from importlib import import_module
 import os
 import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 
 def _dst_for(src: Path) -> Path:
@@ -150,16 +152,16 @@ def convert_one(
     overwrite: bool,
     num_workers: int | None,
     verify: bool,
-) -> dict:
+) -> dict[str, Any]:
     """Worker entry: return a result dict (picklable)."""
-    from scdata.io import read_zarr
-    import scdata_toolkit as scc
     import numpy as np
 
+    legacy_io: Any = import_module("scdata.io")
+    scc: Any = import_module("scdata_toolkit")
     src_path = Path(src)
     dst_path = _dst_for(src_path)
     t0 = time.perf_counter()
-    result: dict = {
+    result: dict[str, Any] = {
         "src": str(src_path),
         "dst": str(dst_path),
         "status": "ok",
@@ -178,7 +180,7 @@ def convert_one(
             result["seconds"] = time.perf_counter() - t0
             return result
 
-        adata = read_zarr(src_path)
+        adata = legacy_io.read_zarr(src_path)
         result["n_obs"] = int(adata.n_obs)
         result["n_vars"] = int(adata.n_vars)
         _promote_scc_dtypes(adata)
@@ -189,10 +191,7 @@ def convert_one(
             store="zip",
             overwrite=overwrite,
             num_workers=num_workers,
-            options=scc.WriteOptions(
-                block_budget=64 << 10,
-                codec=scc.compress.Codec.blosc(shuffle="none"),
-            ),
+            options=scc.WriteOptions(),
         )
         result["dst_bytes"] = dst_path.stat().st_size
 
@@ -271,10 +270,15 @@ def main(argv: list[str] | None = None) -> int:
         print("no .zarr.zip sources found", file=sys.stderr)
         return 2
 
+    scc: Any = import_module("scdata_toolkit")
+
+    write_opts = scc.WriteOptions()
+    codec = write_opts.resolved_codec()
     print(
         f"sources={len(sources)} jobs={args.jobs} overwrite={args.overwrite} "
         f"verify={args.verify} num_workers={args.num_workers} "
-        f"block_budget={64 << 10}",
+        f"chunk_budget={write_opts.chunk_budget} block_budget={write_opts.block_budget} "
+        f"codec={codec.algorithm}/{codec.backend}/shuffle={codec.shuffle}",
         flush=True,
     )
 
@@ -285,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         "verify": bool(args.verify),
     }
 
-    def _handle(res: dict) -> None:
+    def _handle(res: dict[str, Any]) -> None:
         nonlocal ok, skipped, errors
         status = res["status"]
         if status == "ok":

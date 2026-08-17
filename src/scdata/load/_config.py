@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from typing import Literal
 
+from scdata import _core
 from scdata._validate import as_float, as_int
 
 IoMode = Literal["auto", "blocking", "uring"]
@@ -28,6 +29,15 @@ DEFAULT_MAX_CONTROL_BYTES = 64 * _MIB
 
 
 def _cpu_count() -> int:
+    affinity = getattr(os, "sched_getaffinity", None)
+    if affinity is not None:
+        try:
+            count = len(affinity(0))
+        except OSError:
+            pass
+        else:
+            if count:
+                return count
     return os.cpu_count() or 1
 
 
@@ -121,12 +131,24 @@ class IoMergeConfig:
                 "max_encoded_staging_bytes_per_task"
             )
 
-    def _to_core(self) -> dict[str, int | float | str]:
-        values = asdict(self)
-        if self.policy == "adjacent":
-            values["max_io_gap_bytes"] = 0
-            values["max_io_amplification_ratio"] = 1.0
-        return values
+    def _to_core(self) -> _core.IoMergeConfigDict:
+        return {
+            "policy": self.policy,
+            "max_coalesced_io_bytes": self.max_coalesced_io_bytes,
+            "max_io_gap_bytes": 0 if self.policy == "adjacent" else self.max_io_gap_bytes,
+            "max_io_amplification_ratio": (
+                1.0 if self.policy == "adjacent" else self.max_io_amplification_ratio
+            ),
+            "max_decode_ops_per_io_task": self.max_decode_ops_per_io_task,
+            "max_decoded_bytes_per_io_task": self.max_decoded_bytes_per_io_task,
+            "max_encoded_staging_bytes_per_task": self.max_encoded_staging_bytes_per_task,
+            "io_bandwidth_bytes_per_second": self.io_bandwidth_bytes_per_second,
+            "io_operations_per_second": self.io_operations_per_second,
+            "io_merge_delta_bytes": self.io_merge_delta_bytes,
+            "initialize_parallelism_hint": self.initialize_parallelism_hint,
+            "regular_io_parallelism_hint": self.regular_io_parallelism_hint,
+            "min_tasks_per_worker": self.min_tasks_per_worker,
+        }
 
 
 @dataclass(frozen=True)
@@ -168,7 +190,7 @@ class PlanConfig:
         if not isinstance(self.limits, ResourceLimits):
             raise TypeError("limits must be a ResourceLimits instance")
 
-    def _to_core(self) -> dict[str, object]:
+    def _to_core(self) -> _core.PlanConfigDict:
         limits = self.limits
         return {
             "compile_io_concurrency": self.compile_io_concurrency,
@@ -254,16 +276,24 @@ class SessionConfig:
             if value is not None:
                 object.__setattr__(self, name, as_int(value, name, minimum=1))
 
-    def _to_core(self) -> dict[str, int | str]:
+    def _to_core(self) -> _core.SessionConfigDict:
+        initialize_workers = self.initialize_workers
+        initialize_inflight_io_ops = self.initialize_inflight_io_ops
+        if initialize_workers is None or initialize_inflight_io_ops is None:
+            raise RuntimeError("SessionConfig normalization did not initialize worker limits")
         io_ops_per_worker = self.queue_depth if self.io_mode != "blocking" else 1
-        required_io_ops = _checked_product(self.num_workers, io_ops_per_worker, "in-flight I/O ops")
-        required_encoded = _checked_product(
+        regular_io_ops = _checked_product(
+            self.num_workers, io_ops_per_worker, "in-flight I/O ops"
+        )
+        required_io_ops = max(regular_io_ops, initialize_inflight_io_ops)
+        regular_encoded = _checked_product(
             self.num_workers,
             self.max_inflight_encoded_bytes_per_worker,
             "in-flight encoded bytes",
         )
+        required_encoded = max(regular_encoded, self.initialize_inflight_encoded_bytes)
         required_decoded = _checked_product(
-            self.num_workers,
+            max(self.num_workers, initialize_workers),
             self.max_decoded_bytes_per_worker,
             "decoded bytes",
         )
@@ -284,8 +314,8 @@ class SessionConfig:
         )
         return {
             "num_workers": self.num_workers,
-            "initialize_workers": self.initialize_workers,
-            "initialize_inflight_io_ops": self.initialize_inflight_io_ops,
+            "initialize_workers": initialize_workers,
+            "initialize_inflight_io_ops": initialize_inflight_io_ops,
             "initialize_inflight_encoded_bytes": self.initialize_inflight_encoded_bytes,
             "io_mode": self.io_mode,
             "queue_depth": self.queue_depth,

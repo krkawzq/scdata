@@ -100,7 +100,7 @@ def write_dense(
         chunk_n=chunk.n,
         block_policy=block.policy,
         block_n=block.n,
-        num_workers=opts.num_workers,
+        num_workers=opts.worker_count,
         compressor=_codec_to_wire(opts.resolved_codec(), role="dense"),
     )
 
@@ -145,7 +145,7 @@ def write_csr_arrays(
         chunk_n=chunk.n,
         block_policy=block.policy,
         block_n=block.n,
-        num_workers=opts.num_workers,
+        num_workers=opts.worker_count,
         compressor=_codec_to_wire(opts.resolved_codec(), role="csr"),
         indptr_compressor=_codec_to_wire(opts.resolved_indptr_codec(), role="indptr"),
     )

@@ -169,6 +169,22 @@ impl BlockDecoder {
         self.decoded_len as usize
     }
 
+    /// Maximum reusable [`DecodeWorkspace`] vector bytes needed by this block.
+    ///
+    /// Codec-internal state is excluded; this reports the explicit filtered and
+    /// bit-unshuffle buffers allocated by `decode_into`.
+    pub fn workspace_bytes_upper_bound(self) -> Option<usize> {
+        if self.raw || self.shuffle == Shuffle::None {
+            return Some(0);
+        }
+        let decoded = self.decoded_len();
+        if self.shuffle == Shuffle::Bits {
+            decoded.checked_mul(2)
+        } else {
+            Some(decoded)
+        }
+    }
+
     /// Decode one externally loaded payload into caller-owned memory.
     ///
     /// The encoded slice must contain exactly this block's payload. On error,

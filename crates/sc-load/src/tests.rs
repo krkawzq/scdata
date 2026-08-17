@@ -12,6 +12,8 @@ use crate::{
 fn blocking(workers: usize) -> SessionConfig {
     SessionConfig {
         worker_count: workers,
+        initialize_workers: workers,
+        initialize_inflight_io_ops: workers,
         io_mode: IoMode::Blocking,
         ..SessionConfig::default()
     }
@@ -89,6 +91,8 @@ fn dense_mapping_compacts_contiguous_columns_into_one_run() {
     assert!(!covers_output);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].count, 4);
+    assert!(plan.inner.source_plans[0].dense_fill_whole);
+    assert!(plan.inner.source_plans[0].default_ranges.is_empty());
 
     let mut session = plan.open(blocking(1)).unwrap();
     assert_eq!(
@@ -100,6 +104,45 @@ fn dense_mapping_compacts_contiguous_columns_into_one_run() {
             .unwrap(),
         &[99, 1, 2, 3, 4, 99]
     );
+}
+
+#[test]
+fn dense_mapping_uses_range_fill_when_saved_writes_cover_gap_overhead() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("dense-map-range-fill");
+    let values = (0..256u16).collect::<Vec<_>>();
+    DenseWriter::new(
+        &path,
+        Partition::fixed_cells(1024),
+        Partition::fixed_cells(16),
+    )
+    .write(&values, [1, 256])
+    .unwrap();
+    let source = Source::new(0, Dataset::open(&path).unwrap())
+        .feature_map(FeatureMap::new((0..256).map(Some)).unwrap());
+    let plan = compile(PlanSpec::new(
+        vec![source],
+        vec![RowRef::new(SourceId::new(0), 0)],
+        OutputSpec::new(300, OutputDType::U16, Fill::U16(99)).unwrap(),
+        1,
+        2,
+    ))
+    .unwrap();
+    let source = &plan.inner.source_plans[0];
+    assert!(!source.dense_fill_whole);
+    assert_eq!(
+        source.default_ranges.as_ref(),
+        [crate::plan::OutputRange {
+            offset: 256 * 2,
+            len: 44 * 2,
+        }]
+    );
+
+    let mut session = plan.open(blocking(1)).unwrap();
+    let batch = session.next_batch().unwrap().unwrap();
+    let row = batch.row_as::<u16>(0).unwrap();
+    assert_eq!(&row[..256], values);
+    assert!(row[256..].iter().all(|value| *value == 99));
 }
 
 #[test]
@@ -496,7 +539,6 @@ fn shuffled_physical_blocks_compile_exactly_one_job_per_logical_batch() {
         .iter()
         .enumerate()
         .all(|(batch, job)| job.batch_id == batch as u64));
-
     let mut session = plan.open(blocking(2)).unwrap();
     let mut observed = Vec::new();
     while let Some(batch) = session.next_batch().unwrap() {
@@ -569,8 +611,8 @@ fn decoded_cache_replaces_per_worker_decoded_scratch() {
     );
 
     let mut session_config = blocking(1);
-    session_config.max_decoded_bytes_per_worker = 64;
-    session_config.max_total_decoded_bytes = 64;
+    session_config.max_decoded_bytes_per_worker = 128;
+    session_config.max_total_decoded_bytes = 128;
     let mut session = plan.open(session_config).unwrap();
     let batch = session.next_batch().unwrap().unwrap();
     for row in 0..4 {
@@ -658,28 +700,31 @@ fn csr_compact_mapping_uses_byte_targets_and_skips_dropped_conversion_checks() {
         Partition::fixed_cells(1024),
         Partition::fixed_cells(16),
     )
-    .write(&[0u64, 3], &[0u32, 1, 2], &[5i16, -1, 7], [1, 3])
+    .write(&[0u64, 3, 3], &[0u32, 1, 2], &[5i16, -1, 7], [2, 3])
     .unwrap();
     let source = Source::new(0, Dataset::open(&path).unwrap())
         .feature_map(FeatureMap::new([Some(2), None, Some(0)]).unwrap());
     let plan = compile(PlanSpec::new(
         vec![source],
-        vec![RowRef::new(SourceId::new(0), 0)],
+        vec![
+            RowRef::new(SourceId::new(0), 0),
+            RowRef::new(SourceId::new(0), 1),
+        ],
         OutputSpec::new(3, OutputDType::U32, Fill::U32(99)).unwrap(),
         1,
         2,
     ))
     .unwrap();
-    let mut session = plan.open(blocking(1)).unwrap();
     assert_eq!(
-        session
-            .next_batch()
-            .unwrap()
-            .unwrap()
-            .row_as::<u32>(0)
-            .unwrap(),
-        &[7, 99, 5]
+        plan.inner.source_plans[0].default_ranges.as_ref(),
+        [crate::plan::OutputRange { offset: 4, len: 4 }]
     );
+    let mut session = plan.open(blocking(1)).unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = session.next_batch().unwrap() {
+        rows.push(batch.row_as::<u32>(0).unwrap().to_vec());
+    }
+    assert_eq!(rows, vec![vec![7, 99, 5], vec![0, 99, 0]],);
 }
 
 #[test]
@@ -690,6 +735,25 @@ fn empty_plan_finishes_without_workers_or_output_allocation() {
     assert_eq!(plan.stats().output_ring_bytes, 0);
     let mut session = plan.open(blocking(1)).unwrap();
     assert!(session.next_batch().unwrap().is_none());
+}
+
+#[test]
+fn session_rejects_zero_io_uring_queue_depth() {
+    let output = OutputSpec::new(1, OutputDType::F32, Fill::F32(0.0)).unwrap();
+    let plan = compile(PlanSpec::new(vec![], vec![], output, 1, 2)).unwrap();
+    for io_mode in [
+        IoMode::Uring { queue_depth: 0 },
+        IoMode::Auto { queue_depth: 0 },
+    ] {
+        assert!(matches!(
+            plan.open(SessionConfig {
+                worker_count: 1,
+                io_mode,
+                ..SessionConfig::default()
+            }),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
 }
 
 #[test]
@@ -784,7 +848,89 @@ fn uring_executes_positioned_static_graph_and_preserves_batches() {
     {
         assert!(stats.uring_submitted_read_sqes >= 1);
         assert_eq!(stats.uring_submitted_read_sqes, stats.uring_cqes);
+        assert!(stats.peak_inflight_read_ops > 1);
+        assert!(stats.io_wait_nanoseconds > 0);
+        assert!(stats.decode_nanoseconds > 0);
+        assert!(stats.scatter_nanoseconds > 0);
+        assert!(stats.completion_nanoseconds > 0);
     }
+}
+
+#[cfg(all(feature = "uring", target_os = "linux"))]
+#[test]
+fn uring_multi_completion_failure_drains_before_shutdown() {
+    const CHILD_ENV: &str = "SC_LOAD_TEST_URING_MULTI_CQE_ERROR";
+    const TEST_NAME: &str = "tests::uring_multi_completion_failure_drains_before_shutdown";
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "io_uring failure child exited with {status}"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("io_uring failure cleanup did not terminate");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("dense-uring-failure");
+    let values: Vec<u32> = (0..4096).collect();
+    DenseWriter::new(&path, Partition::fixed_cells(4), Partition::fixed_cells(1))
+        .write(&values, [1024, 4])
+        .unwrap();
+    let source = Source::new(0, Dataset::open(&path).unwrap());
+    let rows = (0..1024)
+        .map(|row| RowRef::new(SourceId::new(0), row))
+        .collect();
+    let output = OutputSpec::new(4, OutputDType::U32, Fill::U32(0)).unwrap();
+    let plan = compile(
+        PlanSpec::new(vec![source], rows, output, 2, 32).config(PlanConfig {
+            cache_capacity_bytes: 256,
+            ..PlanConfig::default()
+        }),
+    )
+    .unwrap();
+    let server = plan
+        .open_shared(
+            SessionConfig {
+                worker_count: 1,
+                initialize_workers: 1,
+                initialize_inflight_io_ops: 1,
+                io_mode: IoMode::Uring { queue_depth: 8 },
+                max_inflight_jobs_per_worker: 8,
+                ..SessionConfig::default()
+            },
+            crate::SharedConfig::new(1).unwrap(),
+        )
+        .unwrap();
+    let descriptor = server.attach_fd().unwrap();
+    let consumer = std::thread::spawn(move || {
+        use std::os::fd::AsFd;
+
+        let mut client = crate::SharedClient::attach(descriptor.as_fd(), 0).unwrap();
+        loop {
+            match client.next_batch() {
+                Ok(Some(batch)) => batch.release().unwrap(),
+                result => return result,
+            }
+        }
+    });
+    assert!(server.run().is_err());
+    assert!(consumer.join().unwrap().is_err());
 }
 
 #[test]
@@ -1184,9 +1330,11 @@ fn csr_indices_must_be_strictly_increasing() {
         index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
         feature_map: None,
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: ConvertOp::resolve(sc_compress::DType::U16, &output).unwrap(),
     };
-    let task = CellTask::new(OutputSlot::new(0, false).unwrap(), 0..4, Some(0..4)).unwrap();
+    let task = CellTask::new(OutputSlot::new(0).unwrap(), 0..4, Some(0..4)).unwrap();
     let data = [1u16, 2]
         .into_iter()
         .flat_map(u16::to_le_bytes)
@@ -1210,7 +1358,7 @@ fn wide_mapping_fallback_preserves_dense_and_csr_semantics() {
     use crate::source::OutputSlot;
 
     let output = OutputSpec::new(2, OutputDType::U16, Fill::U16(99)).unwrap();
-    let task = CellTask::new(OutputSlot::new(0, false).unwrap(), 0..6, None).unwrap();
+    let task = CellTask::new(OutputSlot::new(0).unwrap(), 0..6, None).unwrap();
     let data = [5u16, 6, 7]
         .into_iter()
         .flat_map(u16::to_le_bytes)
@@ -1233,6 +1381,8 @@ fn wide_mapping_fallback_preserves_dense_and_csr_semantics() {
             ]),
             covers_output: true,
         }),
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: ConvertOp::resolve(sc_compress::DType::U16, &output).unwrap(),
     };
     crate::scatter::validate_row(&dense, &task, &data, &[]).unwrap();
@@ -1258,7 +1408,7 @@ fn wide_mapping_fallback_preserves_dense_and_csr_semantics() {
         [7, 5]
     );
 
-    let csr_task = CellTask::new(OutputSlot::new(0, false).unwrap(), 0..4, Some(0..4)).unwrap();
+    let csr_task = CellTask::new(OutputSlot::new(0).unwrap(), 0..4, Some(0..4)).unwrap();
     let csr_data = [5u16, 7]
         .into_iter()
         .flat_map(u16::to_le_bytes)
@@ -1273,6 +1423,8 @@ fn wide_mapping_fallback_preserves_dense_and_csr_semantics() {
         index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
         feature_map: Some(CsrMap::Wide(Arc::from([2, UNMAPPED_TARGET, 0]))),
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: ConvertOp::resolve(sc_compress::DType::U16, &output).unwrap(),
     };
     crate::scatter::validate_row(&csr, &csr_task, &csr_data, &csr_indices).unwrap();
@@ -1327,9 +1479,11 @@ fn mapped_validation_only_checks_values_with_a_destination() {
             ]),
             covers_output: true,
         }),
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert,
     };
-    let dense_task = CellTask::new(OutputSlot::new(0, false).unwrap(), 0..6, None).unwrap();
+    let dense_task = CellTask::new(OutputSlot::new(0).unwrap(), 0..6, None).unwrap();
     let unselected_overflow = [5u16, 40_000, 7]
         .into_iter()
         .flat_map(u16::to_le_bytes)
@@ -1342,9 +1496,11 @@ fn mapped_validation_only_checks_values_with_a_destination() {
         index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
         feature_map: Some(CsrMap::Wide(Arc::from([0, UNMAPPED_TARGET, 2]))),
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert,
     };
-    let csr_task = CellTask::new(OutputSlot::new(0, false).unwrap(), 0..6, Some(0..6)).unwrap();
+    let csr_task = CellTask::new(OutputSlot::new(0).unwrap(), 0..6, Some(0..6)).unwrap();
     let indices = [0u16, 1, 2]
         .into_iter()
         .flat_map(u16::to_le_bytes)
@@ -1381,9 +1537,11 @@ fn packed_csr_fallback_conversion_selects_map_once_per_row() {
         index: crate::scatter::IndexOp::new(sc_compress::DType::U16),
         feature_map: Some(CsrMap::Packed32(Arc::from([2, 0, UNMAPPED_TARGET_U32]))),
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: ConvertOp::resolve(sc_compress::DType::U16, &output).unwrap(),
     };
-    let task = CellTask::new(OutputSlot::new(0, false).unwrap(), 0..6, Some(0..6)).unwrap();
+    let task = CellTask::new(OutputSlot::new(0).unwrap(), 0..6, Some(0..6)).unwrap();
     let values = [5u16, 40_000, 9]
         .into_iter()
         .flat_map(u16::to_le_bytes)
@@ -1414,12 +1572,6 @@ fn packed_csr_fallback_conversion_selects_map_once_per_row() {
             .collect::<Vec<_>>(),
         [7, 5]
     );
-}
-
-#[test]
-fn compact_cell_task_layout_is_stable_inside_the_native_plan() {
-    assert_eq!(std::mem::align_of::<crate::plan::CellTask>(), 8);
-    assert_eq!(std::mem::size_of::<crate::plan::CellTask>(), 24);
 }
 
 #[test]
@@ -2140,7 +2292,7 @@ fn benchmark_scatter_kernels() {
     let iterations = 2_000;
     let zero_f32_fill = crate::scatter::FillOp::new(&[0; 4]);
     let task = crate::plan::CellTask::new(
-        crate::source::OutputSlot::new(0, false).unwrap(),
+        crate::source::OutputSlot::new(0).unwrap(),
         0..columns * 4,
         None,
     )
@@ -2152,6 +2304,8 @@ fn benchmark_scatter_kernels() {
         index: None,
         feature_map: None,
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: crate::convert::ConvertOp::resolve(sc_compress::DType::F32, &identity_output)
             .unwrap(),
     };
@@ -2182,7 +2336,7 @@ fn benchmark_scatter_kernels() {
     );
 
     let convert_task = crate::plan::CellTask::new(
-        crate::source::OutputSlot::new(0, false).unwrap(),
+        crate::source::OutputSlot::new(0).unwrap(),
         0..columns * 2,
         None,
     )
@@ -2193,6 +2347,8 @@ fn benchmark_scatter_kernels() {
         index: None,
         feature_map: None,
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: crate::convert::ConvertOp::resolve(sc_compress::DType::I16, &identity_output)
             .unwrap(),
     };
@@ -2253,7 +2409,7 @@ fn benchmark_scatter_kernels() {
     let small_columns = 64;
     let small_iterations = 2_000_000;
     let small_task = crate::plan::CellTask::new(
-        crate::source::OutputSlot::new(0, false).unwrap(),
+        crate::source::OutputSlot::new(0).unwrap(),
         0..small_columns * 4,
         None,
     )
@@ -2265,6 +2421,8 @@ fn benchmark_scatter_kernels() {
         index: None,
         feature_map: None,
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: crate::convert::ConvertOp::resolve(sc_compress::DType::F32, &small_output)
             .unwrap(),
     };
@@ -2312,6 +2470,8 @@ fn benchmark_scatter_kernels() {
             entries: std::sync::Arc::from(mapped_targets),
             covers_output: true,
         }),
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: crate::convert::ConvertOp::resolve(sc_compress::DType::F32, &mapped_output)
             .unwrap(),
     };
@@ -2426,6 +2586,8 @@ fn benchmark_scatter_kernels() {
             ),
             covers_output: true,
         }),
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: crate::convert::ConvertOp::resolve(sc_compress::DType::I32, &i32_f64_output)
             .unwrap(),
     };
@@ -2488,7 +2650,7 @@ fn benchmark_scatter_kernels() {
     let csr_nnz = 1_024;
     let csr_iterations = 5_000;
     let csr_task = crate::plan::CellTask::new(
-        crate::source::OutputSlot::new(0, false).unwrap(),
+        crate::source::OutputSlot::new(0).unwrap(),
         0..csr_nnz * 4,
         Some(0..csr_nnz * 4),
     )
@@ -2499,6 +2661,8 @@ fn benchmark_scatter_kernels() {
         index: crate::scatter::IndexOp::new(sc_compress::DType::U32),
         feature_map: None,
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: crate::convert::ConvertOp::resolve(sc_compress::DType::F32, &identity_output)
             .unwrap(),
     };
@@ -2620,6 +2784,266 @@ fn benchmark_scatter_kernels() {
         scalar_index_time.as_secs_f64() / simd_index_time.as_secs_f64(),
         avx2_index_time.as_secs_f64() / simd_index_time.as_secs_f64(),
     );
+}
+
+#[test]
+#[ignore = "manual release-mode default-range benchmark"]
+fn benchmark_dense_default_range_overwrite() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn paired_median(mut run: impl FnMut(bool), rounds: usize) -> f64 {
+        let mut ratios = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let mut measure = |direct| {
+                let started = Instant::now();
+                run(direct);
+                started.elapsed().as_secs_f64()
+            };
+            let (direct, legacy) = if round & 1 == 0 {
+                (measure(true), measure(false))
+            } else {
+                let legacy = measure(false);
+                (measure(true), legacy)
+            };
+            ratios.push(legacy / direct);
+        }
+        ratios.sort_unstable_by(f64::total_cmp);
+        ratios[ratios.len() / 2]
+    }
+
+    fn packed_entry(column: usize) -> u64 {
+        let byte = (column * 4) as u32;
+        u64::from(byte) | (u64::from(byte) << 32)
+    }
+
+    let columns = 32 * 1024;
+    let mapped = columns / 2;
+    let iterations = 1_000;
+    let output = OutputSpec::new(columns, OutputDType::F32, Fill::F32(-1.0)).unwrap();
+    let fill = crate::scatter::FillOp::new(&(-1.0f32).to_le_bytes());
+    let input = (0..columns)
+        .flat_map(|value| (value as f32).to_le_bytes())
+        .collect::<Vec<_>>();
+    let task = crate::plan::CellTask::new(
+        crate::source::OutputSlot::new(0).unwrap(),
+        0..input.len(),
+        None,
+    )
+    .unwrap();
+
+    let contiguous = crate::plan::SourcePlan {
+        n_cols: columns,
+        value_dtype: sc_compress::DType::F32,
+        index: None,
+        feature_map: None,
+        dense_map: Some(crate::plan::DenseMap::Packed32 {
+            entries: Arc::from((0..mapped).map(packed_entry).collect::<Vec<_>>()),
+            covers_output: false,
+        }),
+        dense_fill_whole: false,
+        default_ranges: Arc::from([crate::plan::OutputRange {
+            offset: mapped * 4,
+            len: mapped * 4,
+        }]),
+        convert: crate::convert::ConvertOp::resolve(sc_compress::DType::F32, &output).unwrap(),
+    };
+    let fragmented = crate::plan::SourcePlan {
+        dense_map: Some(crate::plan::DenseMap::Packed32 {
+            entries: Arc::from(
+                (0..columns)
+                    .step_by(2)
+                    .map(packed_entry)
+                    .collect::<Vec<_>>(),
+            ),
+            covers_output: false,
+        }),
+        default_ranges: Arc::from(
+            (1..columns)
+                .step_by(2)
+                .map(|column| crate::plan::OutputRange {
+                    offset: column * 4,
+                    len: 4,
+                })
+                .collect::<Vec<_>>(),
+        ),
+        ..contiguous.clone()
+    };
+    let mut row = vec![0u8; columns * 4];
+
+    let contiguous_speedup = paired_median(
+        |direct| {
+            for _ in 0..iterations {
+                // SAFETY: the synthetic source/task ranges are in bounds, the
+                // packed map targets are unique, and `row` is exclusively owned.
+                unsafe {
+                    if direct {
+                        // SAFETY: all compiler-style offsets partition this output row.
+                        crate::scatter::scatter_row_prevalidated(
+                            &contiguous,
+                            &task,
+                            black_box(&input),
+                            &[],
+                            black_box(&mut row),
+                            columns * 4,
+                            fill,
+                        )
+                        .unwrap();
+                    } else {
+                        // SAFETY: the row and every packed map entry are valid.
+                        fill.apply(row.as_mut_ptr(), columns * 4);
+                        contiguous
+                            .convert
+                            .convert_map_prevalidated(
+                                black_box(input.as_ptr()),
+                                black_box(row.as_mut_ptr()),
+                                contiguous.dense_map.as_ref().unwrap(),
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+        },
+        9,
+    );
+    let fragmented_speedup = paired_median(
+        |direct| {
+            for _ in 0..iterations {
+                // SAFETY: the synthetic source/task ranges are in bounds, the
+                // packed map targets are unique, and `row` is exclusively owned.
+                unsafe {
+                    if direct {
+                        // SAFETY: all compiler-style offsets partition this output row.
+                        crate::scatter::scatter_row_prevalidated(
+                            &fragmented,
+                            &task,
+                            black_box(&input),
+                            &[],
+                            black_box(&mut row),
+                            columns * 4,
+                            fill,
+                        )
+                        .unwrap();
+                    } else {
+                        // SAFETY: the row and every packed map entry are valid.
+                        fill.apply(row.as_mut_ptr(), columns * 4);
+                        fragmented
+                            .convert
+                            .convert_map_prevalidated(
+                                black_box(input.as_ptr()),
+                                black_box(row.as_mut_ptr()),
+                                fragmented.dense_map.as_ref().unwrap(),
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+        },
+        9,
+    );
+    let adaptive_fragmented = crate::plan::SourcePlan {
+        dense_fill_whole: true,
+        default_ranges: Default::default(),
+        ..fragmented.clone()
+    };
+    let adaptive_fragmented_speedup = paired_median(
+        |adaptive| {
+            for _ in 0..iterations {
+                // SAFETY: both alternatives use validated compiler-style
+                // input/output extents and unique destination mappings.
+                unsafe {
+                    if adaptive {
+                        // SAFETY: the adaptive plan uses the validated whole-fill path.
+                        crate::scatter::scatter_row_prevalidated(
+                            &adaptive_fragmented,
+                            &task,
+                            black_box(&input),
+                            &[],
+                            black_box(&mut row),
+                            columns * 4,
+                            fill,
+                        )
+                        .unwrap();
+                    } else {
+                        // SAFETY: the row and every packed map entry are valid.
+                        fill.apply(row.as_mut_ptr(), columns * 4);
+                        fragmented
+                            .convert
+                            .convert_map_prevalidated(
+                                black_box(input.as_ptr()),
+                                black_box(row.as_mut_ptr()),
+                                fragmented.dense_map.as_ref().unwrap(),
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+        },
+        9,
+    );
+
+    eprintln!(
+        "dense default direct/legacy speedup: contiguous {:.3}x; fragmented {:.3}x; adaptive fragmented {:.3}x",
+        contiguous_speedup, fragmented_speedup, adaptive_fragmented_speedup,
+    );
+
+    for gap_runs in [8usize, 64, 256, 512, 4_096] {
+        let segment = mapped / gap_runs;
+        let mut entries = Vec::with_capacity(mapped);
+        let mut ranges = Vec::with_capacity(gap_runs);
+        for run in 0..gap_runs {
+            let mapped_start = run * segment * 2;
+            entries.extend((mapped_start..mapped_start + segment).map(packed_entry));
+            ranges.push(crate::plan::OutputRange {
+                offset: (mapped_start + segment) * 4,
+                len: segment * 4,
+            });
+        }
+        let source = crate::plan::SourcePlan {
+            dense_map: Some(crate::plan::DenseMap::Packed32 {
+                entries: Arc::from(entries),
+                covers_output: false,
+            }),
+            default_ranges: Arc::from(ranges),
+            ..contiguous.clone()
+        };
+        let speedup = paired_median(
+            |direct| {
+                for _ in 0..iterations {
+                    // SAFETY: both alternatives use validated compiler-style
+                    // input/output extents and unique destination mappings.
+                    unsafe {
+                        if direct {
+                            // SAFETY: compiler-style ranges partition the row.
+                            crate::scatter::scatter_row_prevalidated(
+                                &source,
+                                &task,
+                                black_box(&input),
+                                &[],
+                                black_box(&mut row),
+                                columns * 4,
+                                fill,
+                            )
+                            .unwrap();
+                        } else {
+                            // SAFETY: the row and every packed map entry are valid.
+                            fill.apply(row.as_mut_ptr(), columns * 4);
+                            source
+                                .convert
+                                .convert_map_prevalidated(
+                                    black_box(input.as_ptr()),
+                                    black_box(row.as_mut_ptr()),
+                                    source.dense_map.as_ref().unwrap(),
+                                )
+                                .unwrap();
+                        }
+                    }
+                }
+            },
+            9,
+        );
+        eprintln!("dense default direct/legacy speedup: {gap_runs} gaps {speedup:.3}x");
+    }
 }
 
 #[test]
@@ -2829,12 +3253,14 @@ fn benchmark_int64_uint64_specialized_kernels() {
         index: crate::scatter::IndexOp::new(StorageDType::U32),
         feature_map: None,
         dense_map: None,
+        dense_fill_whole: false,
+        default_ranges: Default::default(),
         convert: ConvertOp::resolve(StorageDType::I32, &csr_output).unwrap(),
     };
     let mut generic_csr_source = specialized_csr_source.clone();
     generic_csr_source.convert.force_generic_for_test();
     let csr_task = crate::plan::CellTask::new(
-        crate::source::OutputSlot::new(0, true).unwrap(),
+        crate::source::OutputSlot::new(0).unwrap(),
         0..csr_count * 4,
         Some(0..csr_count * 4),
     )

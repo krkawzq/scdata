@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import scdata.compress as scc
+from scdata.compress import _write_options
 from scdata.compress._validate import csr_matrix_from_decoded
 
 
@@ -272,6 +273,22 @@ def test_read_limits_object_and_python_integer_validation(tmp_path: Path) -> Non
                 block_cells=1,
             ),
         )
+
+
+def test_write_workers_auto_detect_process_affinity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_write_options.os, "sched_getaffinity", lambda _pid: {2, 4, 6})
+    options = scc.WriteOptions(num_workers=None)
+    assert options.num_workers is None
+    assert _write_options.resolve_write_options(options).num_workers == 3
+
+
+def test_write_workers_fall_back_to_process_cpu_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable_affinity(_pid: int) -> set[int]:
+        raise OSError("affinity unavailable")
+
+    monkeypatch.setattr(_write_options.os, "sched_getaffinity", unavailable_affinity)
+    monkeypatch.setattr(_write_options.os, "process_cpu_count", lambda: 5, raising=False)
+    assert _write_options.resolve_write_options(None).num_workers == 5
 
 
 def test_num_workers_is_configurable_for_writes_and_reads(tmp_path: Path) -> None:

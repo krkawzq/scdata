@@ -1,12 +1,17 @@
+mod blocking;
+
+#[cfg(all(feature = "uring", target_os = "linux"))]
+mod uring;
+
 #[cfg(not(target_os = "linux"))]
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::{BTreeMap, VecDeque};
-#[cfg(all(feature = "uring", target_os = "linux"))]
-use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+#[cfg(feature = "profile")]
+use std::time::Instant;
 
 use dyn_blosc::DecodeWorkspace;
 use parking_lot::{Condvar, Mutex};
@@ -15,14 +20,11 @@ use crate::dtype::{OutputDType, OutputValue};
 use crate::plan::{
     CellTask, CsrScatterTask, DenseScatterTask, PlanData, ReadSource, ReleasePlan, SourcePlan,
 };
-use crate::scatter::{scatter_row_prevalidated, validate_row};
+use crate::scatter::{
+    initialize_empty_row, initialize_empty_row_zeroed, scatter_row_prevalidated,
+    scatter_row_prevalidated_zeroed, validate_row,
+};
 use crate::{Error, IoMode, Result, SessionConfig};
-
-enum WorkerIo {
-    Blocking,
-    #[cfg(all(feature = "uring", target_os = "linux"))]
-    Uring(Box<io_uring::IoUring>),
-}
 
 const RUNNING: u8 = 0;
 const FAILED: u8 = 1;
@@ -87,19 +89,11 @@ pub struct RuntimeStats {
     #[cfg(feature = "profile")]
     pub decode_nanoseconds: u64,
     #[cfg(feature = "profile")]
-    pub data_decode_nanoseconds: u64,
-    #[cfg(feature = "profile")]
-    pub indices_decode_nanoseconds: u64,
-    #[cfg(feature = "profile")]
     pub validation_nanoseconds: u64,
     #[cfg(feature = "profile")]
     pub scatter_nanoseconds: u64,
     #[cfg(feature = "profile")]
-    pub scatter_kernel_nanoseconds: u64,
-    #[cfg(feature = "profile")]
     pub completion_nanoseconds: u64,
-    #[cfg(feature = "profile")]
-    pub window_wait_nanoseconds: u64,
     #[cfg(feature = "profile")]
     pub consumer_wait_nanoseconds: u64,
     #[cfg(feature = "profile")]
@@ -111,50 +105,12 @@ pub struct RuntimeStats {
     #[cfg(feature = "profile")]
     pub decoded_bytes: u64,
     #[cfg(feature = "profile")]
-    pub claim_cas_retries: u64,
-    #[cfg(feature = "profile")]
-    pub window_block_events: u64,
-    #[cfg(feature = "profile")]
-    pub local_full_events: u64,
-    #[cfg(feature = "profile")]
     pub peak_inflight_jobs: usize,
     #[cfg(feature = "profile")]
     pub peak_inflight_read_ops: usize,
     #[cfg(feature = "profile")]
     pub peak_inflight_encoded_bytes: usize,
-    #[cfg(feature = "profile")]
-    pub workers: Vec<WorkerRuntimeStats>,
     pub state: SessionState,
-}
-
-#[cfg(feature = "profile")]
-#[derive(Debug, Clone)]
-pub struct WorkerRuntimeStats {
-    pub worker_id: usize,
-    pub completed_jobs: u64,
-    pub completed_cells: u64,
-    pub decoded_blocks: u64,
-    pub decoded_bytes: u64,
-    pub data_decode_nanoseconds: u64,
-    pub indices_decode_nanoseconds: u64,
-    pub validation_nanoseconds: u64,
-    pub scatter_kernel_nanoseconds: u64,
-    pub completion_nanoseconds: u64,
-    pub window_wait_nanoseconds: u64,
-    pub io_wait_nanoseconds: u64,
-    pub physical_read_ops: u64,
-    pub physical_read_bytes: u64,
-    pub short_read_retries: u64,
-    pub whole_key_materializations: u64,
-    pub claim_cas_retries: u64,
-    pub window_block_events: u64,
-    pub local_full_events: u64,
-    pub uring_prepared_read_sqes: u64,
-    pub uring_submitted_read_sqes: u64,
-    pub uring_submit_calls: u64,
-    pub uring_cqes: u64,
-    pub uring_cancel_requests: u64,
-    pub uring_cancel_cqes: u64,
 }
 
 pub(crate) struct AlignedBuffer {
@@ -457,13 +413,18 @@ impl ExecutionPlan {
         })
     }
 
-    fn priority(&self, node: usize) -> u64 {
+    unsafe fn priority_unchecked(&self, node: usize) -> u64 {
         if node < self.dense_base {
-            self.io[node].priority
+            // SAFETY: caller proves `node` is an executable node, and this
+            // branch proves it lies in the I/O arena.
+            unsafe { self.io.get_unchecked(node).priority }
         } else if node < self.csr_base {
-            self.dense[node - self.dense_base].batch as u64
+            // SAFETY: the arena bases partition every executable node and the
+            // caller has already proved the upper bound.
+            unsafe { self.dense.get_unchecked(node - self.dense_base).batch as u64 }
         } else {
-            self.csr[node - self.csr_base].batch as u64
+            // SAFETY: see the partition proof above.
+            unsafe { self.csr.get_unchecked(node - self.csr_base).batch as u64 }
         }
     }
 }
@@ -544,34 +505,29 @@ impl ReadyQueue {
         }
     }
 
-    fn push(&self, priority: u64, node: usize) {
-        let mut state = self.state.lock();
-        if state.stopped {
-            return;
-        }
-        state.buckets.entry(priority).or_default().push_back(node);
-        self.changed.notify_one();
-    }
-
-    fn pop(&self) -> Option<usize> {
+    fn pop_many(&self, output: &mut Vec<usize>, maximum: usize) -> bool {
+        debug_assert!(maximum > 0);
+        output.clear();
         let mut state = self.state.lock();
         loop {
-            if let Some((&priority, _)) = state.buckets.first_key_value() {
-                let bucket = state
-                    .buckets
-                    .get_mut(&priority)
-                    .expect("selected priority remains present");
-                let node = bucket.pop_front();
-                if bucket.is_empty() {
-                    state.buckets.remove(&priority);
-                }
-                return node;
+            drain_ready(&mut state, output, maximum);
+            if !output.is_empty() {
+                return true;
             }
             if state.stopped {
-                return None;
+                return false;
             }
             self.changed.wait(&mut state);
         }
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn try_pop_many(&self, output: &mut Vec<usize>, maximum: usize) -> bool {
+        debug_assert!(maximum > 0);
+        output.clear();
+        let mut state = self.state.lock();
+        drain_ready(&mut state, output, maximum);
+        !output.is_empty()
     }
 
     fn stop(&self) {
@@ -582,47 +538,157 @@ impl ReadyQueue {
     }
 }
 
+fn drain_ready(state: &mut ReadyState, output: &mut Vec<usize>, maximum: usize) {
+    while output.len() < maximum {
+        let Some((&priority, _)) = state.buckets.first_key_value() else {
+            break;
+        };
+        let bucket = state
+            .buckets
+            .get_mut(&priority)
+            .expect("selected priority remains present");
+        let remaining = maximum - output.len();
+        let take = remaining.min(bucket.len());
+        output.extend(bucket.drain(..take));
+        if bucket.is_empty() {
+            state.buckets.remove(&priority);
+        }
+    }
+}
+
 struct BatchSlot {
     generation: AtomicUsize,
     ready: AtomicBool,
 }
 
+#[cfg(feature = "profile")]
 struct RuntimeCounters {
+    #[cfg(feature = "profile")]
     reads: AtomicUsize,
+    #[cfg(feature = "profile")]
     read_bytes: AtomicUsize,
+    #[cfg(feature = "profile")]
     decoded_blocks: AtomicUsize,
+    #[cfg(feature = "profile")]
     decoded_bytes: AtomicUsize,
+    #[cfg(feature = "profile")]
     completed_jobs: AtomicUsize,
+    #[cfg(feature = "profile")]
     completed_cells: AtomicUsize,
-    #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-    uring_reads: AtomicUsize,
+    #[cfg(feature = "profile")]
+    short_reads: AtomicUsize,
+    #[cfg(feature = "profile")]
+    whole_keys: AtomicUsize,
+    #[cfg(feature = "profile")]
+    uring_prepared: AtomicUsize,
+    #[cfg(feature = "profile")]
+    uring_submitted: AtomicUsize,
+    #[cfg(feature = "profile")]
+    uring_submit_calls: AtomicUsize,
+    #[cfg(feature = "profile")]
+    uring_cqes: AtomicUsize,
+    #[cfg(feature = "profile")]
+    uring_cancel_requests: AtomicUsize,
+    #[cfg(feature = "profile")]
+    uring_cancel_cqes: AtomicUsize,
+    io_wait_nanoseconds: AtomicUsize,
+    decode_nanoseconds: AtomicUsize,
+    validation_nanoseconds: AtomicUsize,
+    scatter_nanoseconds: AtomicUsize,
+    completion_nanoseconds: AtomicUsize,
+    consumer_wait_nanoseconds: AtomicUsize,
+    #[cfg(feature = "profile")]
+    inflight_ops: AtomicUsize,
+    #[cfg(feature = "profile")]
+    inflight_bytes: AtomicUsize,
+    #[cfg(feature = "profile")]
+    peak_inflight_ops: AtomicUsize,
+    #[cfg(feature = "profile")]
+    peak_inflight_bytes: AtomicUsize,
 }
 
+#[cfg(feature = "profile")]
 impl RuntimeCounters {
     fn new() -> Self {
         Self {
+            #[cfg(feature = "profile")]
             reads: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
             read_bytes: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
             decoded_blocks: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
             decoded_bytes: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
             completed_jobs: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
             completed_cells: AtomicUsize::new(0),
-            #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-            uring_reads: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            short_reads: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            whole_keys: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            uring_prepared: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            uring_submitted: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            uring_submit_calls: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            uring_cqes: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            uring_cancel_requests: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            uring_cancel_cqes: AtomicUsize::new(0),
+            io_wait_nanoseconds: AtomicUsize::new(0),
+            decode_nanoseconds: AtomicUsize::new(0),
+            validation_nanoseconds: AtomicUsize::new(0),
+            scatter_nanoseconds: AtomicUsize::new(0),
+            completion_nanoseconds: AtomicUsize::new(0),
+            consumer_wait_nanoseconds: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            inflight_ops: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            inflight_bytes: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            peak_inflight_ops: AtomicUsize::new(0),
+            #[cfg(feature = "profile")]
+            peak_inflight_bytes: AtomicUsize::new(0),
         }
     }
 }
 
 #[cfg(feature = "profile")]
-fn uring_read_count(counters: &RuntimeCounters) -> u64 {
-    #[cfg(all(feature = "uring", target_os = "linux"))]
-    {
-        counters.uring_reads.load(Ordering::Relaxed) as u64
+struct ProfileTimer<'a> {
+    counter: &'a AtomicUsize,
+    started: Instant,
+}
+
+#[cfg(feature = "profile")]
+impl<'a> ProfileTimer<'a> {
+    fn start(counter: &'a AtomicUsize) -> Self {
+        Self {
+            counter,
+            started: Instant::now(),
+        }
     }
-    #[cfg(not(all(feature = "uring", target_os = "linux")))]
-    {
-        let _ = counters;
-        0
+}
+
+#[cfg(feature = "profile")]
+impl Drop for ProfileTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = usize::try_from(self.started.elapsed().as_nanos()).unwrap_or(usize::MAX);
+        self.counter.fetch_add(elapsed, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "profile")]
+fn update_peak(peak: &AtomicUsize, value: usize) {
+    let mut current = peak.load(Ordering::Relaxed);
+    while value > current {
+        match peak.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -662,6 +728,7 @@ struct SessionInner {
     requested_io_mode: IoMode,
     actual_io_mode: IoMode,
     config: SessionConfig,
+    #[cfg(feature = "profile")]
     counters: RuntimeCounters,
 }
 
@@ -765,6 +832,26 @@ impl Session {
         }
         let cache = AlignedBuffer::anonymous(plan.static_plan.cache_capacity)?;
         let execution = ExecutionPlan::lower(&plan, &cache, &output)?;
+        let maximum_decode_workspace = execution
+            ._decode_ops
+            .iter()
+            .map(|operation| {
+                operation
+                    .decoder
+                    .workspace_bytes_upper_bound()
+                    .ok_or_else(|| {
+                        Error::ResourceLimit("DecodeWorkspace byte requirement overflow".into())
+                    })
+            })
+            .try_fold(0usize, |maximum, bytes| {
+                bytes.map(|bytes| maximum.max(bytes))
+            })?;
+        if maximum_decode_workspace > config.max_decoded_bytes_per_worker {
+            return Err(Error::ResourceLimit(format!(
+                "one DecodeOp may require {maximum_decode_workspace} workspace bytes, per-worker limit is {}",
+                config.max_decoded_bytes_per_worker
+            )));
+        }
         if plan.static_plan.dependencies.initial_dependency_count.len()
             != execution.io.len() + execution.dense.len() + execution.csr.len()
         {
@@ -828,6 +915,7 @@ impl Session {
             requested_io_mode,
             actual_io_mode,
             config: config.clone(),
+            #[cfg(feature = "profile")]
             counters: RuntimeCounters::new(),
         });
         if initial_state == FINISHED {
@@ -839,24 +927,40 @@ impl Session {
         }
 
         run_initialize(&inner)?;
-        for node in 0..inner.nodes.len() {
-            inner.enqueue_if_ready(node)?;
-        }
+        inner.enqueue_initial_ready()?;
         let mut workers = Vec::with_capacity(config.worker_count);
+        #[cfg(all(feature = "uring", target_os = "linux"))]
+        let mut prepared_rings = prepared_rings.into_iter();
         for worker_id in 0..config.worker_count {
             let worker_inner = Arc::clone(&inner);
-            #[cfg(all(feature = "uring", target_os = "linux"))]
-            let worker_io = if matches!(actual_io_mode, IoMode::Uring { .. }) {
-                WorkerIo::Uring(Box::new(prepared_rings.remove(0)))
-            } else {
-                WorkerIo::Blocking
+            let builder = std::thread::Builder::new().name(match actual_io_mode {
+                IoMode::Blocking => format!("sc-load-blocking-{worker_id}"),
+                IoMode::Uring { .. } => format!("sc-load-uring-{worker_id}"),
+                IoMode::Auto { .. } => unreachable!("resolved I/O mode is never Auto"),
+            });
+            let spawned = match actual_io_mode {
+                IoMode::Blocking => builder.spawn(move || {
+                    worker_entry(worker_inner, |inner| blocking::run_worker(inner, worker_id))
+                }),
+                IoMode::Uring { .. } => {
+                    #[cfg(all(feature = "uring", target_os = "linux"))]
+                    {
+                        let ring = prepared_rings.next().ok_or_else(|| {
+                            Error::Invariant("prepared io_uring worker is missing".into())
+                        })?;
+                        let worker_config = config.clone();
+                        builder.spawn(move || {
+                            worker_entry(worker_inner, |inner| {
+                                uring::run_worker(inner, ring, worker_config, worker_id)
+                            })
+                        })
+                    }
+                    #[cfg(not(all(feature = "uring", target_os = "linux")))]
+                    unreachable!("unavailable io_uring was rejected before worker startup")
+                }
+                IoMode::Auto { .. } => unreachable!("resolved I/O mode is never Auto"),
             };
-            #[cfg(not(all(feature = "uring", target_os = "linux")))]
-            let worker_io = WorkerIo::Blocking;
-            match std::thread::Builder::new()
-                .name(format!("sc-load-dag-{worker_id}"))
-                .spawn(move || worker_entry(worker_inner, worker_io))
-            {
+            match spawned {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
                     inner.cancel();
@@ -1136,40 +1240,90 @@ impl SessionInner {
         }
     }
 
-    fn enqueue_if_ready(&self, node: usize) -> Result<()> {
-        let state = self
-            .nodes
-            .get(node)
-            .ok_or_else(|| Error::Invariant("runtime node is out of range".into()))?;
-        if state.remaining.load(Ordering::Acquire) != 0 {
-            return Ok(());
+    fn enqueue_initial_ready(&self) -> Result<()> {
+        let mut ready = self.ready.state.lock();
+        let mut inserted = 0usize;
+        for (node, state) in self.nodes.iter().enumerate() {
+            if state.remaining.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            if state
+                .state
+                .compare_exchange(
+                    NODE_WAITING,
+                    NODE_READY,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                // SAFETY: enumeration proves `node` is an executable node.
+                let priority = unsafe { self.execution.priority_unchecked(node) };
+                ready.buckets.entry(priority).or_default().push_back(node);
+                inserted += 1;
+            }
         }
-        if state
-            .state
-            .compare_exchange(
-                NODE_WAITING,
-                NODE_READY,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.ready.push(self.execution.priority(node), node);
+        if inserted == 1 {
+            self.ready.changed.notify_one();
+        } else if inserted > 1 {
+            self.ready.changed.notify_all();
         }
         Ok(())
     }
 
-    fn release_dependency(&self, node: usize) -> Result<()> {
-        let state = self
-            .nodes
-            .get(node)
-            .ok_or_else(|| Error::Invariant("released node is out of range".into()))?;
-        let previous = state.remaining.fetch_sub(1, Ordering::AcqRel);
-        if previous == 0 {
-            return Err(Error::Invariant("dependency counter underflow".into()));
+    fn release_dependencies(&self, nodes: &[usize]) -> Result<()> {
+        if nodes.is_empty() {
+            return Ok(());
         }
-        if previous == 1 {
-            self.enqueue_if_ready(node)?;
+        let mut ready = self.ready.state.lock();
+        let mut inserted = 0usize;
+        for &node in nodes {
+            let state = self
+                .nodes
+                .get(node)
+                .ok_or_else(|| Error::Invariant("released node is out of range".into()))?;
+            let previous = state.remaining.fetch_sub(1, Ordering::AcqRel);
+            if previous == 0 {
+                return Err(Error::Invariant("dependency counter underflow".into()));
+            }
+            if previous != 1 {
+                continue;
+            }
+            if state
+                .state
+                .compare_exchange(
+                    NODE_WAITING,
+                    NODE_READY,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+                && !ready.stopped
+            {
+                // SAFETY: the checked node belongs to the fixed execution arena.
+                let priority = unsafe { self.execution.priority_unchecked(node) };
+                ready.buckets.entry(priority).or_default().push_back(node);
+                inserted += 1;
+            }
+        }
+        if inserted == 1 {
+            self.ready.changed.notify_one();
+        } else if inserted > 1 {
+            self.ready.changed.notify_all();
+        }
+        Ok(())
+    }
+
+    fn release_initialize_dependencies(&self, nodes: &[usize]) -> Result<()> {
+        for &node in nodes {
+            let state = self
+                .nodes
+                .get(node)
+                .ok_or_else(|| Error::Invariant("released node is out of range".into()))?;
+            let previous = state.remaining.fetch_sub(1, Ordering::AcqRel);
+            if previous == 0 {
+                return Err(Error::Invariant("dependency counter underflow".into()));
+            }
         }
         Ok(())
     }
@@ -1180,10 +1334,7 @@ impl SessionInner {
         let successors = unsafe {
             std::slice::from_raw_parts(operation.successors.as_ptr(), operation.successor_count)
         };
-        for &successor in successors {
-            self.release_dependency(successor)?;
-        }
-        Ok(())
+        self.release_dependencies(successors)
     }
 
     fn complete_job_task(&self, batch: usize) -> Result<()> {
@@ -1195,12 +1346,14 @@ impl SessionInner {
         if previous == 0 {
             return Err(Error::Invariant("job completion underflow".into()));
         }
+        #[cfg(feature = "profile")]
         self.counters
             .completed_cells
             .fetch_add(1, Ordering::Relaxed);
         if previous != 1 {
             return Ok(());
         }
+        #[cfg(feature = "profile")]
         self.counters.completed_jobs.fetch_add(1, Ordering::Relaxed);
         self.job_done[batch].store(true, Ordering::Release);
         let slot = ring_slot(&self.plan, batch);
@@ -1230,37 +1383,103 @@ impl SessionInner {
         let Some(range) = releases.release_ranges.get(batch) else {
             return Ok(());
         };
-        for &node in releases
+        let nodes = releases
             .released_nodes
             .get(range.clone())
-            .ok_or_else(|| Error::Invariant("release range is invalid".into()))?
-        {
-            self.release_dependency(node)?;
-        }
-        Ok(())
+            .ok_or_else(|| Error::Invariant("release range is invalid".into()))?;
+        self.release_dependencies(nodes)
     }
 
-    fn execute(
-        &self,
-        node: usize,
-        io: &mut WorkerIo,
-        encoded: &mut Vec<u8>,
-        workspace: &mut DecodeWorkspace,
-    ) -> Result<()> {
+    fn claim_ready_node(&self, node: usize) -> Result<()> {
+        let state = self
+            .nodes
+            .get(node)
+            .ok_or_else(|| Error::Invariant("ready node is out of range".into()))?;
+        state
+            .state
+            .compare_exchange(
+                NODE_READY,
+                NODE_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| Error::Invariant("ready node state is invalid".into()))
+    }
+
+    fn finish_node(&self, node: usize) {
+        // SAFETY: every backend calls this only after `claim_ready_node`
+        // validated the node against the fixed runtime arena.
+        unsafe {
+            self.nodes
+                .get_unchecked(node)
+                .state
+                .store(NODE_DONE, Ordering::Release);
+        }
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn requeue_ready_nodes(&self, nodes: &[usize]) {
+        if nodes.is_empty() {
+            return;
+        }
+        let mut ready = self.ready.state.lock();
+        if ready.stopped {
+            return;
+        }
+        for &node in nodes {
+            // SAFETY: every node came from ReadyQueue and was deliberately
+            // left in NODE_READY state because this worker could not admit it.
+            let priority = unsafe { self.execution.priority_unchecked(node) };
+            ready.buckets.entry(priority).or_default().push_back(node);
+        }
+        if nodes.len() == 1 {
+            self.ready.changed.notify_one();
+        } else {
+            self.ready.changed.notify_all();
+        }
+    }
+
+    fn is_io_node(&self, node: usize) -> bool {
+        node < self.execution.dense_base
+    }
+
+    fn io_task(&self, node: usize) -> Result<&RuntimeIoTask> {
+        self.execution
+            .io
+            .get(node)
+            .ok_or_else(|| Error::Invariant("I/O node is out of range".into()))
+    }
+
+    fn execute_cpu_node(&self, node: usize) -> Result<()> {
         if node < self.execution.dense_base {
-            self.execute_io_with(node, io, encoded, workspace)?;
-            Ok(())
-        } else if node < self.execution.csr_base {
-            let task = &self.execution.dense[node - self.execution.dense_base];
+            return Err(Error::Invariant(
+                "I/O node was routed to the CPU scatter path".into(),
+            ));
+        }
+        if node < self.execution.csr_base {
+            // SAFETY: the caller supplies a valid executable node and this
+            // branch proves the dense-arena subrange.
+            let task = unsafe {
+                self.execution
+                    .dense
+                    .get_unchecked(node - self.execution.dense_base)
+            };
             self.execute_dense(task)?;
+            #[cfg(feature = "profile")]
+            let _timer = self.profile_completion();
             self.complete_job_task(task.batch)
         } else {
-            let task = self
-                .execution
-                .csr
-                .get(node - self.execution.csr_base)
-                .ok_or_else(|| Error::Invariant("CSR node is out of range".into()))?;
+            // SAFETY: node-count validation plus the arena partition proves
+            // this CSR index is in bounds.
+            let task = unsafe {
+                self.execution
+                    .csr
+                    .get_unchecked(node - self.execution.csr_base)
+            };
             self.execute_csr(task)?;
+            #[cfg(feature = "profile")]
+            let _timer = self.profile_completion();
             self.complete_job_task(task.batch)
         }
     }
@@ -1271,43 +1490,17 @@ impl SessionInner {
         encoded: &mut Vec<u8>,
         workspace: &mut DecodeWorkspace,
     ) -> Result<()> {
-        self.execute_io_with(node, &mut WorkerIo::Blocking, encoded, workspace)
+        blocking::read_and_decode(self, node, encoded, workspace, false)
     }
 
-    fn execute_io_with(
+    fn decode_io(
         &self,
         node: usize,
-        io: &mut WorkerIo,
-        encoded: &mut Vec<u8>,
+        encoded: &[u8],
         workspace: &mut DecodeWorkspace,
+        publish_ready: bool,
     ) -> Result<()> {
-        let task = self
-            .execution
-            .io
-            .get(node)
-            .ok_or_else(|| Error::Invariant("I/O node is out of range".into()))?;
-        // SAFETY: lowering points at an immutable source owned by `plan`.
-        let source = unsafe { task.source.as_ref() };
-        match io {
-            WorkerIo::Blocking => {
-                read_exact_source(source, task.file_offset, task.file_len, encoded)?
-            }
-            #[cfg(all(feature = "uring", target_os = "linux"))]
-            WorkerIo::Uring(ring) => {
-                let operations =
-                    read_exact_uring(source, task.file_offset, task.file_len, encoded, ring)?;
-                #[cfg(feature = "profile")]
-                self.counters
-                    .uring_reads
-                    .fetch_add(operations, Ordering::Relaxed);
-                #[cfg(not(feature = "profile"))]
-                let _ = operations;
-            }
-        }
-        self.counters.reads.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .read_bytes
-            .fetch_add(task.file_len, Ordering::Relaxed);
+        let task = self.io_task(node)?;
         // SAFETY: lowering created a contiguous range inside the immutable
         // runtime decode-op arena.
         let operations =
@@ -1328,20 +1521,180 @@ impl SessionInner {
             let output = unsafe {
                 std::slice::from_raw_parts_mut(operation.target.as_ptr(), operation.decoded_len)
             };
-            let written = operation.decoder.decode_into(input, output, workspace)?;
+            let decoded = {
+                #[cfg(feature = "profile")]
+                let _timer = self.profile_decode();
+                operation.decoder.decode_into(input, output, workspace)
+            };
+            let written = decoded?;
             if written != operation.decoded_len {
                 return Err(Error::Decode(format!(
                     "decoder wrote {written} bytes, expected {}",
                     operation.decoded_len
                 )));
             }
-            self.counters.decoded_blocks.fetch_add(1, Ordering::Relaxed);
-            self.counters
-                .decoded_bytes
-                .fetch_add(written, Ordering::Relaxed);
-            self.complete_block_ready(operation)?;
+            #[cfg(feature = "profile")]
+            {
+                self.counters.decoded_blocks.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .decoded_bytes
+                    .fetch_add(written, Ordering::Relaxed);
+            }
+            let completion = {
+                #[cfg(feature = "profile")]
+                let _timer = self.profile_completion();
+                if publish_ready {
+                    self.complete_block_ready(operation)
+                } else {
+                    // Initialize workers finish before the runtime queue starts, so
+                    // one post-join scan can publish every newly ready node at once.
+                    // SAFETY: lowering validated this pointer/count pair against
+                    // the immutable successor arena retained by the session.
+                    let successors = unsafe {
+                        std::slice::from_raw_parts(
+                            operation.successors.as_ptr(),
+                            operation.successor_count,
+                        )
+                    };
+                    self.release_initialize_dependencies(successors)
+                }
+            };
+            completion?;
         }
         Ok(())
+    }
+
+    fn record_reads(&self, operations: usize, bytes: usize) {
+        #[cfg(feature = "profile")]
+        {
+            self.counters.reads.fetch_add(operations, Ordering::Relaxed);
+            self.counters.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "profile"))]
+        let _ = (operations, bytes);
+    }
+
+    #[cfg(feature = "profile")]
+    fn profile_io_wait(&self) -> ProfileTimer<'_> {
+        ProfileTimer::start(&self.counters.io_wait_nanoseconds)
+    }
+
+    #[cfg(feature = "profile")]
+    fn profile_decode(&self) -> ProfileTimer<'_> {
+        ProfileTimer::start(&self.counters.decode_nanoseconds)
+    }
+
+    #[cfg(feature = "profile")]
+    fn profile_validation(&self) -> ProfileTimer<'_> {
+        ProfileTimer::start(&self.counters.validation_nanoseconds)
+    }
+
+    #[cfg(feature = "profile")]
+    fn profile_scatter(&self) -> ProfileTimer<'_> {
+        ProfileTimer::start(&self.counters.scatter_nanoseconds)
+    }
+
+    #[cfg(feature = "profile")]
+    fn profile_completion(&self) -> ProfileTimer<'_> {
+        ProfileTimer::start(&self.counters.completion_nanoseconds)
+    }
+
+    #[cfg(feature = "profile")]
+    fn profile_consumer_wait(&self) -> ProfileTimer<'_> {
+        ProfileTimer::start(&self.counters.consumer_wait_nanoseconds)
+    }
+
+    fn record_short_read(&self) {
+        #[cfg(feature = "profile")]
+        self.counters.short_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_whole_key(&self) {
+        #[cfg(feature = "profile")]
+        self.counters.whole_keys.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn record_uring_prepared(&self, count: usize) {
+        #[cfg(feature = "profile")]
+        self.counters
+            .uring_prepared
+            .fetch_add(count, Ordering::Relaxed);
+        #[cfg(not(feature = "profile"))]
+        let _ = count;
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn record_uring_submitted(&self, count: usize) {
+        #[cfg(feature = "profile")]
+        self.counters
+            .uring_submitted
+            .fetch_add(count, Ordering::Relaxed);
+        #[cfg(not(feature = "profile"))]
+        let _ = count;
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn record_uring_submit_call(&self) {
+        #[cfg(feature = "profile")]
+        self.counters
+            .uring_submit_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn record_uring_cqe(&self) {
+        #[cfg(feature = "profile")]
+        self.counters.uring_cqes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn record_uring_cancel_request(&self) {
+        #[cfg(feature = "profile")]
+        self.counters
+            .uring_cancel_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn record_uring_cancel_cqe(&self) {
+        #[cfg(feature = "profile")]
+        self.counters
+            .uring_cancel_cqes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn record_uring_admit(&self, bytes: usize) {
+        #[cfg(feature = "profile")]
+        {
+            let operations = self.counters.inflight_ops.fetch_add(1, Ordering::Relaxed) + 1;
+            let encoded = self
+                .counters
+                .inflight_bytes
+                .fetch_add(bytes, Ordering::Relaxed)
+                + bytes;
+            update_peak(&self.counters.peak_inflight_ops, operations);
+            update_peak(&self.counters.peak_inflight_bytes, encoded);
+        }
+        #[cfg(not(feature = "profile"))]
+        let _ = bytes;
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn record_uring_release(&self, bytes: usize) {
+        #[cfg(feature = "profile")]
+        {
+            let previous_ops = self.counters.inflight_ops.fetch_sub(1, Ordering::Relaxed);
+            let previous_bytes = self
+                .counters
+                .inflight_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
+            debug_assert!(previous_ops >= 1);
+            debug_assert!(previous_bytes >= bytes);
+        }
+        #[cfg(not(feature = "profile"))]
+        let _ = bytes;
     }
 
     fn execute_dense(&self, task: &RuntimeDenseTask) -> Result<()> {
@@ -1354,19 +1707,61 @@ impl SessionInner {
             if let Some((data, len)) = task.data {
                 let data = std::slice::from_raw_parts(data.as_ptr(), len);
                 if source.requires_runtime_validation() {
-                    validate_row(source, &task.cell, data, &[])?;
+                    let validation = {
+                        #[cfg(feature = "profile")]
+                        let _timer = self.profile_validation();
+                        validate_row(source, &task.cell, data, &[])
+                    };
+                    validation?;
                 }
-                scatter_row_prevalidated(
-                    source,
-                    &task.cell,
-                    data,
-                    &[],
-                    row,
-                    self.plan.row_bytes,
-                    self.plan.fill,
-                )
+                {
+                    #[cfg(feature = "profile")]
+                    let _timer = self.profile_scatter();
+                    if task.batch < self.plan.ring_slots {
+                        // Anonymous allocations and newly truncated shared
+                        // mappings start zero; these are their first owners.
+                        scatter_row_prevalidated_zeroed(
+                            source,
+                            &task.cell,
+                            data,
+                            &[],
+                            row,
+                            self.plan.row_bytes,
+                            self.plan.fill,
+                        )
+                    } else {
+                        scatter_row_prevalidated(
+                            source,
+                            &task.cell,
+                            data,
+                            &[],
+                            row,
+                            self.plan.row_bytes,
+                            self.plan.fill,
+                        )
+                    }
+                }
             } else {
-                self.plan.fill.apply(row.as_mut_ptr(), self.plan.row_bytes);
+                {
+                    #[cfg(feature = "profile")]
+                    let _timer = self.profile_scatter();
+                    if task.batch < self.plan.ring_slots {
+                        // Initial ring generations still contain allocation zeros.
+                        initialize_empty_row_zeroed(
+                            source,
+                            row.as_mut_ptr(),
+                            self.plan.row_bytes,
+                            self.plan.fill,
+                        );
+                    } else {
+                        initialize_empty_row(
+                            source,
+                            row.as_mut_ptr(),
+                            self.plan.row_bytes,
+                            self.plan.fill,
+                        );
+                    }
+                }
                 Ok(())
             }
         }
@@ -1379,17 +1774,39 @@ impl SessionInner {
             let source = task.source.as_ref();
             let data = std::slice::from_raw_parts(task.data.as_ptr(), task.data_len);
             let indices = std::slice::from_raw_parts(task.indices.as_ptr(), task.indices_len);
-            validate_row(source, &task.cell, data, indices)?;
+            let validation = {
+                #[cfg(feature = "profile")]
+                let _timer = self.profile_validation();
+                validate_row(source, &task.cell, data, indices)
+            };
+            validation?;
             let row = std::slice::from_raw_parts_mut(task.output.as_ptr(), task.output_len);
-            scatter_row_prevalidated(
-                source,
-                &task.cell,
-                data,
-                indices,
-                row,
-                self.plan.row_bytes,
-                self.plan.fill,
-            )
+            {
+                #[cfg(feature = "profile")]
+                let _timer = self.profile_scatter();
+                if task.batch < self.plan.ring_slots {
+                    // Initial ring generations still contain allocation zeros.
+                    scatter_row_prevalidated_zeroed(
+                        source,
+                        &task.cell,
+                        data,
+                        indices,
+                        row,
+                        self.plan.row_bytes,
+                        self.plan.fill,
+                    )
+                } else {
+                    scatter_row_prevalidated(
+                        source,
+                        &task.cell,
+                        data,
+                        indices,
+                        row,
+                        self.plan.row_bytes,
+                        self.plan.fill,
+                    )
+                }
+            }
         }
     }
 
@@ -1401,6 +1818,22 @@ impl SessionInner {
             )));
         }
         let slot = ring_slot(&self.plan, logical);
+        match self.state() {
+            SessionState::Failed => return Err(self.terminal_error()),
+            SessionState::Cancelled => return Err(Error::Cancelled),
+            SessionState::Finished => return Ok(false),
+            SessionState::Running => {}
+        }
+        if self.batch_slots[slot].generation.load(Ordering::Acquire) != logical {
+            return Err(Error::Invariant(
+                "consumer observed wrong ring generation".into(),
+            ));
+        }
+        if self.batch_slots[slot].ready.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        #[cfg(feature = "profile")]
+        let _timer = self.profile_consumer_wait();
         let mut guard = self.consumer_lock.lock();
         loop {
             match self.state() {
@@ -1481,41 +1914,33 @@ impl SessionInner {
             #[cfg(feature = "profile")]
             physical_read_bytes: load(&self.counters.read_bytes),
             #[cfg(feature = "profile")]
-            short_read_retries: 0,
+            short_read_retries: load(&self.counters.short_reads),
             #[cfg(feature = "profile")]
-            whole_key_materializations: 0,
+            whole_key_materializations: load(&self.counters.whole_keys),
             #[cfg(feature = "profile")]
-            uring_prepared_read_sqes: uring_read_count(&self.counters),
+            uring_prepared_read_sqes: load(&self.counters.uring_prepared),
             #[cfg(feature = "profile")]
-            uring_submitted_read_sqes: uring_read_count(&self.counters),
+            uring_submitted_read_sqes: load(&self.counters.uring_submitted),
             #[cfg(feature = "profile")]
-            uring_submit_calls: uring_read_count(&self.counters),
+            uring_submit_calls: load(&self.counters.uring_submit_calls),
             #[cfg(feature = "profile")]
-            uring_cqes: uring_read_count(&self.counters),
+            uring_cqes: load(&self.counters.uring_cqes),
             #[cfg(feature = "profile")]
-            uring_cancel_requests: 0,
+            uring_cancel_requests: load(&self.counters.uring_cancel_requests),
             #[cfg(feature = "profile")]
-            uring_cancel_cqes: 0,
+            uring_cancel_cqes: load(&self.counters.uring_cancel_cqes),
             #[cfg(feature = "profile")]
-            io_wait_nanoseconds: 0,
+            io_wait_nanoseconds: load(&self.counters.io_wait_nanoseconds),
             #[cfg(feature = "profile")]
-            decode_nanoseconds: 0,
+            decode_nanoseconds: load(&self.counters.decode_nanoseconds),
             #[cfg(feature = "profile")]
-            data_decode_nanoseconds: 0,
+            validation_nanoseconds: load(&self.counters.validation_nanoseconds),
             #[cfg(feature = "profile")]
-            indices_decode_nanoseconds: 0,
+            scatter_nanoseconds: load(&self.counters.scatter_nanoseconds),
             #[cfg(feature = "profile")]
-            validation_nanoseconds: 0,
+            completion_nanoseconds: load(&self.counters.completion_nanoseconds),
             #[cfg(feature = "profile")]
-            scatter_nanoseconds: 0,
-            #[cfg(feature = "profile")]
-            scatter_kernel_nanoseconds: 0,
-            #[cfg(feature = "profile")]
-            completion_nanoseconds: 0,
-            #[cfg(feature = "profile")]
-            window_wait_nanoseconds: 0,
-            #[cfg(feature = "profile")]
-            consumer_wait_nanoseconds: 0,
+            consumer_wait_nanoseconds: load(&self.counters.consumer_wait_nanoseconds),
             #[cfg(feature = "profile")]
             completed_jobs: load(&self.counters.completed_jobs),
             #[cfg(feature = "profile")]
@@ -1525,47 +1950,11 @@ impl SessionInner {
             #[cfg(feature = "profile")]
             decoded_bytes: load(&self.counters.decoded_bytes),
             #[cfg(feature = "profile")]
-            claim_cas_retries: 0,
+            peak_inflight_jobs: self.counters.peak_inflight_ops.load(Ordering::Relaxed),
             #[cfg(feature = "profile")]
-            window_block_events: 0,
+            peak_inflight_read_ops: self.counters.peak_inflight_ops.load(Ordering::Relaxed),
             #[cfg(feature = "profile")]
-            local_full_events: 0,
-            #[cfg(feature = "profile")]
-            peak_inflight_jobs: 0,
-            #[cfg(feature = "profile")]
-            peak_inflight_read_ops: 0,
-            #[cfg(feature = "profile")]
-            peak_inflight_encoded_bytes: 0,
-            #[cfg(feature = "profile")]
-            workers: (0..self.config.worker_count)
-                .map(|worker_id| WorkerRuntimeStats {
-                    worker_id,
-                    completed_jobs: 0,
-                    completed_cells: 0,
-                    decoded_blocks: 0,
-                    decoded_bytes: 0,
-                    data_decode_nanoseconds: 0,
-                    indices_decode_nanoseconds: 0,
-                    validation_nanoseconds: 0,
-                    scatter_kernel_nanoseconds: 0,
-                    completion_nanoseconds: 0,
-                    window_wait_nanoseconds: 0,
-                    io_wait_nanoseconds: 0,
-                    physical_read_ops: 0,
-                    physical_read_bytes: 0,
-                    short_read_retries: 0,
-                    whole_key_materializations: 0,
-                    claim_cas_retries: 0,
-                    window_block_events: 0,
-                    local_full_events: 0,
-                    uring_prepared_read_sqes: 0,
-                    uring_submitted_read_sqes: 0,
-                    uring_submit_calls: 0,
-                    uring_cqes: 0,
-                    uring_cancel_requests: 0,
-                    uring_cancel_cqes: 0,
-                })
-                .collect(),
+            peak_inflight_encoded_bytes: self.counters.peak_inflight_bytes.load(Ordering::Relaxed),
             state: self.state(),
         }
     }
@@ -1653,233 +2042,15 @@ fn run_initialize(inner: &Arc<SessionInner>) -> Result<()> {
     Ok(())
 }
 
-fn worker_entry(inner: Arc<SessionInner>, mut io: WorkerIo) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut encoded = Vec::new();
-        let mut workspace = DecodeWorkspace::new();
-        while let Some(node) = inner.ready.pop() {
-            if !inner.is_running() {
-                return Ok(());
-            }
-            let state = &inner.nodes[node];
-            if state
-                .state
-                .compare_exchange(
-                    NODE_READY,
-                    NODE_RUNNING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                return Err(Error::Invariant("ready node state is invalid".into()));
-            }
-            inner.execute(node, &mut io, &mut encoded, &mut workspace)?;
-            state.state.store(NODE_DONE, Ordering::Release);
-        }
-        Ok(())
-    }));
+fn worker_entry<F>(inner: Arc<SessionInner>, run: F)
+where
+    F: FnOnce(Arc<SessionInner>) -> Result<()>,
+{
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(Arc::clone(&inner))));
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => inner.fail(error),
         Err(_) => inner.fail(Error::WorkerPanic),
-    }
-}
-
-#[cfg(all(feature = "uring", target_os = "linux"))]
-fn read_exact_uring(
-    source: &ReadSource,
-    offset: u64,
-    len: usize,
-    output: &mut Vec<u8>,
-    ring: &mut io_uring::IoUring,
-) -> Result<usize> {
-    use io_uring::{opcode, types};
-
-    let ReadSource::Positioned {
-        file,
-        base_offset,
-        view_len,
-    } = source
-    else {
-        return Err(Error::Invariant(
-            "io_uring task does not reference a positioned source".into(),
-        ));
-    };
-    let end = offset
-        .checked_add(len as u64)
-        .ok_or_else(|| Error::StalePlan("io_uring range overflow".into()))?;
-    if end > *view_len {
-        return Err(Error::StalePlan(
-            "io_uring range exceeds positioned source".into(),
-        ));
-    }
-    let absolute = base_offset
-        .checked_add(offset)
-        .ok_or_else(|| Error::StalePlan("io_uring absolute offset overflow".into()))?;
-    output.clear();
-    output.try_reserve_exact(len)?;
-    let mut filled = 0usize;
-    let mut operations = 0usize;
-    while filled < len {
-        let request_len = (len - filled).min(u32::MAX as usize);
-        let request_offset = absolute
-            .checked_add(filled as u64)
-            .ok_or_else(|| Error::StalePlan("io_uring read offset overflow".into()))?;
-        // SAFETY: the vector keeps this allocation pinned until the matching
-        // CQE below and exposes at least `request_len` spare bytes.
-        let pointer = unsafe {
-            output
-                .spare_capacity_mut()
-                .as_mut_ptr()
-                .add(filled)
-                .cast::<u8>()
-        };
-        let entry = opcode::Read::new(types::Fd(file.as_raw_fd()), pointer, request_len as u32)
-            .offset(request_offset)
-            .build();
-        // SAFETY: the SQE's buffer remains live and unmoved until submit_and_wait
-        // returns a completion, and this worker is its sole owner.
-        unsafe {
-            ring.submission()
-                .push(&entry)
-                .map_err(|_| Error::Invariant("io_uring submission queue is full".into()))?;
-        }
-        loop {
-            match ring.submit_and_wait(1) {
-                Ok(_) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let completion = ring
-            .completion()
-            .next()
-            .ok_or_else(|| Error::Invariant("io_uring produced no completion".into()))?;
-        let result = completion.result();
-        operations = operations.saturating_add(1);
-        if result < 0 {
-            return Err(std::io::Error::from_raw_os_error(-result).into());
-        }
-        let read = result as usize;
-        if read == 0 {
-            return Err(Error::Io {
-                kind: std::io::ErrorKind::UnexpectedEof,
-                message: format!("io_uring read ended at {filled} of {len} bytes"),
-            });
-        }
-        if read > request_len {
-            return Err(Error::Invariant(
-                "io_uring completion exceeds submitted length".into(),
-            ));
-        }
-        filled += read;
-    }
-    // SAFETY: every byte in the logical length was initialized by successful
-    // read CQEs and the vector was not reallocated while requests were live.
-    unsafe { output.set_len(len) };
-    Ok(operations)
-}
-
-fn read_exact_source(
-    source: &ReadSource,
-    offset: u64,
-    len: usize,
-    output: &mut Vec<u8>,
-) -> Result<()> {
-    match source {
-        ReadSource::Empty => Err(Error::Invariant("cache load uses an empty source".into())),
-        ReadSource::Positioned {
-            file,
-            base_offset,
-            view_len,
-        } => {
-            let end = offset
-                .checked_add(len as u64)
-                .ok_or_else(|| Error::StalePlan("positioned range overflow".into()))?;
-            if end > *view_len {
-                return Err(Error::StalePlan("positioned range exceeds source".into()));
-            }
-            output.clear();
-            output.try_reserve_exact(len)?;
-            let absolute = base_offset
-                .checked_add(offset)
-                .ok_or_else(|| Error::StalePlan("absolute offset overflow".into()))?;
-            let mut filled = 0usize;
-            while filled < len {
-                let read_offset = absolute
-                    .checked_add(filled as u64)
-                    .ok_or_else(|| Error::StalePlan("read offset overflow".into()))?;
-                let read = {
-                    let spare = &mut output.spare_capacity_mut()[..len - filled];
-                    match rustix::io::pread(file, spare, read_offset) {
-                        Ok((initialized, _)) => initialized.len(),
-                        Err(error) if error == rustix::io::Errno::INTR => continue,
-                        Err(error) => return Err(std::io::Error::from(error).into()),
-                    }
-                };
-                if read == 0 {
-                    return Err(Error::Io {
-                        kind: std::io::ErrorKind::UnexpectedEof,
-                        message: format!("positioned read ended at {filled} of {len} bytes"),
-                    });
-                }
-                filled += read;
-                // SAFETY: rustix initialized exactly the reported spare prefix.
-                unsafe { output.set_len(filled) };
-            }
-            Ok(())
-        }
-        ReadSource::RangeKey {
-            store,
-            key,
-            declared_len,
-        } => {
-            let end = usize::try_from(offset)
-                .ok()
-                .and_then(|start| start.checked_add(len))
-                .ok_or_else(|| Error::StalePlan("range-key extent overflow".into()))?;
-            if end > *declared_len {
-                return Err(Error::StalePlan(format!(
-                    "range key '{key}' exceeds declared length"
-                )));
-            }
-            store.read_range_into(key, offset, len, output)?;
-            if output.len() != len {
-                return Err(Error::StalePlan("range-key short read".into()));
-            }
-            Ok(())
-        }
-        ReadSource::WholeKey {
-            store,
-            key,
-            declared_len,
-            cached,
-        } => {
-            let start = usize::try_from(offset)
-                .map_err(|_| Error::StalePlan("whole-key offset exceeds usize".into()))?;
-            let end = start
-                .checked_add(len)
-                .ok_or_else(|| Error::StalePlan("whole-key extent overflow".into()))?;
-            if end > *declared_len {
-                return Err(Error::StalePlan("whole-key extent exceeds source".into()));
-            }
-            if let Some(cached) = cached {
-                output.clear();
-                output.try_reserve_exact(len)?;
-                output.extend_from_slice(cached.get(start..end).ok_or_else(|| {
-                    Error::StalePlan("cached whole-key extent is invalid".into())
-                })?);
-                return Ok(());
-            }
-            store.read_range_into(key, 0, *declared_len, output)?;
-            if output.len() != *declared_len {
-                return Err(Error::StalePlan("whole-key short read".into()));
-            }
-            output.copy_within(start..end, 0);
-            output.truncate(len);
-            Ok(())
-        }
     }
 }
 

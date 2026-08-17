@@ -2,7 +2,7 @@ use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "profile")]
 use std::time::Instant;
 
@@ -13,8 +13,8 @@ use crate::config::{IoMergePolicy, PlanConfig};
 use crate::convert::ConvertOp;
 use crate::plan::{
     CacheSlice, CellTask, CsrMap, CsrScatterTask, DecodeOp, DenseMap, DenseMapEntry, DenseMapRun,
-    DenseScatterTask, DependencyGraph, InitializeJob, IoDecodeLoadTask, OutputSlice, Plan,
-    PlanData, PlanStats, ReadSource, ReleasePlan, SourcePlan, StaticJob, StaticPlanData,
+    DenseScatterTask, DependencyGraph, InitializeJob, IoDecodeLoadTask, OutputRange, OutputSlice,
+    Plan, PlanData, PlanStats, ReadSource, ReleasePlan, SourcePlan, StaticJob, StaticPlanData,
     UNMAPPED_TARGET, UNMAPPED_TARGET_U32,
 };
 use crate::scatter::{FillOp, IndexOp};
@@ -22,6 +22,21 @@ use crate::source::{DatasetKind, OutputSlot};
 use crate::{Error, OutputSpec, Result, RowRef, Source, SourceId};
 
 const MAX_DENSE_CHUNK_TABLE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_NESTED_BUCKET_HEADER_BYTES: usize = 4 * 1024 * 1024;
+const MIN_DENSE_OVERWRITE_BYTES_PER_GAP: usize = 256;
+
+fn use_nested_buckets(count: usize) -> bool {
+    count
+        .checked_mul(size_of::<Vec<usize>>())
+        .is_some_and(|bytes| bytes <= MAX_NESTED_BUCKET_HEADER_BYTES)
+}
+
+fn try_filled_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len)?;
+    values.resize(len, value);
+    Ok(values)
+}
 
 #[derive(Clone)]
 pub struct PlanSpec {
@@ -213,6 +228,7 @@ struct FreeExtent {
 struct ExtentAllocator {
     by_address: BTreeMap<usize, FreeExtent>,
     by_size: BTreeSet<(usize, usize)>,
+    free_bytes: usize,
     slack: usize,
 }
 
@@ -226,14 +242,13 @@ impl ExtentAllocator {
         Self {
             by_address: BTreeMap::from([(0, extent)]),
             by_size: BTreeSet::from([(capacity, 0)]),
+            free_bytes: capacity,
             slack,
         }
     }
 
     fn total_free(&self) -> usize {
-        self.by_address
-            .values()
-            .fold(0usize, |total, extent| total.saturating_add(extent.len))
+        self.free_bytes
     }
 
     fn largest_free(&self) -> usize {
@@ -270,10 +285,22 @@ impl ExtentAllocator {
                 available_after_batch: extent.available_after_batch,
             });
         }
+        // The selected extent is at least `len`; splitting only returns its
+        // unused suffix, so exactly `len` bytes leave the free set.
+        self.free_bytes = self
+            .free_bytes
+            .checked_sub(len)
+            .expect("selected extent remains part of the free-byte total");
         Some(FreeExtent { len, ..extent })
     }
 
     fn release(&mut self, offset: usize, len: usize, available_after_batch: usize) {
+        // Every residency is released exactly once after a successful
+        // allocation, so the total cannot exceed the fixed cache capacity.
+        self.free_bytes = self
+            .free_bytes
+            .checked_add(len)
+            .expect("released cache extent keeps the fixed capacity representable");
         let mut released = FreeExtent {
             offset,
             len,
@@ -334,15 +361,70 @@ fn max_epoch(left: Option<usize>, right: Option<usize>) -> Option<usize> {
     }
 }
 
-fn cost_aware_first_group_end(
+fn cost_aware_group_is_feasible(
     ordered: &[usize],
     residencies: &[StaticResidency],
     objects: &[StaticCacheObject],
     merge: &crate::config::IoMergeOptions,
-) -> Result<usize> {
+) -> Result<bool> {
+    let Some((&first_id, rest)) = ordered.split_first() else {
+        return Ok(false);
+    };
+    let last_id = rest.last().copied().unwrap_or(first_id);
+    let first = &objects[residencies[first_id].object].block;
+    let last = &objects[residencies[last_id].object].block;
+    let span = last
+        .encoded_range
+        .end
+        .checked_sub(first.encoded_range.start)
+        .and_then(|span| usize::try_from(span).ok())
+        .ok_or_else(|| Error::ResourceLimit("I/O fusion span exceeds usize".into()))?;
+    let (payload, decoded) =
+        ordered
+            .iter()
+            .try_fold((0usize, 0usize), |(payload, decoded), residency| {
+                let object = &objects[residencies[*residency].object];
+                Ok::<_, Error>((
+                    payload
+                        .checked_add(range_len_u64(&object.block.encoded_range)?)
+                        .ok_or_else(|| {
+                            Error::ResourceLimit("I/O fusion payload overflow".into())
+                        })?,
+                    decoded
+                        .checked_add(object.block.decoded_len())
+                        .ok_or_else(|| {
+                            Error::ResourceLimit("I/O fusion decoded bytes overflow".into())
+                        })?,
+                ))
+            })?;
+    let gap = span
+        .checked_sub(payload)
+        .ok_or_else(|| Error::Invariant("I/O fusion payload exceeds physical span".into()))?;
+    let amplification = if payload == 0 {
+        1.0
+    } else {
+        span as f64 / payload as f64
+    };
+    Ok((ordered.len() == 1 || span <= merge.max_coalesced_io_bytes)
+        && span <= merge.max_encoded_staging_bytes_per_task
+        && gap <= merge.max_io_gap_bytes
+        && amplification <= merge.max_io_amplification_ratio
+        && decoded <= merge.max_decoded_bytes_per_io_task
+        && ordered.len() <= merge.max_decode_ops_per_io_task)
+}
+
+fn cost_aware_group_ends(
+    ordered: &[usize],
+    residencies: &[StaticResidency],
+    objects: &[StaticCacheObject],
+    merge: &crate::config::IoMergeOptions,
+) -> Result<Vec<usize>> {
     let count = ordered.len();
-    let mut payload_prefix = vec![0usize; count + 1];
-    let mut decoded_prefix = vec![0usize; count + 1];
+    let state_count = count
+        .checked_add(1)
+        .ok_or_else(|| Error::ResourceLimit("I/O fusion state count overflow".into()))?;
+    let mut payload_prefix = try_filled_vec(state_count, 0usize)?;
+    let mut decoded_prefix = try_filled_vec(state_count, 0usize)?;
     for (index, &residency_id) in ordered.iter().enumerate() {
         let object = &objects[residencies[residency_id].object];
         payload_prefix[index + 1] = payload_prefix[index]
@@ -352,10 +434,10 @@ fn cost_aware_first_group_end(
             .checked_add(object.block.decoded_len())
             .ok_or_else(|| Error::ResourceLimit("I/O fusion decoded bytes overflow".into()))?;
     }
-    let mut costs = vec![f64::INFINITY; count + 1];
-    let mut gaps = vec![usize::MAX; count + 1];
-    let mut tasks = vec![0usize; count + 1];
-    let mut previous = vec![usize::MAX; count + 1];
+    let mut costs = try_filled_vec(state_count, f64::INFINITY)?;
+    let mut gaps = try_filled_vec(state_count, usize::MAX)?;
+    let mut tasks = try_filled_vec(state_count, 0usize)?;
+    let mut previous = try_filled_vec(state_count, usize::MAX)?;
     costs[0] = 0.0;
     gaps[0] = 0;
     for end in 1..=count {
@@ -363,8 +445,12 @@ fn cost_aware_first_group_end(
         for start in (earliest..end).rev() {
             let first = &objects[residencies[ordered[start]].object].block;
             let last = &objects[residencies[ordered[end - 1]].object].block;
-            let span = usize::try_from(last.encoded_range.end - first.encoded_range.start)
-                .map_err(|_| Error::ResourceLimit("I/O fusion span exceeds usize".into()))?;
+            let span = last
+                .encoded_range
+                .end
+                .checked_sub(first.encoded_range.start)
+                .and_then(|span| usize::try_from(span).ok())
+                .ok_or_else(|| Error::ResourceLimit("I/O fusion span exceeds usize".into()))?;
             let payload = payload_prefix[end] - payload_prefix[start];
             let decoded = decoded_prefix[end] - decoded_prefix[start];
             let gap = span.checked_sub(payload).ok_or_else(|| {
@@ -375,7 +461,8 @@ fn cost_aware_first_group_end(
             } else {
                 span as f64 / payload as f64
             };
-            if span > merge.max_coalesced_io_bytes
+            let group_count = end - start;
+            if (group_count > 1 && span > merge.max_coalesced_io_bytes)
                 || span > merge.max_encoded_staging_bytes_per_task
                 || gap > merge.max_io_gap_bytes
                 || amplification > merge.max_io_amplification_ratio
@@ -383,13 +470,19 @@ fn cost_aware_first_group_end(
             {
                 continue;
             }
-            let group_count = end - start;
             let uncertainty = usize::from(group_count > 1) * merge.io_merge_delta_bytes;
+            let Some(charged_span) = span.checked_add(uncertainty) else {
+                continue;
+            };
             let group_cost = 1.0 / merge.io_operations_per_second
-                + span.saturating_add(uncertainty) as f64 / merge.io_bandwidth_bytes_per_second;
+                + charged_span as f64 / merge.io_bandwidth_bytes_per_second;
             let candidate_cost = costs[start] + group_cost;
-            let candidate_gap = gaps[start].saturating_add(gap);
-            let candidate_tasks = tasks[start] + 1;
+            let Some(candidate_gap) = gaps[start].checked_add(gap) else {
+                continue;
+            };
+            let candidate_tasks = tasks[start]
+                .checked_add(1)
+                .ok_or_else(|| Error::ResourceLimit("I/O fusion task count overflow".into()))?;
             let better = if !costs[end].is_finite() {
                 true
             } else {
@@ -415,12 +508,14 @@ fn cost_aware_first_group_end(
         }
     }
     let mut cursor = count;
-    let mut first_end = count;
+    let mut group_ends = Vec::new();
+    group_ends.try_reserve_exact(tasks[count])?;
     while cursor > 0 {
-        first_end = cursor;
+        group_ends.push(cursor);
         cursor = previous[cursor];
     }
-    Ok(first_end)
+    group_ends.reverse();
+    Ok(group_ends)
 }
 
 struct CellInfo {
@@ -507,14 +602,21 @@ enum SourceRowLayout {
 }
 
 enum CandidateRemap {
-    Dense(Vec<usize>),
+    Dense {
+        values: Vec<usize>,
+        maximum_len: usize,
+    },
     Sparse(HashMap<usize, usize>),
 }
 
 impl CandidateRemap {
     fn new(raw_candidates: usize, cell_count: usize) -> Result<Self> {
-        if raw_candidates <= cell_count.saturating_mul(2).max(1_024) {
-            Ok(Self::Dense(vec![usize::MAX; raw_candidates]))
+        let maximum_len = cell_count.saturating_mul(2).max(1_024);
+        if raw_candidates <= maximum_len {
+            Ok(Self::Dense {
+                values: try_filled_vec(raw_candidates, usize::MAX)?,
+                maximum_len,
+            })
         } else {
             let mut values = HashMap::new();
             values.try_reserve(cell_count.min(raw_candidates))?;
@@ -524,18 +626,40 @@ impl CandidateRemap {
 
     fn intern(&mut self, raw: usize, next: usize) -> Result<(usize, bool)> {
         match self {
-            Self::Dense(values) => {
+            Self::Dense {
+                values,
+                maximum_len,
+            } if raw < *maximum_len => {
                 if raw >= values.len() {
-                    values.try_reserve(raw + 1 - values.len())?;
-                    values.resize(raw + 1, usize::MAX);
+                    let new_len = raw.checked_add(1).ok_or_else(|| {
+                        Error::ResourceLimit("block candidate remap length overflow".into())
+                    })?;
+                    values.try_reserve(new_len - values.len())?;
+                    values.resize(new_len, usize::MAX);
                 }
-                let slot = &mut values[raw];
+                // SAFETY: the growth branch above established `raw < values.len()`.
+                let slot = unsafe { values.get_unchecked_mut(raw) };
                 if *slot == usize::MAX {
                     *slot = next;
                     Ok((next, true))
                 } else {
                     Ok((*slot, false))
                 }
+            }
+            Self::Dense { values, .. } => {
+                let capacity = next.checked_add(1).ok_or_else(|| {
+                    Error::ResourceLimit("block candidate remap count overflow".into())
+                })?;
+                let mut sparse = HashMap::new();
+                sparse.try_reserve(capacity)?;
+                for (raw, &mapped) in values.iter().enumerate() {
+                    if mapped != usize::MAX {
+                        sparse.insert(raw, mapped);
+                    }
+                }
+                sparse.insert(raw, next);
+                *self = Self::Sparse(sparse);
+                Ok((next, true))
             }
             Self::Sparse(values) => match values.entry(raw) {
                 Entry::Occupied(entry) => Ok((*entry.get(), false)),
@@ -593,6 +717,13 @@ impl Builder {
         }
         request.config.validate()?;
         request.output.validate()?;
+        let maximum_job_cells = request.rows.len().min(request.batch_size);
+        if maximum_job_cells > request.config.limits.max_cells_per_job {
+            return Err(Error::ResourceLimit(format!(
+                "one batch has up to {maximum_job_cells} cells, limit is {}",
+                request.config.limits.max_cells_per_job
+            )));
+        }
 
         let mut source_indices = HashMap::new();
         let mut compiled_sources = Vec::new();
@@ -703,6 +834,23 @@ impl Builder {
                     })
                 })
                 .transpose()?;
+            let mut default_ranges = build_default_ranges(
+                feature_targets.as_deref(),
+                request.output.n_cols,
+                request.output.dtype.size(),
+            )?;
+            let dense_fill_whole = if index_dtype.is_none() {
+                choose_dense_whole_fill(
+                    feature_targets.as_deref(),
+                    request.output.dtype.size(),
+                    default_ranges.len(),
+                )?
+            } else {
+                false
+            };
+            if dense_fill_whole {
+                default_ranges = Arc::from([]);
+            }
             let (feature_map, dense_map) = match (feature_targets, index_dtype) {
                 (None, _) => (None, None),
                 (Some(targets), None) => {
@@ -761,6 +909,8 @@ impl Builder {
                 index,
                 feature_map,
                 dense_map,
+                dense_fill_whole,
+                default_ranges,
                 convert,
             });
             row_layouts.push(row_layout);
@@ -944,6 +1094,7 @@ impl Builder {
         };
         let static_plan =
             self.compile_static_plan(&cells, &cell_blocks, row_stride, row_bytes, &mut stats)?;
+        stats.compile_working_set_bytes = self.peak_compile_payload_bytes;
         #[cfg(feature = "profile")]
         let compile_finalize_ns = elapsed_ns(phase_started);
         stats.compile_time_io_bytes = self.compile_io_bytes;
@@ -960,9 +1111,9 @@ impl Builder {
         stats.predicted_io_seconds = if io_ops == 0 {
             0.0
         } else {
-            (stats.predicted_physical_bytes as f64
-                / self.request.config.io_merge.io_bandwidth_bytes_per_second)
-                .max(io_ops as f64 / self.request.config.io_merge.io_operations_per_second)
+            stats.predicted_physical_bytes as f64
+                / self.request.config.io_merge.io_bandwidth_bytes_per_second
+                + io_ops as f64 / self.request.config.io_merge.io_operations_per_second
         };
 
         let plan = PlanData {
@@ -1453,6 +1604,10 @@ impl Builder {
             (self.chunks.len(), size_of::<ChunkSideOffsets>()),
             (1, marker_bytes),
             (maximum_required_chunks, size_of::<ChunkKey>()),
+            (
+                maximum_required_chunks,
+                size_of::<OnceLock<Result<LoadedChunk>>>(),
+            ),
             (1, self.chunk_metadata_bytes),
             (
                 1,
@@ -1480,6 +1635,7 @@ impl Builder {
                 self.resolved_row_arena_element_size(),
             ),
             (requests.len(), size_of::<ChunkKey>()),
+            (requests.len(), size_of::<OnceLock<Result<LoadedChunk>>>()),
             (1, self.chunk_metadata_bytes),
             (
                 1,
@@ -1512,11 +1668,14 @@ impl Builder {
 
         let next = AtomicUsize::new(0);
         let retained_whole_keys = AtomicUsize::new(self.retained_whole_key_bytes);
-        let mut outcomes = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(concurrency);
+        let mut outcomes = Vec::new();
+        outcomes.try_reserve_exact(requests.len())?;
+        outcomes.resize_with(requests.len(), OnceLock::new);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            handles.try_reserve_exact(concurrency)?;
             for _ in 0..concurrency {
-                handles.push(scope.spawn(|| {
-                    let mut local = Vec::new();
+                handles.push(std::thread::Builder::new().spawn_scoped(scope, || {
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&key) = requests.get(index) else {
@@ -1530,22 +1689,30 @@ impl Builder {
                             &retained_whole_keys,
                             self.request.config.limits.max_retained_whole_key_bytes,
                         );
-                        local.push((index, key, outcome));
+                        let slot = outcomes.get(index).ok_or_else(|| {
+                            Error::Invariant("chunk metadata result slot is missing".into())
+                        })?;
+                        if slot.set(outcome).is_err() {
+                            return Err(Error::Invariant(
+                                "chunk metadata result was installed twice".into(),
+                            ));
+                        }
                     }
-                    local
-                }));
-            }
-            let mut outcomes = Vec::with_capacity(requests.len());
-            for handle in handles {
-                outcomes.extend(handle.join().map_err(|_| {
-                    Error::Invariant("chunk metadata loader thread panicked".into())
+                    Ok::<_, Error>(())
                 })?);
             }
-            Ok::<_, Error>(outcomes)
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    Error::Invariant("chunk metadata loader thread panicked".into())
+                })??;
+            }
+            Ok::<_, Error>(())
         })?;
-        outcomes.sort_unstable_by_key(|(index, _, _)| *index);
-        for (_, key, outcome) in outcomes {
-            self.install_loaded_chunk(key, outcome?)?;
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let outcome = outcome.into_inner().ok_or_else(|| {
+                Error::Invariant("chunk metadata result was not initialized".into())
+            })?;
+            self.install_loaded_chunk(requests[index], outcome?)?;
         }
         Ok(())
     }
@@ -1553,10 +1720,10 @@ impl Builder {
     fn resolve_cell(
         &mut self,
         ordinal: usize,
+        index: RowRef,
         resolved: ResolvedRow,
         row_stride: usize,
     ) -> Result<CellInfo> {
-        let index = self.request.rows[ordinal];
         let source_slot = resolved.did;
         let location = resolved.location;
         let (logical_batch, cell_in_batch) = if let Some(shift) = self.batch_shift {
@@ -1580,7 +1747,7 @@ impl Builder {
             .and_then(|row| row.checked_add(cell_in_batch))
             .and_then(|row| row.checked_mul(row_stride))
             .ok_or_else(|| Error::ResourceLimit("output row offset overflow".into()))?;
-        let output_slot = OutputSlot::new(row_offset, logical_batch < self.ring_slots)
+        let output_slot = OutputSlot::new(row_offset)
             .ok_or_else(|| Error::Invariant("output row offset is not aligned".into()))?;
         match location {
             CellLocation::Empty { chunk } => Ok(CellInfo {
@@ -1627,15 +1794,15 @@ impl Builder {
                     side: Side::Indices,
                     chunk,
                 };
-                let (indices, _) = self.locate_chunk_cell(indices_key, indices_range, false)?;
-                if data.block_index != indices.block_index {
-                    return Err(Error::InvalidDataset(format!(
-                        "CSR mirrored block mismatch in dataset {} chunk {chunk}: data {} vs indices {}",
-                        index.source.get(),
-                        data.block_index,
-                        indices.block_index
-                    )));
-                }
+                // CSR data and indices chunks are encoded with the same block
+                // element partition. Reuse the already resolved data block and
+                // let the exact range check diagnose inconsistent metadata.
+                let (indices, _) = self.locate_chunk_cell_at(
+                    indices_key,
+                    indices_range,
+                    data.block_index,
+                    index.source,
+                )?;
                 Ok(CellInfo {
                     did: source_slot,
                     block_key,
@@ -1675,6 +1842,29 @@ impl Builder {
             }?;
             Ok((block, plan.candidate_base))
         })
+    }
+
+    fn locate_chunk_cell_at(
+        &mut self,
+        key: ChunkKey,
+        cell: Range<usize>,
+        block_index: usize,
+        source: SourceId,
+    ) -> Result<(CellBlock, usize)> {
+        if self.chunk(key).is_none() {
+            self.load_missing_chunk(key)?;
+        }
+        let plan = self
+            .chunk(key)
+            .ok_or_else(|| Error::Invariant("inserted mirrored chunk is missing".into()))?;
+        let block = locate_cell_block_at(plan, key, cell, block_index).map_err(|error| {
+            Error::InvalidDataset(format!(
+                "CSR mirrored block mismatch in dataset {} chunk {} at block {block_index}: {error}",
+                source.get(),
+                key.chunk
+            ))
+        })?;
+        Ok((block, plan.candidate_base))
     }
 
     fn load_missing_chunk(&mut self, cache_key: ChunkKey) -> Result<()> {
@@ -1833,7 +2023,8 @@ impl Builder {
             None => RowCursor::OnDemand,
         };
         for ordinal in 0..cell_count {
-            let index = self.request.rows[ordinal];
+            // SAFETY: `ordinal` is produced by the exact input-row arena bound.
+            let index = unsafe { *self.request.rows.get_unchecked(ordinal) };
             let resolved_row = match &mut resolved_rows {
                 RowCursor::General(rows) => rows.next().ok_or_else(|| {
                     Error::Invariant("resolved row arena is shorter than the request".into())
@@ -1844,7 +2035,7 @@ impl Builder {
                 } => self.resolve_validated_single_dense_row(index, *chunk_cells, *row_bytes)?,
                 RowCursor::OnDemand => self.resolve_row(index)?,
             };
-            let resolved = self.resolve_cell(ordinal, resolved_row, row_stride)?;
+            let resolved = self.resolve_cell(ordinal, index, resolved_row, row_stride)?;
             let raw_key = resolved.block_key;
             let (block_key, is_new) = remap.intern(raw_key, self.block_candidates.len())?;
             if is_new {
@@ -1926,7 +2117,7 @@ impl Builder {
     }
 
     fn compile_static_plan(
-        &self,
+        &mut self,
         cells: &[CompactCell],
         cell_blocks: &[usize],
         row_stride: usize,
@@ -1935,8 +2126,14 @@ impl Builder {
     ) -> Result<StaticPlanData> {
         let batch_count = cells.len().div_ceil(self.request.batch_size);
         let mut objects = Vec::<StaticCacheObject>::new();
-        let mut data_objects = vec![usize::MAX; self.block_candidates.len()];
-        let mut indices_objects = vec![usize::MAX; self.block_candidates.len()];
+        let object_capacity = self
+            .block_candidates
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| Error::ResourceLimit("cache object count overflow".into()))?;
+        objects.try_reserve_exact(object_capacity)?;
+        let mut data_objects = try_filled_vec(self.block_candidates.len(), usize::MAX)?;
+        let mut indices_objects = try_filled_vec(self.block_candidates.len(), usize::MAX)?;
         for (candidate_id, candidate) in self.block_candidates.iter().enumerate() {
             if let Some(block) = &candidate.data {
                 data_objects[candidate_id] = objects.len();
@@ -1954,26 +2151,144 @@ impl Builder {
             }
         }
 
-        let mut requirements = vec![Vec::<usize>::new(); batch_count];
-        for (ordinal, &candidate_id) in cell_blocks.iter().enumerate() {
-            let batch = ordinal / self.request.batch_size;
-            for object in [data_objects[candidate_id], indices_objects[candidate_id]] {
-                if object != usize::MAX {
-                    requirements[batch].push(object);
+        let mut requirements = Vec::<usize>::new();
+        let mut requirement_ranges = Vec::<Range<usize>>::new();
+        requirement_ranges.try_reserve_exact(batch_count)?;
+        let mut requirement_scratch = Vec::<usize>::new();
+        let maximum_batch_references = self
+            .request
+            .batch_size
+            .min(cell_blocks.len())
+            .checked_mul(2)
+            .ok_or_else(|| Error::ResourceLimit("batch reference count overflow".into()))?;
+        let maximum_unique_requirements = maximum_batch_references.min(objects.len()).min(
+            self.request
+                .config
+                .limits
+                .max_blocks_per_job
+                .saturating_add(1),
+        );
+        requirement_scratch.try_reserve_exact(maximum_unique_requirements)?;
+        let mut requirement_seen = try_filled_vec(objects.len(), 0u8)?;
+        let mut maximum_batch_decoded_bytes = 0usize;
+        for batch in 0..batch_count {
+            requirement_scratch.clear();
+            let row_start = batch * self.request.batch_size;
+            let row_end = (row_start + self.request.batch_size).min(cell_blocks.len());
+            for &candidate_id in &cell_blocks[row_start..row_end] {
+                // SAFETY: `cell_blocks` contains only IDs interned into the
+                // complete block-candidate arena used to size both maps.
+                let candidate_objects = unsafe {
+                    [
+                        *data_objects.get_unchecked(candidate_id),
+                        *indices_objects.get_unchecked(candidate_id),
+                    ]
+                };
+                for object in candidate_objects {
+                    if object == usize::MAX {
+                        continue;
+                    }
+                    // SAFETY: non-sentinel object IDs were assigned while
+                    // appending to `objects`, which sized this marker arena.
+                    let seen = unsafe { requirement_seen.get_unchecked_mut(object) };
+                    if *seen == 0 {
+                        *seen = 1;
+                        requirement_scratch.push(object);
+                        if requirement_scratch.len() > self.request.config.limits.max_blocks_per_job
+                        {
+                            return Err(Error::ResourceLimit(format!(
+                                "batch cache working set has more than {} objects",
+                                self.request.config.limits.max_blocks_per_job
+                            )));
+                        }
+                    }
                 }
             }
-        }
-        for batch in &mut requirements {
-            batch.sort_unstable();
-            batch.dedup();
-            if batch.len() > self.request.config.limits.max_blocks_per_job {
+            let decoded_bytes = requirement_scratch
+                .iter()
+                .try_fold(0usize, |total, &object| {
+                    // SAFETY: scratch entries come exclusively from the
+                    // validated object IDs inserted in the loop above.
+                    unsafe { *requirement_seen.get_unchecked_mut(object) = 0 };
+                    total
+                        // SAFETY: the same object-domain proof covers this read.
+                        .checked_add(unsafe { objects.get_unchecked(object) }.block.decoded_len())
+                        .ok_or_else(|| {
+                            Error::ResourceLimit("batch decoded cache requirement overflow".into())
+                        })
+                })?;
+            if decoded_bytes > self.request.config.limits.max_decoded_bytes_per_job {
                 return Err(Error::ResourceLimit(format!(
-                    "batch cache working set has {} objects, limit is {}",
-                    batch.len(),
-                    self.request.config.limits.max_blocks_per_job
+                    "batch {batch} requires {decoded_bytes} decoded bytes, limit is {}",
+                    self.request.config.limits.max_decoded_bytes_per_job
                 )));
             }
+            maximum_batch_decoded_bytes = maximum_batch_decoded_bytes.max(decoded_bytes);
+            let start = requirements.len();
+            requirements.try_reserve(requirement_scratch.len())?;
+            requirements.extend_from_slice(&requirement_scratch);
+            requirement_ranges.push(start..requirements.len());
         }
+
+        let maximum_residencies = requirements.len();
+        let maximum_executable = maximum_residencies
+            .checked_add(cells.len())
+            .ok_or_else(|| Error::ResourceLimit("static task count overflow".into()))?;
+        let maximum_cell_dependencies = cells
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| Error::ResourceLimit("static dependency count overflow".into()))?;
+        let cost_aware_scratch_width =
+            if self.request.config.io_merge.policy == IoMergePolicy::CostAware {
+                size_of::<usize>() * 9 + size_of::<f64>() + size_of::<bool>()
+            } else {
+                0
+            };
+        let successor_scratch_width = if use_nested_buckets(maximum_residencies) {
+            size_of::<Vec<usize>>()
+        } else {
+            size_of::<usize>() * 2
+        };
+        let release_scratch_width = if use_nested_buckets(batch_count) {
+            (size_of::<Vec<usize>>() + size_of::<Range<usize>>()) * 2
+        } else {
+            (size_of::<Range<usize>>() + size_of::<usize>() * 2) * 2
+        };
+        self.check_compile_payload(
+            "static cache compiler",
+            checked_payload_bytes(&[
+                (cells.len(), size_of::<CompactCell>()),
+                (cell_blocks.len(), size_of::<usize>()),
+                (self.block_candidates.len(), size_of::<BlockCandidate>()),
+                (objects.len(), size_of::<StaticCacheObject>()),
+                (data_objects.len(), size_of::<usize>()),
+                (indices_objects.len(), size_of::<usize>()),
+                (requirements.len(), size_of::<usize>()),
+                (requirement_ranges.len(), size_of::<Range<usize>>()),
+                (requirement_scratch.capacity(), size_of::<usize>()),
+                (requirement_seen.len(), size_of::<u8>()),
+                (objects.len(), size_of::<Option<usize>>()),
+                (objects.len(), size_of::<u64>()),
+                (maximum_residencies, size_of::<StaticResidency>()),
+                (requirements.len(), size_of::<usize>()),
+                (maximum_residencies, size_of::<usize>()),
+                (maximum_residencies, size_of::<IoDecodeLoadTask>()),
+                (maximum_residencies, size_of::<DecodeOp>()),
+                (maximum_residencies, size_of::<usize>()),
+                (maximum_residencies, cost_aware_scratch_width),
+                (cells.len(), size_of::<CsrScatterTask>()),
+                (cells.len(), size_of::<[usize; 2]>()),
+                (batch_count, size_of::<StaticJob>()),
+                (maximum_executable, size_of::<u32>()),
+                (maximum_residencies, successor_scratch_width),
+                (maximum_cell_dependencies, size_of::<usize>()),
+                (maximum_executable, size_of::<usize>()),
+                (batch_count, release_scratch_width),
+                (maximum_residencies, size_of::<FreeExtent>() * 3),
+                (1, self.chunk_metadata_bytes),
+                (1, self.retained_whole_key_bytes),
+            ])?,
+        )?;
 
         let capacity = self.request.config.cache_capacity_bytes;
         let alignment = self.request.config.cache_alignment;
@@ -1981,10 +2296,10 @@ impl Builder {
             capacity,
             self.request.config.cache_fragmentation_slack_bytes,
         );
-        let mut resident = vec![None::<usize>; objects.len()];
-        let mut generations = vec![0u64; objects.len()];
+        let mut resident = try_filled_vec(objects.len(), None::<usize>)?;
+        let mut generations = try_filled_vec(objects.len(), 0u64)?;
         let mut residencies = Vec::<StaticResidency>::new();
-        let mut bindings = vec![Vec::<(usize, usize)>::new(); batch_count];
+        let mut bindings = try_filled_vec(requirements.len(), usize::MAX)?;
         let mut next_batch = 0usize;
         let mut cache_hits = 0usize;
         let mut cache_misses = 0usize;
@@ -1992,20 +2307,19 @@ impl Builder {
         let mut fragmentation_stalls = 0usize;
         let mut alignment_loss = 0usize;
         let mut horizon_max = 0usize;
-        let mut missing = Vec::<usize>::new();
+        let mut missing = Vec::<(usize, usize)>::new();
 
         for current_batch in 0..batch_count {
             loop {
                 if next_batch >= batch_count {
                     break;
                 }
-                for &object in &requirements[next_batch] {
-                    if bindings[next_batch]
-                        .binary_search_by_key(&object, |(bound, _)| *bound)
-                        .is_ok()
-                    {
+                let requirement_range = requirement_ranges[next_batch].clone();
+                for position in requirement_range.clone() {
+                    if bindings[position] != usize::MAX {
                         continue;
                     }
+                    let object = requirements[position];
                     if let Some(residency) = resident[object] {
                         residencies[residency].compile_refcount = residencies[residency]
                             .compile_refcount
@@ -2013,26 +2327,27 @@ impl Builder {
                             .ok_or_else(|| {
                                 Error::ResourceLimit("compile cache refcount overflow".into())
                             })?;
-                        bindings[next_batch].push((object, residency));
+                        bindings[position] = residency;
                         cache_hits = cache_hits.saturating_add(1);
                     }
                 }
-                bindings[next_batch].sort_unstable_by_key(|(object, _)| *object);
 
                 missing.clear();
-                missing.extend(requirements[next_batch].iter().copied().filter(|object| {
-                    bindings[next_batch]
-                        .binary_search_by_key(object, |(bound, _)| *bound)
-                        .is_err()
-                }));
-                missing.sort_unstable_by_key(|&object| {
+                missing.try_reserve(requirement_range.len())?;
+                missing.extend(
+                    requirement_range
+                        .clone()
+                        .filter(|&position| bindings[position] == usize::MAX)
+                        .map(|position| (requirements[position], position)),
+                );
+                missing.sort_unstable_by_key(|&(object, _)| {
                     (
                         std::cmp::Reverse(objects[object].block.decoded_len()),
                         object,
                     )
                 });
                 let mut made_progress = false;
-                for &object in &missing {
+                for &(object, position) in &missing {
                     let decoded_len = objects[object].block.decoded_len();
                     let allocation_len = align_up(decoded_len, alignment)?;
                     if allocation_len > capacity {
@@ -2053,6 +2368,7 @@ impl Builder {
                         .checked_add(1)
                         .ok_or_else(|| Error::ResourceLimit("cache generation overflow".into()))?;
                     let residency = residencies.len();
+                    residencies.try_reserve(1)?;
                     residencies.push(StaticResidency {
                         object,
                         cache: CacheSlice {
@@ -2066,13 +2382,19 @@ impl Builder {
                         compile_refcount: 1,
                     });
                     resident[object] = Some(residency);
-                    bindings[next_batch].push((object, residency));
+                    bindings[position] = residency;
                     cache_misses = cache_misses.saturating_add(1);
-                    alignment_loss = alignment_loss.saturating_add(allocation_len - decoded_len);
+                    alignment_loss = alignment_loss
+                        .checked_add(allocation_len - decoded_len)
+                        .ok_or_else(|| {
+                            Error::ResourceLimit("cache alignment loss overflow".into())
+                        })?;
                     made_progress = true;
                 }
-                bindings[next_batch].sort_unstable_by_key(|(object, _)| *object);
-                if bindings[next_batch].len() == requirements[next_batch].len() {
+                if bindings[requirement_range.clone()]
+                    .iter()
+                    .all(|&residency| residency != usize::MAX)
+                {
                     next_batch += 1;
                     horizon_max = horizon_max.max(next_batch.saturating_sub(current_batch));
                     continue;
@@ -2082,26 +2404,24 @@ impl Builder {
                 }
             }
 
-            if bindings[current_batch].len() != requirements[current_batch].len() {
-                let required =
-                    requirements[current_batch]
-                        .iter()
-                        .try_fold(0usize, |total, &object| {
-                            total
-                                .checked_add(align_up(
-                                    objects[object].block.decoded_len(),
-                                    alignment,
-                                )?)
-                                .ok_or_else(|| {
-                                    Error::ResourceLimit("batch cache working set overflow".into())
-                                })
-                        })?;
+            let current_range = requirement_ranges[current_batch].clone();
+            if bindings[current_range.clone()].contains(&usize::MAX) {
+                let required = requirements[current_range.clone()].iter().try_fold(
+                    0usize,
+                    |total, &object| {
+                        total
+                            .checked_add(align_up(objects[object].block.decoded_len(), alignment)?)
+                            .ok_or_else(|| {
+                                Error::ResourceLimit("batch cache working set overflow".into())
+                            })
+                    },
+                )?;
                 return Err(Error::ResourceLimit(format!(
                     "batch {current_batch} requires {required} aligned decoded-cache bytes, cache capacity is {capacity}; largest free extent is {}",
                     allocator.largest_free()
                 )));
             }
-            for &(_, residency_id) in &bindings[current_batch] {
+            for &residency_id in &bindings[current_range] {
                 let residency = &mut residencies[residency_id];
                 residency.compile_refcount = residency
                     .compile_refcount
@@ -2128,8 +2448,15 @@ impl Builder {
                 "static cache simulation did not drain every batch reference".into(),
             ));
         }
+        if resident.iter().any(Option::is_some) {
+            return Err(Error::Invariant(
+                "static cache simulation retained a resident object".into(),
+            ));
+        }
 
-        let mut residency_order = (0..residencies.len()).collect::<Vec<_>>();
+        let mut residency_order = Vec::new();
+        residency_order.try_reserve_exact(residencies.len())?;
+        residency_order.extend(0..residencies.len());
         residency_order.sort_unstable_by_key(|&id| {
             let residency = &residencies[id];
             let object = &objects[residency.object];
@@ -2142,12 +2469,15 @@ impl Builder {
                 id,
             )
         });
-        let mut io_tasks = Vec::with_capacity(residencies.len());
-        let mut decode_ops = Vec::with_capacity(residencies.len());
+        let mut io_tasks = Vec::new();
+        io_tasks.try_reserve_exact(residencies.len())?;
+        let mut decode_ops = Vec::new();
+        decode_ops.try_reserve_exact(residencies.len())?;
         let mut initialize_count = 0usize;
         let mut initialize_decoded = 0usize;
         let mut initialize_io = 0usize;
-        let mut load_owner = Vec::with_capacity(residencies.len());
+        let mut load_owner = Vec::new();
+        load_owner.try_reserve_exact(residencies.len())?;
         let mut data_io_ops = 0u64;
         let mut indices_io_ops = 0u64;
         let mut predicted_bytes = 0u64;
@@ -2156,6 +2486,9 @@ impl Builder {
         let mut maximum_io_decoded = 0usize;
         let merge = &self.request.config.io_merge;
         let mut residency_cursor = 0usize;
+        let mut active_bucket_end = 0usize;
+        let mut cost_group_ends = Vec::<usize>::new();
+        let mut cost_group_cursor = 0usize;
         while residency_cursor < residency_order.len() {
             let first_id = residency_order[residency_cursor];
             let first = &residencies[first_id];
@@ -2180,19 +2513,129 @@ impl Builder {
                     merge.max_encoded_staging_bytes_per_task
                 )));
             }
-            let mut bucket_end = residency_cursor + 1;
-            while bucket_end < residency_order.len() {
-                let candidate = &residencies[residency_order[bucket_end]];
-                let object = &objects[candidate.object];
-                if object.side != first_object.side
-                    || object.block.source != first_object.block.source
-                    || candidate.available_after_batch != first.available_after_batch
-                    || candidate.earliest_consumer_batch != first.earliest_consumer_batch
-                {
-                    break;
+            if residency_cursor >= active_bucket_end {
+                active_bucket_end = residency_cursor + 1;
+                while active_bucket_end < residency_order.len() {
+                    let candidate = &residencies[residency_order[active_bucket_end]];
+                    let object = &objects[candidate.object];
+                    if object.side != first_object.side
+                        || object.block.source != first_object.block.source
+                        || candidate.available_after_batch != first.available_after_batch
+                        || candidate.earliest_consumer_batch != first.earliest_consumer_batch
+                    {
+                        break;
+                    }
+                    active_bucket_end += 1;
                 }
-                bucket_end += 1;
+                cost_group_ends.clear();
+                cost_group_cursor = 0;
+                if merge.policy == IoMergePolicy::CostAware && whole_key_len.is_none() {
+                    let base_ends = cost_aware_group_ends(
+                        &residency_order[residency_cursor..active_bucket_end],
+                        &residencies,
+                        &objects,
+                        merge,
+                    )?;
+                    let bucket_len = active_bucket_end - residency_cursor;
+                    let parallelism_hint = if first.available_after_batch.is_none() {
+                        merge.initialize_parallelism_hint
+                    } else {
+                        merge.regular_io_parallelism_hint
+                    };
+                    let task_floor = parallelism_hint
+                        .saturating_mul(merge.min_tasks_per_worker)
+                        .min(bucket_len);
+                    let mut additional_per_group = try_filled_vec(base_ends.len(), 0usize)?;
+                    let mut candidates = Vec::<(std::cmp::Reverse<usize>, usize)>::new();
+                    candidates.try_reserve_exact(base_ends.len())?;
+                    let mut group_start = 0usize;
+                    for (group, &group_end) in base_ends.iter().enumerate() {
+                        let additional = group_end
+                            .checked_sub(group_start)
+                            .and_then(|length| length.checked_sub(1))
+                            .ok_or_else(|| {
+                                Error::Invariant("CostAware partition is not monotonic".into())
+                            })?;
+                        if additional != 0 {
+                            candidates.push((std::cmp::Reverse(additional), group));
+                        }
+                        group_start = group_end;
+                    }
+                    candidates.sort_unstable();
+                    let needed = task_floor.saturating_sub(base_ends.len());
+                    let mut additional_tasks = 0usize;
+                    for (std::cmp::Reverse(additional), group) in candidates {
+                        if additional_tasks >= needed {
+                            break;
+                        }
+                        let selected = additional.min(needed - additional_tasks);
+                        additional_per_group[group] = selected;
+                        additional_tasks =
+                            additional_tasks.checked_add(selected).ok_or_else(|| {
+                                Error::ResourceLimit("CostAware task floor overflow".into())
+                            })?;
+                    }
+                    if additional_tasks < needed {
+                        return Err(Error::Invariant(
+                            "CostAware partition cannot satisfy its task floor".into(),
+                        ));
+                    }
+                    // A hard-limit fallback may expand any selected group into
+                    // individual blocks, so reserve the complete safe upper
+                    // bound before pushing planned endpoints.
+                    cost_group_ends.try_reserve_exact(bucket_len)?;
+                    let mut group_start = 0usize;
+                    for (group, &group_end) in base_ends.iter().enumerate() {
+                        let group_len = group_end.checked_sub(group_start).ok_or_else(|| {
+                            Error::Invariant("CostAware partition is not monotonic".into())
+                        })?;
+                        let parts =
+                            additional_per_group[group].checked_add(1).ok_or_else(|| {
+                                Error::ResourceLimit("CostAware task count overflow".into())
+                            })?;
+                        let base_len = group_len / parts;
+                        let larger_parts = group_len % parts;
+                        let mut split_is_feasible = true;
+                        let mut end = group_start;
+                        for part in 0..parts {
+                            let start = end;
+                            end = end
+                                .checked_add(base_len + usize::from(part < larger_parts))
+                                .ok_or_else(|| {
+                                    Error::ResourceLimit("CostAware group end overflow".into())
+                                })?;
+                            split_is_feasible &= cost_aware_group_is_feasible(
+                                &residency_order[residency_cursor + start..residency_cursor + end],
+                                &residencies,
+                                &objects,
+                                merge,
+                            )?;
+                        }
+                        if end != group_end {
+                            return Err(Error::Invariant(
+                                "CostAware split did not cover its source group".into(),
+                            ));
+                        }
+                        if split_is_feasible {
+                            let mut end = group_start;
+                            for part in 0..parts {
+                                end = end
+                                    .checked_add(base_len + usize::from(part < larger_parts))
+                                    .ok_or_else(|| {
+                                        Error::ResourceLimit("CostAware group end overflow".into())
+                                    })?;
+                                cost_group_ends.push(residency_cursor + end);
+                            }
+                        } else {
+                            for end in group_start + 1..=group_end {
+                                cost_group_ends.push(residency_cursor + end);
+                            }
+                        }
+                        group_start = group_end;
+                    }
+                }
             }
+            let bucket_end = active_bucket_end;
             let parallelism_hint = if first.available_after_batch.is_none() {
                 merge.initialize_parallelism_hint
             } else {
@@ -2207,32 +2650,39 @@ impl Builder {
                 _ if whole_key_len.is_some() => bucket_end,
                 IoMergePolicy::Adjacent => floor_limited_end,
                 IoMergePolicy::CostAware => {
-                    residency_cursor
-                        + cost_aware_first_group_end(
-                            &residency_order[residency_cursor..bucket_end],
-                            &residencies,
-                            &objects,
-                            merge,
-                        )?
+                    let end = *cost_group_ends.get(cost_group_cursor).ok_or_else(|| {
+                        Error::Invariant("CostAware I/O partition was exhausted early".into())
+                    })?;
+                    cost_group_cursor += 1;
+                    end
                 }
             };
-            let maximum_group_end =
-                if whole_key_len.is_some() && !matches!(merge.policy, IoMergePolicy::Off) {
-                    policy_group_end
-                } else {
-                    policy_group_end.min(floor_limited_end)
-                };
+            let maximum_group_end = if (whole_key_len.is_some()
+                && !matches!(merge.policy, IoMergePolicy::Off))
+                || (whole_key_len.is_none() && merge.policy == IoMergePolicy::CostAware)
+            {
+                policy_group_end
+            } else {
+                policy_group_end.min(floor_limited_end)
+            };
             let mut group_end = residency_cursor + 1;
             while group_end < maximum_group_end {
                 let candidate = &residencies[residency_order[group_end]];
                 let object = &objects[candidate.object];
                 let gap = object.block.encoded_range.start.saturating_sub(read_end);
                 let combined_end = read_end.max(object.block.encoded_range.end);
-                let combined_len =
-                    usize::try_from(combined_end.saturating_sub(read_start)).unwrap_or(usize::MAX);
+                let combined_len = combined_end
+                    .checked_sub(read_start)
+                    .and_then(|len| usize::try_from(len).ok())
+                    .unwrap_or(usize::MAX);
                 let block_encoded = range_len_u64(&object.block.encoded_range)?;
-                let next_payload = payload_bytes.saturating_add(block_encoded);
-                let next_decoded = decoded_bytes.saturating_add(object.block.decoded_len());
+                let Some(next_payload) = payload_bytes.checked_add(block_encoded) else {
+                    break;
+                };
+                let Some(next_decoded) = decoded_bytes.checked_add(object.block.decoded_len())
+                else {
+                    break;
+                };
                 let next_ops = group_end + 1 - residency_cursor;
                 let amplification = if next_payload == 0 {
                     1.0
@@ -2282,8 +2732,13 @@ impl Builder {
                 let object = &objects[residency.object];
                 let block_len = range_len_u64(&object.block.encoded_range)?;
                 decode_ops.push(DecodeOp {
-                    encoded_offset: usize::try_from(object.block.encoded_range.start - read_start)
-                        .map_err(|_| {
+                    encoded_offset: object
+                        .block
+                        .encoded_range
+                        .start
+                        .checked_sub(read_start)
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .ok_or_else(|| {
                             Error::ResourceLimit("coalesced block offset exceeds usize".into())
                         })?,
                     encoded_len: block_len,
@@ -2292,7 +2747,11 @@ impl Builder {
                     ready_node: residency_id,
                 });
                 if first.available_after_batch.is_none() {
-                    initialize_decoded = initialize_decoded.saturating_add(residency.cache.len);
+                    initialize_decoded = initialize_decoded
+                        .checked_add(residency.cache.len)
+                        .ok_or_else(|| {
+                            Error::ResourceLimit("InitializeJob decoded bytes overflow".into())
+                        })?;
                 }
             }
             io_tasks.push(IoDecodeLoadTask {
@@ -2305,27 +2764,77 @@ impl Builder {
             });
             load_owner.push(first.earliest_consumer_batch);
             if first.available_after_batch.is_none() {
-                initialize_count += 1;
-                initialize_io = initialize_io.saturating_add(encoded_len);
+                initialize_count = initialize_count.checked_add(1).ok_or_else(|| {
+                    Error::ResourceLimit("InitializeJob task count overflow".into())
+                })?;
+                initialize_io = initialize_io.checked_add(encoded_len).ok_or_else(|| {
+                    Error::ResourceLimit("InitializeJob I/O bytes overflow".into())
+                })?;
             }
             match first_object.side {
-                Side::Data => data_io_ops = data_io_ops.saturating_add(1),
-                Side::Indices => indices_io_ops = indices_io_ops.saturating_add(1),
+                Side::Data => {
+                    data_io_ops = data_io_ops.checked_add(1).ok_or_else(|| {
+                        Error::ResourceLimit("data I/O operation count overflow".into())
+                    })?;
+                }
+                Side::Indices => {
+                    indices_io_ops = indices_io_ops.checked_add(1).ok_or_else(|| {
+                        Error::ResourceLimit("indices I/O operation count overflow".into())
+                    })?;
+                }
             }
-            predicted_bytes = predicted_bytes.saturating_add(encoded_len as u64);
-            fusion_payload_bytes = fusion_payload_bytes.saturating_add(payload_bytes as u64);
+            predicted_bytes =
+                predicted_bytes
+                    .checked_add(u64::try_from(encoded_len).map_err(|_| {
+                        Error::ResourceLimit("predicted I/O bytes exceed u64".into())
+                    })?)
+                    .ok_or_else(|| Error::ResourceLimit("predicted I/O bytes overflow".into()))?;
+            fusion_payload_bytes =
+                fusion_payload_bytes
+                    .checked_add(u64::try_from(payload_bytes).map_err(|_| {
+                        Error::ResourceLimit("I/O fusion payload exceeds u64".into())
+                    })?)
+                    .ok_or_else(|| Error::ResourceLimit("I/O fusion payload overflow".into()))?;
             maximum_decode_ops = maximum_decode_ops.max(group_end - residency_cursor);
             maximum_io_decoded = maximum_io_decoded.max(decoded_bytes);
             residency_cursor = group_end;
         }
 
+        let csr_task_capacity = cell_blocks.iter().try_fold(0usize, |count, &candidate| {
+            let is_csr = self
+                .block_candidates
+                .get(candidate)
+                .ok_or_else(|| Error::Invariant("cell block candidate is missing".into()))?
+                .indices
+                .is_some();
+            count
+                .checked_add(usize::from(is_csr))
+                .ok_or_else(|| Error::ResourceLimit("CSR task count overflow".into()))
+        })?;
+        let dense_task_capacity = cells
+            .len()
+            .checked_sub(csr_task_capacity)
+            .ok_or_else(|| Error::Invariant("CSR task count exceeds cell count".into()))?;
         let mut dense_tasks = Vec::<DenseScatterTask>::new();
+        dense_tasks.try_reserve_exact(dense_task_capacity)?;
         let mut csr_tasks = Vec::<CsrScatterTask>::new();
+        csr_tasks.try_reserve_exact(csr_task_capacity)?;
         let mut dense_loads = Vec::<Option<usize>>::new();
+        dense_loads.try_reserve_exact(dense_task_capacity)?;
         let mut csr_loads = Vec::<[usize; 2]>::new();
-        let mut jobs = Vec::<StaticJob>::with_capacity(batch_count);
+        csr_loads.try_reserve_exact(csr_task_capacity)?;
+        let mut jobs = Vec::<StaticJob>::new();
+        jobs.try_reserve_exact(batch_count)?;
         let mut io_cursor = initialize_count;
-        for (batch, batch_bindings) in bindings.iter().enumerate() {
+        for (batch, requirement_range) in requirement_ranges.iter().enumerate() {
+            let requirement_range = requirement_range.clone();
+            let batch_requirements = &requirements[requirement_range.clone()];
+            let batch_bindings = &bindings[requirement_range];
+            for (&object, &residency) in batch_requirements.iter().zip(batch_bindings) {
+                // SAFETY: requirements contain compiler-created object IDs and
+                // `resident` was sized from the complete object arena.
+                unsafe { *resident.get_unchecked_mut(object) = Some(residency) };
+            }
             let io_start = io_cursor;
             while io_cursor < io_tasks.len() && load_owner[io_cursor] == batch {
                 io_cursor += 1;
@@ -2342,34 +2851,44 @@ impl Builder {
                 )));
             }
             for ordinal in row_start..row_end {
-                let candidate_id = cell_blocks[ordinal];
-                let candidate = &self.block_candidates[candidate_id];
-                let compact = &cells[ordinal];
+                // SAFETY: the row range is clipped to `cells.len()`, and the
+                // parallel cell-block arena has exactly the same length.
+                let candidate_id = unsafe { *cell_blocks.get_unchecked(ordinal) };
+                // SAFETY: candidate IDs were interned against this frozen arena.
+                let candidate = unsafe { self.block_candidates.get_unchecked(candidate_id) };
+                // SAFETY: `ordinal < row_end <= cells.len()`.
+                let compact = unsafe { cells.get_unchecked(ordinal) };
                 let output = OutputSlice {
                     ring_offset: compact.output_slot.row_offset(),
                     len: row_stride,
                     generation: batch as u64,
                 };
                 let cell = CellTask::new(
-                    OutputSlot::new(output.ring_offset, false).ok_or_else(|| {
-                        Error::Invariant("static output offset is not aligned".into())
-                    })?,
+                    compact.output_slot,
                     compact.data_range(),
                     compact.indices_range(),
                 )
                 .ok_or_else(|| Error::ResourceLimit("static cell task range exceeds u32".into()))?;
                 let lookup = |object: usize| -> Result<(CacheSlice, usize)> {
-                    let binding = batch_bindings
-                        .binary_search_by_key(&object, |(candidate, _)| *candidate)
-                        .ok()
-                        .and_then(|index| batch_bindings.get(index))
+                    // SAFETY: data/indices object IDs were created from this
+                    // object arena. The batch requirement pass installed every
+                    // object needed by the current cell before task lowering.
+                    let residency = unsafe { *resident.get_unchecked(object) }
                         .ok_or_else(|| Error::Invariant("batch cache binding is missing".into()))?;
-                    let residency = binding.1;
-                    Ok((residencies[residency].cache, residency))
+                    // SAFETY: batch bindings store only IDs returned when a
+                    // residency was appended to this frozen arena.
+                    Ok((
+                        unsafe { residencies.get_unchecked(residency).cache },
+                        residency,
+                    ))
                 };
                 if candidate.indices.is_some() {
-                    let (data, data_load) = lookup(data_objects[candidate_id])?;
-                    let (indices, indices_load) = lookup(indices_objects[candidate_id])?;
+                    // SAFETY: the candidate-domain proof above covers both maps.
+                    let data_object = unsafe { *data_objects.get_unchecked(candidate_id) };
+                    // SAFETY: a CSR candidate always installed an indices object.
+                    let indices_object = unsafe { *indices_objects.get_unchecked(candidate_id) };
+                    let (data, data_load) = lookup(data_object)?;
+                    let (indices, indices_load) = lookup(indices_object)?;
                     csr_tasks.push(CsrScatterTask {
                         data,
                         indices,
@@ -2381,7 +2900,9 @@ impl Builder {
                     csr_loads.push([data_load, indices_load]);
                 } else {
                     let (data, load) = if candidate.data.is_some() {
-                        let (slice, load) = lookup(data_objects[candidate_id])?;
+                        // SAFETY: a present data block installed this candidate map entry.
+                        let data_object = unsafe { *data_objects.get_unchecked(candidate_id) };
+                        let (slice, load) = lookup(data_object)?;
                         (Some(slice), Some(load))
                     } else {
                         (None, None)
@@ -2409,6 +2930,11 @@ impl Builder {
                 output_generation: batch as u64,
                 completion_node: 0,
             });
+            for &object in batch_requirements {
+                // SAFETY: this is the same validated object slice installed at
+                // the start of the batch; clearing restores the simulation map.
+                unsafe { *resident.get_unchecked_mut(object) = None };
+            }
         }
         if io_cursor != io_tasks.len() {
             return Err(Error::Invariant(
@@ -2420,66 +2946,168 @@ impl Builder {
         let dense_base = load_count;
         let csr_base = dense_base + dense_tasks.len();
         let executable = csr_base + csr_tasks.len();
-        let mut dependency_counts = vec![0u32; executable];
-        let mut block_successor_lists = vec![Vec::<usize>::new(); residencies.len()];
-        let mut prefix_buckets = vec![Vec::<usize>::new(); batch_count];
-        let mut ring_buckets = vec![Vec::<usize>::new(); batch_count];
+        let mut dependency_counts = try_filled_vec(executable, 0u32)?;
+        let mut block_successor_lists = use_nested_buckets(residencies.len())
+            .then(|| try_filled_vec(residencies.len(), Vec::<usize>::new()))
+            .transpose()?;
+        let mut block_successor_counts = if block_successor_lists.is_none() {
+            try_filled_vec(residencies.len(), 0usize)?
+        } else {
+            Vec::new()
+        };
         for (load, task) in io_tasks.iter().enumerate() {
             if let Some(batch) = task.available_after_batch {
                 let batch = usize::try_from(batch)
                     .map_err(|_| Error::ResourceLimit("prefix batch exceeds usize".into()))?;
+                if batch >= batch_count {
+                    return Err(Error::Invariant(
+                        "prefix release batch is outside the plan".into(),
+                    ));
+                }
                 dependency_counts[load] = 1;
-                prefix_buckets[batch].push(load);
             }
         }
         for (task_id, load) in dense_loads.iter().enumerate() {
             let node = dense_base + task_id;
             if let Some(ready) = *load {
-                block_successor_lists[ready].push(node);
-                dependency_counts[node] = dependency_counts[node]
+                if let Some(lists) = block_successor_lists.as_mut() {
+                    // SAFETY: every `ready` value is a residency ID returned
+                    // by the static binding table used to size these lists.
+                    let list = unsafe { lists.get_unchecked_mut(ready) };
+                    list.try_reserve(1)?;
+                    list.push(node);
+                } else {
+                    // SAFETY: the flat count arena has the same residency domain.
+                    let successor_count =
+                        unsafe { block_successor_counts.get_unchecked_mut(ready) };
+                    *successor_count = successor_count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::ResourceLimit("successor count overflow".into()))?;
+                }
+                // SAFETY: `dense_base + task_id` is inside the dense segment
+                // used to size `dependency_counts`.
+                let dependency_count = unsafe { dependency_counts.get_unchecked_mut(node) };
+                *dependency_count = dependency_count
                     .checked_add(1)
                     .ok_or_else(|| Error::ResourceLimit("dependency count exceeds u32".into()))?;
             }
             let batch = dense_tasks[task_id].output.generation as usize;
             if batch >= self.ring_slots {
-                dependency_counts[node] = dependency_counts[node]
+                // SAFETY: the dense node proof above is independent of its
+                // cache-edge count.
+                let dependency_count = unsafe { dependency_counts.get_unchecked_mut(node) };
+                *dependency_count = dependency_count
                     .checked_add(1)
                     .ok_or_else(|| Error::ResourceLimit("dependency count exceeds u32".into()))?;
-                ring_buckets[batch - self.ring_slots].push(node);
             }
             dense_tasks[task_id].completion_node = node;
         }
         for (task_id, loads) in csr_loads.iter().enumerate() {
             let node = csr_base + task_id;
             for &ready in loads {
-                block_successor_lists[ready].push(node);
-                dependency_counts[node] = dependency_counts[node]
+                if let Some(lists) = block_successor_lists.as_mut() {
+                    // SAFETY: CSR load IDs come from the same residency binding
+                    // table used to size these successor lists.
+                    let list = unsafe { lists.get_unchecked_mut(ready) };
+                    list.try_reserve(1)?;
+                    list.push(node);
+                } else {
+                    // SAFETY: the flat count arena has the same residency domain.
+                    let successor_count =
+                        unsafe { block_successor_counts.get_unchecked_mut(ready) };
+                    *successor_count = successor_count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::ResourceLimit("successor count overflow".into()))?;
+                }
+                // SAFETY: `csr_base + task_id` is inside the CSR segment used
+                // to size `dependency_counts`.
+                let dependency_count = unsafe { dependency_counts.get_unchecked_mut(node) };
+                *dependency_count = dependency_count
                     .checked_add(1)
                     .ok_or_else(|| Error::ResourceLimit("dependency count exceeds u32".into()))?;
             }
             let batch = csr_tasks[task_id].output.generation as usize;
             if batch >= self.ring_slots {
-                dependency_counts[node] = dependency_counts[node]
+                // SAFETY: the CSR node proof above is independent of its
+                // cache-edge count.
+                let dependency_count = unsafe { dependency_counts.get_unchecked_mut(node) };
+                *dependency_count = dependency_count
                     .checked_add(1)
                     .ok_or_else(|| Error::ResourceLimit("dependency count exceeds u32".into()))?;
-                ring_buckets[batch - self.ring_slots].push(node);
             }
             csr_tasks[task_id].completion_node = node;
         }
         for (batch, job) in jobs.iter_mut().enumerate() {
             job.completion_node = executable + batch;
         }
-        let mut block_ready_ranges = Vec::with_capacity(block_successor_lists.len());
-        let mut block_ready_successors = Vec::new();
-        for list in &mut block_successor_lists {
-            list.sort_unstable();
-            list.dedup();
-            let start = block_ready_successors.len();
-            block_ready_successors.extend_from_slice(list);
-            block_ready_ranges.push(start..block_ready_successors.len());
-        }
-        let prefix_releases = flatten_release_buckets(prefix_buckets)?;
-        let ring_releases = flatten_release_buckets(ring_buckets)?;
+        let (block_ready_ranges, block_ready_successors) =
+            if let Some(lists) = block_successor_lists {
+                flatten_successor_lists(lists)?
+            } else {
+                let successor_count =
+                    block_successor_counts
+                        .iter()
+                        .try_fold(0usize, |total, &count| {
+                            total.checked_add(count).ok_or_else(|| {
+                                Error::ResourceLimit("block successor arena count overflow".into())
+                            })
+                        })?;
+                let mut ranges = Vec::new();
+                ranges.try_reserve_exact(block_successor_counts.len())?;
+                let mut successors = Vec::new();
+                successors.try_reserve_exact(successor_count)?;
+                successors.resize(successor_count, usize::MAX);
+                let mut cursors = Vec::new();
+                cursors.try_reserve_exact(block_successor_counts.len())?;
+                let mut successor_cursor = 0usize;
+                for &count in &block_successor_counts {
+                    let start = successor_cursor;
+                    successor_cursor = successor_cursor.checked_add(count).ok_or_else(|| {
+                        Error::ResourceLimit("block successor arena count overflow".into())
+                    })?;
+                    ranges.push(start..successor_cursor);
+                    cursors.push(start);
+                }
+                for (task_id, load) in dense_loads.iter().enumerate() {
+                    if let Some(ready) = *load {
+                        // SAFETY: the count pass reserved exactly one slot for
+                        // this repeated dense edge.
+                        let cursor = unsafe { cursors.get_unchecked_mut(ready) };
+                        // SAFETY: count and fill traverse identical load data.
+                        unsafe { *successors.get_unchecked_mut(*cursor) = dense_base + task_id };
+                        *cursor += 1;
+                    }
+                }
+                for (task_id, loads) in csr_loads.iter().enumerate() {
+                    let node = csr_base + task_id;
+                    for &ready in loads {
+                        // SAFETY: the count pass reserved one slot per CSR edge.
+                        let cursor = unsafe { cursors.get_unchecked_mut(ready) };
+                        // SAFETY: count and fill traverse identical load data.
+                        unsafe { *successors.get_unchecked_mut(*cursor) = node };
+                        *cursor += 1;
+                    }
+                }
+                if cursors
+                    .iter()
+                    .zip(&ranges)
+                    .any(|(cursor, range)| *cursor != range.end)
+                {
+                    return Err(Error::Invariant(
+                        "block successor CSR fill is incomplete".into(),
+                    ));
+                }
+                (ranges, successors)
+            };
+        let prefix_releases = build_prefix_release_plan(batch_count, &io_tasks)?;
+        let ring_releases = build_ring_release_plan(
+            batch_count,
+            self.ring_slots,
+            dense_base,
+            csr_base,
+            &dense_tasks,
+            &csr_tasks,
+        )?;
 
         let arena_bytes = checked_payload_bytes(&[
             (io_tasks.len(), size_of::<IoDecodeLoadTask>()),
@@ -2514,21 +3142,15 @@ impl Builder {
         stats.data_io_ops = data_io_ops;
         stats.indices_io_ops = indices_io_ops;
         stats.predicted_physical_bytes = predicted_bytes;
-        stats.gap_bytes = 0;
+        stats.gap_bytes = predicted_bytes
+            .checked_sub(fusion_payload_bytes)
+            .ok_or_else(|| Error::Invariant("I/O payload exceeds physical span".into()))?;
         stats.maximum_encoded_bytes_per_side = objects
             .iter()
             .map(|object| range_len_u64(&object.block.encoded_range).unwrap_or(usize::MAX))
             .max()
             .unwrap_or(0);
-        stats.maximum_decoded_bytes_per_job = requirements
-            .iter()
-            .map(|batch| {
-                batch.iter().fold(0usize, |total, object| {
-                    total.saturating_add(objects[*object].block.decoded_len())
-                })
-            })
-            .max()
-            .unwrap_or(0);
+        stats.maximum_decoded_bytes_per_job = maximum_batch_decoded_bytes;
         stats.output_ring_bytes = row_stride
             .checked_mul(self.request.batch_size)
             .and_then(|bytes| bytes.checked_mul(self.ring_slots))
@@ -2538,7 +3160,10 @@ impl Builder {
         stats.cache_alignment_loss_bytes = alignment_loss;
         stats.unique_cache_objects = objects.len();
         stats.residency_loads = residencies.len();
-        stats.residency_reloads = residencies.len().saturating_sub(objects.len());
+        stats.residency_reloads = residencies
+            .len()
+            .checked_sub(objects.len())
+            .ok_or_else(|| Error::Invariant("fewer residencies than cache objects".into()))?;
         stats.cache_reference_hits = cache_hits;
         stats.cache_reference_misses = cache_misses;
         stats.cache_capacity_stalls = capacity_stalls;
@@ -2550,7 +3175,13 @@ impl Builder {
         stats.dependency_edges = block_ready_successors.len();
         stats.independent_block_loads = residencies.len();
         stats.fused_io_tasks = io_tasks.len();
-        stats.predicted_io_ops_saved = residencies.len().saturating_sub(io_tasks.len());
+        stats.predicted_io_ops_saved =
+            residencies
+                .len()
+                .checked_sub(io_tasks.len())
+                .ok_or_else(|| {
+                    Error::Invariant("I/O fusion created more tasks than independent loads".into())
+                })?;
         stats.io_payload_bytes = fusion_payload_bytes;
         stats.io_span_bytes = predicted_bytes;
         stats.io_read_amplification = if fusion_payload_bytes == 0 {
@@ -2561,7 +3192,13 @@ impl Builder {
         stats.maximum_decode_ops_per_io_task = maximum_decode_ops;
         stats.maximum_decoded_bytes_per_io_task = maximum_io_decoded;
         stats.initialize_fused_io_tasks = initialize_count;
-        stats.regular_fused_io_tasks = io_tasks.len().saturating_sub(initialize_count);
+        stats.regular_fused_io_tasks =
+            io_tasks
+                .len()
+                .checked_sub(initialize_count)
+                .ok_or_else(|| {
+                    Error::Invariant("InitializeJob exceeds the fused I/O task arena".into())
+                })?;
         stats.arena_bytes = arena_bytes;
         let _ = row_bytes;
 
@@ -2589,7 +3226,80 @@ impl Builder {
     }
 }
 
-fn build_dense_map(
+pub(crate) fn build_default_ranges(
+    targets: Option<&[Option<usize>]>,
+    output_columns: usize,
+    target_size: usize,
+) -> Result<Arc<[OutputRange]>> {
+    let Some(targets) = targets else {
+        return Ok(Arc::from([]));
+    };
+    let mut mapped = Vec::new();
+    mapped.try_reserve_exact(targets.len().min(output_columns))?;
+    mapped.extend(targets.iter().copied().flatten());
+    mapped.sort_unstable();
+    if mapped.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Error::Invariant(
+            "feature map contains duplicate output targets".into(),
+        ));
+    }
+
+    let mut ranges = Vec::new();
+    ranges.try_reserve_exact(mapped.len().saturating_add(1))?;
+    let mut start = 0usize;
+    for target in mapped {
+        if target >= output_columns {
+            return Err(Error::Invariant(
+                "feature map target exceeds output columns".into(),
+            ));
+        }
+        if start < target {
+            ranges.push(output_range(start, target, target_size)?);
+        }
+        start = target
+            .checked_add(1)
+            .ok_or_else(|| Error::ResourceLimit("default output range overflow".into()))?;
+    }
+    if start < output_columns {
+        ranges.push(output_range(start, output_columns, target_size)?);
+    }
+    Ok(Arc::from(ranges))
+}
+
+pub(crate) fn choose_dense_whole_fill(
+    targets: Option<&[Option<usize>]>,
+    target_size: usize,
+    gap_count: usize,
+) -> Result<bool> {
+    let Some(targets) = targets else {
+        return Ok(false);
+    };
+    if gap_count == 0 {
+        return Ok(false);
+    }
+    let mapped = targets.iter().filter(|target| target.is_some()).count();
+    let mapped_bytes = mapped
+        .checked_mul(target_size)
+        .ok_or_else(|| Error::ResourceLimit("dense mapped byte count overflow".into()))?;
+    let minimum_savings = gap_count.saturating_mul(MIN_DENSE_OVERWRITE_BYTES_PER_GAP);
+    // Range-only initialization saves `mapped_bytes` of repeated stores, but
+    // each gap adds a scattered fill operation. Below this ratio one streaming
+    // fill is cheaper and also avoids retaining a fragmented range table.
+    Ok(mapped_bytes != 0 && mapped_bytes < minimum_savings)
+}
+
+fn output_range(start: usize, end: usize, target_size: usize) -> Result<OutputRange> {
+    let offset = start
+        .checked_mul(target_size)
+        .ok_or_else(|| Error::ResourceLimit("default output byte offset overflow".into()))?;
+    let len = end
+        .checked_sub(start)
+        .and_then(|elements| elements.checked_mul(target_size))
+        .ok_or_else(|| Error::ResourceLimit("default output byte length overflow".into()))?;
+    Ok(OutputRange { offset, len })
+}
+
+pub(crate) fn build_dense_map(
     targets: Vec<Option<usize>>,
     source_size: usize,
     target_size: usize,
@@ -2636,11 +3346,17 @@ fn build_dense_map(
             .checked_mul(target_size)
             .is_some_and(|bytes| bytes <= u32::MAX as usize);
     let entry_bytes = if packed {
-        mapped.saturating_mul(size_of::<u64>())
+        mapped
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| Error::ResourceLimit("dense map entry bytes overflow".into()))?
     } else {
-        mapped.saturating_mul(size_of::<DenseMapEntry>())
+        mapped
+            .checked_mul(size_of::<DenseMapEntry>())
+            .ok_or_else(|| Error::ResourceLimit("dense map entry bytes overflow".into()))?
     };
-    let run_bytes = run_count.saturating_mul(size_of::<DenseMapRun>());
+    let run_bytes = run_count
+        .checked_mul(size_of::<DenseMapRun>())
+        .ok_or_else(|| Error::ResourceLimit("dense map run bytes overflow".into()))?;
     if run_bytes < entry_bytes {
         let mut runs: Vec<DenseMapRun> = Vec::new();
         runs.try_reserve_exact(run_count)?;
@@ -2928,7 +3644,7 @@ fn load_chunk_detached(
                 declared_u64,
                 1,
                 declared,
-                usize::from(retained).saturating_mul(declared),
+                if retained { declared } else { 0 },
             )
         };
     if decoder.header().encoded_size() != declared {
@@ -3172,25 +3888,224 @@ fn checked_payload_bytes(parts: &[(usize, usize)]) -> Result<usize> {
     })
 }
 
-fn flatten_release_buckets(mut buckets: Vec<Vec<usize>>) -> Result<ReleasePlan> {
-    let count = buckets.iter().try_fold(0usize, |total, values| {
+fn flatten_successor_lists(mut lists: Vec<Vec<usize>>) -> Result<(Vec<Range<usize>>, Vec<usize>)> {
+    let count = lists.iter().try_fold(0usize, |total, list| {
         total
-            .checked_add(values.len())
-            .ok_or_else(|| Error::ResourceLimit("release plan entry count overflow".into()))
+            .checked_add(list.len())
+            .ok_or_else(|| Error::ResourceLimit("block successor arena count overflow".into()))
     })?;
-    let mut ranges = Vec::with_capacity(buckets.len());
-    let mut nodes = Vec::with_capacity(count);
-    for values in &mut buckets {
-        values.sort_unstable();
-        values.dedup();
-        let start = nodes.len();
-        nodes.append(values);
-        ranges.push(start..nodes.len());
+    let mut ranges = Vec::new();
+    ranges.try_reserve_exact(lists.len())?;
+    let mut successors = Vec::new();
+    successors.try_reserve_exact(count)?;
+    for list in &mut lists {
+        let start = successors.len();
+        successors.append(list);
+        ranges.push(start..successors.len());
+    }
+    Ok((ranges, successors))
+}
+
+struct ReleaseStorage {
+    ranges: Vec<Range<usize>>,
+    nodes: Vec<usize>,
+    cursors: Vec<usize>,
+}
+
+fn allocate_release_storage(counts: &[usize]) -> Result<ReleaseStorage> {
+    let mut ranges = Vec::new();
+    ranges.try_reserve_exact(counts.len())?;
+    let mut cursor = 0usize;
+    for &count in counts {
+        let start = cursor;
+        cursor = cursor
+            .checked_add(count)
+            .ok_or_else(|| Error::ResourceLimit("release plan entry count overflow".into()))?;
+        ranges.push(start..cursor);
+    }
+    let mut nodes = Vec::new();
+    nodes.try_reserve_exact(cursor)?;
+    nodes.resize(cursor, usize::MAX);
+    let mut cursors = Vec::new();
+    cursors.try_reserve_exact(ranges.len())?;
+    cursors.extend(ranges.iter().map(|range| range.start));
+    Ok(ReleaseStorage {
+        ranges,
+        nodes,
+        cursors,
+    })
+}
+
+fn finish_release_plan(
+    ranges: Vec<Range<usize>>,
+    nodes: Vec<usize>,
+    cursors: &[usize],
+) -> Result<ReleasePlan> {
+    if cursors
+        .iter()
+        .zip(&ranges)
+        .any(|(cursor, range)| *cursor != range.end)
+    {
+        return Err(Error::Invariant(
+            "release plan CSR fill is incomplete".into(),
+        ));
     }
     Ok(ReleasePlan {
         release_ranges: ranges.into_boxed_slice(),
         released_nodes: nodes.into_boxed_slice(),
     })
+}
+
+fn flatten_release_lists(lists: Vec<Vec<usize>>) -> Result<ReleasePlan> {
+    let (ranges, nodes) = flatten_successor_lists(lists)?;
+    Ok(ReleasePlan {
+        release_ranges: ranges.into_boxed_slice(),
+        released_nodes: nodes.into_boxed_slice(),
+    })
+}
+
+fn build_prefix_release_plan(
+    batch_count: usize,
+    io_tasks: &[IoDecodeLoadTask],
+) -> Result<ReleasePlan> {
+    if use_nested_buckets(batch_count) {
+        let mut buckets = try_filled_vec(batch_count, Vec::<usize>::new())?;
+        for (node, task) in io_tasks.iter().enumerate() {
+            let Some(batch) = task.available_after_batch else {
+                continue;
+            };
+            let batch = usize::try_from(batch)
+                .map_err(|_| Error::ResourceLimit("prefix batch exceeds usize".into()))?;
+            let bucket = buckets.get_mut(batch).ok_or_else(|| {
+                Error::Invariant("prefix release batch is outside the plan".into())
+            })?;
+            bucket.try_reserve(1)?;
+            bucket.push(node);
+        }
+        return flatten_release_lists(buckets);
+    }
+    let mut counts = try_filled_vec(batch_count, 0usize)?;
+    for task in io_tasks {
+        let Some(batch) = task.available_after_batch else {
+            continue;
+        };
+        let batch = usize::try_from(batch)
+            .map_err(|_| Error::ResourceLimit("prefix batch exceeds usize".into()))?;
+        let count = counts
+            .get_mut(batch)
+            .ok_or_else(|| Error::Invariant("prefix release batch is outside the plan".into()))?;
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::ResourceLimit("prefix release count overflow".into()))?;
+    }
+    let ReleaseStorage {
+        ranges,
+        mut nodes,
+        mut cursors,
+    } = allocate_release_storage(&counts)?;
+    for (node, task) in io_tasks.iter().enumerate() {
+        let Some(batch) = task.available_after_batch else {
+            continue;
+        };
+        let batch = usize::try_from(batch)
+            .map_err(|_| Error::ResourceLimit("prefix batch exceeds usize".into()))?;
+        // SAFETY: the count pass validated every batch and reserved exactly
+        // one destination for this repeated I/O task.
+        let destination = unsafe { cursors.get_unchecked_mut(batch) };
+        // SAFETY: count and fill traverse the identical immutable task arena.
+        unsafe { *nodes.get_unchecked_mut(*destination) = node };
+        *destination += 1;
+    }
+    finish_release_plan(ranges, nodes, &cursors)
+}
+
+fn build_ring_release_plan(
+    batch_count: usize,
+    ring_slots: usize,
+    dense_base: usize,
+    csr_base: usize,
+    dense_tasks: &[DenseScatterTask],
+    csr_tasks: &[CsrScatterTask],
+) -> Result<ReleasePlan> {
+    if use_nested_buckets(batch_count) {
+        let mut buckets = try_filled_vec(batch_count, Vec::<usize>::new())?;
+        for (task_id, task) in dense_tasks.iter().enumerate() {
+            let batch = usize::try_from(task.output.generation)
+                .map_err(|_| Error::ResourceLimit("dense ring batch exceeds usize".into()))?;
+            if batch >= ring_slots {
+                let release = batch - ring_slots;
+                let bucket = buckets.get_mut(release).ok_or_else(|| {
+                    Error::Invariant("ring release batch is outside the plan".into())
+                })?;
+                bucket.try_reserve(1)?;
+                bucket.push(dense_base + task_id);
+            }
+        }
+        for (task_id, task) in csr_tasks.iter().enumerate() {
+            let batch = usize::try_from(task.output.generation)
+                .map_err(|_| Error::ResourceLimit("CSR ring batch exceeds usize".into()))?;
+            if batch >= ring_slots {
+                let release = batch - ring_slots;
+                let bucket = buckets.get_mut(release).ok_or_else(|| {
+                    Error::Invariant("ring release batch is outside the plan".into())
+                })?;
+                bucket.try_reserve(1)?;
+                bucket.push(csr_base + task_id);
+            }
+        }
+        return flatten_release_lists(buckets);
+    }
+    let mut counts = try_filled_vec(batch_count, 0usize)?;
+    for batch in dense_tasks
+        .iter()
+        .map(|task| task.output.generation)
+        .chain(csr_tasks.iter().map(|task| task.output.generation))
+    {
+        let batch = usize::try_from(batch)
+            .map_err(|_| Error::ResourceLimit("ring batch exceeds usize".into()))?;
+        if batch < ring_slots {
+            continue;
+        }
+        let release = batch - ring_slots;
+        let count = counts
+            .get_mut(release)
+            .ok_or_else(|| Error::Invariant("ring release batch is outside the plan".into()))?;
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::ResourceLimit("ring release count overflow".into()))?;
+    }
+    let ReleaseStorage {
+        ranges,
+        mut nodes,
+        mut cursors,
+    } = allocate_release_storage(&counts)?;
+    for (task_id, task) in dense_tasks.iter().enumerate() {
+        let batch = usize::try_from(task.output.generation)
+            .map_err(|_| Error::ResourceLimit("dense ring batch exceeds usize".into()))?;
+        if batch >= ring_slots {
+            let release = batch - ring_slots;
+            // SAFETY: the count pass validated this release and reserved one
+            // destination for the same dense task.
+            let destination = unsafe { cursors.get_unchecked_mut(release) };
+            // SAFETY: both passes traverse the same dense task arena.
+            unsafe { *nodes.get_unchecked_mut(*destination) = dense_base + task_id };
+            *destination += 1;
+        }
+    }
+    for (task_id, task) in csr_tasks.iter().enumerate() {
+        let batch = usize::try_from(task.output.generation)
+            .map_err(|_| Error::ResourceLimit("CSR ring batch exceeds usize".into()))?;
+        if batch >= ring_slots {
+            let release = batch - ring_slots;
+            // SAFETY: the count pass validated this release and reserved one
+            // destination for the same CSR task.
+            let destination = unsafe { cursors.get_unchecked_mut(release) };
+            // SAFETY: both passes traverse the same CSR task arena.
+            unsafe { *nodes.get_unchecked_mut(*destination) = csr_base + task_id };
+            *destination += 1;
+        }
+    }
+    finish_release_plan(ranges, nodes, &cursors)
 }
 
 fn chunk_metadata_charge(
@@ -3219,7 +4134,30 @@ fn chunk_metadata_charge(
 
 #[cfg(test)]
 mod required_chunk_marker_tests {
-    use super::{required_chunk_is_set, set_required_chunk};
+    use super::{required_chunk_is_set, set_required_chunk, CandidateRemap, ExtentAllocator};
+
+    #[test]
+    fn extent_allocator_tracks_free_bytes_across_split_and_merge() {
+        let mut allocator = ExtentAllocator::new(1024, 0);
+        let first = allocator.allocate(256).unwrap();
+        let second = allocator.allocate(128).unwrap();
+        assert_eq!(allocator.total_free(), 640);
+        allocator.release(first.offset, first.len, 0);
+        assert_eq!(allocator.total_free(), 896);
+        allocator.release(second.offset, second.len, 1);
+        assert_eq!(allocator.total_free(), 1024);
+        assert_eq!(allocator.largest_free(), 1024);
+    }
+
+    #[test]
+    fn candidate_remap_promotes_sparse_raw_ids_without_dense_growth() {
+        let mut remap = CandidateRemap::new(0, 1).unwrap();
+        assert_eq!(remap.intern(7, 0).unwrap(), (0, true));
+        assert_eq!(remap.intern(1_000_000, 1).unwrap(), (1, true));
+        assert_eq!(remap.intern(7, 2).unwrap(), (0, false));
+        assert_eq!(remap.intern(1_000_000, 2).unwrap(), (1, false));
+        assert!(matches!(remap, CandidateRemap::Sparse(_)));
+    }
 
     #[test]
     fn markers_cover_word_boundaries() {

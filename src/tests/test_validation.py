@@ -8,6 +8,14 @@ import pytest
 import scdata.load as sc_load
 
 
+def test_default_worker_count_uses_process_affinity(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scdata.load._config as config
+
+    monkeypatch.setattr(config.os, "sched_getaffinity", lambda _pid: {2, 4, 6})
+    monkeypatch.setattr(config.os, "cpu_count", lambda: 99)
+    assert config._cpu_count() == 3
+
+
 def test_config_defaults_are_python_owned_and_immutable() -> None:
     plan = sc_load.PlanConfig()
     merge = sc_load.IoMergeConfig()

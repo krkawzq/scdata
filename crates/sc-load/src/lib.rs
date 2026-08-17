@@ -23,6 +23,8 @@ mod source;
 mod share;
 
 #[cfg(test)]
+mod real_scatter_bench;
+#[cfg(test)]
 mod tests;
 
 pub use compiler::{compile, PlanSpec};
@@ -33,8 +35,6 @@ pub use dtype::{promote_kind, OutputDType, OutputValue, PromoteKind, StorageDTyp
 pub use error::{Error, Result};
 pub use output::{Fill, FloatCastPolicy, OutputSpec, OverflowPolicy};
 pub use plan::{Plan, PlanStats};
-#[cfg(feature = "profile")]
-pub use session::WorkerRuntimeStats;
 pub use session::{Batch, CancellationHandle, RuntimeStats, Session, SessionState};
 #[cfg(all(target_os = "linux", target_has_atomic = "64"))]
 pub use share::{

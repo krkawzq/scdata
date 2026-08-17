@@ -50,11 +50,16 @@ in the Plan.
 
 ## I/O backends and fusion
 
-Blocking and io_uring execute the same graph. Blocking workers reuse one
-encoded staging vector. On Linux, explicit `IoMode::Uring` requires positioned
-sources; `Auto` selects io_uring only when every source is positioned and every
-worker ring can be created, otherwise it selects blocking. Key-backed and
-Deflated ZIP sources use blocking.
+Blocking and io_uring execute the same graph through private worker strategies
+in `session/blocking.rs` and `session/uring.rs`; scheduling, cache dependencies
+and ring lifecycle stay in `session/mod.rs`. Blocking workers batch ready-node
+claims and reuse one encoded staging vector. Each io_uring worker owns one ring,
+keeps multiple positioned reads in flight up to queue/job/byte limits, reuses
+best-fit slot buffers, resubmits short reads, validates slot generations, and
+drains read/cancel CQEs before buffers are released. On Linux, explicit
+`IoMode::Uring` requires positioned sources; `Auto` selects io_uring only when
+every source is positioned and every worker ring can be created, otherwise it
+selects blocking. Key-backed and Deflated ZIP sources use blocking.
 
 `IoMergeOptions` supports:
 
@@ -113,9 +118,11 @@ explicit opt-in. Signedness overflow follows `OverflowPolicy` (`Error`,
 `UseFill`, `UseValue`, or `Unchecked`).
 
 CSR indices are validated for bounds and strict increasing order before the
-unsafe scatter kernel. Fallible conversions are validated before batch
-publication. Cache/output pointer lowering validates every extent; raw pointers
-never enter reusable Plan state.
+unsafe scatter kernel. Each CSR output row is zero-initialized for structural
+absence; `Fill` is then written only to output columns without a mapped source
+feature. Fallible conversions are validated before batch publication.
+Cache/output pointer lowering validates every extent; raw pointers never enter
+reusable Plan state.
 
 ## Shared ring
 
@@ -131,4 +138,21 @@ The `profile` feature adds compile/runtime counters. Compile statistics include
 cache residency loads/reloads, hits/misses, capacity/fragmentation stalls,
 cache horizon, independent/fused I/O tasks, saved I/O operations,
 payload/span/amplification, DecodeOps per task and dependency edges. Runtime
-statistics cover reads, decode/scatter completion and backend selection.
+statistics report physical reads, io_uring submission/completion, peak in-flight
+resources, and measured I/O-wait, decode, validation, scatter, completion and
+consumer-wait time. Stage times are summed across workers and are therefore
+worker-time totals rather than session wall time. Profile-only timers and
+counters are compiled out of ordinary builds.
+
+The ignored `real_scatter_bench::benchmark_real_decoded_scatter` test isolates
+decoded Dense/CSR → mapped output kernels. Dataset decode and CSR densification
+happen before timing. It reads `real_dataset.txt` by default and covers source
+mapping ratios `1`, `1/2`, `1/5`, `1/10`, both complete output genes and `1/3`
+unmapped output genes. Run it on a worker in release mode, for example:
+
+```bash
+SC_LOAD_REAL_SCATTER_ROWS=128 \
+taskset -c 64 cargo test -p sc-load --release --all-features --lib \
+  real_scatter_bench::benchmark_real_decoded_scatter -- \
+  --exact --ignored --nocapture --test-threads=1
+```

@@ -33,6 +33,7 @@ anndata = ["anndata>=0.10", "zarr>=2.16"]
 dev = [
     "maturin>=1.8,<2",
     "pytest>=8.0",
+    "pyright>=1.1.410",
     "ruff>=0.12",
     "scipy>=1.13",
     "pandas>=2",
@@ -54,3 +55,8 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+
+[tool.pyright]
+include = ["src/scdata", "scripts/convert_zarrzip_to_scczip.py"]
+pythonVersion = "3.9"
+typeCheckingMode = "standard"

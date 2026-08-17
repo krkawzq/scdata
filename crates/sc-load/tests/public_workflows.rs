@@ -97,10 +97,10 @@ fn csr_plan_scatter_handles_empty_rows_mapping_and_promotion() {
     assert_eq!(
         observed,
         vec![
-            vec![-9, -9, -9, -9, -9, -9],
-            vec![-9, 3, -9, 4, -9, -9],
-            vec![2, -9, -9, -9, 1, -9],
-            vec![-9, -9, -9, -9, -9, -9],
+            vec![0, 0, -9, 0, 0, -9],
+            vec![0, 3, -9, 4, 0, -9],
+            vec![2, 0, -9, 0, 1, -9],
+            vec![0, 0, -9, 0, 0, -9],
         ]
     );
     assert_eq!(stats.actual_io_mode, IoMode::Blocking);
@@ -274,8 +274,8 @@ fn widening_to_64_bit_outputs_handles_dense_maps_and_csr_scatter() {
     assert_eq!(
         drain_rows::<u64>(&csr_plan, 1).0,
         vec![
-            vec![u64::from(u32::MAX), 99, 99, 0, 99],
-            vec![17, u64::from((1u32 << 31) + 1), 99, 99, 99],
+            vec![u64::from(u32::MAX), 0, 99, 0, 99],
+            vec![17, u64::from((1u32 << 31) + 1), 99, 0, 99],
         ]
     );
 }

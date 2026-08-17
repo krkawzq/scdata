@@ -117,6 +117,8 @@ def write_scc(
         ``fixed_cells`` from each matrix's row width.
     num_workers
         Per-matrix chunk workers. Overrides ``options.num_workers`` when provided.
+        ``None`` uses the logical CPUs available to the current process and
+        respects Linux CPU affinity/container cpusets.
     overwrite
         When false, refuse to replace an existing ``path``.
     convert_strings_to_categoricals
@@ -399,7 +401,7 @@ def read_scc(
                 cleaned, held = _partition_scc_arrays(raw_kwargs)
                 raw = ad.AnnData(**cleaned)
                 _inject_scc_arrays(raw, held)
-                raw.obs_names = adata.obs_names
+                raw.obs_names = [str(name) for name in adata.obs_names]
                 adata.raw = raw
 
             if "obs" in f and isinstance(f["obs"], zarr.Array):
@@ -1174,6 +1176,4 @@ def _anndata_zarr_context() -> Iterator[None]:
 
 
 def _invalid_meta(message: str) -> NoReturn:
-    error = InvalidMetaError(message)
-    error.kind = "invalid_meta"
-    raise error
+    raise InvalidMetaError(message)

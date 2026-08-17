@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from typing import Any, Literal, Mapping
 
@@ -26,6 +27,26 @@ __all__ = [
 PartitionPolicy = Literal["cells", "budget"]
 
 
+def _available_cpu_count() -> int:
+    """Return the logical CPUs currently available to this process."""
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if get_affinity is not None:
+        try:
+            affinity = get_affinity(0)
+        except OSError:
+            pass
+        else:
+            if affinity:
+                return len(affinity)
+
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if process_cpu_count is not None:
+        count = process_cpu_count()
+        if count is not None:
+            return max(1, count)
+    return os.cpu_count() or 1
+
+
 @dataclass(frozen=True)
 class WriteOptions:
     """Chunk/block partition knobs shared by all sc-compress writers.
@@ -38,7 +59,9 @@ class WriteOptions:
     ``codec`` configures dense or CSR matrix data through one representation-
     independent Blosc policy. ``indptr_codec`` applies only to CSR row pointers;
     dense writers intentionally do not consume it so the same immutable options
-    object can be reused for mixed matrix collections such as AnnData.
+    object can be reused for mixed matrix collections such as AnnData. When
+    ``num_workers`` is ``None``, it is resolved from the logical CPUs available
+    to the current process, respecting Linux CPU affinity and container cpusets.
     """
 
     chunk_policy: PartitionPolicy = "budget"
@@ -49,20 +72,27 @@ class WriteOptions:
     block_budget: int | None = DEFAULT_BLOCK_BUDGET
     codec: Codec | None = None
     indptr_codec: Codec | None = None
-    num_workers: int = 1
+    num_workers: int | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "num_workers",
-            as_int(self.num_workers, name="num_workers", minimum=1, maximum=_UINTP_MAX),
-        )
+        if self.num_workers is not None:
+            object.__setattr__(
+                self,
+                "num_workers",
+                as_int(self.num_workers, name="num_workers", minimum=1, maximum=_UINTP_MAX),
+            )
         if self.codec is not None and not isinstance(self.codec, Codec):
             raise TypeError(f"codec must be Codec or None, got {type(self.codec).__name__}")
         if self.indptr_codec is not None and not isinstance(self.indptr_codec, Codec):
             raise TypeError(
                 f"indptr_codec must be Codec or None, got {type(self.indptr_codec).__name__}"
             )
+
+    @property
+    def worker_count(self) -> int:
+        """Resolved worker count forwarded to the native writer."""
+        value = self.num_workers
+        return _available_cpu_count() if value is None else value
 
     def with_overrides(
         self,
@@ -78,7 +108,7 @@ class WriteOptions:
         num_workers: int | None = None,
     ) -> WriteOptions:
         """Return a copy with only the non-``None`` values replaced."""
-        changes = {
+        changes: dict[str, object] = {
             name: value
             for name, value in (
                 ("chunk_policy", chunk_policy),
@@ -150,7 +180,7 @@ def resolve_write_options(
         options = DEFAULT_WRITE_OPTIONS
     elif not isinstance(options, WriteOptions):
         raise TypeError(f"options must be WriteOptions or None, got {type(options).__name__}")
-    return options.with_overrides(
+    resolved = options.with_overrides(
         chunk_policy=chunk_policy,
         block_policy=block_policy,
         chunk_cells=chunk_cells,
@@ -161,3 +191,6 @@ def resolve_write_options(
         indptr_codec=indptr_codec,
         num_workers=num_workers,
     )
+    if resolved.num_workers is None:
+        resolved = replace(resolved, num_workers=_available_cpu_count())
+    return resolved

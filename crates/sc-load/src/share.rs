@@ -5,7 +5,7 @@
 //! the ring, and publishes ready ring generations to rank-local consumers.
 
 use std::mem::ManuallyDrop;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -652,7 +652,7 @@ fn owner_process_is_alive(token: u64, published_start_time: u64) -> bool {
 }
 
 struct SharedMapping {
-    fd: OwnedFd,
+    producer_fd: Option<OwnedFd>,
     base: NonNull<u8>,
     layout: SharedLayout,
 }
@@ -682,8 +682,12 @@ impl SharedMapping {
         fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL)
             .map_err(|error| Error::Allocation(format!("failed to seal shared memfd: {error}")))?;
 
-        let base = map_shared(&fd, layout.total_bytes)?;
-        let mapping = Self { fd, base, layout };
+        let base = map_shared(fd.as_fd(), layout.total_bytes)?;
+        let mapping = Self {
+            producer_fd: Some(fd),
+            base,
+            layout,
+        };
         mapping.initialize()?;
         if mapping.layout.ring_bytes > 0 {
             // SAFETY: the ring starts on a page boundary and the kernel rounds
@@ -720,11 +724,7 @@ impl SharedMapping {
                 "shared ring mapping size {total_bytes} is invalid"
             )));
         }
-        let owned = dup(fd).map_err(|error| Error::Io {
-            kind: std::io::Error::from(error).kind(),
-            message: error.to_string(),
-        })?;
-        let base = map_shared(&owned, total_bytes)?;
+        let base = map_shared(fd, total_bytes)?;
         // SAFETY: the mapping contains at least HEADER_SIZE aligned bytes. The
         // producer initializes this header before any descriptor is exported.
         let header = unsafe { &*base.as_ptr().cast::<SharedHeader>() };
@@ -737,7 +737,7 @@ impl SharedMapping {
             }
         };
         let mapping = Self {
-            fd: owned,
+            producer_fd: None,
             base,
             layout,
         };
@@ -1020,7 +1020,7 @@ impl Drop for SharedMapping {
     }
 }
 
-fn map_shared(fd: &OwnedFd, len: usize) -> Result<NonNull<u8>> {
+fn map_shared(fd: BorrowedFd<'_>, len: usize) -> Result<NonNull<u8>> {
     // SAFETY: null hint, non-zero page-rounded length, and a size-sealed memfd.
     let pointer = unsafe {
         mmap(
@@ -1106,7 +1106,11 @@ impl SharedServer {
 
     pub fn attach_fd(&self) -> Result<OwnedFd> {
         self.ensure_process()?;
-        dup(&self.mapping.fd).map_err(|error| Error::Io {
+        let descriptor =
+            self.mapping.producer_fd.as_ref().ok_or_else(|| {
+                Error::Invariant("shared producer mapping has no descriptor".into())
+            })?;
+        dup(descriptor).map_err(|error| Error::Io {
             kind: std::io::Error::from(error).kind(),
             message: error.to_string(),
         })
@@ -1838,6 +1842,7 @@ impl Drop for SharedBatch {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsFd;
     use std::process::Command;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -1883,8 +1888,12 @@ mod tests {
         ftruncate(&fd, total_bytes as u64).expect("size test memfd");
         fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL)
             .expect("seal test memfd");
-        let base = map_shared(&fd, total_bytes).expect("map test memfd");
-        let mapping = SharedMapping { fd, base, layout };
+        let base = map_shared(fd.as_fd(), total_bytes).expect("map test memfd");
+        let mapping = SharedMapping {
+            producer_fd: Some(fd),
+            base,
+            layout,
+        };
         mapping.initialize().expect("initialize test mapping");
         mapping
     }
@@ -1898,6 +1907,18 @@ mod tests {
             process_id,
             Some(stat.start_time.wrapping_add(1))
         ));
+    }
+
+    #[test]
+    fn attached_mapping_does_not_retain_a_descriptor() {
+        let producer = one_batch_mapping();
+        let descriptor = producer
+            .producer_fd
+            .as_ref()
+            .expect("producer descriptor")
+            .as_fd();
+        let attached = SharedMapping::attach(descriptor).expect("attach test mapping");
+        assert!(attached.producer_fd.is_none());
     }
 
     #[test]

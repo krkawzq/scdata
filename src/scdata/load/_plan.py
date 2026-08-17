@@ -13,7 +13,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import asdict
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping, SupportsIndex
 
 import numpy as np
 from numpy.typing import NDArray
@@ -254,7 +254,7 @@ class Plan:
             _base_dir=source.parent,
         )
 
-    def __reduce_ex__(self, protocol: int) -> tuple[object, tuple[bytes]]:
+    def __reduce_ex__(self, protocol: SupportsIndex) -> tuple[object, tuple[bytes]]:
         del protocol
         return _restore_plan_v1, (self.dumps(),)
 
