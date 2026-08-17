@@ -483,6 +483,28 @@ unsafe fn gather32_i32_f32_avx2(
     Ok(())
 }
 
+/// One IEEE-754 rounding of the exact integer, matching `value as f32`.
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_cvtepu32_ps(values: __m256i) -> __m256 {
+    let lo = _mm256_and_si256(values, _mm256_set1_epi32(0xffff));
+    let hi = _mm256_srli_epi32::<16>(values);
+    _mm256_add_ps(
+        _mm256_mul_ps(_mm256_cvtepi32_ps(hi), _mm256_set1_ps(65536.0)),
+        _mm256_cvtepi32_ps(lo),
+    )
+}
+
+/// One IEEE-754 rounding of the exact integer, matching `value as f32`.
+#[target_feature(enable = "sse2")]
+unsafe fn sse2_cvtepu32_ps(values: __m128i) -> __m128 {
+    let lo = _mm_and_si128(values, _mm_set1_epi32(0xffff));
+    let hi = _mm_srli_epi32::<16>(values);
+    _mm_add_ps(
+        _mm_mul_ps(_mm_cvtepi32_ps(hi), _mm_set1_ps(65536.0)),
+        _mm_cvtepi32_ps(lo),
+    )
+}
+
 #[target_feature(enable = "avx2")]
 unsafe fn gather32_u32_f32_avx2(
     input: *const u8,
@@ -493,20 +515,15 @@ unsafe fn gather32_u32_f32_avx2(
 ) -> Result<()> {
     const LANES: usize = 8;
     let vector_count = source_offsets.len() / LANES * LANES;
-    let correction = _mm256_set1_ps(4_294_967_296.0);
-    // SAFETY: all accesses use the compiler-sealed mapping. Signed conversion
-    // plus a 2^32 correction implements the complete u32 domain.
+    // SAFETY: all accesses use the compiler-sealed mapping.
     unsafe {
         let target = output.add(target_byte);
         for index in (0..vector_count).step_by(LANES) {
             let offsets = _mm256_loadu_si256(source_offsets.as_ptr().add(index).cast::<__m256i>());
             let values = _mm256_i32gather_epi32::<1>(input.cast::<i32>(), offsets);
-            let signed = _mm256_cvtepi32_ps(values);
-            let negative = _mm256_srai_epi32::<31>(values);
-            let add = _mm256_and_ps(_mm256_castsi256_ps(negative), correction);
             _mm256_storeu_ps(
                 target.add(index * 4).cast::<f32>(),
-                _mm256_add_ps(signed, add),
+                avx2_cvtepu32_ps(values),
             );
         }
         for (index, &source_byte) in source_offsets[vector_count..].iter().enumerate() {
@@ -1380,19 +1397,14 @@ unsafe fn i32_f32(input: *const u8, output: *mut u8, count: usize, op: &ConvertO
 unsafe fn u32_f32(input: *const u8, output: *mut u8, count: usize, op: &ConvertOp) -> Result<()> {
     let lanes = 8;
     let vector_count = count / lanes * lanes;
-    let correction = _mm256_set1_ps(4_294_967_296.0);
     // SAFETY: dispatch checked AVX2 and all 8-lane unaligned accesses fit the
-    // validated ranges. Signed conversion plus a 2^32 correction implements
-    // the full u32 domain with IEEE-754 round-to-nearest semantics.
+    // validated ranges.
     unsafe {
         for index in (0..vector_count).step_by(lanes) {
             let values = _mm256_loadu_si256(input.add(index * 4).cast::<__m256i>());
-            let signed = _mm256_cvtepi32_ps(values);
-            let negative = _mm256_srai_epi32::<31>(values);
-            let add = _mm256_and_ps(_mm256_castsi256_ps(negative), correction);
             _mm256_storeu_ps(
                 output.add(index * 4).cast::<f32>(),
-                _mm256_add_ps(signed, add),
+                avx2_cvtepu32_ps(values),
             );
         }
     }
@@ -1609,17 +1621,15 @@ unsafe fn sse2_u32_f32(
 ) -> Result<()> {
     const LANES: usize = 4;
     let vector_count = count / LANES * LANES;
-    let correction = _mm_set1_ps(4_294_967_296.0);
     // SAFETY: SSE2 is baseline on x86_64 and every unaligned operation stays
-    // inside the caller-validated four-element windows. Signed conversion plus
-    // a 2^32 correction covers the complete u32 domain.
+    // inside the caller-validated four-element windows.
     unsafe {
         for index in (0..vector_count).step_by(LANES) {
             let values = _mm_loadu_si128(input.add(index * 4).cast::<__m128i>());
-            let signed = _mm_cvtepi32_ps(values);
-            let negative = _mm_srai_epi32::<31>(values);
-            let add = _mm_and_ps(_mm_castsi128_ps(negative), correction);
-            _mm_storeu_ps(output.add(index * 4).cast::<f32>(), _mm_add_ps(signed, add));
+            _mm_storeu_ps(
+                output.add(index * 4).cast::<f32>(),
+                sse2_cvtepu32_ps(values),
+            );
         }
     }
     finish_scalar!(input, output, vector_count, count, op);

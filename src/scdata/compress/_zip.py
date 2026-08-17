@@ -15,7 +15,7 @@ from operator import index
 from os import PathLike
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, SupportsIndex
+from typing import Any, SupportsIndex, Union
 
 from scdata.compress._validate import ensure_path
 from scdata.compress._write_options import WriteOptions
@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 META_NAME = "meta.json"
-Archive = str | PathLike[str] | zipfile.ZipFile
+Archive = Union[str, PathLike[str], zipfile.ZipFile]
 
 
 def archive_path(archive: Archive) -> Path:
