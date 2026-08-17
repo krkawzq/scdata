@@ -42,7 +42,6 @@ class PlanStats:
     cache_capacity_stalls: int
     cache_fragmentation_stalls: int
     cache_horizon_max_batches: int
-    output_ring_slots: int
     initialize_io_tasks: int
     executable_tasks: int
     dependency_edges: int
@@ -91,7 +90,6 @@ class PlanStats:
             "cache_capacity_stalls",
             "cache_fragmentation_stalls",
             "cache_horizon_max_batches",
-            "output_ring_slots",
             "initialize_io_tasks",
             "executable_tasks",
             "dependency_edges",

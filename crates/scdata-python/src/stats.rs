@@ -50,7 +50,6 @@ pub(crate) fn plan_stats_to_dict<'py>(
         stats.cache_fragmentation_stalls,
     )?;
     values.set_item("cache_horizon_max_batches", stats.cache_horizon_max_batches)?;
-    values.set_item("output_ring_slots", stats.output_ring_slots)?;
     values.set_item("initialize_io_tasks", stats.initialize_io_tasks)?;
     values.set_item("executable_tasks", stats.executable_tasks)?;
     values.set_item("dependency_edges", stats.dependency_edges)?;

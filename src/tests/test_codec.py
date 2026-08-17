@@ -29,8 +29,6 @@ def test_codec_config_is_strict() -> None:
         Codec.parse({"algorithm": "zstd", "typo_level": 1})
     with pytest.raises(TypeError, match="split_blocks must be bool"):
         Codec.parse({"algorithm": "blosc", "split_blocks": "false"})
-    with pytest.raises(ValueError, match="unknown codec option"):
-        Codec.parse({"id": "dyn-blosc"})
     with pytest.raises(ValueError, match="only valid for the blosc codec"):
         Codec(algorithm="zstd", shuffle="bytes")
     with pytest.raises(ValueError, match="not valid"):

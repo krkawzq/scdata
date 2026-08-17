@@ -68,9 +68,9 @@ def test_obs_names_and_list_keys(tmp_path: Path) -> None:
 
     dataset = sc_load.register(path)
     assert dataset.obs_names == ("c0", "c1", "c2")
-    assert dataset.n_obs == 3
-    assert dataset.n_vars == 4
-    assert dataset.var_names == ("g0", "g1", "g2", "g3")
+    assert dataset.n_rows == 3
+    assert dataset.n_cols == 4
+    assert dataset.feature_names == ("g0", "g1", "g2", "g3")
     np.testing.assert_array_equal(dataset.rows_for(["c2", "c0"]), np.array([2, 0], dtype=np.uint64))
 
     pca_ds = sc_load.register(path, key="obsm/X_pca")

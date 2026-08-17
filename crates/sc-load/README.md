@@ -158,15 +158,20 @@ consumer-wait time. Stage times are summed across workers and are therefore
 worker-time totals rather than session wall time. Profile-only timers and
 counters are compiled out of ordinary builds.
 
-The ignored `real_scatter_bench::benchmark_real_decoded_scatter` test isolates
-decoded Dense/CSR → mapped output kernels. Dataset decode and CSR densification
-happen before timing. It reads `real_dataset.txt` by default and covers source
-mapping ratios `1`, `1/2`, `1/5`, `1/10`, both complete output genes and `1/3`
-unmapped output genes. Run it on a worker in release mode, for example:
+The optional `scatter_profile` example isolates decoded Dense/CSR → mapped
+output kernels. It is compiled only with the `profile` feature and never runs
+as part of `cargo test`, so machine-specific timing is not a correctness gate.
+The default `real` suite decodes/densifies before timing, reads
+`real_dataset.txt`, and scans mapping ratios from `1` through `1/1000`, with
+both complete output genes and `1/3` unmapped output genes:
 
 ```bash
 SC_LOAD_REAL_SCATTER_ROWS=128 \
-taskset -c 64 cargo test -p sc-load --release --all-features --lib \
-  real_scatter_bench::benchmark_real_decoded_scatter -- \
-  --exact --ignored --nocapture --test-threads=1
+taskset -c 64 cargo run -p sc-load --release \
+  --example scatter_profile --features profile
 ```
+
+Set `SC_LOAD_SCATTER_PROFILE` to `all`, `fastpaths`, `gather`, `csr-init`,
+`dense-init`, `csr-sparse`, `csr-hybrid`, or `identity` for a synthetic decision
+suite. These suites print measurements and candidate speedups; they do not
+assert performance thresholds.

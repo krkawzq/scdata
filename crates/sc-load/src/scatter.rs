@@ -750,20 +750,43 @@ unsafe fn scatter_row_prevalidated_inner(
         // invariants give every mapped output element at most one nnz writer.
         // CSR absence is a structural zero; OutputSpec::fill applies only to
         // output columns that have no source feature mapping.
-        if !is_zeroed {
-            // SAFETY: the function contract proves the logical row prefix writable.
-            unsafe { row.as_mut_ptr().write_bytes(0, row_bytes) };
+        let count = values.len() >> convert.src_shift;
+
+        // A canonical CSR row with one entry per source column necessarily has
+        // indices 0..n_cols. Identity mapping can therefore use the contiguous
+        // conversion kernel and overwrite the complete logical row directly.
+        if count == source.n_cols && map.is_none() {
+            // SAFETY: validation proved the canonical full-column row and exact
+            // value extent. Identity compilation equates source/output widths.
+            return unsafe {
+                convert.convert_slice_unchecked(values.as_ptr(), row.as_mut_ptr(), count)
+            };
         }
-        if !fill.is_zero() {
-            // SAFETY: compiler-built default ranges are disjoint and bounded.
-            unsafe { fill.apply_default_ranges(source, row.as_mut_ptr()) };
-        }
+
         let index_range = task.indices_range();
         let index_size = usize::from(index.size);
         // SAFETY: validation proved the range, element alignment, equal nnz,
         // strict index ordering, column bounds, and conversion policy.
         let index_bytes = unsafe { indices.get_unchecked(index_range) };
-        let count = values.len() >> convert.src_shift;
+
+        if count == source.n_cols {
+            // Every mapped source feature is present, so mapped writes and
+            // default ranges partition the output. A whole-row structural-zero
+            // pass would only write bytes that these operations overwrite.
+            if !(is_zeroed && fill.is_zero()) {
+                // SAFETY: compiler-built default ranges are disjoint and bounded.
+                unsafe { fill.apply_default_ranges(source, row.as_mut_ptr()) };
+            }
+        } else {
+            if !is_zeroed {
+                // SAFETY: the function contract proves the logical row prefix writable.
+                unsafe { row.as_mut_ptr().write_bytes(0, row_bytes) };
+            }
+            if !fill.is_zero() {
+                // SAFETY: compiler-built default ranges are disjoint and bounded.
+                unsafe { fill.apply_default_ranges(source, row.as_mut_ptr()) };
+            }
+        }
         match source.csr_sparse_map.as_ref() {
             Some(CsrSparseMap::Packed32(entries))
                 if csr_sparse_binary_is_cheaper(entries.len(), count) =>
@@ -1520,7 +1543,9 @@ mod systematic_tests {
         csr_sparse_binary_is_cheaper, CellTask, CsrMap, CsrSparseMap, CsrSparseMapEntry, DenseMap,
         DenseMapEntry, DenseMapRun, SourcePlan, UNMAPPED_TARGET, UNMAPPED_TARGET_U32,
     };
-    use crate::scatter::{scatter_row_prevalidated, validate_row, FillOp, IndexOp};
+    use crate::scatter::{
+        scatter_row_prevalidated, scatter_row_prevalidated_zeroed, validate_row, FillOp, IndexOp,
+    };
     use crate::source::OutputSlot;
     use crate::{
         compile, Dataset, FeatureMap, IoMode, PlanSpec, RowRef, SessionConfig, Source, SourceId,
@@ -1875,6 +1900,11 @@ mod systematic_tests {
         if len != 0 {
             hybrid_dense[0] = 0;
         }
+        let hybrid_logical_targets = (0..len)
+            .map(|column| (column == 0).then_some(0))
+            .collect::<Vec<_>>();
+        let hybrid_defaults =
+            build_default_ranges(Some(&hybrid_logical_targets), 1, dst_size).unwrap();
         let sparse_packed: Arc<[u64]> = if len == 0 {
             Default::default()
         } else {
@@ -1883,11 +1913,12 @@ mod systematic_tests {
         let hybrid_packed = SourcePlan {
             feature_map: Some(CsrMap::Packed32(Arc::from(hybrid_dense.clone()))),
             csr_sparse_map: Some(CsrSparseMap::Packed32(sparse_packed)),
-            default_ranges: Default::default(),
+            default_ranges: Arc::clone(&hybrid_defaults),
             ..identity.clone()
         };
         let dense_packed = SourcePlan {
             feature_map: Some(CsrMap::Packed32(Arc::from(hybrid_dense))),
+            default_ranges: Arc::clone(&hybrid_defaults),
             ..identity.clone()
         };
         assert_same(
@@ -1915,11 +1946,12 @@ mod systematic_tests {
         let hybrid_wide_source = SourcePlan {
             feature_map: Some(CsrMap::Wide(Arc::from(hybrid_wide.clone()))),
             csr_sparse_map: Some(CsrSparseMap::Wide(sparse_wide)),
-            default_ranges: Default::default(),
+            default_ranges: Arc::clone(&hybrid_defaults),
             ..identity.clone()
         };
         let dense_wide = SourcePlan {
             feature_map: Some(CsrMap::Wide(Arc::from(hybrid_wide))),
+            default_ranges: hybrid_defaults,
             ..identity
         };
         assert_same(
@@ -2047,6 +2079,117 @@ mod systematic_tests {
         assert!(csr_source.feature_map.is_none());
         assert!(csr_source.csr_sparse_map.is_none());
         assert!(csr_source.dense_map.is_none());
+    }
+
+    #[test]
+    fn full_csr_rows_overwrite_without_losing_default_or_structural_zero_semantics() {
+        let output = OutputSpec::new(4, OutputDType::U32, Fill::U32(99)).unwrap();
+        let convert = ConvertOp::resolve(StorageDType::U16, &output).unwrap();
+        let logical_targets = [Some(2), None, Some(0)];
+        let mapped = SourcePlan {
+            feature_map: Some(CsrMap::Packed32(Arc::from([8, UNMAPPED_TARGET_U32, 0]))),
+            default_ranges: build_default_ranges(Some(&logical_targets), 4, 4).unwrap(),
+            ..source(
+                3,
+                StorageDType::U16,
+                IndexOp::new(StorageDType::U16),
+                None,
+                false,
+                Default::default(),
+                convert,
+            )
+        };
+        let values = [5u16, 6, 7]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let indices = encode_indices(&[0, 1, 2], StorageDType::U16);
+        let full = task(0..values.len(), Some(0..indices.len()));
+        validate_row(&mapped, &full, &values, &indices).unwrap();
+        let fill = FillOp::new(&99u32.to_le_bytes());
+
+        let mut reused = vec![0xA5; 16];
+        let mut zeroed = vec![0; 16];
+        unsafe {
+            // SAFETY: validation above covers these exact immutable inputs, and
+            // both output rows are distinct, complete, and uniquely owned.
+            scatter_row_prevalidated(&mapped, &full, &values, &indices, &mut reused, 16, fill)
+                .unwrap();
+            scatter_row_prevalidated_zeroed(
+                &mapped,
+                &full,
+                &values,
+                &indices,
+                &mut zeroed,
+                16,
+                fill,
+            )
+            .unwrap();
+        }
+        let decode = |row: &[u8]| {
+            row.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(decode(&reused), [7, 99, 5, 99]);
+        assert_eq!(zeroed, reused);
+
+        reused.fill(0xA5);
+        unsafe {
+            // SAFETY: the same validated full row and output extent apply; this
+            // additionally checks zero defaults on a reused, non-zero buffer.
+            scatter_row_prevalidated(
+                &mapped,
+                &full,
+                &values,
+                &indices,
+                &mut reused,
+                16,
+                FillOp::new(&0u32.to_le_bytes()),
+            )
+            .unwrap();
+        }
+        assert_eq!(decode(&reused), [7, 0, 5, 0]);
+
+        let sparse = task(0..2, Some(0..2));
+        validate_row(&mapped, &sparse, &values, &indices).unwrap();
+        reused.fill(0xA5);
+        unsafe {
+            // SAFETY: the sparse task selects the first complete value/index;
+            // validation proves its mapped target and the output extent.
+            scatter_row_prevalidated(&mapped, &sparse, &values, &indices, &mut reused, 16, fill)
+                .unwrap();
+        }
+        assert_eq!(decode(&reused), [0, 99, 5, 99]);
+
+        let identity_output = OutputSpec::new(3, OutputDType::U32, Fill::U32(0)).unwrap();
+        let identity = source(
+            3,
+            StorageDType::U16,
+            IndexOp::new(StorageDType::U16),
+            None,
+            false,
+            Default::default(),
+            ConvertOp::resolve(StorageDType::U16, &identity_output).unwrap(),
+        );
+        validate_row(&identity, &full, &values, &indices).unwrap();
+        reused.resize(12, 0xA5);
+        reused.fill(0xA5);
+        unsafe {
+            // SAFETY: the validated full canonical row implies identity indices
+            // 0..n_cols and `reused` owns the exact destination extent.
+            scatter_row_prevalidated(
+                &identity,
+                &full,
+                &values,
+                &indices,
+                &mut reused,
+                12,
+                FillOp::new(&0u32.to_le_bytes()),
+            )
+            .unwrap();
+        }
+        assert_eq!(decode(&reused), [5, 6, 7]);
     }
 
     fn source(

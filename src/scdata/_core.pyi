@@ -112,11 +112,17 @@ class PlanMeta(TypedDict):
     row_stride_bytes: int
     is_empty: bool
 
-class PlanStatsDict(TypedDict):
+class _PlanProfileStatsDict(TypedDict, total=False):
+    """Counters present only when the extension is built with ``profile``."""
+
+    compile_resolve_ns: int
+    compile_finalize_ns: int
+
+class PlanStatsDict(_PlanProfileStatsDict):
     """Compiler cost-model snapshot from :func:`plan_stats`.
 
-    Builds with the ``profile`` feature may add extra nanosecond counters
-    (for example ``compile_resolve_ns`` and ``compile_finalize_ns``).
+    Profile-only counters are optional because ordinary extension builds do
+    not include them.
     """
 
     input_rows: int
@@ -167,11 +173,38 @@ class SessionMeta(TypedDict):
     exhausted: bool
     state: SessionStateName
 
-class RuntimeStatsDict(TypedDict):
+class _RuntimeProfileStatsDict(TypedDict, total=False):
+    """Counters present only when the extension is built with ``profile``."""
+
+    physical_read_ops: int
+    physical_read_bytes: int
+    short_read_retries: int
+    whole_key_materializations: int
+    uring_prepared_read_sqes: int
+    uring_submitted_read_sqes: int
+    uring_submit_calls: int
+    uring_cqes: int
+    uring_cancel_requests: int
+    uring_cancel_cqes: int
+    io_wait_nanoseconds: int
+    decode_nanoseconds: int
+    validation_nanoseconds: int
+    scatter_nanoseconds: int
+    completion_nanoseconds: int
+    consumer_wait_nanoseconds: int
+    completed_jobs: int
+    completed_cells: int
+    decoded_blocks: int
+    decoded_bytes: int
+    peak_inflight_jobs: int
+    peak_inflight_read_ops: int
+    peak_inflight_encoded_bytes: int
+
+class RuntimeStatsDict(_RuntimeProfileStatsDict):
     """Worker / I/O snapshot from :func:`session_stats`.
 
-    Builds with the ``profile`` feature may add read, decode, scatter, and
-    per-worker counters.
+    Profile-only counters are optional because ordinary extension builds do
+    not include them.
     """
 
     requested_io_mode: IoModeName

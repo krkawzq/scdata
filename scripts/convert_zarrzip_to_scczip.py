@@ -129,6 +129,58 @@ def _promote_scc_dtypes(adata):
     return adata
 
 
+def _integerize_counts_matrix(matrix):
+    """Cast a non-negative integer-valued matrix to uint16 or uint32 by max."""
+    import numpy as np
+    from scipy import sparse
+
+    if matrix is None:
+        return matrix, None
+    is_sp = sparse.issparse(matrix)
+    data = matrix.data if is_sp else np.asarray(matrix).reshape(-1)
+    if data.size == 0:
+        target = np.uint16
+        out = matrix.astype(target) if is_sp else np.asarray(matrix).astype(target, copy=False)
+        return out, target
+    minv = float(np.min(data))
+    if minv < -1e-4:
+        raise ValueError(f"negative values cannot cast to uint, min={minv}")
+    rounded = np.rint(data)
+    if not np.allclose(data, rounded, rtol=0, atol=1e-3):
+        raise ValueError("matrix is not integer-valued")
+    maxv = int(rounded.max())
+    if maxv <= np.iinfo(np.uint16).max:
+        target = np.uint16
+    elif maxv <= np.iinfo(np.uint32).max:
+        target = np.uint32
+    else:
+        raise ValueError(f"max count {maxv} exceeds uint32")
+    if is_sp:
+        out = matrix.copy()
+        out.data = rounded.astype(target, copy=False)
+        return out, target
+    return np.rint(np.asarray(matrix)).astype(target, copy=False), target
+
+
+def _integerize_adata_counts(adata) -> str | None:
+    """Store X / layers / raw.X as uint16 or uint32. Returns the X storage dtype name."""
+    import numpy as np
+
+    adata.X, x_dtype = _integerize_counts_matrix(adata.X)
+    for key in list(adata.layers.keys()):
+        if key is None:
+            continue
+        adata.layers[key], _ = _integerize_counts_matrix(adata.layers[key])
+    if adata.raw is not None and adata.raw.X is not None:
+        converted, _ = _integerize_counts_matrix(adata.raw.X)
+        if converted is not adata.raw.X:
+            raw = adata.raw.to_adata()
+            raw.X = converted
+            adata.raw = raw
+    return None if x_dtype is None else np.dtype(x_dtype).name
+
+
+
 def _as_dense_rows(matrix, n: int):
     """First ``n`` rows as a dense ndarray (SciPy CSR or scdata-toolkit ScCsr)."""
     import numpy as np
@@ -152,6 +204,7 @@ def convert_one(
     overwrite: bool,
     num_workers: int | None,
     verify: bool,
+    integer_counts: bool,
 ) -> dict[str, Any]:
     """Worker entry: return a result dict (picklable)."""
     import numpy as np
@@ -167,6 +220,7 @@ def convert_one(
         "status": "ok",
         "n_obs": None,
         "n_vars": None,
+        "x_dtype": None,
         "src_bytes": src_path.stat().st_size if src_path.exists() else None,
         "dst_bytes": None,
         "seconds": None,
@@ -184,6 +238,10 @@ def convert_one(
         result["n_obs"] = int(adata.n_obs)
         result["n_vars"] = int(adata.n_vars)
         _promote_scc_dtypes(adata)
+        if integer_counts:
+            result["x_dtype"] = _integerize_adata_counts(adata)
+        elif adata.X is not None:
+            result["x_dtype"] = np.dtype(adata.X.dtype).name
 
         scc.write_scc(
             adata,
@@ -256,6 +314,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="stop scheduling more work after the first error",
     )
+    p.add_argument(
+        "--integer-counts",
+        action="store_true",
+        help="store X/layers/raw.X as uint16 or uint32 according to the value range",
+    )
     return p.parse_args(argv)
 
 
@@ -277,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"sources={len(sources)} jobs={args.jobs} overwrite={args.overwrite} "
         f"verify={args.verify} num_workers={args.num_workers} "
+        f"integer_counts={args.integer_counts} "
         f"chunk_budget={write_opts.chunk_budget} block_budget={write_opts.block_budget} "
         f"codec={codec.algorithm}/{codec.backend}/shuffle={codec.shuffle}",
         flush=True,
@@ -287,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
         "overwrite": bool(args.overwrite),
         "num_workers": args.num_workers,
         "verify": bool(args.verify),
+        "integer_counts": bool(args.integer_counts),
     }
 
     def _handle(res: dict[str, Any]) -> None:
@@ -302,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             status,
             f"obs={res.get('n_obs')}",
             f"vars={res.get('n_vars')}",
+            f"dtype={res.get('x_dtype')}",
             f"src={res.get('src_bytes')}",
             f"dst={res.get('dst_bytes')}",
             f"t={res.get('seconds'):.2f}s" if res.get("seconds") is not None else "t=?",

@@ -4,27 +4,29 @@ __pycache__/
 *$py.class
 *.so
 *.pyd
+*.egg
+*.egg-info/
+.eggs/
 build/
 dist/
 wheels/
-*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
+.coverage.*
 htmlcov/
 .venv/
 .venv-convert/
 
-# Local outputs / scratch
-outputs/
-tmp/
-*.bak
-*.bak/
-
 # Rust
 target/
-**/target/
+*.rs.bk
+
+# Local outputs / scratch
+outputs/
+tmp*/
+*.bak
 
 # OS / editor / agents
 .DS_Store
@@ -33,7 +35,10 @@ target/
 .cursor/
 .grok/
 
-# Local pod / machine state (do not commit)
-ssh
+# Intentionally unversioned lockfiles
 uv.lock
 Cargo.lock
+
+# Local files
+ssh
+real_dataset.txt
