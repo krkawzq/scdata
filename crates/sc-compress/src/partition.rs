@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+/// Default decoded-byte target for one chunk (100 MiB).
+pub const DEFAULT_CHUNK_BUDGET: u64 = 100 << 20;
+
+/// Default decoded-byte target for one independently compressed block (64 KiB).
+pub const DEFAULT_BLOCK_BUDGET: u64 = 64 << 10;
+
 /// How rows are packed into chunks or DynBlosc blocks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
@@ -373,6 +379,12 @@ fn to_usize(value: u64, context: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_byte_budgets_are_100_mib_chunks_and_64_kib_blocks() {
+        assert_eq!(DEFAULT_CHUNK_BUDGET, 100 << 20);
+        assert_eq!(DEFAULT_BLOCK_BUDGET, 64 << 10);
+    }
 
     #[test]
     fn zero_sized_partitions_are_rejected() {

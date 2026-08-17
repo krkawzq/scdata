@@ -28,6 +28,7 @@ pub(crate) fn plan_meta<'py>(py: Python<'py>, plan: &PyPlan) -> PyResult<Bound<'
     values.set_item("batch_size", inner.batch_size())?;
     values.set_item("batch_count", inner.batch_count())?;
     values.set_item("prefetch_step", inner.prefetch_step())?;
+    values.set_item("cache_capacity_bytes", inner.stats().cache_capacity_bytes)?;
     values.set_item("n_cols", inner.output_spec().n_cols())?;
     values.set_item("dtype", inner.output_spec().dtype().as_str())?;
     values.set_item("row_stride_bytes", inner.row_stride_bytes())?;

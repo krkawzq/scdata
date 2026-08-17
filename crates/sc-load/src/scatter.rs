@@ -141,7 +141,7 @@ impl FillOp {
     }
 
     #[inline(always)]
-    unsafe fn apply(self, row: *mut u8, row_bytes: usize) {
+    pub(crate) unsafe fn apply(self, row: *mut u8, row_bytes: usize) {
         // SAFETY: caller proves `row..row+row_bytes` is writable.
         unsafe { (self.fill)(row, row_bytes, self.word) };
     }

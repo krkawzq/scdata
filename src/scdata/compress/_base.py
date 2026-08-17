@@ -19,6 +19,7 @@ from scdata.exceptions import InternalError
 if TYPE_CHECKING:
     from typing_extensions import Self
 
+    from scdata.compress._codec import Codec
     from scdata.compress._csr import ScCsr
     from scdata.compress._dense import ScDense
     from scdata.compress._limits import ReadLimits
@@ -37,6 +38,8 @@ class StoreInfo:
     storage_dtype: str
     storage_index_dtype: str | None
     nnz: int | None
+    codec: Codec
+    indptr_codec: Codec | None
     num_workers: int
     limits: ReadLimits
 
@@ -51,6 +54,8 @@ class StoreInfo:
             "storage_dtype": self.storage_dtype,
             "storage_index_dtype": self.storage_index_dtype,
             "nnz": self.nnz,
+            "codec": self.codec,
+            "indptr_codec": self.indptr_codec,
             "num_workers": self.num_workers,
             "limits": self.limits,
         }
@@ -133,6 +138,19 @@ class MatrixStore:
         return None if value is None else str(value)
 
     @property
+    def codec(self) -> Codec:
+        from scdata.compress._codec import _codec_from_wire
+
+        return _codec_from_wire(self._require_meta()["compressor"])
+
+    @property
+    def indptr_codec(self) -> Codec | None:
+        from scdata.compress._codec import _codec_from_wire
+
+        payload = self._require_meta().get("indptr_compressor")
+        return None if payload is None else _codec_from_wire(payload)
+
+    @property
     def nnz(self) -> int | None:
         value = self._require_meta()["nnz"]
         return None if value is None else int(value)
@@ -165,6 +183,8 @@ class MatrixStore:
             storage_dtype=self.storage_dtype,
             storage_index_dtype=self.storage_index_dtype,
             nnz=self.nnz,
+            codec=self.codec,
+            indptr_codec=self.indptr_codec,
             num_workers=self.num_workers,
             limits=self.limits,
         )

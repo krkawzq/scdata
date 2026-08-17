@@ -94,7 +94,36 @@ pub fn store_meta<'py>(py: Python<'py>, store: &PyStore) -> PyResult<Bound<'py, 
     values.set_item("max_decoded_size", limits.decoded_size())?;
     values.set_item("max_block_count", limits.block_count())?;
     values.set_item("num_workers", limits.thread_count())?;
+    match inner {
+        Matrix::Csr(matrix) => {
+            values.set_item(
+                "compressor",
+                compressor_to_py(py, &matrix.meta().data.compressor)?,
+            )?;
+            values.set_item(
+                "indptr_compressor",
+                compressor_to_py(py, &matrix.meta().indptr.compressor)?,
+            )?;
+        }
+        Matrix::Dense(matrix) => {
+            values.set_item(
+                "compressor",
+                compressor_to_py(py, &matrix.meta().data.compressor)?,
+            )?;
+            values.set_item("indptr_compressor", py.None())?;
+        }
+    }
     Ok(values)
+}
+
+fn compressor_to_py<'py>(
+    py: Python<'py>,
+    compressor: &sc_compress::Compressor,
+) -> PyResult<Bound<'py, PyAny>> {
+    let text = serde_json::to_string(compressor).map_err(|error| {
+        invalid_argument(format!("failed to serialize store compressor: {error}"))
+    })?;
+    py.import("json")?.call_method1("loads", (text,))
 }
 
 #[pyfunction]

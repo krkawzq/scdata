@@ -5,8 +5,8 @@ use std::sync::Arc;
 use sc_compress::{ByteStore, CsrWriter, DenseMatrix, DenseWriter, Partition};
 
 use crate::{
-    compile, Dataset, Error, FeatureMap, Fill, IoMode, OutputDType, OutputSpec, OverflowPolicy,
-    PlanConfig, PlanSpec, RowRef, SessionConfig, Source, SourceId,
+    compile, Dataset, Error, FeatureMap, Fill, IoMergeOptions, IoMergePolicy, IoMode, OutputDType,
+    OutputSpec, OverflowPolicy, PlanConfig, PlanSpec, RowRef, SessionConfig, Source, SourceId,
 };
 
 fn blocking(workers: usize) -> SessionConfig {
@@ -35,7 +35,6 @@ fn dense_mapping_promotion_and_ring_reuse_preserve_order() {
         .collect();
     let output = OutputSpec::new(4, OutputDType::U32, Fill::U32(9)).unwrap();
     let config = PlanConfig {
-        coalescing_distance: 2,
         ..PlanConfig::default()
     };
     let plan = compile(PlanSpec::new(vec![source], row_refs, output, 2, 3).config(config)).unwrap();
@@ -396,7 +395,7 @@ fn dense_gather_checked_sign_preserves_overflow_policy() {
 }
 
 #[test]
-fn contiguous_identity_block_decodes_directly_and_uses_only_live_ring_slots() {
+fn contiguous_identity_block_uses_one_static_cache_residency_and_one_ring_slot() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("dense-direct-block");
     let values = (0..128u16).collect::<Vec<_>>();
@@ -417,12 +416,9 @@ fn contiguous_identity_block_decodes_directly_and_uses_only_live_ring_slots() {
     assert_eq!(plan.batch_count(), 1);
     assert_eq!(plan.inner.ring_slots, 1);
     assert_eq!(plan.stats().output_ring_bytes, 4 * 64);
-    assert!(plan
-        .inner
-        .blocks
-        .iter()
-        .any(|block| block.direct_output().is_some()));
-    assert!(plan.inner.cells.iter().all(|cell| cell.is_direct_decode()));
+    assert_eq!(plan.stats().unique_cache_objects, 1);
+    assert_eq!(plan.stats().residency_loads, 1);
+    assert_eq!(plan.stats().initialize_io_tasks, 1);
 
     let mut session = plan.open(blocking(2)).unwrap();
     let batch = session.next_batch().unwrap().unwrap();
@@ -435,7 +431,7 @@ fn contiguous_identity_block_decodes_directly_and_uses_only_live_ring_slots() {
 }
 
 #[test]
-fn adjacent_blocks_coalesce_without_read_amplification_when_bandwidth_bound() {
+fn adjacent_cache_objects_share_one_physical_read_without_sharing_residency() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("dense-adjacent-blocks");
     let values = (0..512u16).collect::<Vec<_>>();
@@ -450,20 +446,23 @@ fn adjacent_blocks_coalesce_without_read_amplification_when_bandwidth_bound() {
         .collect();
     let output = OutputSpec::new(64, OutputDType::U16, Fill::U16(0)).unwrap();
     let config = PlanConfig {
-        io_bandwidth_bytes_per_second: 1.0,
-        io_operations_per_second: 1_000_000_000.0,
-        coalescing_distance: 1,
-        delta_bytes: 0.0,
+        io_merge: IoMergeOptions {
+            initialize_parallelism_hint: 1,
+            regular_io_parallelism_hint: 1,
+            min_tasks_per_worker: 1,
+            ..IoMergeOptions::default()
+        },
         ..PlanConfig::default()
     };
     let plan = compile(PlanSpec::new(vec![source], rows, output, 8, 2).config(config)).unwrap();
     assert_eq!(plan.stats().block_jobs, 8);
-    assert!(plan.stats().jobs < plan.stats().block_jobs);
-    assert_eq!(plan.stats().data_io_ops as usize, plan.stats().jobs);
+    assert_eq!(plan.stats().jobs, 1);
+    assert_eq!(plan.stats().unique_cache_objects, 8);
+    assert_eq!(plan.stats().data_io_ops, 1);
 }
 
 #[test]
-fn shuffled_physical_blocks_compile_one_completion_per_logical_batch() {
+fn shuffled_physical_blocks_compile_exactly_one_job_per_logical_batch() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("dense-batch-completions");
     DenseWriter::new(&path, Partition::fixed_cells(8), Partition::fixed_cells(1))
@@ -476,7 +475,6 @@ fn shuffled_physical_blocks_compile_one_completion_per_logical_batch() {
         .map(|row| RowRef::new(source_id, u64::from(row)))
         .collect();
     let config = PlanConfig {
-        coalescing_distance: 4,
         ..PlanConfig::default()
     };
     let plan = compile(
@@ -490,16 +488,14 @@ fn shuffled_physical_blocks_compile_one_completion_per_logical_batch() {
         .config(config),
     )
     .unwrap();
-    assert_eq!(plan.inner.jobs.len(), 1);
-    let completions = &plan.inner.completions[plan.inner.jobs[0].completions.clone()];
-    assert_eq!(completions.len(), 4);
-    assert_eq!(
-        completions
-            .iter()
-            .map(|completion| (completion.ring_batch(), completion.completed()))
-            .collect::<Vec<_>>(),
-        [(0, 2), (1, 2), (2, 2), (3, 2)]
-    );
+    assert_eq!(plan.inner.static_plan.jobs.len(), 4);
+    assert!(plan
+        .inner
+        .static_plan
+        .jobs
+        .iter()
+        .enumerate()
+        .all(|(batch, job)| job.batch_id == batch as u64));
 
     let mut session = plan.open(blocking(2)).unwrap();
     let mut observed = Vec::new();
@@ -512,9 +508,9 @@ fn shuffled_physical_blocks_compile_one_completion_per_logical_batch() {
 }
 
 #[test]
-fn configurable_coalesced_io_limit_stops_cross_block_merging() {
+fn cache_objects_are_not_merged_into_cross_block_runtime_jobs() {
     assert_eq!(
-        PlanConfig::default().max_coalesced_io_bytes,
+        PlanConfig::default().io_merge.max_coalesced_io_bytes,
         32 * 1024 * 1024
     );
 
@@ -529,20 +525,20 @@ fn configurable_coalesced_io_limit_stops_cross_block_merging() {
     let rows = (0..8).map(|row| RowRef::new(source_id, row)).collect();
     let output = OutputSpec::new(64, OutputDType::U16, Fill::U16(0)).unwrap();
     let config = PlanConfig {
-        io_bandwidth_bytes_per_second: 1.0,
-        io_operations_per_second: 1_000_000_000.0,
-        coalescing_distance: 1,
-        max_coalesced_io_bytes: 1,
-        delta_bytes: 0.0,
+        io_merge: IoMergeOptions {
+            max_coalesced_io_bytes: 1,
+            ..IoMergeOptions::default()
+        },
         ..PlanConfig::default()
     };
     let plan = compile(PlanSpec::new(vec![source], rows, output, 8, 2).config(config)).unwrap();
     assert_eq!(plan.stats().block_jobs, 8);
-    assert_eq!(plan.stats().jobs, plan.stats().block_jobs);
+    assert_eq!(plan.stats().jobs, 1);
+    assert_eq!(plan.stats().data_io_ops as usize, plan.stats().block_jobs);
 }
 
 #[test]
-fn decoded_soft_target_splits_jobs_but_runtime_scratch_streams_one_block() {
+fn decoded_cache_replaces_per_worker_decoded_scratch() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("decoded-soft-target");
     let values = (0..128u16).collect::<Vec<_>>();
@@ -552,13 +548,7 @@ fn decoded_soft_target_splits_jobs_but_runtime_scratch_streams_one_block() {
     let rows = (0..4)
         .map(|row| RowRef::new(SourceId::new(0), row))
         .collect();
-    let config = PlanConfig {
-        io_bandwidth_bytes_per_second: 1.0,
-        io_operations_per_second: 1_000_000_000.0,
-        delta_bytes: 0.0,
-        target_decoded_bytes_per_job: 128,
-        ..PlanConfig::default()
-    };
+    let config = PlanConfig::default();
     let plan = compile(
         PlanSpec::new(
             vec![Source::new(0, Dataset::open(&path).unwrap())],
@@ -571,9 +561,12 @@ fn decoded_soft_target_splits_jobs_but_runtime_scratch_streams_one_block() {
     )
     .unwrap();
     assert_eq!(plan.stats().block_jobs, 4);
-    assert_eq!(plan.stats().jobs, 2);
-    assert_eq!(plan.stats().maximum_decoded_bytes_per_job, 128);
-    assert_eq!(plan.inner.runtime.maximum_data_decoded, 64);
+    assert_eq!(plan.stats().jobs, 1);
+    assert_eq!(plan.stats().maximum_decoded_bytes_per_job, 256);
+    assert_eq!(
+        plan.stats().cache_arena_bytes,
+        PlanConfig::default().cache_capacity_bytes
+    );
 
     let mut session_config = blocking(1);
     session_config.max_decoded_bytes_per_worker = 64;
@@ -700,27 +693,6 @@ fn empty_plan_finishes_without_workers_or_output_allocation() {
 }
 
 #[test]
-fn session_rejects_decoded_scratch_above_configured_limits() {
-    let temporary = tempfile::tempdir().unwrap();
-    let path = temporary.path().join("decoded-limit");
-    DenseWriter::new(&path, Partition::fixed_cells(1), Partition::fixed_cells(1))
-        .write(&[1u16, 2], [1, 2])
-        .unwrap();
-    let plan = compile(PlanSpec::new(
-        vec![Source::new(0, Dataset::open(&path).unwrap())],
-        vec![RowRef::new(SourceId::new(0), 0)],
-        OutputSpec::new(2, OutputDType::U32, Fill::U32(0)).unwrap(),
-        1,
-        2,
-    ))
-    .unwrap();
-    let mut config = blocking(1);
-    config.max_decoded_bytes_per_worker = 1;
-    config.max_total_decoded_bytes = 1;
-    assert!(matches!(plan.open(config), Err(Error::ResourceLimit(_))));
-}
-
-#[test]
 fn feature_map_rejects_duplicate_targets() {
     let error = FeatureMap::new([Some(1), Some(1)]).unwrap_err();
     assert!(matches!(error, Error::InvalidInput(_)));
@@ -768,7 +740,7 @@ fn whole_key_plan_rejects_explicit_uring_and_auto_uses_blocking() {
 
 #[cfg(all(feature = "uring", target_os = "linux"))]
 #[test]
-fn uring_queues_multiple_positioned_jobs_and_preserves_batches() {
+fn uring_executes_positioned_static_graph_and_preserves_batches() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("dense-uring");
     let values: Vec<u32> = (0..64).collect();
@@ -781,7 +753,13 @@ fn uring_queues_multiple_positioned_jobs_and_preserves_batches() {
         .map(|row| RowRef::new(SourceId::new(0), row))
         .collect();
     let output = OutputSpec::new(4, OutputDType::U32, Fill::U32(0)).unwrap();
-    let plan = compile(PlanSpec::new(vec![source], rows, output, 2, 4)).unwrap();
+    let plan = compile(
+        PlanSpec::new(vec![source], rows, output, 2, 4).config(PlanConfig {
+            cache_capacity_bytes: 128,
+            ..PlanConfig::default()
+        }),
+    )
+    .unwrap();
     let mut session = plan
         .open(SessionConfig {
             worker_count: 1,
@@ -804,7 +782,7 @@ fn uring_queues_multiple_positioned_jobs_and_preserves_batches() {
     assert_eq!(stats.actual_io_mode, IoMode::Uring { queue_depth: 8 });
     #[cfg(feature = "profile")]
     {
-        assert!(stats.uring_submitted_read_sqes > 1);
+        assert!(stats.uring_submitted_read_sqes >= 1);
         assert_eq!(stats.uring_submitted_read_sqes, stats.uring_cqes);
     }
 }
@@ -870,6 +848,29 @@ fn cancellation_is_terminal_and_wakes_consumer() {
         .unwrap();
     assert!(matches!(session.next_batch(), Err(Error::Cancelled)));
     assert_eq!(session.state(), crate::SessionState::Cancelled);
+}
+
+#[test]
+fn batch_ready_publication_is_linearized_with_consumer_sleep() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("consumer-wakeup");
+    DenseWriter::new(&path, Partition::fixed_cells(1), Partition::fixed_cells(1))
+        .write(&[7u16, 9], [1, 2])
+        .unwrap();
+    let plan = compile(PlanSpec::new(
+        vec![Source::new(0, Dataset::open(&path).unwrap())],
+        vec![RowRef::new(SourceId::new(0), 0)],
+        OutputSpec::new(2, OutputDType::U16, Fill::U16(0)).unwrap(),
+        1,
+        1,
+    ))
+    .unwrap();
+
+    for _ in 0..256 {
+        let mut session = plan.open(blocking(2)).unwrap();
+        let batch = session.next_batch().unwrap().unwrap();
+        assert_eq!(batch.row_as::<u16>(0).unwrap(), &[7, 9]);
+    }
 }
 
 #[test]
@@ -1416,14 +1417,7 @@ fn packed_csr_fallback_conversion_selects_map_once_per_row() {
 }
 
 #[test]
-fn batch_slot_state_occupies_one_exclusive_cache_line() {
-    assert_eq!(std::mem::align_of::<crate::session::BatchSlot>(), 64);
-    assert_eq!(std::mem::size_of::<crate::session::BatchSlot>(), 64);
-    #[cfg(feature = "profile")]
-    {
-        assert_eq!(std::mem::align_of::<crate::session::WorkerStats>(), 256);
-        assert_eq!(std::mem::size_of::<crate::session::WorkerStats>(), 256);
-    }
+fn compact_cell_task_layout_is_stable_inside_the_native_plan() {
     assert_eq!(std::mem::align_of::<crate::plan::CellTask>(), 8);
     assert_eq!(std::mem::size_of::<crate::plan::CellTask>(), 24);
 }
@@ -1432,8 +1426,11 @@ fn batch_slot_state_occupies_one_exclusive_cache_line() {
 fn rejects_non_finite_merge_threshold() {
     let output = OutputSpec::new(1, OutputDType::F32, Fill::F32(0.0)).unwrap();
     let config = PlanConfig {
-        io_bandwidth_bytes_per_second: f64::MAX,
-        io_operations_per_second: 0.5,
+        io_merge: IoMergeOptions {
+            policy: IoMergePolicy::CostAware,
+            io_bandwidth_bytes_per_second: f64::INFINITY,
+            ..IoMergeOptions::default()
+        },
         ..PlanConfig::default()
     };
     let error = match compile(PlanSpec::new(vec![], vec![], output, 1, 2).config(config)) {
@@ -1447,7 +1444,10 @@ fn rejects_non_finite_merge_threshold() {
 fn rejects_zero_coalesced_io_limit() {
     let output = OutputSpec::new(1, OutputDType::F32, Fill::F32(0.0)).unwrap();
     let config = PlanConfig {
-        max_coalesced_io_bytes: 0,
+        io_merge: IoMergeOptions {
+            max_coalesced_io_bytes: 0,
+            ..IoMergeOptions::default()
+        },
         ..PlanConfig::default()
     };
     let error = match compile(PlanSpec::new(vec![], vec![], output, 1, 2).config(config)) {

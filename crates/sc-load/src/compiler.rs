@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,12 +9,13 @@ use std::time::Instant;
 use dyn_blosc::{BlockDecoder, DecodeLimits, Decoder};
 use sc_compress::chunk_key;
 
-use crate::config::PlanConfig;
+use crate::config::{IoMergePolicy, PlanConfig};
 use crate::convert::ConvertOp;
 use crate::plan::{
-    BatchCompletion, BlockGroup, BlockSpec, CellTask, CsrMap, DenseMap, DenseMapEntry, DenseMapRun,
-    Job, JobSide, Plan, PlanData, PlanStats, ReadSource, SourcePlan, UNMAPPED_TARGET,
-    UNMAPPED_TARGET_U32,
+    CacheSlice, CellTask, CsrMap, CsrScatterTask, DecodeOp, DenseMap, DenseMapEntry, DenseMapRun,
+    DenseScatterTask, DependencyGraph, InitializeJob, IoDecodeLoadTask, OutputSlice, Plan,
+    PlanData, PlanStats, ReadSource, ReleasePlan, SourcePlan, StaticJob, StaticPlanData,
+    UNMAPPED_TARGET, UNMAPPED_TARGET_U32,
 };
 use crate::scatter::{FillOp, IndexOp};
 use crate::source::{DatasetKind, OutputSlot};
@@ -28,6 +29,7 @@ pub struct PlanSpec {
     pub rows: Vec<RowRef>,
     pub output: OutputSpec,
     pub batch_size: usize,
+    /// Number of output-ring generations resident at once.
     pub prefetch_step: usize,
     pub config: PlanConfig,
 }
@@ -186,6 +188,241 @@ struct BlockCandidate {
     indices: Option<BlockInfo>,
 }
 
+#[derive(Clone)]
+struct StaticCacheObject {
+    side: Side,
+    block: BlockInfo,
+}
+
+struct StaticResidency {
+    object: usize,
+    cache: CacheSlice,
+    allocation_len: usize,
+    earliest_consumer_batch: usize,
+    available_after_batch: Option<usize>,
+    compile_refcount: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FreeExtent {
+    offset: usize,
+    len: usize,
+    available_after_batch: Option<usize>,
+}
+
+struct ExtentAllocator {
+    by_address: BTreeMap<usize, FreeExtent>,
+    by_size: BTreeSet<(usize, usize)>,
+    slack: usize,
+}
+
+impl ExtentAllocator {
+    fn new(capacity: usize, slack: usize) -> Self {
+        let extent = FreeExtent {
+            offset: 0,
+            len: capacity,
+            available_after_batch: None,
+        };
+        Self {
+            by_address: BTreeMap::from([(0, extent)]),
+            by_size: BTreeSet::from([(capacity, 0)]),
+            slack,
+        }
+    }
+
+    fn total_free(&self) -> usize {
+        self.by_address
+            .values()
+            .fold(0usize, |total, extent| total.saturating_add(extent.len))
+    }
+
+    fn largest_free(&self) -> usize {
+        self.by_size.last().map_or(0, |(len, _)| *len)
+    }
+
+    fn allocate(&mut self, len: usize) -> Option<FreeExtent> {
+        let best_waste = self
+            .by_size
+            .range((len, 0)..)
+            .next()
+            .map(|(extent_len, _)| extent_len - len)?;
+        let allowed = best_waste.saturating_add(self.slack.max(len / 16));
+        let selected = self
+            .by_size
+            .range((len, 0)..)
+            .take_while(|(extent_len, _)| extent_len - len <= allowed)
+            .filter_map(|(extent_len, offset)| {
+                self.by_address.get(offset).map(|extent| {
+                    (
+                        epoch_sort_key(extent.available_after_batch),
+                        extent_len - len,
+                        *offset,
+                    )
+                })
+            })
+            .min()?;
+        let offset = selected.2;
+        let extent = self.remove(offset)?;
+        if extent.len > len {
+            self.insert(FreeExtent {
+                offset: extent.offset + len,
+                len: extent.len - len,
+                available_after_batch: extent.available_after_batch,
+            });
+        }
+        Some(FreeExtent { len, ..extent })
+    }
+
+    fn release(&mut self, offset: usize, len: usize, available_after_batch: usize) {
+        let mut released = FreeExtent {
+            offset,
+            len,
+            available_after_batch: Some(available_after_batch),
+        };
+        if let Some((&left_offset, left)) = self.by_address.range(..offset).next_back() {
+            if left.offset + left.len == offset {
+                let left = self
+                    .remove(left_offset)
+                    .expect("left extent remains indexed");
+                released.offset = left.offset;
+                released.len += left.len;
+                released.available_after_batch =
+                    max_epoch(released.available_after_batch, left.available_after_batch);
+            }
+        }
+        if let Some((&right_offset, right)) = self.by_address.range(released.offset..).next() {
+            if released.offset + released.len == right.offset {
+                let right = self
+                    .remove(right_offset)
+                    .expect("right extent remains indexed");
+                released.len += right.len;
+                released.available_after_batch =
+                    max_epoch(released.available_after_batch, right.available_after_batch);
+            }
+        }
+        self.insert(released);
+    }
+
+    fn insert(&mut self, extent: FreeExtent) {
+        debug_assert!(extent.len > 0);
+        let previous = self.by_address.insert(extent.offset, extent);
+        debug_assert!(previous.is_none());
+        let inserted = self.by_size.insert((extent.len, extent.offset));
+        debug_assert!(inserted);
+    }
+
+    fn remove(&mut self, offset: usize) -> Option<FreeExtent> {
+        let extent = self.by_address.remove(&offset)?;
+        let removed = self.by_size.remove(&(extent.len, extent.offset));
+        debug_assert!(removed);
+        Some(extent)
+    }
+}
+
+fn epoch_sort_key(epoch: Option<usize>) -> (bool, usize) {
+    match epoch {
+        None => (false, 0),
+        Some(batch) => (true, batch),
+    }
+}
+
+fn max_epoch(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(left), Some(right)) => Some(left.max(right)),
+    }
+}
+
+fn cost_aware_first_group_end(
+    ordered: &[usize],
+    residencies: &[StaticResidency],
+    objects: &[StaticCacheObject],
+    merge: &crate::config::IoMergeOptions,
+) -> Result<usize> {
+    let count = ordered.len();
+    let mut payload_prefix = vec![0usize; count + 1];
+    let mut decoded_prefix = vec![0usize; count + 1];
+    for (index, &residency_id) in ordered.iter().enumerate() {
+        let object = &objects[residencies[residency_id].object];
+        payload_prefix[index + 1] = payload_prefix[index]
+            .checked_add(range_len_u64(&object.block.encoded_range)?)
+            .ok_or_else(|| Error::ResourceLimit("I/O fusion payload overflow".into()))?;
+        decoded_prefix[index + 1] = decoded_prefix[index]
+            .checked_add(object.block.decoded_len())
+            .ok_or_else(|| Error::ResourceLimit("I/O fusion decoded bytes overflow".into()))?;
+    }
+    let mut costs = vec![f64::INFINITY; count + 1];
+    let mut gaps = vec![usize::MAX; count + 1];
+    let mut tasks = vec![0usize; count + 1];
+    let mut previous = vec![usize::MAX; count + 1];
+    costs[0] = 0.0;
+    gaps[0] = 0;
+    for end in 1..=count {
+        let earliest = end.saturating_sub(merge.max_decode_ops_per_io_task);
+        for start in (earliest..end).rev() {
+            let first = &objects[residencies[ordered[start]].object].block;
+            let last = &objects[residencies[ordered[end - 1]].object].block;
+            let span = usize::try_from(last.encoded_range.end - first.encoded_range.start)
+                .map_err(|_| Error::ResourceLimit("I/O fusion span exceeds usize".into()))?;
+            let payload = payload_prefix[end] - payload_prefix[start];
+            let decoded = decoded_prefix[end] - decoded_prefix[start];
+            let gap = span.checked_sub(payload).ok_or_else(|| {
+                Error::Invariant("I/O fusion payload exceeds physical span".into())
+            })?;
+            let amplification = if payload == 0 {
+                1.0
+            } else {
+                span as f64 / payload as f64
+            };
+            if span > merge.max_coalesced_io_bytes
+                || span > merge.max_encoded_staging_bytes_per_task
+                || gap > merge.max_io_gap_bytes
+                || amplification > merge.max_io_amplification_ratio
+                || decoded > merge.max_decoded_bytes_per_io_task
+            {
+                continue;
+            }
+            let group_count = end - start;
+            let uncertainty = usize::from(group_count > 1) * merge.io_merge_delta_bytes;
+            let group_cost = 1.0 / merge.io_operations_per_second
+                + span.saturating_add(uncertainty) as f64 / merge.io_bandwidth_bytes_per_second;
+            let candidate_cost = costs[start] + group_cost;
+            let candidate_gap = gaps[start].saturating_add(gap);
+            let candidate_tasks = tasks[start] + 1;
+            let better = if !costs[end].is_finite() {
+                true
+            } else {
+                let tolerance = f64::EPSILON * candidate_cost.abs().max(costs[end].abs()).max(1.0);
+                candidate_cost + tolerance < costs[end]
+                    || ((candidate_cost - costs[end]).abs() <= tolerance
+                        && (candidate_gap < gaps[end]
+                            || (candidate_gap == gaps[end]
+                                && (candidate_tasks > tasks[end]
+                                    || (candidate_tasks == tasks[end] && start < previous[end])))))
+            };
+            if better {
+                costs[end] = candidate_cost;
+                gaps[end] = candidate_gap;
+                tasks[end] = candidate_tasks;
+                previous[end] = start;
+            }
+        }
+        if previous[end] == usize::MAX {
+            return Err(Error::ResourceLimit(format!(
+                "no feasible I/O fusion partition ends at independent load {end}"
+            )));
+        }
+    }
+    let mut cursor = count;
+    let mut first_end = count;
+    while cursor > 0 {
+        first_end = cursor;
+        cursor = previous[cursor];
+    }
+    Ok(first_end)
+}
+
 struct CellInfo {
     did: u32,
     block_key: usize,
@@ -269,65 +506,6 @@ enum SourceRowLayout {
     },
 }
 
-struct TempBlockJob {
-    block_key: usize,
-    cell_count: usize,
-    anchor: usize,
-    batch_min: usize,
-    batch_max: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum MemberNode {
-    Block(usize),
-    Concat { left: usize, right: usize },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RunKey {
-    did: u32,
-    data_source: usize,
-    indices_source: Option<usize>,
-}
-
-struct TempRun {
-    member_root: usize,
-    block_count: usize,
-    anchor: usize,
-    batch_min: usize,
-    batch_max: usize,
-    active: bool,
-    did: u32,
-    /// Cached for O(1) merge decisions (avoid re-scanning blocks).
-    data_source: usize,
-    indices_source: Option<usize>,
-    data_range: Option<Range<u64>>,
-    indices_range: Option<Range<u64>>,
-    data_decoded: usize,
-    indices_decoded: usize,
-    cell_count: usize,
-}
-
-struct MergeProjection {
-    anchor: usize,
-    batch_min: usize,
-    batch_max: usize,
-    did: u32,
-    data_source: usize,
-    indices_source: Option<usize>,
-    data_range: Option<Range<u64>>,
-    indices_range: Option<Range<u64>>,
-    data_decoded: usize,
-    indices_decoded: usize,
-    cell_count: usize,
-    block_count: usize,
-}
-
-struct MergedRuns {
-    runs: Vec<TempRun>,
-    members: Vec<MemberNode>,
-}
-
 enum CandidateRemap {
     Dense(Vec<usize>),
     Sparse(HashMap<usize, usize>),
@@ -370,12 +548,6 @@ impl CandidateRemap {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Cost {
-    bytes: u64,
-    ops: u64,
-}
-
 struct Builder {
     request: PlanSpec,
     source_indices: HashMap<SourceId, u32>,
@@ -409,31 +581,17 @@ struct ChunkSideOffsets {
     indices: Option<usize>,
 }
 
-type FinalizedPlan = (
-    Vec<Job>,
-    Vec<BlockGroup>,
-    Vec<CellTask>,
-    Vec<BatchCompletion>,
-    Vec<BlockSpec>,
-    PlanStats,
-);
-
 impl Builder {
     fn new(mut request: PlanSpec) -> Result<Self> {
         if request.batch_size == 0 {
             return Err(Error::InvalidConfig("batch_size must be positive".into()));
         }
-        if request.prefetch_step <= 1 {
+        if request.prefetch_step == 0 {
             return Err(Error::InvalidConfig(
-                "prefetch_step must be greater than 1".into(),
+                "prefetch_step must be positive".into(),
             ));
         }
-        if request.prefetch_step > u32::MAX as usize {
-            return Err(Error::InvalidConfig(
-                "prefetch_step exceeds compact ring-slot representation".into(),
-            ));
-        }
-        request.config.validate(request.prefetch_step)?;
+        request.config.validate()?;
         request.output.validate()?;
 
         let mut source_indices = HashMap::new();
@@ -739,7 +897,6 @@ impl Builder {
                 size_of::<RowRef>()
                     .saturating_add(retained_resolved_row_bytes)
                     .saturating_add(size_of::<CompactCell>())
-                    .saturating_add(size_of::<TempBlockJob>())
                     .saturating_add(size_of::<usize>() * 2)
                     .saturating_add(size_of::<BlockCandidate>()),
             )
@@ -757,63 +914,43 @@ impl Builder {
         } else {
             None
         };
-        let (block_jobs, cell_blocks, cells) =
-            self.resolve_and_merge_same_blocks(resolved_rows, row_stride)?;
+        let (cell_blocks, cells) = self.resolve_and_merge_same_blocks(resolved_rows, row_stride)?;
         // Resolution is the last phase that needs input rows, source lookup,
-        // or dataset metadata. Release all three before allocating merge
-        // arenas; chunk plans retain only the decoder/read data needed later.
+        // or dataset metadata. The static cache compiler consumes only compact
+        // block identities, row ranges, and frozen decoder metadata.
         drop(std::mem::take(&mut self.request.rows));
         drop(std::mem::take(&mut self.registered_sources));
         drop(std::mem::take(&mut self.source_indices));
         drop(std::mem::take(&mut self.row_layouts));
         #[cfg(feature = "profile")]
         let compile_resolve_ns = elapsed_ns(phase_started);
-        #[cfg(feature = "profile")]
-        let compile_same_block_ns = 0;
-        let block_job_count = block_jobs.len();
         self.check_compile_payload(
-            "cross-block merge",
+            "static cache graph",
             checked_payload_bytes(&[
                 (cells.len(), size_of::<CompactCell>()),
-                (self.request.rows.len(), size_of::<RowRef>()),
-                (block_jobs.len(), size_of::<TempBlockJob>()),
                 (cell_blocks.len(), size_of::<usize>()),
-                (block_jobs.len(), size_of::<TempRun>()),
-                (block_jobs.len(), size_of::<MemberNode>() * 2),
-                (block_jobs.len(), size_of::<usize>()),
                 (self.block_candidates.len(), size_of::<BlockCandidate>()),
                 (1, self.chunk_metadata_bytes),
                 (1, self.retained_whole_key_bytes),
-                (block_jobs.len(), size_of::<RunKey>() + size_of::<usize>()),
             ])?,
         )?;
         #[cfg(feature = "profile")]
         let phase_started = Instant::now();
-        let merged = self.merge_runs(&block_jobs)?;
-        #[cfg(feature = "profile")]
-        let compile_merge_runs_ns = elapsed_ns(phase_started);
-        #[cfg(feature = "profile")]
-        let phase_started = Instant::now();
-        let (jobs, arena_groups, arena_cells, arena_completions, arena_blocks, mut stats) = self
-            .finalize(
-                &cells,
-                &block_jobs,
-                &cell_blocks,
-                &merged,
-                output_ring_bytes,
-            )?;
+        let mut stats = PlanStats {
+            output_ring_bytes,
+            compile_working_set_bytes: self.peak_compile_payload_bytes,
+            retained_whole_key_bytes: self.retained_whole_key_bytes,
+            ..PlanStats::default()
+        };
+        let static_plan =
+            self.compile_static_plan(&cells, &cell_blocks, row_stride, row_bytes, &mut stats)?;
         #[cfg(feature = "profile")]
         let compile_finalize_ns = elapsed_ns(phase_started);
-        stats.input_rows = cells.len();
-        stats.block_jobs = block_job_count;
-        stats.jobs = jobs.len();
         stats.compile_time_io_bytes = self.compile_io_bytes;
         stats.compile_time_io_ops = self.compile_io_ops;
         #[cfg(feature = "profile")]
         {
             stats.compile_resolve_ns = compile_resolve_ns;
-            stats.compile_same_block_ns = compile_same_block_ns;
-            stats.compile_merge_runs_ns = compile_merge_runs_ns;
             stats.compile_finalize_ns = compile_finalize_ns;
         }
         let io_ops = stats
@@ -824,15 +961,13 @@ impl Builder {
             0.0
         } else {
             (stats.predicted_physical_bytes as f64
-                / self.request.config.io_bandwidth_bytes_per_second)
-                .max(io_ops as f64 / self.request.config.io_operations_per_second)
+                / self.request.config.io_merge.io_bandwidth_bytes_per_second)
+                .max(io_ops as f64 / self.request.config.io_merge.io_operations_per_second)
         };
 
-        let runtime = runtime_envelope(&self.sources, &jobs, &arena_groups, &arena_blocks)?;
         let plan = PlanData {
             batch_size: self.request.batch_size,
             batch_count,
-            prefetch_step: self.request.prefetch_step,
             ring_slots: self.ring_slots,
             ring_mask: self.ring_mask,
             fill: FillOp::new(
@@ -841,15 +976,10 @@ impl Builder {
             row_bytes,
             output: self.request.output,
             row_stride,
-            jobs,
-            groups: arena_groups,
-            cells: arena_cells,
-            completions: arena_completions,
-            blocks: arena_blocks,
             sources: self.sources,
             source_plans: self.source_plans,
-            runtime,
             stats,
+            static_plan,
         };
         Ok(Plan {
             inner: Arc::new(plan),
@@ -1675,16 +1805,11 @@ impl Builder {
         &mut self,
         resolved_rows: Option<PreloadedRows>,
         row_stride: usize,
-    ) -> Result<(Vec<TempBlockJob>, Vec<usize>, Vec<CompactCell>)> {
+    ) -> Result<(Vec<usize>, Vec<CompactCell>)> {
         let cell_count = self.request.rows.len();
         let mut remap = CandidateRemap::new(self.next_block_candidate, cell_count)?;
         let candidate_hint = self.next_block_candidate.min(cell_count);
         self.block_candidates.try_reserve_exact(candidate_hint)?;
-        let mut latest_job = Vec::new();
-        latest_job.try_reserve_exact(candidate_hint)?;
-        let mut jobs = Vec::<TempBlockJob>::new();
-        let initial_job_capacity = candidate_hint.saturating_mul(8).max(1_024).min(cell_count);
-        jobs.try_reserve_exact(initial_job_capacity)?;
         let mut cell_blocks = Vec::new();
         cell_blocks.try_reserve_exact(cell_count)?;
         let mut cells = Vec::new();
@@ -1738,45 +1863,9 @@ impl Builder {
                 };
                 self.validate_block_candidate(&candidate)?;
                 self.block_candidates.push(candidate);
-                latest_job.push(usize::MAX);
             }
             cells.push(CompactCell::from_resolved(&resolved));
-
-            let batch = if let Some(shift) = self.batch_shift {
-                ordinal >> shift
-            } else {
-                ordinal / self.request.batch_size
-            };
-            let latest = latest_job.get_mut(block_key).ok_or_else(|| {
-                Error::Invariant("compact block candidate index is out of range".into())
-            })?;
-            let target = (*latest != usize::MAX
-                && batch.saturating_sub(jobs[*latest].batch_min)
-                    < self.request.config.coalescing_distance)
-                .then_some(*latest);
-            if let Some(job_id) = target {
-                let job = &mut jobs[job_id];
-                if job.cell_count == self.request.config.limits.max_cells_per_job {
-                    return Err(Error::ResourceLimit(format!(
-                        "same-block job at anchor {} exceeds max_cells_per_job",
-                        job.anchor
-                    )));
-                }
-                job.cell_count += 1;
-                job.batch_max = batch;
-                cell_blocks.push(job_id);
-            } else {
-                let job_id = jobs.len();
-                jobs.push(TempBlockJob {
-                    block_key,
-                    cell_count: 1,
-                    anchor: ordinal,
-                    batch_min: batch,
-                    batch_max: batch,
-                });
-                cell_blocks.push(job_id);
-                *latest = job_id;
-            }
+            cell_blocks.push(block_key);
         }
         if let RowCursor::General(mut rows) = resolved_rows {
             if rows.next().is_some() {
@@ -1786,7 +1875,7 @@ impl Builder {
             }
         }
         self.next_block_candidate = self.block_candidates.len();
-        Ok((jobs, cell_blocks, cells))
+        Ok((cell_blocks, cells))
     }
 
     fn validate_block_candidate(&self, candidate: &BlockCandidate) -> Result<()> {
@@ -1836,1006 +1925,668 @@ impl Builder {
         })
     }
 
-    fn merge_runs(&self, block_jobs: &[TempBlockJob]) -> Result<MergedRuns> {
-        let mut runs = Vec::new();
-        let mut members = Vec::new();
-        runs.try_reserve_exact(block_jobs.len())?;
-        let maximum_member_nodes = block_jobs
-            .len()
-            .checked_mul(2)
-            .ok_or_else(|| Error::ResourceLimit("run member node count overflow".into()))?;
-        members.try_reserve_exact(maximum_member_nodes)?;
-        let mut total = Cost { bytes: 0, ops: 0 };
-        for (id, job) in block_jobs.iter().enumerate() {
-            let member_root = members.len();
-            members.push(MemberNode::Block(id));
-            let run = self.make_run(member_root, job)?;
-            let cost = run.cost()?;
-            total.bytes = total
-                .bytes
-                .checked_add(cost.bytes)
-                .ok_or_else(|| Error::ResourceLimit("predicted I/O bytes overflow".into()))?;
-            total.ops = total
-                .ops
-                .checked_add(cost.ops)
-                .ok_or_else(|| Error::ResourceLimit("predicted I/O ops overflow".into()))?;
-            runs.push(run);
-        }
-        let threshold = self.request.config.io_bandwidth_bytes_per_second
-            / self.request.config.io_operations_per_second
-            + self.request.config.delta_bytes;
-        let max_coalesced_io_bytes = u64::try_from(self.request.config.max_coalesced_io_bytes)
-            .map_err(|_| Error::InvalidConfig("max_coalesced_io_bytes exceeds u64".into()))?;
-        let mut candidates: HashMap<RunKey, usize> = HashMap::new();
-        candidates.try_reserve(runs.len())?;
-
-        for current_id in 0..runs.len() {
-            let key = runs[current_id].run_key();
-            let mut accepted = None;
-            let right = runs[current_id].cost()?;
-            // Request-order scheduling only needs the newest live predecessor.
-            // Searching the whole prefetch window makes shuffled plans
-            // quadratic when `coalescing_distance` is intentionally huge. The
-            // physical-order pass below handles remaining spatial neighbors.
-            let candidate_id = candidates.get(&key).copied().filter(|candidate_id| {
-                runs[current_id]
-                    .batch_min
-                    .saturating_sub(runs[*candidate_id].batch_min)
-                    < self.request.config.coalescing_distance
-            });
-            if let Some(candidate_id) = candidate_id {
-                let Some(merged) = self.project_merge(&runs[candidate_id], &runs[current_id])?
-                else {
-                    candidates.insert(key, current_id);
-                    continue;
-                };
-                let left = runs[candidate_id].cost()?;
-                let combined = merged.cost()?;
-                let new_bytes = total
-                    .bytes
-                    .checked_sub(left.bytes)
-                    .and_then(|value| value.checked_sub(right.bytes))
-                    .and_then(|value| value.checked_add(combined.bytes))
-                    .ok_or_else(|| Error::Invariant("I/O byte accounting underflow".into()))?;
-                let new_ops = total
-                    .ops
-                    .checked_sub(left.ops)
-                    .and_then(|value| value.checked_sub(right.ops))
-                    .and_then(|value| value.checked_add(combined.ops))
-                    .ok_or_else(|| Error::Invariant("I/O operation accounting underflow".into()))?;
-                let average = if new_ops == 0 {
-                    0.0
-                } else {
-                    new_bytes as f64 / new_ops as f64
-                };
-                let separate_bytes = left.bytes.checked_add(right.bytes).ok_or_else(|| {
-                    Error::ResourceLimit("separate I/O byte cost overflow".into())
-                })?;
-                // Coalescing overlapping or adjacent ranges cannot increase
-                // physical bytes. It removes an operation without consuming
-                // bandwidth budget, so it remains profitable even after the
-                // global plan has crossed the configured bytes/op balance.
-                if combined.bytes <= max_coalesced_io_bytes
-                    && (combined.bytes <= separate_bytes || average < threshold)
-                {
-                    accepted = Some((candidate_id, merged, new_bytes, new_ops));
-                }
-            }
-            if let Some((candidate_id, merged, new_bytes, new_ops)) = accepted {
-                let member_root = members.len();
-                members.push(MemberNode::Concat {
-                    left: runs[candidate_id].member_root,
-                    right: runs[current_id].member_root,
-                });
-                runs[candidate_id] = merged.into_run(member_root);
-                runs[current_id].active = false;
-                total = Cost {
-                    bytes: new_bytes,
-                    ops: new_ops,
-                };
-            } else {
-                candidates.insert(key, current_id);
-            }
-        }
-
-        // The online pass sees blocks in request order. With a shuffled access
-        // sequence, a newly arrived interval can bridge two older intervals,
-        // but a single online merge cannot revisit the second neighbor. A
-        // physical-order consolidation pass closes the remaining spatial
-        // components in O(n log n), applying the same bytes/op profitability
-        // rule as the request-order pass.
-        drop(candidates);
-        let mut physical_groups: HashMap<RunKey, Vec<usize>> = HashMap::new();
-        physical_groups.try_reserve(runs.len())?;
-        for (run_id, run) in runs.iter().enumerate() {
-            if run.active {
-                let group = physical_groups.entry(run.run_key()).or_default();
-                group.try_reserve(1)?;
-                group.push(run_id);
-            }
-        }
-        for run_ids in physical_groups.values_mut() {
-            run_ids.sort_unstable_by_key(|run_id| {
-                let run = &runs[*run_id];
-                (
-                    run.data_range.as_ref().map_or(0, |range| range.start),
-                    run.indices_range.as_ref().map_or(0, |range| range.start),
-                    run.anchor,
-                )
-            });
-            let Some((&first, remaining)) = run_ids.split_first() else {
-                continue;
-            };
-            let mut survivor = first;
-            for &next in remaining {
-                let Some(merged) = self.project_merge(&runs[survivor], &runs[next])? else {
-                    survivor = next;
-                    continue;
-                };
-                let left = runs[survivor].cost()?;
-                let right = runs[next].cost()?;
-                let combined = merged.cost()?;
-                let separate_bytes = left.bytes.checked_add(right.bytes).ok_or_else(|| {
-                    Error::ResourceLimit("physical consolidation byte cost overflow".into())
-                })?;
-                let merged_bytes = combined.bytes;
-                let new_bytes = total
-                    .bytes
-                    .checked_sub(left.bytes)
-                    .and_then(|value| value.checked_sub(right.bytes))
-                    .and_then(|value| value.checked_add(combined.bytes))
-                    .ok_or_else(|| Error::Invariant("I/O byte accounting underflow".into()))?;
-                let new_ops = total
-                    .ops
-                    .checked_sub(left.ops)
-                    .and_then(|value| value.checked_sub(right.ops))
-                    .and_then(|value| value.checked_add(combined.ops))
-                    .ok_or_else(|| Error::Invariant("I/O operation accounting underflow".into()))?;
-                let average = if new_ops == 0 {
-                    0.0
-                } else {
-                    new_bytes as f64 / new_ops as f64
-                };
-                if merged_bytes > max_coalesced_io_bytes
-                    || (merged_bytes > separate_bytes && average >= threshold)
-                {
-                    survivor = next;
-                    continue;
-                }
-                let member_root = members.len();
-                members.push(MemberNode::Concat {
-                    left: runs[survivor].member_root,
-                    right: runs[next].member_root,
-                });
-                runs[survivor] = merged.into_run(member_root);
-                runs[next].active = false;
-                total = Cost {
-                    bytes: new_bytes,
-                    ops: new_ops,
-                };
-            }
-        }
-        Ok(MergedRuns { runs, members })
-    }
-
-    fn make_run(&self, member_root: usize, job: &TempBlockJob) -> Result<TempRun> {
-        let candidate = self
-            .block_candidates
-            .get(job.block_key)
-            .ok_or_else(|| Error::Invariant("block job candidate metadata is missing".into()))?;
-        let data_source = candidate.data.as_ref().map_or(0, |block| block.source);
-        let indices_source = candidate.indices.as_ref().map(|block| block.source);
-        let data_range = self.block_physical_range(candidate.data.as_ref())?;
-        let indices_range = self.block_physical_range(candidate.indices.as_ref())?;
-        let data_decoded = candidate.data.as_ref().map_or(0, BlockInfo::decoded_len);
-        let indices_decoded = candidate.indices.as_ref().map_or(0, BlockInfo::decoded_len);
-        Ok(TempRun {
-            member_root,
-            block_count: 1,
-            anchor: job.anchor,
-            batch_min: job.batch_min,
-            batch_max: job.batch_max,
-            active: true,
-            did: candidate.did,
-            data_source,
-            indices_source,
-            data_range,
-            indices_range,
-            data_decoded,
-            indices_decoded,
-            cell_count: job.cell_count,
-        })
-    }
-
-    fn block_physical_range(&self, block: Option<&BlockInfo>) -> Result<Option<Range<u64>>> {
-        let Some(block) = block else {
-            return Ok(None);
-        };
-        let source = &self.sources[block.source];
-        if let ReadSource::WholeKey { declared_len, .. } = source {
-            let declared_len = u64::try_from(*declared_len)
-                .map_err(|_| Error::ResourceLimit("whole-key length exceeds u64".into()))?;
-            return Ok(Some(0..declared_len));
-        }
-        Ok(Some(block.encoded_range.clone()))
-    }
-
-    fn project_merge(&self, left: &TempRun, right: &TempRun) -> Result<Option<MergeProjection>> {
-        let batch_min = left.batch_min.min(right.batch_min);
-        let batch_max = left.batch_max.max(right.batch_max);
-        let batch_span = batch_max
-            .saturating_sub(batch_min)
-            .checked_add(1)
-            .ok_or_else(|| Error::ResourceLimit("merged batch span overflow".into()))?;
-        if batch_span > self.request.config.coalescing_distance {
-            return Ok(None);
-        }
-        let block_count = left
-            .block_count
-            .checked_add(right.block_count)
-            .ok_or_else(|| Error::ResourceLimit("merged block count overflow".into()))?;
-        if block_count > self.request.config.limits.max_blocks_per_job {
-            return Ok(None);
-        }
-        let cell_count = left
-            .cell_count
-            .checked_add(right.cell_count)
-            .ok_or_else(|| Error::ResourceLimit("merged cell count overflow".into()))?;
-        if cell_count > self.request.config.limits.max_cells_per_job {
-            return Ok(None);
-        }
-        let data_decoded = left
-            .data_decoded
-            .checked_add(right.data_decoded)
-            .ok_or_else(|| Error::ResourceLimit("decoded data bytes overflow".into()))?;
-        let indices_decoded = left
-            .indices_decoded
-            .checked_add(right.indices_decoded)
-            .ok_or_else(|| Error::ResourceLimit("decoded indices bytes overflow".into()))?;
-        let decoded = data_decoded
-            .checked_add(indices_decoded)
-            .ok_or_else(|| Error::ResourceLimit("merged decoded bytes overflow".into()))?;
-        if decoded > self.request.config.limits.max_decoded_bytes_per_job
-            || decoded > self.request.config.target_decoded_bytes_per_job
-        {
-            return Ok(None);
-        }
-        let data_range = union_optional_range(left.data_range.clone(), right.data_range.clone());
-        let indices_range =
-            union_optional_range(left.indices_range.clone(), right.indices_range.clone());
-        if let Some(range) = &data_range {
-            if range_len_u64(range)? > self.request.config.limits.max_encoded_bytes_per_side {
-                return Ok(None);
-            }
-        }
-        if let Some(range) = &indices_range {
-            if range_len_u64(range)? > self.request.config.limits.max_encoded_bytes_per_side {
-                return Ok(None);
-            }
-        }
-        Ok(Some(MergeProjection {
-            anchor: left.anchor.min(right.anchor),
-            batch_min,
-            batch_max,
-            did: left.did,
-            data_source: left.data_source,
-            indices_source: left.indices_source,
-            data_range,
-            indices_range,
-            data_decoded,
-            indices_decoded,
-            cell_count,
-            block_count,
-        }))
-    }
-
-    fn finalize(
+    fn compile_static_plan(
         &self,
         cells: &[CompactCell],
-        block_jobs: &[TempBlockJob],
         cell_blocks: &[usize],
-        merged: &MergedRuns,
-        output_ring_bytes: usize,
-    ) -> Result<FinalizedPlan> {
-        let runs = &merged.runs;
-        let active_run_count = runs.iter().filter(|run| run.active).count();
-        let block_spec_count = runs
-            .iter()
-            .filter(|run| run.active)
-            .try_fold(0usize, |total, run| {
-                let sides = usize::from(run.data_range.is_some())
-                    + usize::from(run.indices_range.is_some());
-                run.block_count
-                    .checked_mul(sides)
-                    .and_then(|count| total.checked_add(count))
-            })
-            .ok_or_else(|| Error::ResourceLimit("compile block arena count overflow".into()))?;
-        let completion_capacity = runs.iter().filter(|run| run.active).try_fold(
-            0usize,
-            |total, run| -> Result<usize> {
-                let batch_span = run
-                    .batch_max
-                    .checked_sub(run.batch_min)
-                    .and_then(|span| span.checked_add(1))
-                    .ok_or_else(|| Error::Invariant("final run batch range is invalid".into()))?;
-                let distinct_batches = run.cell_count.min(batch_span);
-                let split_descriptors =
-                    run.cell_count.saturating_sub(distinct_batches) / u32::MAX as usize;
-                total
-                    .checked_add(distinct_batches)
-                    .and_then(|count| count.checked_add(split_descriptors))
-                    .ok_or_else(|| {
-                        Error::ResourceLimit("batch completion arena count overflow".into())
-                    })
-            },
-        )?;
-        let arena_bytes = cells
-            .len()
-            .checked_mul(size_of::<CellTask>())
-            .and_then(|bytes| {
-                completion_capacity
-                    .checked_mul(size_of::<BatchCompletion>())
-                    .and_then(|completion_bytes| bytes.checked_add(completion_bytes))
-            })
-            .and_then(|bytes| {
-                block_spec_count
-                    .checked_mul(size_of::<BlockSpec>())
-                    .and_then(|block_bytes| bytes.checked_add(block_bytes))
-            })
-            .and_then(|bytes| {
-                block_jobs
-                    .len()
-                    .checked_mul(size_of::<BlockGroup>())
-                    .and_then(|group_bytes| bytes.checked_add(group_bytes))
-            })
-            .and_then(|bytes| {
-                active_run_count
-                    .checked_mul(size_of::<Job>())
-                    .and_then(|job_bytes| bytes.checked_add(job_bytes))
-            })
-            .ok_or_else(|| Error::ResourceLimit("compile arena byte count overflow".into()))?;
+        row_stride: usize,
+        row_bytes: usize,
+        stats: &mut PlanStats,
+    ) -> Result<StaticPlanData> {
+        let batch_count = cells.len().div_ceil(self.request.batch_size);
+        let mut objects = Vec::<StaticCacheObject>::new();
+        let mut data_objects = vec![usize::MAX; self.block_candidates.len()];
+        let mut indices_objects = vec![usize::MAX; self.block_candidates.len()];
+        for (candidate_id, candidate) in self.block_candidates.iter().enumerate() {
+            if let Some(block) = &candidate.data {
+                data_objects[candidate_id] = objects.len();
+                objects.push(StaticCacheObject {
+                    side: Side::Data,
+                    block: block.clone(),
+                });
+            }
+            if let Some(block) = &candidate.indices {
+                indices_objects[candidate_id] = objects.len();
+                objects.push(StaticCacheObject {
+                    side: Side::Indices,
+                    block: block.clone(),
+                });
+            }
+        }
+
+        let mut requirements = vec![Vec::<usize>::new(); batch_count];
+        for (ordinal, &candidate_id) in cell_blocks.iter().enumerate() {
+            let batch = ordinal / self.request.batch_size;
+            for object in [data_objects[candidate_id], indices_objects[candidate_id]] {
+                if object != usize::MAX {
+                    requirements[batch].push(object);
+                }
+            }
+        }
+        for batch in &mut requirements {
+            batch.sort_unstable();
+            batch.dedup();
+            if batch.len() > self.request.config.limits.max_blocks_per_job {
+                return Err(Error::ResourceLimit(format!(
+                    "batch cache working set has {} objects, limit is {}",
+                    batch.len(),
+                    self.request.config.limits.max_blocks_per_job
+                )));
+            }
+        }
+
+        let capacity = self.request.config.cache_capacity_bytes;
+        let alignment = self.request.config.cache_alignment;
+        let mut allocator = ExtentAllocator::new(
+            capacity,
+            self.request.config.cache_fragmentation_slack_bytes,
+        );
+        let mut resident = vec![None::<usize>; objects.len()];
+        let mut generations = vec![0u64; objects.len()];
+        let mut residencies = Vec::<StaticResidency>::new();
+        let mut bindings = vec![Vec::<(usize, usize)>::new(); batch_count];
+        let mut next_batch = 0usize;
+        let mut cache_hits = 0usize;
+        let mut cache_misses = 0usize;
+        let mut capacity_stalls = 0usize;
+        let mut fragmentation_stalls = 0usize;
+        let mut alignment_loss = 0usize;
+        let mut horizon_max = 0usize;
+        let mut missing = Vec::<usize>::new();
+
+        for current_batch in 0..batch_count {
+            loop {
+                if next_batch >= batch_count {
+                    break;
+                }
+                for &object in &requirements[next_batch] {
+                    if bindings[next_batch]
+                        .binary_search_by_key(&object, |(bound, _)| *bound)
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    if let Some(residency) = resident[object] {
+                        residencies[residency].compile_refcount = residencies[residency]
+                            .compile_refcount
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                Error::ResourceLimit("compile cache refcount overflow".into())
+                            })?;
+                        bindings[next_batch].push((object, residency));
+                        cache_hits = cache_hits.saturating_add(1);
+                    }
+                }
+                bindings[next_batch].sort_unstable_by_key(|(object, _)| *object);
+
+                missing.clear();
+                missing.extend(requirements[next_batch].iter().copied().filter(|object| {
+                    bindings[next_batch]
+                        .binary_search_by_key(object, |(bound, _)| *bound)
+                        .is_err()
+                }));
+                missing.sort_unstable_by_key(|&object| {
+                    (
+                        std::cmp::Reverse(objects[object].block.decoded_len()),
+                        object,
+                    )
+                });
+                let mut made_progress = false;
+                for &object in &missing {
+                    let decoded_len = objects[object].block.decoded_len();
+                    let allocation_len = align_up(decoded_len, alignment)?;
+                    if allocation_len > capacity {
+                        return Err(Error::ResourceLimit(format!(
+                            "batch {next_batch} contains a decoded cache object requiring {allocation_len} aligned bytes, cache capacity is {capacity}"
+                        )));
+                    }
+                    let Some(extent) = allocator.allocate(allocation_len) else {
+                        if allocator.total_free() >= allocation_len {
+                            fragmentation_stalls = fragmentation_stalls.saturating_add(1);
+                        } else {
+                            capacity_stalls = capacity_stalls.saturating_add(1);
+                        }
+                        continue;
+                    };
+                    let generation = generations[object];
+                    generations[object] = generation
+                        .checked_add(1)
+                        .ok_or_else(|| Error::ResourceLimit("cache generation overflow".into()))?;
+                    let residency = residencies.len();
+                    residencies.push(StaticResidency {
+                        object,
+                        cache: CacheSlice {
+                            offset: extent.offset,
+                            len: decoded_len,
+                            generation,
+                        },
+                        allocation_len,
+                        earliest_consumer_batch: next_batch,
+                        available_after_batch: extent.available_after_batch,
+                        compile_refcount: 1,
+                    });
+                    resident[object] = Some(residency);
+                    bindings[next_batch].push((object, residency));
+                    cache_misses = cache_misses.saturating_add(1);
+                    alignment_loss = alignment_loss.saturating_add(allocation_len - decoded_len);
+                    made_progress = true;
+                }
+                bindings[next_batch].sort_unstable_by_key(|(object, _)| *object);
+                if bindings[next_batch].len() == requirements[next_batch].len() {
+                    next_batch += 1;
+                    horizon_max = horizon_max.max(next_batch.saturating_sub(current_batch));
+                    continue;
+                }
+                if !made_progress {
+                    break;
+                }
+            }
+
+            if bindings[current_batch].len() != requirements[current_batch].len() {
+                let required =
+                    requirements[current_batch]
+                        .iter()
+                        .try_fold(0usize, |total, &object| {
+                            total
+                                .checked_add(align_up(
+                                    objects[object].block.decoded_len(),
+                                    alignment,
+                                )?)
+                                .ok_or_else(|| {
+                                    Error::ResourceLimit("batch cache working set overflow".into())
+                                })
+                        })?;
+                return Err(Error::ResourceLimit(format!(
+                    "batch {current_batch} requires {required} aligned decoded-cache bytes, cache capacity is {capacity}; largest free extent is {}",
+                    allocator.largest_free()
+                )));
+            }
+            for &(_, residency_id) in &bindings[current_batch] {
+                let residency = &mut residencies[residency_id];
+                residency.compile_refcount = residency
+                    .compile_refcount
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::Invariant("compile cache refcount underflow".into()))?;
+                if residency.compile_refcount == 0 {
+                    if resident[residency.object] != Some(residency_id) {
+                        return Err(Error::Invariant(
+                            "compile resident table generation mismatch".into(),
+                        ));
+                    }
+                    resident[residency.object] = None;
+                    allocator.release(
+                        residency.cache.offset,
+                        residency.allocation_len,
+                        current_batch,
+                    );
+                }
+            }
+        }
+        if next_batch != batch_count || residencies.iter().any(|value| value.compile_refcount != 0)
+        {
+            return Err(Error::Invariant(
+                "static cache simulation did not drain every batch reference".into(),
+            ));
+        }
+
+        let mut residency_order = (0..residencies.len()).collect::<Vec<_>>();
+        residency_order.sort_unstable_by_key(|&id| {
+            let residency = &residencies[id];
+            let object = &objects[residency.object];
+            (
+                residency.available_after_batch.is_some(),
+                residency.earliest_consumer_batch,
+                epoch_sort_key(residency.available_after_batch),
+                object.block.source,
+                object.block.encoded_range.start,
+                id,
+            )
+        });
+        let mut io_tasks = Vec::with_capacity(residencies.len());
+        let mut decode_ops = Vec::with_capacity(residencies.len());
+        let mut initialize_count = 0usize;
+        let mut initialize_decoded = 0usize;
+        let mut initialize_io = 0usize;
+        let mut load_owner = Vec::with_capacity(residencies.len());
+        let mut data_io_ops = 0u64;
+        let mut indices_io_ops = 0u64;
+        let mut predicted_bytes = 0u64;
+        let mut fusion_payload_bytes = 0u64;
+        let mut maximum_decode_ops = 0usize;
+        let mut maximum_io_decoded = 0usize;
+        let merge = &self.request.config.io_merge;
+        let mut residency_cursor = 0usize;
+        while residency_cursor < residency_order.len() {
+            let first_id = residency_order[residency_cursor];
+            let first = &residencies[first_id];
+            let first_object = &objects[first.object];
+            let whole_key_len = match &self.sources[first_object.block.source] {
+                ReadSource::WholeKey { declared_len, .. } => Some(*declared_len),
+                _ => None,
+            };
+            let mut read_start = first_object.block.encoded_range.start;
+            let mut read_end = first_object.block.encoded_range.end;
+            let mut payload_bytes = range_len_u64(&first_object.block.encoded_range)?;
+            let mut decoded_bytes = first_object.block.decoded_len();
+            if decoded_bytes > merge.max_decoded_bytes_per_io_task {
+                return Err(Error::ResourceLimit(format!(
+                    "one cache object requires {decoded_bytes} decoded bytes in an I/O task, limit is {}",
+                    merge.max_decoded_bytes_per_io_task
+                )));
+            }
+            if whole_key_len.is_none() && payload_bytes > merge.max_encoded_staging_bytes_per_task {
+                return Err(Error::ResourceLimit(format!(
+                    "one cache object requires {payload_bytes} encoded staging bytes, limit is {}",
+                    merge.max_encoded_staging_bytes_per_task
+                )));
+            }
+            let mut bucket_end = residency_cursor + 1;
+            while bucket_end < residency_order.len() {
+                let candidate = &residencies[residency_order[bucket_end]];
+                let object = &objects[candidate.object];
+                if object.side != first_object.side
+                    || object.block.source != first_object.block.source
+                    || candidate.available_after_batch != first.available_after_batch
+                    || candidate.earliest_consumer_batch != first.earliest_consumer_batch
+                {
+                    break;
+                }
+                bucket_end += 1;
+            }
+            let parallelism_hint = if first.available_after_batch.is_none() {
+                merge.initialize_parallelism_hint
+            } else {
+                merge.regular_io_parallelism_hint
+            };
+            let task_floor = parallelism_hint
+                .saturating_mul(merge.min_tasks_per_worker)
+                .min(bucket_end - residency_cursor);
+            let floor_limited_end = bucket_end.saturating_sub(task_floor.saturating_sub(1));
+            let policy_group_end = match merge.policy {
+                IoMergePolicy::Off => residency_cursor + 1,
+                _ if whole_key_len.is_some() => bucket_end,
+                IoMergePolicy::Adjacent => floor_limited_end,
+                IoMergePolicy::CostAware => {
+                    residency_cursor
+                        + cost_aware_first_group_end(
+                            &residency_order[residency_cursor..bucket_end],
+                            &residencies,
+                            &objects,
+                            merge,
+                        )?
+                }
+            };
+            let maximum_group_end =
+                if whole_key_len.is_some() && !matches!(merge.policy, IoMergePolicy::Off) {
+                    policy_group_end
+                } else {
+                    policy_group_end.min(floor_limited_end)
+                };
+            let mut group_end = residency_cursor + 1;
+            while group_end < maximum_group_end {
+                let candidate = &residencies[residency_order[group_end]];
+                let object = &objects[candidate.object];
+                let gap = object.block.encoded_range.start.saturating_sub(read_end);
+                let combined_end = read_end.max(object.block.encoded_range.end);
+                let combined_len =
+                    usize::try_from(combined_end.saturating_sub(read_start)).unwrap_or(usize::MAX);
+                let block_encoded = range_len_u64(&object.block.encoded_range)?;
+                let next_payload = payload_bytes.saturating_add(block_encoded);
+                let next_decoded = decoded_bytes.saturating_add(object.block.decoded_len());
+                let next_ops = group_end + 1 - residency_cursor;
+                let amplification = if next_payload == 0 {
+                    1.0
+                } else {
+                    combined_len as f64 / next_payload as f64
+                };
+                let policy_allows = match merge.policy {
+                    IoMergePolicy::Off => false,
+                    IoMergePolicy::Adjacent => gap == 0,
+                    IoMergePolicy::CostAware => true,
+                };
+                if object.side != first_object.side
+                    || object.block.source != first_object.block.source
+                    || candidate.available_after_batch != first.available_after_batch
+                    || candidate.earliest_consumer_batch != first.earliest_consumer_batch
+                    || !policy_allows
+                    || next_ops > merge.max_decode_ops_per_io_task
+                    || next_decoded > merge.max_decoded_bytes_per_io_task
+                    || (whole_key_len.is_none()
+                        && (combined_len > merge.max_coalesced_io_bytes
+                            || combined_len > merge.max_encoded_staging_bytes_per_task
+                            || amplification > merge.max_io_amplification_ratio))
+                {
+                    break;
+                }
+                read_end = combined_end;
+                payload_bytes = next_payload;
+                decoded_bytes = next_decoded;
+                group_end += 1;
+            }
+            let encoded_len = if let Some(declared_len) = whole_key_len {
+                read_start = 0;
+                if declared_len > merge.max_encoded_staging_bytes_per_task {
+                    return Err(Error::ResourceLimit(format!(
+                        "whole-key I/O task requires {declared_len} staging bytes, limit is {}",
+                        merge.max_encoded_staging_bytes_per_task
+                    )));
+                }
+                declared_len
+            } else {
+                usize::try_from(read_end - read_start)
+                    .map_err(|_| Error::ResourceLimit("coalesced I/O range exceeds usize".into()))?
+            };
+            let decode_start = decode_ops.len();
+            for &residency_id in &residency_order[residency_cursor..group_end] {
+                let residency = &residencies[residency_id];
+                let object = &objects[residency.object];
+                let block_len = range_len_u64(&object.block.encoded_range)?;
+                decode_ops.push(DecodeOp {
+                    encoded_offset: usize::try_from(object.block.encoded_range.start - read_start)
+                        .map_err(|_| {
+                            Error::ResourceLimit("coalesced block offset exceeds usize".into())
+                        })?,
+                    encoded_len: block_len,
+                    decoder: object.block.decoder,
+                    cache: residency.cache,
+                    ready_node: residency_id,
+                });
+                if first.available_after_batch.is_none() {
+                    initialize_decoded = initialize_decoded.saturating_add(residency.cache.len);
+                }
+            }
+            io_tasks.push(IoDecodeLoadTask {
+                source: first_object.block.source,
+                file_offset: read_start,
+                file_len: encoded_len,
+                decode_ops: decode_start..decode_ops.len(),
+                earliest_consumer_batch: first.earliest_consumer_batch as u64,
+                available_after_batch: first.available_after_batch.map(|value| value as u64),
+            });
+            load_owner.push(first.earliest_consumer_batch);
+            if first.available_after_batch.is_none() {
+                initialize_count += 1;
+                initialize_io = initialize_io.saturating_add(encoded_len);
+            }
+            match first_object.side {
+                Side::Data => data_io_ops = data_io_ops.saturating_add(1),
+                Side::Indices => indices_io_ops = indices_io_ops.saturating_add(1),
+            }
+            predicted_bytes = predicted_bytes.saturating_add(encoded_len as u64);
+            fusion_payload_bytes = fusion_payload_bytes.saturating_add(payload_bytes as u64);
+            maximum_decode_ops = maximum_decode_ops.max(group_end - residency_cursor);
+            maximum_io_decoded = maximum_io_decoded.max(decoded_bytes);
+            residency_cursor = group_end;
+        }
+
+        let mut dense_tasks = Vec::<DenseScatterTask>::new();
+        let mut csr_tasks = Vec::<CsrScatterTask>::new();
+        let mut dense_loads = Vec::<Option<usize>>::new();
+        let mut csr_loads = Vec::<[usize; 2]>::new();
+        let mut jobs = Vec::<StaticJob>::with_capacity(batch_count);
+        let mut io_cursor = initialize_count;
+        for (batch, batch_bindings) in bindings.iter().enumerate() {
+            let io_start = io_cursor;
+            while io_cursor < io_tasks.len() && load_owner[io_cursor] == batch {
+                io_cursor += 1;
+            }
+            let dense_start = dense_tasks.len();
+            let csr_start = csr_tasks.len();
+            let row_start = batch * self.request.batch_size;
+            let row_end = (row_start + self.request.batch_size).min(cells.len());
+            let job_cells = row_end - row_start;
+            if job_cells > self.request.config.limits.max_cells_per_job {
+                return Err(Error::ResourceLimit(format!(
+                    "batch {batch} has {job_cells} cells, limit is {}",
+                    self.request.config.limits.max_cells_per_job
+                )));
+            }
+            for ordinal in row_start..row_end {
+                let candidate_id = cell_blocks[ordinal];
+                let candidate = &self.block_candidates[candidate_id];
+                let compact = &cells[ordinal];
+                let output = OutputSlice {
+                    ring_offset: compact.output_slot.row_offset(),
+                    len: row_stride,
+                    generation: batch as u64,
+                };
+                let cell = CellTask::new(
+                    OutputSlot::new(output.ring_offset, false).ok_or_else(|| {
+                        Error::Invariant("static output offset is not aligned".into())
+                    })?,
+                    compact.data_range(),
+                    compact.indices_range(),
+                )
+                .ok_or_else(|| Error::ResourceLimit("static cell task range exceeds u32".into()))?;
+                let lookup = |object: usize| -> Result<(CacheSlice, usize)> {
+                    let binding = batch_bindings
+                        .binary_search_by_key(&object, |(candidate, _)| *candidate)
+                        .ok()
+                        .and_then(|index| batch_bindings.get(index))
+                        .ok_or_else(|| Error::Invariant("batch cache binding is missing".into()))?;
+                    let residency = binding.1;
+                    Ok((residencies[residency].cache, residency))
+                };
+                if candidate.indices.is_some() {
+                    let (data, data_load) = lookup(data_objects[candidate_id])?;
+                    let (indices, indices_load) = lookup(indices_objects[candidate_id])?;
+                    csr_tasks.push(CsrScatterTask {
+                        data,
+                        indices,
+                        cell,
+                        output,
+                        source_plan: candidate.did as usize,
+                        completion_node: 0,
+                    });
+                    csr_loads.push([data_load, indices_load]);
+                } else {
+                    let (data, load) = if candidate.data.is_some() {
+                        let (slice, load) = lookup(data_objects[candidate_id])?;
+                        (Some(slice), Some(load))
+                    } else {
+                        (None, None)
+                    };
+                    dense_tasks.push(DenseScatterTask {
+                        data,
+                        cell,
+                        output,
+                        source_plan: candidate.did as usize,
+                        completion_node: 0,
+                    });
+                    dense_loads.push(load);
+                }
+            }
+            jobs.push(StaticJob {
+                batch_id: batch as u64,
+                io_tasks: io_start..io_cursor,
+                csr_tasks: csr_start..csr_tasks.len(),
+                dense_tasks: dense_start..dense_tasks.len(),
+                output_slot: if self.ring_slots == 0 {
+                    0
+                } else {
+                    batch % self.ring_slots
+                },
+                output_generation: batch as u64,
+                completion_node: 0,
+            });
+        }
+        if io_cursor != io_tasks.len() {
+            return Err(Error::Invariant(
+                "regular load tasks are not grouped by owner batch".into(),
+            ));
+        }
+
+        let load_count = io_tasks.len();
+        let dense_base = load_count;
+        let csr_base = dense_base + dense_tasks.len();
+        let executable = csr_base + csr_tasks.len();
+        let mut dependency_counts = vec![0u32; executable];
+        let mut block_successor_lists = vec![Vec::<usize>::new(); residencies.len()];
+        let mut prefix_buckets = vec![Vec::<usize>::new(); batch_count];
+        let mut ring_buckets = vec![Vec::<usize>::new(); batch_count];
+        for (load, task) in io_tasks.iter().enumerate() {
+            if let Some(batch) = task.available_after_batch {
+                let batch = usize::try_from(batch)
+                    .map_err(|_| Error::ResourceLimit("prefix batch exceeds usize".into()))?;
+                dependency_counts[load] = 1;
+                prefix_buckets[batch].push(load);
+            }
+        }
+        for (task_id, load) in dense_loads.iter().enumerate() {
+            let node = dense_base + task_id;
+            if let Some(ready) = *load {
+                block_successor_lists[ready].push(node);
+                dependency_counts[node] = dependency_counts[node]
+                    .checked_add(1)
+                    .ok_or_else(|| Error::ResourceLimit("dependency count exceeds u32".into()))?;
+            }
+            let batch = dense_tasks[task_id].output.generation as usize;
+            if batch >= self.ring_slots {
+                dependency_counts[node] = dependency_counts[node]
+                    .checked_add(1)
+                    .ok_or_else(|| Error::ResourceLimit("dependency count exceeds u32".into()))?;
+                ring_buckets[batch - self.ring_slots].push(node);
+            }
+            dense_tasks[task_id].completion_node = node;
+        }
+        for (task_id, loads) in csr_loads.iter().enumerate() {
+            let node = csr_base + task_id;
+            for &ready in loads {
+                block_successor_lists[ready].push(node);
+                dependency_counts[node] = dependency_counts[node]
+                    .checked_add(1)
+                    .ok_or_else(|| Error::ResourceLimit("dependency count exceeds u32".into()))?;
+            }
+            let batch = csr_tasks[task_id].output.generation as usize;
+            if batch >= self.ring_slots {
+                dependency_counts[node] = dependency_counts[node]
+                    .checked_add(1)
+                    .ok_or_else(|| Error::ResourceLimit("dependency count exceeds u32".into()))?;
+                ring_buckets[batch - self.ring_slots].push(node);
+            }
+            csr_tasks[task_id].completion_node = node;
+        }
+        for (batch, job) in jobs.iter_mut().enumerate() {
+            job.completion_node = executable + batch;
+        }
+        let mut block_ready_ranges = Vec::with_capacity(block_successor_lists.len());
+        let mut block_ready_successors = Vec::new();
+        for list in &mut block_successor_lists {
+            list.sort_unstable();
+            list.dedup();
+            let start = block_ready_successors.len();
+            block_ready_successors.extend_from_slice(list);
+            block_ready_ranges.push(start..block_ready_successors.len());
+        }
+        let prefix_releases = flatten_release_buckets(prefix_buckets)?;
+        let ring_releases = flatten_release_buckets(ring_buckets)?;
+
+        let arena_bytes = checked_payload_bytes(&[
+            (io_tasks.len(), size_of::<IoDecodeLoadTask>()),
+            (decode_ops.len(), size_of::<DecodeOp>()),
+            (dense_tasks.len(), size_of::<DenseScatterTask>()),
+            (csr_tasks.len(), size_of::<CsrScatterTask>()),
+            (jobs.len(), size_of::<StaticJob>()),
+            (dependency_counts.len(), size_of::<u32>()),
+            (block_ready_ranges.len(), size_of::<Range<usize>>()),
+            (block_ready_successors.len(), size_of::<usize>()),
+            (
+                prefix_releases.release_ranges.len(),
+                size_of::<Range<usize>>(),
+            ),
+            (prefix_releases.released_nodes.len(), size_of::<usize>()),
+            (
+                ring_releases.release_ranges.len(),
+                size_of::<Range<usize>>(),
+            ),
+            (ring_releases.released_nodes.len(), size_of::<usize>()),
+        ])?;
         if arena_bytes > self.request.config.limits.max_compile_arena_bytes {
             return Err(Error::ResourceLimit(format!(
                 "compile arena has {arena_bytes} bytes, limit is {}",
                 self.request.config.limits.max_compile_arena_bytes
             )));
         }
-        let retained_bytes = cells
-            .len()
-            .checked_mul(size_of::<CompactCell>())
-            .and_then(|bytes| {
-                block_jobs
-                    .len()
-                    .checked_mul(size_of::<TempBlockJob>())
-                    .and_then(|job_bytes| bytes.checked_add(job_bytes))
-            })
-            .and_then(|bytes| {
-                cell_blocks
-                    .len()
-                    .checked_mul(size_of::<usize>())
-                    .and_then(|member_bytes| bytes.checked_add(member_bytes))
-            })
-            .and_then(|bytes| {
-                runs.len()
-                    .checked_mul(size_of::<TempRun>())
-                    .and_then(|run_bytes| bytes.checked_add(run_bytes))
-            })
-            .and_then(|bytes| {
-                merged
-                    .members
-                    .len()
-                    .checked_mul(size_of::<MemberNode>())
-                    .and_then(|node_bytes| bytes.checked_add(node_bytes))
-            })
-            .and_then(|bytes| {
-                self.block_candidates
-                    .len()
-                    .checked_mul(size_of::<BlockCandidate>())
-                    .and_then(|candidate_bytes| bytes.checked_add(candidate_bytes))
-            })
-            .and_then(|bytes| bytes.checked_add(self.chunk_metadata_bytes))
-            .and_then(|bytes| bytes.checked_add(self.retained_whole_key_bytes))
-            .ok_or_else(|| Error::ResourceLimit("retained compile byte count overflow".into()))?;
-        let maximum_run_blocks = runs
+
+        stats.input_rows = cells.len();
+        stats.block_jobs = objects.len();
+        stats.jobs = batch_count;
+        stats.data_io_ops = data_io_ops;
+        stats.indices_io_ops = indices_io_ops;
+        stats.predicted_physical_bytes = predicted_bytes;
+        stats.gap_bytes = 0;
+        stats.maximum_encoded_bytes_per_side = objects
             .iter()
-            .filter(|run| run.active)
-            .map(|run| run.block_count)
+            .map(|object| range_len_u64(&object.block.encoded_range).unwrap_or(usize::MAX))
             .max()
             .unwrap_or(0);
-        let finalize_temporary_bytes = block_jobs
-            .len()
-            .checked_mul(size_of::<usize>())
-            .and_then(|bytes| {
-                block_jobs
-                    .len()
-                    .checked_mul(size_of::<usize>())
-                    .and_then(|value| value.checked_mul(3))
-                    .and_then(|value| bytes.checked_add(value))
-            })
-            .and_then(|bytes| {
-                runs.len()
-                    .checked_mul(size_of::<Range<usize>>())
-                    .and_then(|value| value.checked_mul(3))
-                    .and_then(|value| bytes.checked_add(value))
-            })
-            .and_then(|bytes| {
-                runs.len()
-                    .checked_mul(size_of::<usize>())
-                    .and_then(|value| {
-                        active_run_count
-                            .checked_mul(size_of::<usize>())
-                            .and_then(|active_bytes| value.checked_add(active_bytes))
-                    })
-                    .and_then(|value| bytes.checked_add(value))
-            })
-            .and_then(|bytes| {
-                cells
-                    .len()
-                    .checked_mul(size_of::<(usize, usize)>())
-                    .and_then(|value| bytes.checked_add(value))
-            })
-            .and_then(|bytes| {
-                maximum_run_blocks
-                    .checked_mul(size_of::<usize>())
-                    .and_then(|value| bytes.checked_add(value))
-            })
-            .ok_or_else(|| Error::ResourceLimit("finalize temporary byte count overflow".into()))?;
-        let working_set = arena_bytes
-            .checked_add(retained_bytes)
-            .and_then(|bytes| bytes.checked_add(finalize_temporary_bytes))
-            .ok_or_else(|| Error::ResourceLimit("compile working set overflow".into()))?;
-        if working_set > self.request.config.limits.max_compile_working_set_bytes {
-            return Err(Error::ResourceLimit(format!(
-                "compile working-set payload requires {working_set} bytes, limit is {}",
-                self.request.config.limits.max_compile_working_set_bytes
-            )));
-        }
-
-        let mut active_ids = Vec::new();
-        active_ids.try_reserve_exact(active_run_count)?;
-        let mut run_blocks = Vec::new();
-        run_blocks.try_reserve_exact(block_jobs.len())?;
-        let mut run_block_ranges = vec![0..0; runs.len()];
-        let mut traversal = Vec::new();
-        traversal.try_reserve_exact(maximum_run_blocks)?;
-        for (run_id, run) in runs.iter().enumerate().filter(|(_, run)| run.active) {
-            active_ids.push(run_id);
-            let start = run_blocks.len();
-            append_run_members(
-                run.member_root,
-                &merged.members,
-                &mut traversal,
-                &mut run_blocks,
-            )?;
-            let end = run_blocks.len();
-            if end - start != run.block_count {
-                return Err(Error::Invariant("run member count is inconsistent".into()));
-            }
-            run_block_ranges[run_id] = start..end;
-        }
-
-        let mut block_to_run = vec![usize::MAX; block_jobs.len()];
-        for &run_id in &active_ids {
-            for &block_id in &run_blocks[run_block_ranges[run_id].clone()] {
-                let owner = block_to_run
-                    .get_mut(block_id)
-                    .ok_or_else(|| Error::Invariant("run member block is out of range".into()))?;
-                if *owner != usize::MAX {
-                    return Err(Error::Invariant(
-                        "block belongs to multiple final runs".into(),
-                    ));
-                }
-                *owner = run_id;
-            }
-        }
-
-        let mut run_cell_ranges = vec![0..0; runs.len()];
-        let mut next_cell = 0usize;
-        for &run_id in &active_ids {
-            let end = next_cell
-                .checked_add(runs[run_id].cell_count)
-                .ok_or_else(|| Error::ResourceLimit("ordered cell range overflow".into()))?;
-            run_cell_ranges[run_id] = next_cell..end;
-            next_cell = end;
-        }
-        if next_cell != cells.len() || cell_blocks.len() != cells.len() {
-            return Err(Error::Invariant(
-                "final runs do not cover every cell exactly once".into(),
-            ));
-        }
-        let mut cell_cursors = run_cell_ranges
+        stats.maximum_decoded_bytes_per_job = requirements
             .iter()
-            .map(|range| range.start)
-            .collect::<Vec<_>>();
-        let mut ordered_cells = vec![(usize::MAX, usize::MAX); cells.len()];
-        for (cell_id, &block_id) in cell_blocks.iter().enumerate() {
-            let run_id = *block_to_run
-                .get(block_id)
-                .ok_or_else(|| Error::Invariant("cell block is out of range".into()))?;
-            if run_id == usize::MAX {
-                return Err(Error::Invariant("cell block has no final run".into()));
-            }
-            let cursor = &mut cell_cursors[run_id];
-            if *cursor >= run_cell_ranges[run_id].end {
-                return Err(Error::Invariant("final run cell range overflow".into()));
-            }
-            ordered_cells[*cursor] = (cell_id, block_id);
-            *cursor += 1;
-        }
-        for &run_id in &active_ids {
-            if cell_cursors[run_id] != run_cell_ranges[run_id].end {
-                return Err(Error::Invariant(
-                    "final run cell range is incomplete".into(),
-                ));
-            }
-        }
-
-        let mut arena_completions = Vec::new();
-        arena_completions.try_reserve_exact(completion_capacity)?;
-        let mut run_completion_ranges = vec![0..0; runs.len()];
-        for &run_id in &active_ids {
-            let start = arena_completions.len();
-            let ordered = &ordered_cells[run_cell_ranges[run_id].clone()];
-            let mut index = 0usize;
-            while index < ordered.len() {
-                let logical_batch = if let Some(shift) = self.batch_shift {
-                    ordered[index].0 >> shift
-                } else {
-                    ordered[index].0 / self.request.batch_size
-                };
-                let mut end = index + 1;
-                while end < ordered.len() {
-                    let next_batch = if let Some(shift) = self.batch_shift {
-                        ordered[end].0 >> shift
-                    } else {
-                        ordered[end].0 / self.request.batch_size
-                    };
-                    if next_batch != logical_batch {
-                        break;
-                    }
-                    end += 1;
-                }
-                let ring_batch = if self.ring_mask == usize::MAX {
-                    logical_batch % self.ring_slots
-                } else {
-                    logical_batch & self.ring_mask
-                };
-                append_batch_completions(&mut arena_completions, ring_batch, end - index)?;
-                index = end;
-            }
-            run_completion_ranges[run_id] = start..arena_completions.len();
-        }
-
-        let mut block_rank = vec![usize::MAX; block_jobs.len()];
-        for (rank, &block_id) in run_blocks.iter().enumerate() {
-            *block_rank
-                .get_mut(block_id)
-                .ok_or_else(|| Error::Invariant("run block rank is out of range".into()))? = rank;
-        }
-        for &run_id in &active_ids {
-            ordered_cells[run_cell_ranges[run_id].clone()]
-                .sort_unstable_by_key(|&(cell_id, block_id)| (block_rank[block_id], cell_id));
-        }
-
-        let mut direct_outputs = vec![usize::MAX; block_jobs.len()];
-        let logical_row_bytes = self
-            .request
-            .output
-            .n_cols
-            .checked_mul(self.request.output.dtype.size())
-            .ok_or_else(|| Error::ResourceLimit("direct output row size overflow".into()))?;
-        let mut ordered_start = 0usize;
-        while ordered_start < ordered_cells.len() {
-            let block_id = ordered_cells[ordered_start].1;
-            let mut ordered_end = ordered_start + 1;
-            while ordered_end < ordered_cells.len() && ordered_cells[ordered_end].1 == block_id {
-                ordered_end += 1;
-            }
-            let block_job = &block_jobs[block_id];
-            let candidate = &self.block_candidates[block_job.block_key];
-            let Some(data) = candidate.data.as_ref() else {
-                ordered_start = ordered_end;
-                continue;
-            };
-            let source_plan = &self.source_plans[candidate.did as usize];
-            if candidate.indices.is_none()
-                && source_plan.can_decode_direct()
-                && block_job.cell_count == ordered_end - ordered_start
-            {
-                let first_output = cells[ordered_cells[ordered_start].0]
-                    .output_slot
-                    .row_offset();
-                let mut decoded_cursor = 0usize;
-                let mut eligible = true;
-                for &(cell_id, _) in &ordered_cells[ordered_start..ordered_end] {
-                    let cell = &cells[cell_id];
-                    let expected_end =
-                        decoded_cursor
-                            .checked_add(logical_row_bytes)
-                            .ok_or_else(|| {
-                                Error::ResourceLimit("direct decoded extent overflow".into())
-                            })?;
-                    let expected_output =
-                        first_output.checked_add(decoded_cursor).ok_or_else(|| {
-                            Error::ResourceLimit("direct output extent overflow".into())
-                        })?;
-                    if cell.data_range() != (decoded_cursor..expected_end)
-                        || cell.output_slot.row_offset() != expected_output
-                    {
-                        eligible = false;
-                        break;
-                    }
-                    decoded_cursor = expected_end;
-                }
-                if eligible && decoded_cursor == data.decoded_len() {
-                    direct_outputs[block_id] = first_output;
-                }
-            }
-            ordered_start = ordered_end;
-        }
-
-        let mut jobs = Vec::new();
-        let mut arena_groups = Vec::new();
-        let mut arena_cells = Vec::new();
-        let mut arena_blocks = Vec::new();
-        let mut stats = PlanStats {
-            output_ring_bytes,
-            ..PlanStats::default()
-        };
-        jobs.try_reserve_exact(active_run_count)?;
-        arena_groups.try_reserve_exact(block_jobs.len())?;
-        arena_cells.try_reserve_exact(cells.len())?;
-        arena_blocks.try_reserve_exact(block_spec_count)?;
-        let mut data_specs = vec![usize::MAX; block_jobs.len()];
-        let mut indices_specs = vec![usize::MAX; block_jobs.len()];
-
-        for &run_id in &active_ids {
-            let run = &runs[run_id];
-            let block_ids = &run_blocks[run_block_ranges[run_id].clone()];
-            let data_read = run.data_range.clone().unwrap_or(0..0);
-            let indices_read = run.indices_range.clone();
-            let data_source = run.data_source;
-            let indices_source = run.indices_source;
-
-            #[cfg(feature = "profile")]
-            let data_blocks_start = arena_blocks.len();
-            let mut data_decoded = 0usize;
-            for block_id in block_ids {
-                let candidate = &self.block_candidates[block_jobs[*block_id].block_key];
-                let Some(block) = &candidate.data else {
-                    continue;
-                };
-                let direct_output = direct_outputs[*block_id];
-                data_decoded = data_decoded
-                    .checked_add(block.decoded_len())
-                    .ok_or_else(|| Error::ResourceLimit("decoded data bytes overflow".into()))?;
-                let encoded_range = relative_range(&block.encoded_range, &data_read)?;
-                let direct_output_plus_one = if direct_output == usize::MAX {
-                    0
-                } else {
-                    direct_output.checked_add(1).ok_or_else(|| {
-                        Error::ResourceLimit("direct output offset overflow".into())
-                    })?
-                };
-                let spec_id = arena_blocks.len();
-                arena_blocks.push(
-                    BlockSpec::new(block.decoder, encoded_range, direct_output_plus_one)
-                        .ok_or_else(|| {
-                            Error::ResourceLimit(
-                                "block spec exceeds compact offset representation".into(),
-                            )
-                        })?,
-                );
-                data_specs[*block_id] = spec_id;
-            }
-            #[cfg(feature = "profile")]
-            let data_blocks_end = arena_blocks.len();
-
-            #[cfg(feature = "profile")]
-            let indices_blocks_start = arena_blocks.len();
-            let mut indices_decoded = 0usize;
-            for block_id in block_ids {
-                let candidate = &self.block_candidates[block_jobs[*block_id].block_key];
-                let Some(block) = &candidate.indices else {
-                    continue;
-                };
-                indices_decoded = indices_decoded
-                    .checked_add(block.decoded_len())
-                    .ok_or_else(|| Error::ResourceLimit("decoded indices bytes overflow".into()))?;
-                let read = indices_read.as_ref().ok_or_else(|| {
-                    Error::Invariant("CSR indices block has no physical read".into())
-                })?;
-                let spec_id = arena_blocks.len();
-                arena_blocks.push(
-                    BlockSpec::new(
-                        block.decoder,
-                        relative_range(&block.encoded_range, read)?,
-                        0,
-                    )
-                    .ok_or_else(|| {
-                        Error::ResourceLimit(
-                            "indices block spec exceeds compact offset representation".into(),
-                        )
-                    })?,
-                );
-                indices_specs[*block_id] = spec_id;
-            }
-            #[cfg(feature = "profile")]
-            let indices_blocks_end = arena_blocks.len();
-
-            let groups_start = arena_groups.len();
-            let ordered = &ordered_cells[run_cell_ranges[run_id].clone()];
-            let mut ordered_cursor = 0usize;
-            for &block_id in block_ids {
-                let candidate = &self.block_candidates[block_jobs[block_id].block_key];
-                let group_cells_start = arena_cells.len();
-                while ordered_cursor < ordered.len() && ordered[ordered_cursor].1 == block_id {
-                    let cell = &cells[ordered[ordered_cursor].0];
-                    let direct_decode = direct_outputs[block_id] != usize::MAX;
-                    let data_range = if direct_decode || candidate.data.is_none() {
-                        0..0
-                    } else {
-                        cell.data_range()
-                    };
-                    let indices_range = if candidate.indices.is_some() {
-                        Some(cell.indices_range().ok_or_else(|| {
-                            Error::Invariant("CSR compact cell has no indices range".into())
-                        })?)
-                    } else {
-                        None
-                    };
-                    let task =
-                        CellTask::new(cell.output_slot, data_range, indices_range).ok_or_else(
-                            || {
-                                Error::ResourceLimit(
-                                    "cell task exceeds compact decoded-offset/aligned-row representation"
-                                        .into(),
-                                )
-                            },
-                        )?;
-                    arena_cells.push(if direct_decode {
-                        task.with_direct_decode()
-                    } else {
-                        task
-                    });
-                    ordered_cursor += 1;
-                }
-                if group_cells_start == arena_cells.len() {
-                    return Err(Error::Invariant("block group has no cell tasks".into()));
-                }
-                let data_block = if candidate.data.is_some() {
-                    let spec = data_specs[block_id];
-                    if spec == usize::MAX {
-                        return Err(Error::Invariant("data block spec is missing".into()));
-                    }
-                    Some(spec)
-                } else {
-                    None
-                };
-                let indices_block = if candidate.indices.is_some() {
-                    let spec = indices_specs[block_id];
-                    if spec == usize::MAX {
-                        return Err(Error::Invariant("indices block spec is missing".into()));
-                    }
-                    Some(spec)
-                } else {
-                    None
-                };
-                arena_groups.push(
-                    BlockGroup::new(
-                        data_block,
-                        indices_block,
-                        group_cells_start..arena_cells.len(),
-                    )
-                    .ok_or_else(|| {
-                        Error::ResourceLimit("block group index exceeds compact encoding".into())
-                    })?,
-                );
-            }
-            if ordered_cursor != ordered.len() {
-                return Err(Error::Invariant(
-                    "block groups do not cover every run cell".into(),
-                ));
-            }
-            let groups_end = arena_groups.len();
-            let right_exclusive = run
-                .batch_max
-                .checked_add(1)
-                .ok_or_else(|| Error::ResourceLimit("job batch range overflow".into()))?;
-            let start_step = right_exclusive.saturating_sub(self.request.prefetch_step);
-            let data = JobSide {
-                source: data_source,
-                read_range: data_read,
-                #[cfg(feature = "profile")]
-                blocks: data_blocks_start..data_blocks_end,
-            };
-            let indices = if let Some(read_range) = indices_read {
-                Some(JobSide {
-                    source: indices_source.ok_or_else(|| {
-                        Error::Invariant("indices read has no registered source".into())
-                    })?,
-                    read_range,
-                    #[cfg(feature = "profile")]
-                    blocks: indices_blocks_start..indices_blocks_end,
+            .map(|batch| {
+                batch.iter().fold(0usize, |total, object| {
+                    total.saturating_add(objects[*object].block.decoded_len())
                 })
-            } else {
-                None
-            };
-            let data_encoded = data.encoded_len(&self.sources[data.source]);
-            let indices_encoded = indices
-                .as_ref()
-                .map_or(0, |side| side.encoded_len(&self.sources[side.source]));
-            stats.maximum_encoded_bytes_per_side = stats
-                .maximum_encoded_bytes_per_side
-                .max(data_encoded)
-                .max(indices_encoded);
-            let decoded_bytes = data_decoded
-                .checked_add(indices_decoded)
-                .ok_or_else(|| Error::ResourceLimit("decoded job byte count overflow".into()))?;
-            stats.maximum_decoded_bytes_per_job =
-                stats.maximum_decoded_bytes_per_job.max(decoded_bytes);
-            if data_encoded > 0 {
-                stats.data_io_ops = stats
-                    .data_io_ops
-                    .checked_add(1)
-                    .ok_or_else(|| Error::ResourceLimit("data I/O count overflow".into()))?;
-                let data_encoded = u64::try_from(data_encoded).map_err(|_| {
-                    Error::ResourceLimit("predicted data byte count exceeds u64".into())
-                })?;
-                stats.predicted_physical_bytes = stats
-                    .predicted_physical_bytes
-                    .checked_add(data_encoded)
-                    .ok_or_else(|| Error::ResourceLimit("predicted bytes overflow".into()))?;
-            }
-            if indices_encoded > 0 {
-                stats.indices_io_ops = stats
-                    .indices_io_ops
-                    .checked_add(1)
-                    .ok_or_else(|| Error::ResourceLimit("indices I/O count overflow".into()))?;
-                let indices_encoded = u64::try_from(indices_encoded).map_err(|_| {
-                    Error::ResourceLimit("predicted indices byte count exceeds u64".into())
-                })?;
-                stats.predicted_physical_bytes = stats
-                    .predicted_physical_bytes
-                    .checked_add(indices_encoded)
-                    .ok_or_else(|| Error::ResourceLimit("predicted bytes overflow".into()))?;
-            }
-            let block_encoded: usize =
-                block_ids
-                    .iter()
-                    .try_fold(0usize, |total, id| -> Result<usize> {
-                        let candidate = &self.block_candidates[block_jobs[*id].block_key];
-                        let data_bytes = candidate
-                            .data
-                            .as_ref()
-                            .map(|block| range_len_u64(&block.encoded_range))
-                            .transpose()?
-                            .unwrap_or(0);
-                        let indices_bytes = candidate
-                            .indices
-                            .as_ref()
-                            .map(|block| range_len_u64(&block.encoded_range))
-                            .transpose()?
-                            .unwrap_or(0);
-                        let bytes = data_bytes.checked_add(indices_bytes).ok_or_else(|| {
-                            Error::ResourceLimit("block byte count overflow".into())
-                        })?;
-                        total
-                            .checked_add(bytes)
-                            .ok_or_else(|| Error::ResourceLimit("block byte count overflow".into()))
-                    })?;
-            let gap_bytes = data_encoded
-                .checked_add(indices_encoded)
-                .and_then(|bytes| bytes.checked_sub(block_encoded))
-                .ok_or_else(|| Error::Invariant("gap byte accounting underflow".into()))?;
-            let gap_bytes = u64::try_from(gap_bytes)
-                .map_err(|_| Error::ResourceLimit("gap byte count exceeds u64".into()))?;
-            stats.gap_bytes = stats
-                .gap_bytes
-                .checked_add(gap_bytes)
-                .ok_or_else(|| Error::ResourceLimit("gap byte count overflow".into()))?;
-            jobs.push(Job {
-                source_plan: run.did,
-                completions: run_completion_ranges[run_id].clone(),
-                groups: groups_start..groups_end,
-                data,
-                indices,
-                start_step,
-                anchor: run.anchor,
-                #[cfg(all(feature = "uring", target_os = "linux"))]
-                batch_min: run.batch_min,
-                #[cfg(all(feature = "uring", target_os = "linux"))]
-                batch_max: run.batch_max,
-            });
-        }
-        jobs.sort_by_key(|job| (job.start_step, job.anchor));
-        for pair in jobs.windows(2) {
-            if pair[0].start_step > pair[1].start_step {
-                return Err(Error::Invariant(
-                    "job start_step order is not monotonic".into(),
-                ));
-            }
-        }
+            })
+            .max()
+            .unwrap_or(0);
+        stats.output_ring_bytes = row_stride
+            .checked_mul(self.request.batch_size)
+            .and_then(|bytes| bytes.checked_mul(self.ring_slots))
+            .ok_or_else(|| Error::ResourceLimit("output ring bytes overflow".into()))?;
+        stats.cache_capacity_bytes = capacity;
+        stats.cache_arena_bytes = capacity;
+        stats.cache_alignment_loss_bytes = alignment_loss;
+        stats.unique_cache_objects = objects.len();
+        stats.residency_loads = residencies.len();
+        stats.residency_reloads = residencies.len().saturating_sub(objects.len());
+        stats.cache_reference_hits = cache_hits;
+        stats.cache_reference_misses = cache_misses;
+        stats.cache_capacity_stalls = capacity_stalls;
+        stats.cache_fragmentation_stalls = fragmentation_stalls;
+        stats.cache_horizon_max_batches = horizon_max;
+        stats.output_ring_slots = self.ring_slots;
+        stats.initialize_io_tasks = initialize_count;
+        stats.executable_tasks = executable;
+        stats.dependency_edges = block_ready_successors.len();
+        stats.independent_block_loads = residencies.len();
+        stats.fused_io_tasks = io_tasks.len();
+        stats.predicted_io_ops_saved = residencies.len().saturating_sub(io_tasks.len());
+        stats.io_payload_bytes = fusion_payload_bytes;
+        stats.io_span_bytes = predicted_bytes;
+        stats.io_read_amplification = if fusion_payload_bytes == 0 {
+            1.0
+        } else {
+            predicted_bytes as f64 / fusion_payload_bytes as f64
+        };
+        stats.maximum_decode_ops_per_io_task = maximum_decode_ops;
+        stats.maximum_decoded_bytes_per_io_task = maximum_io_decoded;
+        stats.initialize_fused_io_tasks = initialize_count;
+        stats.regular_fused_io_tasks = io_tasks.len().saturating_sub(initialize_count);
         stats.arena_bytes = arena_bytes;
-        stats.compile_working_set_bytes = working_set.max(self.peak_compile_payload_bytes);
-        stats.retained_whole_key_bytes = self.retained_whole_key_bytes;
-        Ok((
-            jobs,
-            arena_groups,
-            arena_cells,
-            arena_completions,
-            arena_blocks,
-            stats,
-        ))
-    }
-}
+        let _ = row_bytes;
 
-fn runtime_envelope(
-    sources: &[ReadSource],
-    jobs: &[Job],
-    groups: &[BlockGroup],
-    blocks: &[BlockSpec],
-) -> Result<crate::plan::RuntimeEnvelope> {
-    let all_positioned = sources
-        .iter()
-        .all(|source| matches!(source, ReadSource::Empty | ReadSource::Positioned { .. }));
-    #[cfg(target_os = "linux")]
-    let has_fuse_source = {
-        const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
-
-        sources.iter().any(|source| {
-            let ReadSource::Positioned { file, .. } = source else {
-                return false;
-            };
-            rustix::fs::fstatfs(file).is_ok_and(|stats| stats.f_type as u64 == FUSE_SUPER_MAGIC)
+        Ok(StaticPlanData {
+            initialize: InitializeJob {
+                io_tasks: 0..initialize_count,
+                decoded_bytes: initialize_decoded,
+                io_bytes: initialize_io,
+            },
+            jobs: jobs.into_boxed_slice(),
+            io_decode_tasks: io_tasks.into_boxed_slice(),
+            decode_ops: decode_ops.into_boxed_slice(),
+            csr_scatter_tasks: csr_tasks.into_boxed_slice(),
+            dense_scatter_tasks: dense_tasks.into_boxed_slice(),
+            dependencies: DependencyGraph {
+                initial_dependency_count: dependency_counts.into_boxed_slice(),
+                block_ready_ranges: block_ready_ranges.into_boxed_slice(),
+                block_ready_successors: block_ready_successors.into_boxed_slice(),
+            },
+            prefix_releases,
+            ring_releases,
+            cache_capacity: capacity,
+            cache_alignment: alignment,
         })
-    };
-    #[cfg(not(target_os = "linux"))]
-    let has_fuse_source = false;
-
-    let mut envelope = crate::plan::RuntimeEnvelope {
-        all_positioned,
-        has_fuse_source,
-        ..crate::plan::RuntimeEnvelope::default()
-    };
-    for job in jobs {
-        let data_encoded = job.data.encoded_len(&sources[job.data.source]);
-        let indices_encoded = job
-            .indices
-            .as_ref()
-            .map_or(0, |side| side.encoded_len(&sources[side.source]));
-        let combined_encoded = data_encoded
-            .checked_add(indices_encoded)
-            .ok_or_else(|| Error::ResourceLimit("job encoded byte count overflow".into()))?;
-        envelope.maximum_data_encoded = envelope.maximum_data_encoded.max(data_encoded);
-        envelope.maximum_indices_encoded = envelope.maximum_indices_encoded.max(indices_encoded);
-        envelope.maximum_combined_encoded = envelope.maximum_combined_encoded.max(combined_encoded);
     }
-    for group in groups {
-        let data_decoded = match group.data_block() {
-            Some(block) => {
-                let block = blocks
-                    .get(block)
-                    .ok_or_else(|| Error::Invariant("data block group index is invalid".into()))?;
-                if block.direct_output().is_some() {
-                    0
-                } else {
-                    block.decoded_len()
-                }
-            }
-            None => 0,
-        };
-        let indices_decoded = match group.indices_block() {
-            Some(block) => blocks
-                .get(block)
-                .ok_or_else(|| Error::Invariant("indices block group index is invalid".into()))?
-                .decoded_len(),
-            None => 0,
-        };
-        envelope.maximum_data_decoded = envelope.maximum_data_decoded.max(data_decoded);
-        envelope.maximum_indices_decoded = envelope.maximum_indices_decoded.max(indices_decoded);
-    }
-    Ok(envelope)
 }
 
 fn build_dense_map(
@@ -3394,19 +3145,6 @@ fn append_positioned_exact(
     Ok(())
 }
 
-fn relative_range(block: &Range<u64>, read: &Range<u64>) -> Result<Range<usize>> {
-    if block.start < read.start || block.end > read.end {
-        return Err(Error::Invariant(
-            "block range is outside physical read".into(),
-        ));
-    }
-    let start = usize::try_from(block.start - read.start)
-        .map_err(|_| Error::ResourceLimit("relative block start exceeds usize".into()))?;
-    let end = usize::try_from(block.end - read.start)
-        .map_err(|_| Error::ResourceLimit("relative block end exceeds usize".into()))?;
-    Ok(start..end)
-}
-
 fn align_up(value: usize, alignment: usize) -> Result<usize> {
     if value == 0 {
         return Ok(0);
@@ -3434,19 +3172,25 @@ fn checked_payload_bytes(parts: &[(usize, usize)]) -> Result<usize> {
     })
 }
 
-fn append_batch_completions(
-    arena: &mut Vec<BatchCompletion>,
-    ring_batch: usize,
-    mut completed: usize,
-) -> Result<()> {
-    while completed != 0 {
-        let part = completed.min(u32::MAX as usize);
-        arena.push(BatchCompletion::new(ring_batch, part).ok_or_else(|| {
-            Error::ResourceLimit("batch completion exceeds compact representation".into())
-        })?);
-        completed -= part;
+fn flatten_release_buckets(mut buckets: Vec<Vec<usize>>) -> Result<ReleasePlan> {
+    let count = buckets.iter().try_fold(0usize, |total, values| {
+        total
+            .checked_add(values.len())
+            .ok_or_else(|| Error::ResourceLimit("release plan entry count overflow".into()))
+    })?;
+    let mut ranges = Vec::with_capacity(buckets.len());
+    let mut nodes = Vec::with_capacity(count);
+    for values in &mut buckets {
+        values.sort_unstable();
+        values.dedup();
+        let start = nodes.len();
+        nodes.append(values);
+        ranges.push(start..nodes.len());
     }
-    Ok(())
+    Ok(ReleasePlan {
+        release_ranges: ranges.into_boxed_slice(),
+        released_nodes: nodes.into_boxed_slice(),
+    })
 }
 
 fn chunk_metadata_charge(
@@ -3471,98 +3215,6 @@ fn chunk_metadata_charge(
         ),
         (1, key_len),
     ])
-}
-
-impl TempRun {
-    fn run_key(&self) -> RunKey {
-        RunKey {
-            did: self.did,
-            data_source: self.data_source,
-            indices_source: self.indices_source,
-        }
-    }
-
-    fn cost(&self) -> Result<Cost> {
-        ranges_cost(&self.data_range, &self.indices_range)
-    }
-}
-
-impl MergeProjection {
-    fn cost(&self) -> Result<Cost> {
-        ranges_cost(&self.data_range, &self.indices_range)
-    }
-
-    fn into_run(self, member_root: usize) -> TempRun {
-        TempRun {
-            member_root,
-            block_count: self.block_count,
-            anchor: self.anchor,
-            batch_min: self.batch_min,
-            batch_max: self.batch_max,
-            active: true,
-            did: self.did,
-            data_source: self.data_source,
-            indices_source: self.indices_source,
-            data_range: self.data_range,
-            indices_range: self.indices_range,
-            data_decoded: self.data_decoded,
-            indices_decoded: self.indices_decoded,
-            cell_count: self.cell_count,
-        }
-    }
-}
-
-fn append_run_members(
-    root: usize,
-    nodes: &[MemberNode],
-    stack: &mut Vec<usize>,
-    output: &mut Vec<usize>,
-) -> Result<()> {
-    stack.clear();
-    stack.push(root);
-    while let Some(node_id) = stack.pop() {
-        match *nodes
-            .get(node_id)
-            .ok_or_else(|| Error::Invariant("run member node is out of range".into()))?
-        {
-            MemberNode::Block(block_id) => output.push(block_id),
-            MemberNode::Concat { left, right } => {
-                stack.try_reserve(2)?;
-                stack.push(right);
-                stack.push(left);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ranges_cost(data: &Option<Range<u64>>, indices: &Option<Range<u64>>) -> Result<Cost> {
-    let mut cost = Cost { bytes: 0, ops: 0 };
-    for range in [data, indices].into_iter().flatten() {
-        if !range.is_empty() {
-            let bytes = range
-                .end
-                .checked_sub(range.start)
-                .ok_or_else(|| Error::Invariant("physical range is reversed".into()))?;
-            cost.bytes = cost
-                .bytes
-                .checked_add(bytes)
-                .ok_or_else(|| Error::ResourceLimit("run byte cost overflow".into()))?;
-            cost.ops += 1;
-        }
-    }
-    Ok(cost)
-}
-
-fn union_optional_range(left: Option<Range<u64>>, right: Option<Range<u64>>) -> Option<Range<u64>> {
-    match (left, right) {
-        (None, None) => None,
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (Some(a), Some(b)) => {
-            // Whole-key ranges are identical; positioned ranges expand by min/max.
-            Some(a.start.min(b.start)..a.end.max(b.end))
-        }
-    }
 }
 
 #[cfg(test)]

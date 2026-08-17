@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import struct
+import tempfile
+import threading
+import zipfile
 from collections.abc import Iterable, Iterator
+from dataclasses import asdict
+from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 import numpy as np
 from numpy.typing import NDArray
 
 from scdata import _core
 from scdata.exceptions import InternalError
-from scdata.load._config import DEFAULT_MAX_CONTROL_BYTES, PlanConfig, SessionConfig
+from scdata.load._config import DEFAULT_MAX_CONTROL_BYTES, IoMergeConfig, PlanConfig, SessionConfig
+from scdata.load._config import ResourceLimits
 from scdata.load._dataset import Dataset, RowRef
+from scdata.compress._limits import ReadLimits
 from scdata.load._output import OutputSpec
+from scdata.load._location import resolve_matrix_location
 from scdata.load._stats import PlanStats, RuntimeStats, SessionState
 from scdata.load._validation import as_int, normalize_rows
 
@@ -25,18 +37,39 @@ if TYPE_CHECKING:
 __all__ = ["Plan", "Prefetch", "Session", "compile", "prefetch"]
 
 _U32_MAX = (1 << 32) - 1
+_PLAN_MAGIC = b"SCPLAN01"
+_PLAN_HEADER = struct.Struct("<8sHHQQQ32s")
+_PLAN_FORMAT_MAJOR = 1
+_PLAN_FORMAT_MINOR = 0
+_MAX_PLAN_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class Plan:
     """An immutable, reusable prefetch plan."""
 
-    __slots__ = ("_inner", "_meta", "_output", "_stats")
+    __slots__ = ("_bind_lock", "_inner", "_meta", "_output", "_stats", "_template")
 
-    def __init__(self, inner: _core._Plan, output: OutputSpec) -> None:
+    def __init__(
+        self,
+        inner: _core._Plan | None,
+        output: OutputSpec,
+        *,
+        template: dict[str, Any],
+        meta: Mapping[str, Any] | None = None,
+        stats: Mapping[str, Any] | None = None,
+    ) -> None:
         self._inner = inner
-        self._meta = _core.plan_meta(inner)
         self._output = output
-        self._stats = PlanStats._from_mapping(_core.plan_stats(inner))
+        self._template = template
+        self._bind_lock = threading.Lock()
+        if inner is not None:
+            self._meta = _core.plan_meta(inner)
+            self._stats = PlanStats._from_mapping(_core.plan_stats(inner))
+        else:
+            if meta is None or stats is None:
+                raise ValueError("lazy Plan requires encoded metadata and statistics")
+            self._meta = dict(meta)
+            self._stats = PlanStats._from_mapping(stats)
 
     @property
     def batch_size(self) -> int:
@@ -48,7 +81,12 @@ class Plan:
 
     @property
     def prefetch_step(self) -> int:
+        """Number of output-ring slots compiled into the plan."""
         return int(self._meta["prefetch_step"])
+
+    @property
+    def cache_capacity_bytes(self) -> int:
+        return int(self._meta["cache_capacity_bytes"])
 
     @property
     def n_rows(self) -> int:
@@ -90,7 +128,7 @@ class Plan:
     def open(self, config: SessionConfig | None = None) -> Session:
         """Start one independent execution session."""
         resolved = _resolve_session_config(config)
-        inner = _core.plan_open(self._inner, resolved._to_core())
+        inner = _core.plan_open(self._require_inner(), resolved._to_core())
         return Session(inner, self)
 
     def open_distributed(
@@ -124,6 +162,165 @@ class Plan:
         with self.open(config) as session:
             return session.read()
 
+    @property
+    def bound(self) -> bool:
+        """Whether source paths have been opened and verified."""
+        return self._inner is not None
+
+    def bind(
+        self,
+        *,
+        sources: Mapping[int, str | os.PathLike[str]] | None = None,
+        verify: Literal["strict"] = "strict",
+    ) -> Plan:
+        """Open and strictly verify serialized sources, then compile the native plan."""
+        self._require_inner(sources=sources, verify=verify)
+        return self
+
+    def dumps(self) -> bytes:
+        """Serialize the relocatable plan template without runtime pointers or file handles."""
+        return _encode_plan_image(self._template, self._meta, self._stats, self._output)
+
+    @classmethod
+    def loads(
+        cls,
+        blob: bytes | bytearray | memoryview,
+        *,
+        sources: Mapping[int, str | os.PathLike[str]] | None = None,
+        verify: Literal["strict"] = "strict",
+        lazy: bool = True,
+        _base_dir: Path | None = None,
+    ) -> Plan:
+        """Parse a bounded plan image; source I/O is deferred when ``lazy=True``."""
+        template, meta, stats, output = _decode_plan_image(blob, base_dir=_base_dir)
+        plan = cls(None, output, template=template, meta=meta, stats=stats)
+        if sources is not None:
+            plan._apply_source_overrides(sources)
+        if not lazy:
+            plan.bind(verify=verify)
+        elif verify != "strict":
+            raise ValueError("verify must be 'strict'")
+        return plan
+
+    def save(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        relative_sources: bool = False,
+    ) -> None:
+        """Atomically save this plan image."""
+        target = Path(os.fspath(path)).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        template = _copy_template(self._template)
+        if relative_sources:
+            for source in template["sources"]:
+                source["path"] = os.path.relpath(source["path"], target.parent)
+        image = _encode_plan_image(template, self._meta, self._stats, self._output)
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(image)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            directory_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    @classmethod
+    def load(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        sources: Mapping[int, str | os.PathLike[str]] | None = None,
+        verify: Literal["strict"] = "strict",
+        lazy: bool = True,
+    ) -> Plan:
+        """Load a plan image, resolving relative sources against its directory."""
+        source = Path(os.fspath(path)).resolve()
+        return cls.loads(
+            source.read_bytes(),
+            sources=sources,
+            verify=verify,
+            lazy=lazy,
+            _base_dir=source.parent,
+        )
+
+    def __reduce_ex__(self, protocol: int) -> tuple[object, tuple[bytes]]:
+        del protocol
+        return _restore_plan_v1, (self.dumps(),)
+
+    def _apply_source_overrides(
+        self, sources: Mapping[int, str | os.PathLike[str]]
+    ) -> None:
+        if self._inner is not None:
+            raise ValueError("cannot override sources after Plan binding")
+        if not isinstance(sources, Mapping):
+            raise TypeError("sources must be a mapping from source id to path")
+        for source_id, path in sources.items():
+            normalized = as_int(source_id, "source id", maximum=_U32_MAX)
+            try:
+                source = self._template["sources"][normalized]
+            except IndexError as error:
+                raise ValueError(f"source id {normalized} is not registered") from error
+            source["path"] = os.fspath(path)
+
+    def _require_inner(
+        self,
+        *,
+        sources: Mapping[int, str | os.PathLike[str]] | None = None,
+        verify: Literal["strict"] = "strict",
+    ) -> _core._Plan:
+        if verify != "strict":
+            raise ValueError("verify must be 'strict'")
+        if self._inner is not None:
+            if sources is not None:
+                raise ValueError("cannot override sources after Plan binding")
+            return self._inner
+        with self._bind_lock:
+            if self._inner is not None:
+                return self._inner
+            if sources is not None:
+                self._apply_source_overrides(sources)
+            datasets = [_dataset_from_source_spec(source) for source in self._template["sources"]]
+            for source, dataset in zip(self._template["sources"], datasets):
+                manifest = _source_manifest(source["path"], source["key"])
+                if manifest != source["manifest"]:
+                    raise ValueError(
+                        f"stale plan source {source['source_id']}: storage manifest changed"
+                    )
+                observed = (dataset.kind, list(dataset.shape), dataset.dtype.name)
+                expected = (source["kind"], source["shape"], source["dtype"])
+                if observed != expected:
+                    raise ValueError(
+                        f"stale plan source {source['source_id']}: expected {expected}, "
+                        f"observed {observed}"
+                    )
+            config = _plan_config_from_dict(self._template["config"])
+            inner = _core.plan_compile(
+                [dataset._require_inner() for dataset in datasets],
+                list(range(len(datasets))),
+                [dataset._feature_map_array for dataset in datasets],
+                self._template["row_source_ids"],
+                self._template["row_indices"],
+                self._output._to_core(),
+                self.batch_size,
+                self.prefetch_step,
+                config._to_core(),
+            )
+            self._inner = inner
+            self._meta = _core.plan_meta(inner)
+            self._stats = PlanStats._from_mapping(_core.plan_stats(inner))
+            return inner
+
     def info(self) -> dict[str, object]:
         """Return compact, serialization-friendly plan diagnostics."""
         return {
@@ -133,6 +330,7 @@ class Plan:
             "batch_size": self.batch_size,
             "batch_count": self.batch_count,
             "prefetch_step": self.prefetch_step,
+            "cache_capacity_bytes": self.cache_capacity_bytes,
             "row_stride_bytes": self.row_stride_bytes,
             "stats": self._stats.as_dict(),
         }
@@ -144,7 +342,7 @@ class Plan:
         return (
             f"Plan(shape={self.shape!r}, batches={self.batch_count}, "
             f"batch_size={self.batch_size}, dtype={self.dtype.name!r}, "
-            f"prefetch_step={self.prefetch_step})"
+            f"cache={self.cache_capacity_bytes}, prefetch_step={self.prefetch_step})"
         )
 
 
@@ -501,14 +699,13 @@ def compile(
     normalized_prefetch_step = as_int(
         prefetch_step,
         "prefetch_step",
-        minimum=2,
+        minimum=1,
         maximum=_U32_MAX,
     )
     if config is None:
         config = PlanConfig()
     elif not isinstance(config, PlanConfig):
         raise TypeError("config must be a PlanConfig instance")
-    config._validate_for(normalized_prefetch_step)
 
     default_source_id = 0 if len(dataset_list) == 1 else None
     row_source_ids, row_indices = normalize_rows(rows, default_source_id=default_source_id)
@@ -524,7 +721,16 @@ def compile(
         normalized_prefetch_step,
         config._to_core(),
     )
-    return Plan(inner, output)
+    template = {
+        "sources": [
+            _source_spec(source_id, dataset)
+            for source_id, dataset in enumerate(dataset_list)
+        ],
+        "row_source_ids": None if row_source_ids is None else row_source_ids.copy(),
+        "row_indices": row_indices.copy(),
+        "config": asdict(config),
+    }
+    return Plan(inner, output, template=template)
 
 
 def prefetch(
@@ -547,6 +753,216 @@ def prefetch(
         config=plan_config,
     )
     return plan.prefetch(config)
+
+
+def _source_spec(source_id: int, dataset: Dataset) -> dict[str, Any]:
+    return {
+        "source_id": source_id,
+        "path": os.fspath(dataset.path.resolve()),
+        "key": dataset.key,
+        "kind": dataset.kind,
+        "shape": list(dataset.shape),
+        "dtype": dataset.dtype.name,
+        "feature_map": None if dataset.feature_map is None else list(dataset.feature_map),
+        "limits": asdict(dataset.limits),
+        "manifest": _source_manifest(dataset.path, dataset.key),
+    }
+
+
+def _source_manifest(path: str | os.PathLike[str], key: str) -> dict[str, Any]:
+    location = resolve_matrix_location(path, key)
+    if location.kind == "dir":
+        meta = location.open_path / "meta.json"
+        manifest: dict[str, Any] = {
+            "kind": "dir",
+            "meta_sha256": hashlib.sha256(meta.read_bytes()).hexdigest(),
+        }
+        indptr = location.open_path / "indptr"
+        if indptr.is_file():
+            size = indptr.stat().st_size
+            manifest["indptr_size"] = size
+            if size <= 64 * 1024 * 1024:
+                manifest["indptr_sha256"] = hashlib.sha256(indptr.read_bytes()).hexdigest()
+        return manifest
+    prefix = location.zip_prefix or ""
+    with zipfile.ZipFile(location.open_path) as archive:
+        entries = {}
+        for name in ("meta.json", "indptr"):
+            logical = f"{prefix}/{name}" if prefix else name
+            try:
+                info = archive.getinfo(logical)
+            except KeyError:
+                continue
+            entries[name] = {
+                "crc32": info.CRC,
+                "compressed_size": info.compress_size,
+                "size": info.file_size,
+            }
+    return {"kind": "zip", "entries": entries}
+
+
+def _dataset_from_source_spec(source: Mapping[str, Any]) -> Dataset:
+    return Dataset(
+        source["path"],
+        key=source["key"],
+        feature_map=source["feature_map"],
+        feature_names=None,
+        obs_names=None,
+        limits=ReadLimits(**source["limits"]),
+    )
+
+
+def _plan_config_from_dict(values: Mapping[str, Any]) -> PlanConfig:
+    config = dict(values)
+    config["limits"] = ResourceLimits(**config["limits"])
+    config["io_merge"] = IoMergeConfig(**config["io_merge"])
+    return PlanConfig(**config)
+
+
+def _copy_template(template: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "sources": [dict(source) for source in template["sources"]],
+        "row_source_ids": (
+            None
+            if template["row_source_ids"] is None
+            else np.asarray(template["row_source_ids"], dtype=np.uint32).copy()
+        ),
+        "row_indices": np.asarray(template["row_indices"], dtype=np.uint64).copy(),
+        "config": json.loads(json.dumps(template["config"])),
+    }
+
+
+def _encode_plan_image(
+    template: Mapping[str, Any],
+    meta: Mapping[str, Any],
+    stats: PlanStats,
+    output: OutputSpec,
+) -> bytes:
+    source_ids = template["row_source_ids"]
+    source_bytes = (
+        b""
+        if source_ids is None
+        else np.asarray(source_ids, dtype="<u4", order="C").tobytes()
+    )
+    row_bytes = np.asarray(template["row_indices"], dtype="<u8", order="C").tobytes()
+    stats_values = stats.as_dict()
+    profile = stats_values.pop("profile")
+    stats_values.update(profile)
+    document = {
+        "sources": template["sources"],
+        "config": template["config"],
+        "meta": dict(meta),
+        "stats": stats_values,
+        "output": output.as_dict(),
+        "has_row_source_ids": source_ids is not None,
+    }
+    metadata = json.dumps(
+        document,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    body = metadata + source_bytes + row_bytes
+    total = _PLAN_HEADER.size + len(body)
+    if total > _MAX_PLAN_IMAGE_BYTES:
+        raise ValueError(f"plan image requires {total} bytes, limit is {_MAX_PLAN_IMAGE_BYTES}")
+    header = _PLAN_HEADER.pack(
+        _PLAN_MAGIC,
+        _PLAN_FORMAT_MAJOR,
+        _PLAN_FORMAT_MINOR,
+        len(metadata),
+        len(source_bytes),
+        len(row_bytes),
+        hashlib.sha256(body).digest(),
+    )
+    return header + body
+
+
+def _decode_plan_image(
+    blob: bytes | bytearray | memoryview,
+    *,
+    base_dir: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], OutputSpec]:
+    try:
+        view = memoryview(blob).cast("B")
+    except TypeError as error:
+        raise TypeError("plan image must be bytes-like") from error
+    if len(view) > _MAX_PLAN_IMAGE_BYTES:
+        raise ValueError("plan image exceeds the configured size limit")
+    if len(view) < _PLAN_HEADER.size:
+        raise ValueError("plan image is shorter than its header")
+    magic, major, minor, metadata_len, source_len, row_len, digest = _PLAN_HEADER.unpack(
+        view[: _PLAN_HEADER.size]
+    )
+    if magic != _PLAN_MAGIC:
+        raise ValueError("invalid plan image magic")
+    if major != _PLAN_FORMAT_MAJOR or minor > _PLAN_FORMAT_MINOR:
+        raise ValueError(f"unsupported plan image version {major}.{minor}")
+    body_len = metadata_len + source_len + row_len
+    if body_len != len(view) - _PLAN_HEADER.size:
+        raise ValueError("plan image section lengths do not match total length")
+    body = view[_PLAN_HEADER.size :]
+    if hashlib.sha256(body).digest() != digest:
+        raise ValueError("plan image checksum mismatch")
+    metadata_end = metadata_len
+    source_end = metadata_end + source_len
+    try:
+        document = json.loads(bytes(body[:metadata_end]).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid plan metadata JSON") from error
+    if not isinstance(document, dict):
+        raise ValueError("plan metadata must be a JSON object")
+    row_payload = body[source_end:]
+    if row_len % 8:
+        raise ValueError("row-index section is not aligned to uint64")
+    row_indices = np.frombuffer(row_payload, dtype="<u8").astype(np.uint64, copy=True)
+    has_source_ids = document.get("has_row_source_ids")
+    if has_source_ids:
+        if source_len % 4:
+            raise ValueError("row-source section is not aligned to uint32")
+        row_source_ids = np.frombuffer(
+            body[metadata_end:source_end], dtype="<u4"
+        ).astype(np.uint32, copy=True)
+        if row_source_ids.size != row_indices.size:
+            raise ValueError("row-source and row-index sections have different lengths")
+    elif source_len != 0:
+        raise ValueError("plan has row-source bytes without the corresponding flag")
+    else:
+        row_source_ids = None
+    sources = document.get("sources")
+    if not isinstance(sources, list):
+        raise ValueError("plan sources must be a list")
+    normalized_sources = []
+    for expected_id, source in enumerate(sources):
+        if not isinstance(source, dict) or source.get("source_id") != expected_id:
+            raise ValueError("plan source IDs must be contiguous and ordered")
+        normalized = dict(source)
+        path = Path(os.fspath(normalized["path"]))
+        if not path.is_absolute() and base_dir is not None:
+            path = base_dir / path
+        normalized["path"] = os.fspath(path)
+        normalized_sources.append(normalized)
+    output_values = document["output"]
+    output = OutputSpec(
+        output_values["n_cols"],
+        output_values["dtype"],
+        fill=output_values["fill"],
+        overflow=output_values["overflow"],
+        overflow_value=output_values["overflow_value"],
+        allow_float_rounding=output_values["allow_float_rounding"],
+    )
+    template = {
+        "sources": normalized_sources,
+        "row_source_ids": row_source_ids,
+        "row_indices": row_indices,
+        "config": document["config"],
+    }
+    return template, document["meta"], document["stats"], output
+
+
+def _restore_plan_v1(blob: bytes) -> Plan:
+    return Plan.loads(blob, lazy=True)
 
 
 def _normalize_datasets(datasets: Dataset | Iterable[Dataset]) -> list[Dataset]:

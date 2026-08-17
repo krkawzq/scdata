@@ -19,7 +19,14 @@ from scdata.exceptions import (
     UnsupportedError,
     WorkerPanicError,
 )
-from scdata.load._config import IoMode, PlanConfig, ResourceLimits, SessionConfig
+from scdata.load._config import (
+    IoMergeConfig,
+    IoMergePolicy,
+    IoMode,
+    PlanConfig,
+    ResourceLimits,
+    SessionConfig,
+)
 from scdata.load._dataset import Dataset, DatasetKind, RowRef, register
 from scdata.load._distributed import DistributedIterator, DistributedSession, distributed_prefetch
 from scdata.load._location import list_keys, read_feature_names, read_obs_names
@@ -43,6 +50,8 @@ __all__ = [
     "InvalidDatasetError",
     "InvalidInputError",
     "IoError",
+    "IoMergeConfig",
+    "IoMergePolicy",
     "IoMode",
     "OutputSpec",
     "OverflowPolicy",

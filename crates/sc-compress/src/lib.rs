@@ -50,7 +50,7 @@ pub use meta::{
 };
 pub use numeric::{IntegerIndex, MatrixValue};
 pub use parallel::default_threads;
-pub use partition::Partition;
+pub use partition::{Partition, DEFAULT_BLOCK_BUDGET, DEFAULT_CHUNK_BUDGET};
 pub use select::{AxisIndex, CsrOutput, NormalizedAxis, NormalizedSelection, Selection};
 pub use storage::{
     chunk_key, ByteStore, ByteStoreMut, DirectoryStore, PositionedValue, StoreLocation, ZipStore,

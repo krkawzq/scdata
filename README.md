@@ -48,6 +48,23 @@ plan = scdata.compile(dataset, rows, output=output)
 matrix = plan.read()
 ```
 
+`prefetch_step` is exactly the output-ring slot count. Decoded prefetch is
+independent and uses `PlanConfig(cache_capacity_bytes=...)`. Compatible cache
+loads are fused after residency assignment according to nested
+`IoMergeConfig(policy="off" | "adjacent" | "cost")`.
+
+Compiled requests can be moved without serializing native handles or runtime
+pointers:
+
+```python
+plan.save("train.scplan", relative_sources=True)
+lazy = scdata.Plan.load("train.scplan")  # no source I/O yet
+lazy.bind(sources={0: "/new/mount/sample.scc"})
+```
+
+`Plan.dumps/loads` and pickle use the same bounded, checksummed plan image.
+Source manifests are verified when a lazy plan first binds.
+
 `register()` accepts `.scc` directories and `.scc.zip` archives. Discover
 available matrices with `scdata.load.list_keys(path)` (`"X"`, `"layers/<name>"`,
 `"raw/X"`, `"obsm/<name>"`, …), then pass `key=`. Expression keys expose

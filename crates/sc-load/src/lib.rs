@@ -26,7 +26,9 @@ mod share;
 mod tests;
 
 pub use compiler::{compile, PlanSpec};
-pub use config::{IoMode, PlanConfig, ResourceLimits, SessionConfig};
+pub use config::{
+    IoMergeOptions, IoMergePolicy, IoMode, PlanConfig, ResourceLimits, SessionConfig,
+};
 pub use dtype::{promote_kind, OutputDType, OutputValue, PromoteKind, StorageDType};
 pub use error::{Error, Result};
 pub use output::{Fill, FloatCastPolicy, OutputSpec, OverflowPolicy};

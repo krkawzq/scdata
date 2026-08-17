@@ -189,7 +189,10 @@ def convert_one(
             store="zip",
             overwrite=overwrite,
             num_workers=num_workers,
-            options=scc.WriteOptions(block_budget=64 << 10),
+            options=scc.WriteOptions(
+                block_budget=64 << 10,
+                codec=scc.compress.Codec.blosc(shuffle="none"),
+            ),
         )
         result["dst_bytes"] = dst_path.stat().st_size
 

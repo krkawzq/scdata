@@ -22,6 +22,7 @@ from scdata.compress._validate import (
     normalize_dense,
     require_scipy_csr,
 )
+from scdata.compress._codec import Codec, _codec_to_wire
 from scdata.compress._write_options import WriteOptions, resolve_write_options
 
 
@@ -39,6 +40,8 @@ def write(
     matrix: Any,
     *,
     options: WriteOptions | None = None,
+    codec: Codec | str | dict[str, Any] | None = None,
+    indptr_codec: Codec | str | dict[str, Any] | None = None,
     num_workers: int | None = None,
     overwrite: bool = True,
 ) -> None:
@@ -56,14 +59,19 @@ def write(
             path,
             matrix,
             options=options,
+            codec=codec,
+            indptr_codec=indptr_codec,
             num_workers=num_workers,
             overwrite=overwrite,
         )
         return
+    if indptr_codec is not None:
+        raise ValueError("indptr_codec applies only to CSR inputs, not dense matrices")
     write_dense(
         path,
         matrix,
         options=options,
+        codec=codec,
         num_workers=num_workers,
         overwrite=overwrite,
     )
@@ -74,13 +82,14 @@ def write_dense(
     values: Any,
     *,
     options: WriteOptions | None = None,
+    codec: Codec | str | dict[str, Any] | None = None,
     num_workers: int | None = None,
     overwrite: bool = True,
 ) -> None:
     """Write a dense matrix after NumPy dtype/layout normalization."""
     path_obj = ensure_path(path)
     ensure_writable_path(path_obj, overwrite=overwrite)
-    opts = resolve_write_options(options, num_workers=num_workers)
+    opts = resolve_write_options(options, codec=codec, num_workers=num_workers)
     array = normalize_dense(values)
     row_bytes = int(array.shape[1]) * int(array.dtype.itemsize)
     chunk, block = opts.resolve(dense=True, row_bytes=row_bytes)
@@ -92,6 +101,7 @@ def write_dense(
         block_policy=block.policy,
         block_n=block.n,
         num_workers=opts.num_workers,
+        compressor=_codec_to_wire(opts.resolved_codec(), role="dense"),
     )
 
 
@@ -103,13 +113,20 @@ def write_csr_arrays(
     shape: tuple[int, int] | list[int],
     *,
     options: WriteOptions | None = None,
+    codec: Codec | str | dict[str, Any] | None = None,
+    indptr_codec: Codec | str | dict[str, Any] | None = None,
     num_workers: int | None = None,
     overwrite: bool = True,
 ) -> None:
     """Write explicit CSR buffers after structural and precision checks."""
     path_obj = ensure_path(path)
     ensure_writable_path(path_obj, overwrite=overwrite)
-    opts = resolve_write_options(options, num_workers=num_workers)
+    opts = resolve_write_options(
+        options,
+        codec=codec,
+        indptr_codec=indptr_codec,
+        num_workers=num_workers,
+    )
     chunk, block = opts.resolve(dense=False)
     indptr_u64, indices_u64, data_array, (n_rows, n_cols) = normalize_csr_arrays(
         indptr,
@@ -129,6 +146,8 @@ def write_csr_arrays(
         block_policy=block.policy,
         block_n=block.n,
         num_workers=opts.num_workers,
+        compressor=_codec_to_wire(opts.resolved_codec(), role="csr"),
+        indptr_compressor=_codec_to_wire(opts.resolved_indptr_codec(), role="indptr"),
     )
 
 
@@ -137,6 +156,8 @@ def write_csr(
     matrix: Any,
     *,
     options: WriteOptions | None = None,
+    codec: Codec | str | dict[str, Any] | None = None,
+    indptr_codec: Codec | str | dict[str, Any] | None = None,
     num_workers: int | None = None,
     overwrite: bool = True,
 ) -> None:
@@ -147,7 +168,12 @@ def write_csr(
     """
     path_obj = ensure_path(path)
     ensure_writable_path(path_obj, overwrite=overwrite)
-    opts = resolve_write_options(options, num_workers=num_workers)
+    opts = resolve_write_options(
+        options,
+        codec=codec,
+        indptr_codec=indptr_codec,
+        num_workers=num_workers,
+    )
     opts.resolve(dense=False)
     csr = require_scipy_csr(matrix)
     if not getattr(csr, "has_canonical_format", False):

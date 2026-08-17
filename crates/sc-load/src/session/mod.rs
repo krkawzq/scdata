@@ -1,37 +1,38 @@
-mod blocking;
-
-#[cfg(all(feature = "uring", target_os = "linux"))]
-mod uring;
-
 #[cfg(not(target_os = "linux"))]
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::mem::MaybeUninit;
-use std::ops::Deref;
+use std::collections::{BTreeMap, VecDeque};
+#[cfg(all(feature = "uring", target_os = "linux"))]
+use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
-#[cfg(feature = "profile")]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-#[cfg(feature = "profile")]
-use std::time::Instant;
 
-use crate::dtype::{OutputDType, OutputValue};
-#[cfg(all(feature = "uring", target_os = "linux"))]
-use crate::plan::Job;
-#[cfg(feature = "profile")]
-use crate::plan::JobSide;
-use crate::plan::PlanData;
-use crate::scatter::{scatter_row_prevalidated, validate_row};
-use crate::{Error, IoMode, Result, SessionConfig};
 use dyn_blosc::DecodeWorkspace;
 use parking_lot::{Condvar, Mutex};
+
+use crate::dtype::{OutputDType, OutputValue};
+use crate::plan::{
+    CellTask, CsrScatterTask, DenseScatterTask, PlanData, ReadSource, ReleasePlan, SourcePlan,
+};
+use crate::scatter::{scatter_row_prevalidated, validate_row};
+use crate::{Error, IoMode, Result, SessionConfig};
+
+enum WorkerIo {
+    Blocking,
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    Uring(Box<io_uring::IoUring>),
+}
 
 const RUNNING: u8 = 0;
 const FAILED: u8 = 1;
 const CANCELLED: u8 = 2;
 const FINISHED: u8 = 3;
-const WINDOW_BROADCAST_THRESHOLD: usize = 4;
+
+const NODE_WAITING: u8 = 0;
+const NODE_READY: u8 = 1;
+const NODE_RUNNING: u8 = 2;
+const NODE_DONE: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -126,8 +127,6 @@ pub struct RuntimeStats {
     pub state: SessionState,
 }
 
-/// Per-worker cumulative profile. Timings are wall-clock residency of worker
-/// phases, so sums across workers intentionally exceed session wall time.
 #[cfg(feature = "profile")]
 #[derive(Debug, Clone)]
 pub struct WorkerRuntimeStats {
@@ -158,70 +157,17 @@ pub struct WorkerRuntimeStats {
     pub uring_cancel_cqes: u64,
 }
 
-#[repr(align(64))]
-struct CachePadded<T>(T);
-
-impl<T> Deref for CachePadded<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[repr(C, align(64))]
-struct ConsumerWait {
-    waiting: AtomicBool,
-    lock: Mutex<()>,
-    condvar: Condvar,
-}
-
-impl ConsumerWait {
-    fn new() -> Self {
-        Self {
-            waiting: AtomicBool::new(false),
-            lock: Mutex::new(()),
-            condvar: Condvar::new(),
-        }
-    }
-}
-
-#[repr(C, align(64))]
-struct WindowWait {
-    waiters: AtomicUsize,
-    lock: Mutex<()>,
-    condvar: Condvar,
-}
-
-impl WindowWait {
-    fn new() -> Self {
-        Self {
-            waiters: AtomicUsize::new(0),
-            lock: Mutex::new(()),
-            condvar: Condvar::new(),
-        }
-    }
-}
-
-#[repr(C, align(64))]
-pub(crate) struct BatchSlot {
-    remaining: AtomicUsize,
-    generation: AtomicUsize,
-}
-
 pub(crate) struct AlignedBuffer {
     pointer: NonNull<u8>,
     len: usize,
-    /// When false, the bytes are borrowed from an external mapping (for example
-    /// a shared memfd ring) and this type must not unmap or free them.
     owned: bool,
 }
 
 impl AlignedBuffer {
-    fn zeroed(len: usize) -> Result<Self> {
+    fn anonymous(len: usize) -> Result<Self> {
         if len == 0 {
             return Ok(Self {
-                pointer: NonNull::<CachePadded<()>>::dangling().cast(),
+                pointer: NonNull::dangling(),
                 len,
                 owned: true,
             });
@@ -229,10 +175,8 @@ impl AlignedBuffer {
         #[cfg(target_os = "linux")]
         {
             use rustix::mm::{Advice, MapFlags, ProtFlags};
-
-            // SAFETY: a null hint requests a fresh anonymous mapping. The
-            // mapping is private, writable, page-aligned, and owned solely by
-            // this `AlignedBuffer` until its matching `munmap` in `Drop`.
+            // SAFETY: this requests one private anonymous mapping owned by the
+            // returned buffer until its matching `munmap` in `Drop`.
             let pointer = unsafe {
                 rustix::mm::mmap_anonymous(
                     std::ptr::null_mut(),
@@ -243,11 +187,8 @@ impl AlignedBuffer {
             }
             .map_err(|error| Error::Allocation(error.to_string()))?;
             let pointer = NonNull::new(pointer.cast::<u8>())
-                .ok_or_else(|| Error::Allocation("mmap returned a null pointer".into()))?;
-            // SAFETY: `pointer..pointer+len` is the live anonymous mapping just
-            // created above. Transparent huge pages preserve byte semantics;
-            // this is a best-effort placement hint, so kernel policy may ignore
-            // it without changing correctness.
+                .ok_or_else(|| Error::Allocation("mmap returned null".into()))?;
+            // SAFETY: this is the live mapping above; the advice is optional.
             let _ =
                 unsafe { rustix::mm::madvise(pointer.as_ptr().cast(), len, Advice::LinuxHugepage) };
             Ok(Self {
@@ -260,9 +201,8 @@ impl AlignedBuffer {
         {
             let layout = Layout::from_size_align(len, 64)
                 .map_err(|error| Error::Allocation(error.to_string()))?;
-            // SAFETY: `layout` has non-zero size and valid 64-byte alignment.
-            // Zeroing once makes untouched row padding and fresh zero-filled
-            // output rows initialized without repeated per-row stores.
+            // SAFETY: layout is non-zero and valid. Zero initialization keeps
+            // output padding initialized on platforms without anonymous mmap.
             let pointer = unsafe { alloc_zeroed(layout) };
             let pointer = NonNull::new(pointer)
                 .ok_or_else(|| Error::Allocation(format!("failed to allocate {len} bytes")))?;
@@ -274,43 +214,42 @@ impl AlignedBuffer {
         }
     }
 
-    /// Borrow an externally owned output ring. The caller retains mapping
-    /// ownership and must outlive every session that uses this buffer.
     pub(crate) fn from_shared(pointer: NonNull<u8>, len: usize) -> Self {
-        if len == 0 {
-            return Self {
-                pointer: NonNull::<CachePadded<()>>::dangling().cast(),
-                len,
-                owned: false,
-            };
-        }
         Self {
-            pointer,
+            pointer: if len == 0 {
+                NonNull::dangling()
+            } else {
+                pointer
+            },
             len,
             owned: false,
         }
     }
 
-    unsafe fn slice(&self, offset: usize, len: usize) -> &[u8] {
-        debug_assert!(offset <= self.len && len <= self.len - offset);
-        // SAFETY: the caller proves the requested range is initialized, within
-        // this allocation, and not concurrently written for the borrow.
-        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr().add(offset), len) }
+    fn pointer_at(&self, offset: usize, len: usize) -> Result<NonNull<u8>> {
+        if offset > self.len || len > self.len - offset {
+            return Err(Error::Invariant(format!(
+                "buffer range {offset}..{} exceeds {} bytes",
+                offset.saturating_add(len),
+                self.len
+            )));
+        }
+        // SAFETY: the validated offset lies in this allocation (or is the
+        // one-past pointer for an empty range).
+        Ok(unsafe { NonNull::new_unchecked(self.pointer.as_ptr().add(offset)) })
     }
 
-    unsafe fn row_pointer(&self, offset: usize, len: usize) -> *mut u8 {
+    unsafe fn slice(&self, offset: usize, len: usize) -> &[u8] {
         debug_assert!(offset <= self.len && len <= self.len - offset);
-        // SAFETY: the checked offset lies within this allocation. Dereferencing
-        // and aliasing requirements remain with the caller.
-        unsafe { self.pointer.as_ptr().add(offset) }
+        // SAFETY: caller proves the range is initialized and no writer aliases it.
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr().add(offset), len) }
     }
 }
 
-// SAFETY: access is synchronized by static row ownership, per-slot generation,
-// release/acquire completion counters, and the single-consumer lease protocol.
+// SAFETY: all access is governed by immutable static ranges, dependency
+// publication, and output-generation leases.
 unsafe impl Send for AlignedBuffer {}
-// SAFETY: see the `Send` implementation; no unsynchronized shared references
-// are constructed while worker writes are possible.
+// SAFETY: the same graph prevents unsynchronized aliased mutable access.
 unsafe impl Sync for AlignedBuffer {}
 
 impl Drop for AlignedBuffer {
@@ -320,19 +259,370 @@ impl Drop for AlignedBuffer {
         }
         #[cfg(target_os = "linux")]
         {
-            // SAFETY: Linux construction always obtains this exact pointer and
-            // length from `mmap_anonymous`; all worker references are gone
-            // before `SessionInner` and this buffer are dropped.
+            // SAFETY: construction obtained this exact mapping and workers are joined.
             let _ = unsafe { rustix::mm::munmap(self.pointer.as_ptr().cast(), self.len) };
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let layout =
-                Layout::from_size_align(self.len, 64).expect("allocation layout stays valid");
-            // SAFETY: this pointer was allocated with the identical layout and
-            // has not been deallocated or moved.
+            let layout = Layout::from_size_align(self.len, 64)
+                .expect("buffer allocation layout remains valid");
+            // SAFETY: this matches the allocation in `anonymous`.
             unsafe { dealloc(self.pointer.as_ptr(), layout) };
         }
+    }
+}
+
+struct RuntimeDecodeOp {
+    encoded_offset: usize,
+    encoded_len: usize,
+    decoder: dyn_blosc::BlockDecoder,
+    target: NonNull<u8>,
+    decoded_len: usize,
+    successors: NonNull<usize>,
+    successor_count: usize,
+}
+
+struct RuntimeIoTask {
+    source: NonNull<ReadSource>,
+    file_offset: u64,
+    file_len: usize,
+    decode_ops: NonNull<RuntimeDecodeOp>,
+    decode_op_count: usize,
+    priority: u64,
+}
+
+struct RuntimeDenseTask {
+    data: Option<(NonNull<u8>, usize)>,
+    source: NonNull<SourcePlan>,
+    output: NonNull<u8>,
+    output_len: usize,
+    cell: CellTask,
+    batch: usize,
+}
+
+struct RuntimeCsrTask {
+    data: NonNull<u8>,
+    data_len: usize,
+    indices: NonNull<u8>,
+    indices_len: usize,
+    source: NonNull<SourcePlan>,
+    output: NonNull<u8>,
+    output_len: usize,
+    cell: CellTask,
+    batch: usize,
+}
+
+// SAFETY: descriptors point only into frozen plan arenas and session-owned
+// cache/output allocations that outlive every worker.
+unsafe impl Send for RuntimeDecodeOp {}
+// SAFETY: disjoint generation ownership makes descriptor targets thread-safe.
+unsafe impl Sync for RuntimeDecodeOp {}
+// SAFETY: see `RuntimeDecodeOp`; source objects are immutable.
+unsafe impl Send for RuntimeIoTask {}
+// SAFETY: RuntimeIoTask contains only immutable source/descriptor pointers;
+// each encoded staging buffer remains worker-local.
+unsafe impl Sync for RuntimeIoTask {}
+// SAFETY: the static graph assigns one writer to each output row generation
+// and keeps the referenced cache generation immutable during scatter.
+unsafe impl Send for RuntimeDenseTask {}
+// SAFETY: see the `Send` proof; concurrent readers never mutate descriptors.
+unsafe impl Sync for RuntimeDenseTask {}
+// SAFETY: CSR pointers obey the same immutable-cache and unique-output-row
+// ownership rules established by the compiler and dependency graph.
+unsafe impl Send for RuntimeCsrTask {}
+// SAFETY: see the `Send` proof; descriptors and source plans are immutable.
+unsafe impl Sync for RuntimeCsrTask {}
+
+struct ExecutionPlan {
+    io: Box<[RuntimeIoTask]>,
+    _decode_ops: Box<[RuntimeDecodeOp]>,
+    dense: Box<[RuntimeDenseTask]>,
+    csr: Box<[RuntimeCsrTask]>,
+    dense_base: usize,
+    csr_base: usize,
+}
+
+impl ExecutionPlan {
+    fn lower(plan: &PlanData, cache: &AlignedBuffer, output: &AlignedBuffer) -> Result<Self> {
+        let logical = &plan.static_plan;
+        if logical.cache_alignment < 64 || !logical.cache_alignment.is_power_of_two() {
+            return Err(Error::Invariant("static cache alignment is invalid".into()));
+        }
+        let mut init_decoded = 0usize;
+        let mut init_io = 0usize;
+        for task in logical
+            .io_decode_tasks
+            .get(logical.initialize.io_tasks.clone())
+            .ok_or_else(|| Error::Invariant("InitializeJob I/O range is invalid".into()))?
+        {
+            init_io = init_io.saturating_add(task.file_len);
+            for operation in logical
+                .decode_ops
+                .get(task.decode_ops.clone())
+                .ok_or_else(|| Error::Invariant("InitializeJob decode range is invalid".into()))?
+            {
+                init_decoded = init_decoded.saturating_add(operation.cache.len);
+            }
+        }
+        if init_decoded != logical.initialize.decoded_bytes
+            || init_io != logical.initialize.io_bytes
+        {
+            return Err(Error::Invariant(
+                "InitializeJob byte accounting is inconsistent".into(),
+            ));
+        }
+        let graph = &logical.dependencies;
+        let successor_base = NonNull::new(graph.block_ready_successors.as_ptr().cast_mut())
+            .unwrap_or_else(NonNull::dangling);
+        for (batch, job) in logical.jobs.iter().enumerate() {
+            if job.batch_id != batch as u64
+                || job.output_generation != batch as u64
+                || job.output_slot != batch % plan.ring_slots
+                || job.io_tasks.end > logical.io_decode_tasks.len()
+            {
+                return Err(Error::Invariant("static Job layout is inconsistent".into()));
+            }
+        }
+        let mut decode_ops = Vec::with_capacity(logical.decode_ops.len());
+        for operation in logical.decode_ops.iter().copied() {
+            let range = graph
+                .block_ready_ranges
+                .get(operation.ready_node)
+                .ok_or_else(|| Error::Invariant("decode ready node is out of range".into()))?;
+            let successors = graph
+                .block_ready_successors
+                .get(range.clone())
+                .ok_or_else(|| Error::Invariant("decode successor range is invalid".into()))?;
+            if successors
+                .iter()
+                .any(|&node| node >= graph.initial_dependency_count.len())
+            {
+                return Err(Error::Invariant(
+                    "decode successor node is out of range".into(),
+                ));
+            }
+            // SAFETY: `range` was validated against the immutable successor
+            // arena, including its legal one-past position when it is empty.
+            let successor_pointer =
+                unsafe { NonNull::new_unchecked(successor_base.as_ptr().add(range.start)) };
+            decode_ops.push(RuntimeDecodeOp {
+                encoded_offset: operation.encoded_offset,
+                encoded_len: operation.encoded_len,
+                decoder: operation.decoder,
+                target: cache.pointer_at(operation.cache.offset, operation.cache.len)?,
+                decoded_len: operation.cache.len,
+                successors: successor_pointer,
+                successor_count: successors.len(),
+            });
+        }
+        let decode_ops = decode_ops.into_boxed_slice();
+        let decode_base =
+            NonNull::new(decode_ops.as_ptr().cast_mut()).unwrap_or_else(NonNull::dangling);
+        let mut io = Vec::with_capacity(logical.io_decode_tasks.len());
+        for task in &logical.io_decode_tasks {
+            let source = plan
+                .sources
+                .get(task.source)
+                .ok_or_else(|| Error::Invariant("static I/O source is missing".into()))?;
+            let operation_count = task.decode_ops.end - task.decode_ops.start;
+            // SAFETY: the logical range was compiler-built inside decode_ops.
+            let operations =
+                unsafe { NonNull::new_unchecked(decode_base.as_ptr().add(task.decode_ops.start)) };
+            io.push(RuntimeIoTask {
+                source: NonNull::from(source),
+                file_offset: task.file_offset,
+                file_len: task.file_len,
+                decode_ops: operations,
+                decode_op_count: operation_count,
+                priority: task.earliest_consumer_batch,
+            });
+        }
+        let mut dense = Vec::with_capacity(logical.dense_scatter_tasks.len());
+        for task in &logical.dense_scatter_tasks {
+            dense.push(lower_dense(plan, cache, output, task)?);
+        }
+        let mut csr = Vec::with_capacity(logical.csr_scatter_tasks.len());
+        for task in &logical.csr_scatter_tasks {
+            csr.push(lower_csr(plan, cache, output, task)?);
+        }
+        let dense_base = io.len();
+        let csr_base = dense_base + dense.len();
+        Ok(Self {
+            io: io.into_boxed_slice(),
+            _decode_ops: decode_ops,
+            dense: dense.into_boxed_slice(),
+            csr: csr.into_boxed_slice(),
+            dense_base,
+            csr_base,
+        })
+    }
+
+    fn priority(&self, node: usize) -> u64 {
+        if node < self.dense_base {
+            self.io[node].priority
+        } else if node < self.csr_base {
+            self.dense[node - self.dense_base].batch as u64
+        } else {
+            self.csr[node - self.csr_base].batch as u64
+        }
+    }
+}
+
+fn lower_dense(
+    plan: &PlanData,
+    cache: &AlignedBuffer,
+    output: &AlignedBuffer,
+    task: &DenseScatterTask,
+) -> Result<RuntimeDenseTask> {
+    let source = plan
+        .source_plans
+        .get(task.source_plan)
+        .ok_or_else(|| Error::Invariant("dense source plan is missing".into()))?;
+    Ok(RuntimeDenseTask {
+        data: task
+            .data
+            .map(|slice| -> Result<_> {
+                Ok((cache.pointer_at(slice.offset, slice.len)?, slice.len))
+            })
+            .transpose()?,
+        source: NonNull::from(source),
+        output: output.pointer_at(task.output.ring_offset, task.output.len)?,
+        output_len: task.output.len,
+        cell: task.cell,
+        batch: usize::try_from(task.output.generation)
+            .map_err(|_| Error::ResourceLimit("dense batch exceeds usize".into()))?,
+    })
+}
+
+fn lower_csr(
+    plan: &PlanData,
+    cache: &AlignedBuffer,
+    output: &AlignedBuffer,
+    task: &CsrScatterTask,
+) -> Result<RuntimeCsrTask> {
+    let source = plan
+        .source_plans
+        .get(task.source_plan)
+        .ok_or_else(|| Error::Invariant("CSR source plan is missing".into()))?;
+    Ok(RuntimeCsrTask {
+        data: cache.pointer_at(task.data.offset, task.data.len)?,
+        data_len: task.data.len,
+        indices: cache.pointer_at(task.indices.offset, task.indices.len)?,
+        indices_len: task.indices.len,
+        source: NonNull::from(source),
+        output: output.pointer_at(task.output.ring_offset, task.output.len)?,
+        output_len: task.output.len,
+        cell: task.cell,
+        batch: usize::try_from(task.output.generation)
+            .map_err(|_| Error::ResourceLimit("CSR batch exceeds usize".into()))?,
+    })
+}
+
+struct RuntimeNodeState {
+    remaining: AtomicU32,
+    state: AtomicU8,
+}
+
+struct ReadyState {
+    buckets: BTreeMap<u64, VecDeque<usize>>,
+    stopped: bool,
+}
+
+struct ReadyQueue {
+    state: Mutex<ReadyState>,
+    changed: Condvar,
+}
+
+impl ReadyQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ReadyState {
+                buckets: BTreeMap::new(),
+                stopped: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn push(&self, priority: u64, node: usize) {
+        let mut state = self.state.lock();
+        if state.stopped {
+            return;
+        }
+        state.buckets.entry(priority).or_default().push_back(node);
+        self.changed.notify_one();
+    }
+
+    fn pop(&self) -> Option<usize> {
+        let mut state = self.state.lock();
+        loop {
+            if let Some((&priority, _)) = state.buckets.first_key_value() {
+                let bucket = state
+                    .buckets
+                    .get_mut(&priority)
+                    .expect("selected priority remains present");
+                let node = bucket.pop_front();
+                if bucket.is_empty() {
+                    state.buckets.remove(&priority);
+                }
+                return node;
+            }
+            if state.stopped {
+                return None;
+            }
+            self.changed.wait(&mut state);
+        }
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock();
+        state.stopped = true;
+        state.buckets.clear();
+        self.changed.notify_all();
+    }
+}
+
+struct BatchSlot {
+    generation: AtomicUsize,
+    ready: AtomicBool,
+}
+
+struct RuntimeCounters {
+    reads: AtomicUsize,
+    read_bytes: AtomicUsize,
+    decoded_blocks: AtomicUsize,
+    decoded_bytes: AtomicUsize,
+    completed_jobs: AtomicUsize,
+    completed_cells: AtomicUsize,
+    #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
+    uring_reads: AtomicUsize,
+}
+
+impl RuntimeCounters {
+    fn new() -> Self {
+        Self {
+            reads: AtomicUsize::new(0),
+            read_bytes: AtomicUsize::new(0),
+            decoded_blocks: AtomicUsize::new(0),
+            decoded_bytes: AtomicUsize::new(0),
+            completed_jobs: AtomicUsize::new(0),
+            completed_cells: AtomicUsize::new(0),
+            #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
+            uring_reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "profile")]
+fn uring_read_count(counters: &RuntimeCounters) -> u64 {
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    {
+        counters.uring_reads.load(Ordering::Relaxed) as u64
+    }
+    #[cfg(not(all(feature = "uring", target_os = "linux")))]
+    {
+        let _ = counters;
+        0
     }
 }
 
@@ -353,9 +643,31 @@ pub struct Batch<'a> {
     released: bool,
 }
 
+struct SessionInner {
+    plan: Arc<PlanData>,
+    _cache: AlignedBuffer,
+    output: AlignedBuffer,
+    execution: ExecutionPlan,
+    nodes: Box<[RuntimeNodeState]>,
+    ready: ReadyQueue,
+    job_remaining: Box<[AtomicUsize]>,
+    job_done: Box<[AtomicBool]>,
+    prefix_cursor: Mutex<usize>,
+    batch_slots: Box<[BatchSlot]>,
+    consume_idx: AtomicUsize,
+    state: AtomicU8,
+    first_error: Mutex<Option<Error>>,
+    consumer_lock: Mutex<()>,
+    consumer_changed: Condvar,
+    requested_io_mode: IoMode,
+    actual_io_mode: IoMode,
+    config: SessionConfig,
+    counters: RuntimeCounters,
+}
+
 impl Session {
     pub(crate) fn start(plan: Arc<PlanData>, config: SessionConfig) -> Result<Self> {
-        let output = AlignedBuffer::zeroed(plan.stats.output_ring_bytes)?;
+        let output = AlignedBuffer::anonymous(plan.stats.output_ring_bytes)?;
         Self::start_with_output(plan, config, output)
     }
 
@@ -365,52 +677,133 @@ impl Session {
         output: AlignedBuffer,
     ) -> Result<Self> {
         config.validate()?;
-        let requested = config.io_mode;
-        let selected = choose_io_mode(&plan, requested)?;
-        #[cfg(all(feature = "uring", target_os = "linux"))]
-        let mut actual = selected;
-        #[cfg(not(all(feature = "uring", target_os = "linux")))]
-        let actual = selected;
+        let requested_io_mode = config.io_mode;
+        let all_positioned = plan
+            .sources
+            .iter()
+            .all(|source| matches!(source, ReadSource::Empty | ReadSource::Positioned { .. }));
         #[cfg(all(feature = "uring", target_os = "linux"))]
         let mut prepared_rings = Vec::new();
-        #[cfg(all(feature = "uring", target_os = "linux"))]
-        if let IoMode::Uring { queue_depth } = actual {
-            prepared_rings.try_reserve_exact(config.worker_count)?;
-            for _ in 0..config.worker_count {
-                match io_uring::IoUring::new(queue_depth) {
-                    Ok(ring) => prepared_rings.push(ring),
-                    Err(_error) if matches!(requested, IoMode::Auto { .. }) => {
-                        prepared_rings.clear();
-                        actual = IoMode::Blocking;
-                        break;
+        let actual_io_mode = match requested_io_mode {
+            IoMode::Blocking => IoMode::Blocking,
+            IoMode::Uring {
+                queue_depth: _queue_depth,
+            } => {
+                if !all_positioned {
+                    return Err(Error::Unsupported(
+                        "io_uring requires positioned filesystem sources".into(),
+                    ));
+                }
+                #[cfg(all(feature = "uring", target_os = "linux"))]
+                {
+                    prepared_rings.try_reserve_exact(config.worker_count)?;
+                    for _ in 0..config.worker_count {
+                        prepared_rings.push(io_uring::IoUring::new(_queue_depth)?);
                     }
-                    Err(error) => return Err(error.into()),
+                    IoMode::Uring {
+                        queue_depth: _queue_depth,
+                    }
+                }
+                #[cfg(not(all(feature = "uring", target_os = "linux")))]
+                return Err(Error::Unsupported(
+                    "io_uring requires Linux and the uring feature".into(),
+                ));
+            }
+            IoMode::Auto { queue_depth } => {
+                #[cfg(all(feature = "uring", target_os = "linux"))]
+                {
+                    if all_positioned {
+                        let mut available = true;
+                        prepared_rings.try_reserve_exact(config.worker_count)?;
+                        for _ in 0..config.worker_count {
+                            match io_uring::IoUring::new(queue_depth) {
+                                Ok(ring) => prepared_rings.push(ring),
+                                Err(_) => {
+                                    available = false;
+                                    prepared_rings.clear();
+                                    break;
+                                }
+                            }
+                        }
+                        if available {
+                            IoMode::Uring { queue_depth }
+                        } else {
+                            IoMode::Blocking
+                        }
+                    } else {
+                        IoMode::Blocking
+                    }
+                }
+                #[cfg(not(all(feature = "uring", target_os = "linux")))]
+                {
+                    let _ = (queue_depth, all_positioned);
+                    IoMode::Blocking
                 }
             }
-        }
-        validate_worker_capacity(&plan, &config, actual)?;
+        };
         if output.len != plan.stats.output_ring_bytes {
             return Err(Error::Invariant(format!(
-                "output ring length {} does not match plan requirement {}",
+                "output ring has {} bytes, plan requires {}",
                 output.len, plan.stats.output_ring_bytes
             )));
         }
-        let slots = plan.ring_slots;
-        let mut batch_slots = Vec::new();
-        batch_slots.try_reserve_exact(slots)?;
-        for slot in 0..slots {
-            if slot < plan.batch_count {
-                batch_slots.push(BatchSlot {
-                    remaining: AtomicUsize::new(batch_len(&plan, slot)),
-                    generation: AtomicUsize::new(slot),
-                });
-            } else {
-                batch_slots.push(BatchSlot {
-                    remaining: AtomicUsize::new(0),
-                    generation: AtomicUsize::new(usize::MAX),
-                });
-            }
+        let regular_io_tasks = plan
+            .static_plan
+            .io_decode_tasks
+            .get(plan.static_plan.initialize.io_tasks.end..)
+            .ok_or_else(|| Error::Invariant("InitializeJob I/O range is invalid".into()))?;
+        let maximum_regular_encoded = regular_io_tasks
+            .iter()
+            .map(|task| task.file_len)
+            .max()
+            .unwrap_or(0);
+        if maximum_regular_encoded > config.max_inflight_encoded_bytes_per_worker {
+            return Err(Error::ResourceLimit(format!(
+                "regular I/O task requires {maximum_regular_encoded} encoded bytes, per-worker limit is {}",
+                config.max_inflight_encoded_bytes_per_worker
+            )));
         }
+        let cache = AlignedBuffer::anonymous(plan.static_plan.cache_capacity)?;
+        let execution = ExecutionPlan::lower(&plan, &cache, &output)?;
+        if plan.static_plan.dependencies.initial_dependency_count.len()
+            != execution.io.len() + execution.dense.len() + execution.csr.len()
+        {
+            return Err(Error::Invariant(
+                "runtime dependency count does not match executable tasks".into(),
+            ));
+        }
+        let dependencies = &plan.static_plan.dependencies.initial_dependency_count;
+        let nodes = dependencies
+            .iter()
+            .map(|remaining| RuntimeNodeState {
+                remaining: AtomicU32::new(*remaining),
+                state: AtomicU8::new(NODE_WAITING),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let job_remaining = plan
+            .static_plan
+            .jobs
+            .iter()
+            .map(|job| {
+                AtomicUsize::new(
+                    (job.dense_tasks.end - job.dense_tasks.start)
+                        + (job.csr_tasks.end - job.csr_tasks.start),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let job_done = (0..plan.batch_count)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let batch_slots = (0..plan.ring_slots)
+            .map(|slot| BatchSlot {
+                generation: AtomicUsize::new(slot),
+                ready: AtomicBool::new(false),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let initial_state = if plan.batch_count == 0 {
             FINISHED
         } else {
@@ -418,75 +811,71 @@ impl Session {
         };
         let inner = Arc::new(SessionInner {
             plan,
+            _cache: cache,
             output,
+            execution,
+            nodes,
+            ready: ReadyQueue::new(),
+            job_remaining,
+            job_done,
+            prefix_cursor: Mutex::new(0),
             batch_slots,
-            consume_idx: CachePadded(AtomicUsize::new(0)),
-            next_job: CachePadded(AtomicUsize::new(0)),
-            state: CachePadded(AtomicU8::new(initial_state)),
+            consume_idx: AtomicUsize::new(0),
+            state: AtomicU8::new(initial_state),
             first_error: Mutex::new(None),
-            consumer_wait: ConsumerWait::new(),
-            window_wait: WindowWait::new(),
-            stats: AtomicRuntimeStats::new(requested, actual, &config),
+            consumer_lock: Mutex::new(()),
+            consumer_changed: Condvar::new(),
+            requested_io_mode,
+            actual_io_mode,
+            config: config.clone(),
+            counters: RuntimeCounters::new(),
         });
-        let mut workers = Vec::new();
-        if initial_state == RUNNING {
-            workers.try_reserve_exact(config.worker_count)?;
-            match actual {
-                IoMode::Blocking => {
-                    for worker_id in 0..config.worker_count {
-                        let worker = Arc::clone(&inner);
-                        let spawned = std::thread::Builder::new()
-                            .name(format!("sc-load-blocking-{worker_id}"))
-                            .spawn(move || {
-                                worker_entry(worker, |inner| blocking::run_worker(inner, worker_id))
-                            });
-                        match spawned {
-                            Ok(worker) => workers.push(worker),
-                            Err(error) => {
-                                stop_started_workers(&inner, &mut workers);
-                                return Err(error.into());
-                            }
-                        }
+        if initial_state == FINISHED {
+            inner.ready.stop();
+            return Ok(Self {
+                inner,
+                workers: Vec::new(),
+            });
+        }
+
+        run_initialize(&inner)?;
+        for node in 0..inner.nodes.len() {
+            inner.enqueue_if_ready(node)?;
+        }
+        let mut workers = Vec::with_capacity(config.worker_count);
+        for worker_id in 0..config.worker_count {
+            let worker_inner = Arc::clone(&inner);
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            let worker_io = if matches!(actual_io_mode, IoMode::Uring { .. }) {
+                WorkerIo::Uring(Box::new(prepared_rings.remove(0)))
+            } else {
+                WorkerIo::Blocking
+            };
+            #[cfg(not(all(feature = "uring", target_os = "linux")))]
+            let worker_io = WorkerIo::Blocking;
+            match std::thread::Builder::new()
+                .name(format!("sc-load-dag-{worker_id}"))
+                .spawn(move || worker_entry(worker_inner, worker_io))
+            {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    inner.cancel();
+                    for worker in workers.drain(..) {
+                        let _ = worker.join();
                     }
+                    return Err(error.into());
                 }
-                IoMode::Uring { .. } => {
-                    #[cfg(all(feature = "uring", target_os = "linux"))]
-                    {
-                        debug_assert_eq!(prepared_rings.len(), config.worker_count);
-                        for (worker_id, ring) in prepared_rings.into_iter().enumerate() {
-                            let worker = Arc::clone(&inner);
-                            let worker_config = config.clone();
-                            let spawned = std::thread::Builder::new()
-                                .name(format!("sc-load-uring-{worker_id}"))
-                                .spawn(move || {
-                                    worker_entry(worker, |inner| {
-                                        uring::run_worker(inner, ring, worker_config, worker_id)
-                                    })
-                                });
-                            match spawned {
-                                Ok(worker) => workers.push(worker),
-                                Err(error) => {
-                                    stop_started_workers(&inner, &mut workers);
-                                    return Err(error.into());
-                                }
-                            }
-                        }
-                    }
-                    #[cfg(not(all(feature = "uring", target_os = "linux")))]
-                    unreachable!("choose_io_mode rejects unavailable io_uring");
-                }
-                IoMode::Auto { .. } => unreachable!("actual mode is never Auto"),
             }
         }
         Ok(Self { inner, workers })
     }
 
     pub fn state(&self) -> SessionState {
-        SessionState::from_raw(self.inner.state.load(Ordering::Acquire))
+        self.inner.state()
     }
 
     pub fn stats(&self) -> RuntimeStats {
-        self.inner.stats.snapshot(self.state())
+        self.inner.stats()
     }
 
     pub fn cancel(&self) {
@@ -499,115 +888,12 @@ impl Session {
         }
     }
 
-    /// Wait up to `timeout` for logical batch `logical` to complete in the ring.
-    ///
-    /// Used by the shared-ring producer. Does not advance `consume_idx` and does
-    /// not require exclusive `Batch` ownership of prior leases. A bounded wait
-    /// lets the shared control plane observe cross-process cancellation even
-    /// while session workers are still active.
     pub(crate) fn wait_ready_for(
         &self,
         logical: usize,
         timeout: std::time::Duration,
     ) -> Result<bool> {
-        let plan = &self.inner.plan;
-        if logical >= plan.batch_count {
-            return Err(Error::InvalidInput(format!(
-                "logical batch {logical} is outside plan batch_count {}",
-                plan.batch_count
-            )));
-        }
-        let slot = ring_slot(plan, logical);
-        match self.state() {
-            SessionState::Failed => return Err(self.inner.execution_error()),
-            SessionState::Cancelled => return Err(Error::Cancelled),
-            SessionState::Finished => {
-                return Err(Error::Invariant(
-                    "session finished before shared wait_ready".into(),
-                ))
-            }
-            SessionState::Running => {}
-        }
-        let generation = self.inner.batch_slots[slot]
-            .generation
-            .load(Ordering::Acquire);
-        if generation != logical {
-            return Err(Error::Invariant(format!(
-                "ring slot {slot} has generation {generation}, expected {logical}"
-            )));
-        }
-        if self.inner.batch_slots[slot]
-            .remaining
-            .load(Ordering::Acquire)
-            == 0
-        {
-            return Ok(true);
-        }
-        let mut guard = self.inner.consumer_wait.lock.lock();
-        let _ = self
-            .inner
-            .consumer_wait
-            .waiting
-            .swap(true, Ordering::AcqRel);
-        let result = (|| {
-            match self.state() {
-                SessionState::Failed => return Err(self.inner.execution_error()),
-                SessionState::Cancelled => return Err(Error::Cancelled),
-                SessionState::Finished => {
-                    return Err(Error::Invariant(
-                        "session finished before shared wait_ready".into(),
-                    ))
-                }
-                SessionState::Running => {}
-            }
-            let generation = self.inner.batch_slots[slot]
-                .generation
-                .load(Ordering::Acquire);
-            if generation != logical {
-                return Err(Error::Invariant(format!(
-                    "ring slot {slot} has generation {generation}, expected {logical}"
-                )));
-            }
-            if self.inner.batch_slots[slot]
-                .remaining
-                .load(Ordering::Acquire)
-                == 0
-            {
-                return Ok(true);
-            }
-            self.inner
-                .consumer_wait
-                .condvar
-                .wait_for(&mut guard, timeout);
-            match self.state() {
-                SessionState::Failed => return Err(self.inner.execution_error()),
-                SessionState::Cancelled => return Err(Error::Cancelled),
-                SessionState::Finished => {
-                    return Err(Error::Invariant(
-                        "session finished before shared wait_ready".into(),
-                    ))
-                }
-                SessionState::Running => {}
-            }
-            let generation = self.inner.batch_slots[slot]
-                .generation
-                .load(Ordering::Acquire);
-            if generation != logical {
-                return Err(Error::Invariant(format!(
-                    "ring slot {slot} has generation {generation}, expected {logical}"
-                )));
-            }
-            Ok(self.inner.batch_slots[slot]
-                .remaining
-                .load(Ordering::Acquire)
-                == 0)
-        })();
-        self.inner
-            .consumer_wait
-            .waiting
-            .store(false, Ordering::Release);
-        drop(guard);
-        result
+        self.inner.wait_ready(logical, Some(timeout))
     }
 
     pub(crate) fn consume_idx(&self) -> usize {
@@ -615,112 +901,33 @@ impl Session {
     }
 
     pub(crate) fn terminal_error(&self) -> Error {
-        match self.state() {
-            SessionState::Failed => self.inner.execution_error(),
-            SessionState::Cancelled => Error::Cancelled,
-            state => Error::Invariant(format!(
-                "requested a terminal session error while state is {state:?}"
-            )),
-        }
+        self.inner.terminal_error()
     }
 
     pub(crate) fn batch_count(&self) -> usize {
         self.inner.plan.batch_count
     }
 
-    /// Commit a shared-path release for `logical`.
-    ///
-    /// Caller must ensure releases are applied in order (`logical == consume_idx`).
     pub(crate) fn commit_release(&self, logical: usize) -> Result<()> {
-        let expected = self.inner.consume_idx.load(Ordering::Acquire);
+        let expected = self.consume_idx();
         if logical != expected {
             return Err(Error::Invariant(format!(
-                "shared commit_release expected logical {expected}, got {logical}"
+                "release expected batch {expected}, got {logical}"
             )));
         }
-        self.release_batch_inner(logical);
-        Ok(())
+        self.inner.release_batch(logical)
     }
 
     pub fn next_batch(&mut self) -> Result<Option<Batch<'_>>> {
-        let logical = self.inner.consume_idx.load(Ordering::Acquire);
+        let logical = self.consume_idx();
         if logical >= self.inner.plan.batch_count {
             return match self.state() {
-                SessionState::Failed => Err(self.inner.execution_error()),
+                SessionState::Failed => Err(self.terminal_error()),
                 SessionState::Cancelled => Err(Error::Cancelled),
                 _ => Ok(None),
             };
         }
-        let slot = ring_slot(&self.inner.plan, logical);
-        match self.state() {
-            SessionState::Failed => return Err(self.inner.execution_error()),
-            SessionState::Cancelled => return Err(Error::Cancelled),
-            SessionState::Finished => return Ok(None),
-            SessionState::Running => {}
-        }
-        let generation = self.inner.batch_slots[slot]
-            .generation
-            .load(Ordering::Acquire);
-        if generation != logical {
-            return Err(Error::Invariant(format!(
-                "ring slot {slot} has generation {generation}, expected {logical}"
-            )));
-        }
-        if self.inner.batch_slots[slot]
-            .remaining
-            .load(Ordering::Acquire)
-            == 0
-        {
-            return Ok(Some(Batch {
-                rows: batch_len(&self.inner.plan, logical),
-                session: self,
-                logical_batch: logical,
-                released: false,
-            }));
-        }
-        #[cfg(feature = "profile")]
-        let wait_start = Instant::now();
-        let mut guard = self.inner.consumer_wait.lock.lock();
-        let ready = loop {
-            let _ = self
-                .inner
-                .consumer_wait
-                .waiting
-                .swap(true, Ordering::AcqRel);
-            match self.state() {
-                SessionState::Failed => break Err(self.inner.execution_error()),
-                SessionState::Cancelled => break Err(Error::Cancelled),
-                SessionState::Finished => break Ok(false),
-                SessionState::Running => {}
-            }
-            let generation = self.inner.batch_slots[slot]
-                .generation
-                .load(Ordering::Acquire);
-            if generation != logical {
-                break Err(Error::Invariant(format!(
-                    "ring slot {slot} has generation {generation}, expected {logical}"
-                )));
-            }
-            if self.inner.batch_slots[slot]
-                .remaining
-                .load(Ordering::Acquire)
-                == 0
-            {
-                break Ok(true);
-            }
-            self.inner.consumer_wait.condvar.wait(&mut guard);
-        };
-        self.inner
-            .consumer_wait
-            .waiting
-            .store(false, Ordering::Release);
-        drop(guard);
-        #[cfg(feature = "profile")]
-        self.inner
-            .stats
-            .consumer_wait_ns
-            .fetch_add(elapsed_ns(wait_start), Ordering::Relaxed);
-        if !ready? {
+        if !self.inner.wait_ready(logical, None)? {
             return Ok(None);
         }
         Ok(Some(Batch {
@@ -731,34 +938,9 @@ impl Session {
         }))
     }
 
-    fn release_batch(&mut self, logical: usize) {
-        self.release_batch_inner(logical);
-    }
-
-    fn release_batch_inner(&self, logical: usize) {
-        let plan = &self.inner.plan;
-        let slot = ring_slot(plan, logical);
-        let next_generation = logical + plan.ring_slots;
-        if next_generation < plan.batch_count {
-            self.inner.batch_slots[slot]
-                .remaining
-                .store(batch_len(plan, next_generation), Ordering::Relaxed);
-            self.inner.batch_slots[slot]
-                .generation
-                .store(next_generation, Ordering::Release);
-        }
-        let next = logical + 1;
-        self.inner.consume_idx.store(next, Ordering::Release);
-        if next == plan.batch_count {
-            let _ = self.inner.state.compare_exchange(
-                RUNNING,
-                FINISHED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            self.inner.wake_all_window_workers();
-        } else {
-            self.inner.wake_window_workers_for_progress();
+    fn release_batch(&self, logical: usize) {
+        if let Err(error) = self.inner.release_batch(logical) {
+            self.inner.fail(error);
         }
     }
 }
@@ -769,7 +951,7 @@ impl CancellationHandle {
     }
 
     pub fn state(&self) -> SessionState {
-        SessionState::from_raw(self.inner.state.load(Ordering::Acquire))
+        self.inner.state()
     }
 }
 
@@ -803,15 +985,13 @@ impl Batch<'_> {
         self.session.inner.plan.row_stride
     }
 
-    /// Padded row-major bytes. Use [`Self::row`] to omit cache-line padding.
     pub fn bytes(&self) -> &[u8] {
         let plan = &self.session.inner.plan;
         let slot = ring_slot(plan, self.logical_batch);
         let offset = slot * plan.batch_size * plan.row_stride;
         let len = self.rows * plan.row_stride;
-        // SAFETY: a lease is returned only after the release/acquire completion
-        // handshake, and the mutable borrow of `Session` prevents a second
-        // consumer lease. The slot is not reusable until this lease drops.
+        // SAFETY: Batch is returned after release/acquire publication and the
+        // mutable Session borrow holds this generation lease.
         unsafe { self.session.inner.output.slice(offset, len) }
     }
 
@@ -824,7 +1004,6 @@ impl Batch<'_> {
         self.bytes().get(start..start + row_bytes)
     }
 
-    /// Typed view of a single logical row (exactly `n_cols` elements, no padding).
     pub fn row_as<T: OutputValue>(&self, row: usize) -> Result<&[T]> {
         if T::DTYPE != self.dtype() {
             return Err(Error::InvalidInput(format!(
@@ -838,27 +1017,25 @@ impl Batch<'_> {
             .ok_or_else(|| Error::InvalidInput(format!("row {row} out of range")))?;
         #[cfg(target_endian = "big")]
         return Err(Error::Unsupported(
-            "typed batch views require a little-endian target; use row bytes".into(),
+            "typed batch views require little endian".into(),
         ));
         #[cfg(target_endian = "little")]
         {
             if std::mem::size_of::<T>() != self.dtype().size()
-                || std::mem::align_of::<T>() > 64
                 || bytes.as_ptr().align_offset(std::mem::align_of::<T>()) != 0
             {
-                return Err(Error::Invariant(
-                    "sealed output type layout does not match batch dtype".into(),
-                ));
+                return Err(Error::Invariant("batch element layout mismatch".into()));
             }
-            let len = bytes.len() / std::mem::size_of::<T>();
-            // SAFETY: OutputValue is sealed to primitive numeric types, the
-            // layout and alignment were checked, and this target is little-endian.
-            Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), len) })
+            // SAFETY: OutputValue is sealed and layout/alignment were checked.
+            Ok(unsafe {
+                std::slice::from_raw_parts(
+                    bytes.as_ptr().cast::<T>(),
+                    bytes.len() / std::mem::size_of::<T>(),
+                )
+            })
         }
     }
 
-    /// Contiguous logical values. Padded multi-row batches use [`Self::row_as`]
-    /// or [`Self::as_padded_slice`] instead.
     pub fn as_slice<T: OutputValue>(&self) -> Result<&[T]> {
         if self.rows == 1 {
             return self.row_as(0);
@@ -866,16 +1043,15 @@ impl Batch<'_> {
         let row_bytes = self
             .n_cols()
             .checked_mul(self.dtype().size())
-            .ok_or_else(|| Error::Invariant("logical row byte length overflow".into()))?;
+            .ok_or_else(|| Error::Invariant("logical row bytes overflow".into()))?;
         if self.row_stride_bytes() != row_bytes {
             return Err(Error::Unsupported(
-                "batch rows are cache-line padded; use row_as or as_padded_slice".into(),
+                "batch rows are padded; use row_as or as_padded_slice".into(),
             ));
         }
         self.as_padded_slice()
     }
 
-    /// Full ring-slot storage, including zero-initialized row padding.
     pub fn as_padded_slice<T: OutputValue>(&self) -> Result<&[T]> {
         if T::DTYPE != self.dtype() {
             return Err(Error::InvalidInput(format!(
@@ -884,26 +1060,19 @@ impl Batch<'_> {
                 self.dtype()
             )));
         }
-        #[cfg(target_endian = "big")]
-        return Err(Error::Unsupported(
-            "typed batch views require a little-endian target; use bytes".into(),
-        ));
-        #[cfg(target_endian = "little")]
+        let bytes = self.bytes();
+        if !bytes.len().is_multiple_of(std::mem::size_of::<T>())
+            || bytes.as_ptr().align_offset(std::mem::align_of::<T>()) != 0
         {
-            let bytes = self.bytes();
-            if std::mem::size_of::<T>() != self.dtype().size()
-                || !bytes.len().is_multiple_of(std::mem::size_of::<T>())
-                || bytes.as_ptr().align_offset(std::mem::align_of::<T>()) != 0
-            {
-                return Err(Error::Invariant(
-                    "batch byte length not aligned to element type".into(),
-                ));
-            }
-            let len = bytes.len() / std::mem::size_of::<T>();
-            // SAFETY: OutputValue is sealed, the layout was checked, and every
-            // logical byte and padding byte is initialized before publication.
-            Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), len) })
+            return Err(Error::Invariant("padded batch layout mismatch".into()));
         }
+        // SAFETY: the complete published stride, including padding, is initialized.
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                bytes.as_ptr().cast::<T>(),
+                bytes.len() / std::mem::size_of::<T>(),
+            )
+        })
     }
 
     pub fn release(mut self) {
@@ -924,549 +1093,792 @@ impl Drop for Batch<'_> {
     }
 }
 
-pub(crate) struct SessionInner {
-    pub plan: Arc<PlanData>,
-    output: AlignedBuffer,
-    batch_slots: Vec<BatchSlot>,
-    consume_idx: CachePadded<AtomicUsize>,
-    next_job: CachePadded<AtomicUsize>,
-    state: CachePadded<AtomicU8>,
-    first_error: Mutex<Option<Arc<Error>>>,
-    consumer_wait: ConsumerWait,
-    window_wait: WindowWait,
-    stats: AtomicRuntimeStats,
-}
-
 impl SessionInner {
+    fn state(&self) -> SessionState {
+        SessionState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
     fn is_running(&self) -> bool {
         self.state.load(Ordering::Acquire) == RUNNING
     }
 
     fn fail(&self, error: Error) {
         let mut first_error = self.first_error.lock();
-        if self.state.load(Ordering::Acquire) != RUNNING {
-            return;
-        }
-        *first_error = Some(Arc::new(error));
         if self
             .state
-            .compare_exchange(RUNNING, FAILED, Ordering::Release, Ordering::Acquire)
+            .compare_exchange(RUNNING, FAILED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            drop(first_error);
-            self.wake_all_waiters();
+            *first_error = Some(error);
         }
+        drop(first_error);
+        self.ready.stop();
+        self.wake_consumer();
     }
 
     fn cancel(&self) {
-        if self
+        let _ =
+            self.state
+                .compare_exchange(RUNNING, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
+        self.ready.stop();
+        self.wake_consumer();
+    }
+
+    fn terminal_error(&self) -> Error {
+        match self.state() {
+            SessionState::Failed => {
+                Error::Session(Arc::new(self.first_error.lock().clone().unwrap_or_else(
+                    || Error::Invariant("session failed without an error".into()),
+                )))
+            }
+            SessionState::Cancelled => Error::Cancelled,
+            state => Error::Invariant(format!("session state {state:?} is not terminal")),
+        }
+    }
+
+    fn enqueue_if_ready(&self, node: usize) -> Result<()> {
+        let state = self
+            .nodes
+            .get(node)
+            .ok_or_else(|| Error::Invariant("runtime node is out of range".into()))?;
+        if state.remaining.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+        if state
             .state
-            .compare_exchange(RUNNING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                NODE_WAITING,
+                NODE_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
-            self.wake_all_waiters();
+            self.ready.push(self.execution.priority(node), node);
         }
+        Ok(())
     }
 
-    fn execution_error(&self) -> Error {
-        self.first_error
-            .lock()
-            .clone()
-            .map(Error::Session)
-            .unwrap_or_else(|| {
-                Error::Session(Arc::new(Error::Invariant("missing first error".into())))
-            })
-    }
-
-    #[cfg(all(feature = "uring", target_os = "linux"))]
-    fn claim_job(&self, _worker_id: usize, capacity: impl Fn(&Job) -> bool) -> Claim {
-        loop {
-            if !self.is_running() {
-                return Claim::Stopped;
-            }
-            let next = self.next_job.load(Ordering::Relaxed);
-            let Some(job) = self.plan.jobs.get(next) else {
-                return Claim::Exhausted;
-            };
-            debug_assert!(job.batch_min <= job.batch_max);
-            debug_assert_eq!(
-                job.start_step,
-                (job.batch_max + 1).saturating_sub(self.plan.prefetch_step)
-            );
-            if self.consume_idx.load(Ordering::Acquire) < job.start_step {
-                #[cfg(feature = "profile")]
-                self.worker_stats(_worker_id)
-                    .window_blocks
-                    .fetch_add(1, Ordering::Relaxed);
-                return Claim::WindowBlocked;
-            }
-            if !capacity(job) {
-                #[cfg(feature = "profile")]
-                self.worker_stats(_worker_id)
-                    .local_full
-                    .fetch_add(1, Ordering::Relaxed);
-                return Claim::LocalFull;
-            }
-            if self
-                .next_job
-                .compare_exchange_weak(next, next + 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.wake_window_workers_if_claimable();
-                return Claim::Claimed(next);
-            }
-            #[cfg(feature = "profile")]
-            self.worker_stats(_worker_id)
-                .claim_retries
-                .fetch_add(1, Ordering::Relaxed);
+    fn release_dependency(&self, node: usize) -> Result<()> {
+        let state = self
+            .nodes
+            .get(node)
+            .ok_or_else(|| Error::Invariant("released node is out of range".into()))?;
+        let previous = state.remaining.fetch_sub(1, Ordering::AcqRel);
+        if previous == 0 {
+            return Err(Error::Invariant("dependency counter underflow".into()));
         }
-    }
-
-    fn claim_blocking_jobs(&self, _worker_id: usize, maximum: usize) -> RangeClaim {
-        debug_assert!(maximum > 0);
-        loop {
-            if !self.is_running() {
-                return RangeClaim::Stopped;
-            }
-            let next = self.next_job.load(Ordering::Relaxed);
-            let Some(job) = self.plan.jobs.get(next) else {
-                return RangeClaim::Exhausted;
-            };
-            let consumed = self.consume_idx.load(Ordering::Acquire);
-            if consumed < job.start_step {
-                #[cfg(feature = "profile")]
-                self.worker_stats(_worker_id)
-                    .window_blocks
-                    .fetch_add(1, Ordering::Relaxed);
-                return RangeClaim::WindowBlocked;
-            }
-            let limit = next.saturating_add(maximum).min(self.plan.jobs.len());
-            let mut end = next + 1;
-            while end < limit && self.plan.jobs[end].start_step <= consumed {
-                end += 1;
-            }
-            if self
-                .next_job
-                .compare_exchange_weak(next, end, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.wake_window_workers_if_claimable();
-                return RangeClaim::Claimed(next..end);
-            }
-            #[cfg(feature = "profile")]
-            self.worker_stats(_worker_id)
-                .claim_retries
-                .fetch_add(1, Ordering::Relaxed);
+        if previous == 1 {
+            self.enqueue_if_ready(node)?;
         }
+        Ok(())
     }
 
-    fn wait_for_window(&self, _worker_id: usize) {
-        #[cfg(feature = "profile")]
-        let started = Instant::now();
-        let mut guard = self.window_wait.lock.lock();
-        self.window_wait.waiters.fetch_add(1, Ordering::AcqRel);
-        while self.is_running()
-            && self
-                .plan
-                .jobs
-                .get(self.next_job.load(Ordering::Relaxed))
-                .is_some_and(|job| self.consume_idx.load(Ordering::Acquire) < job.start_step)
+    fn complete_block_ready(&self, operation: &RuntimeDecodeOp) -> Result<()> {
+        // SAFETY: lowering validated this pointer/count pair against the
+        // immutable plan successor arena, which outlives all workers.
+        let successors = unsafe {
+            std::slice::from_raw_parts(operation.successors.as_ptr(), operation.successor_count)
+        };
+        for &successor in successors {
+            self.release_dependency(successor)?;
+        }
+        Ok(())
+    }
+
+    fn complete_job_task(&self, batch: usize) -> Result<()> {
+        let counter = self
+            .job_remaining
+            .get(batch)
+            .ok_or_else(|| Error::Invariant("job completion batch is invalid".into()))?;
+        let previous = counter.fetch_sub(1, Ordering::AcqRel);
+        if previous == 0 {
+            return Err(Error::Invariant("job completion underflow".into()));
+        }
+        self.counters
+            .completed_cells
+            .fetch_add(1, Ordering::Relaxed);
+        if previous != 1 {
+            return Ok(());
+        }
+        self.counters.completed_jobs.fetch_add(1, Ordering::Relaxed);
+        self.job_done[batch].store(true, Ordering::Release);
+        let slot = ring_slot(&self.plan, batch);
+        if self.batch_slots[slot].generation.load(Ordering::Acquire) != batch {
+            return Err(Error::Invariant(
+                "output generation changed before publish".into(),
+            ));
+        }
         {
-            self.window_wait.condvar.wait(&mut guard);
+            let _guard = self.consumer_lock.lock();
+            self.batch_slots[slot].ready.store(true, Ordering::Release);
+            self.consumer_changed.notify_all();
         }
-        let previous = self.window_wait.waiters.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0);
-        drop(guard);
-        #[cfg(feature = "profile")]
-        self.worker_stats(_worker_id)
-            .window_wait_ns
-            .fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        self.advance_prefix()
     }
 
-    fn wake_consumer(&self) {
-        if self.consumer_wait.waiting.swap(false, Ordering::AcqRel) {
-            let _guard = self.consumer_wait.lock.lock();
-            self.consumer_wait.condvar.notify_one();
+    fn advance_prefix(&self) -> Result<()> {
+        let mut cursor = self.prefix_cursor.lock();
+        while *cursor < self.job_done.len() && self.job_done[*cursor].load(Ordering::Acquire) {
+            self.release_nodes(&self.plan.static_plan.prefix_releases, *cursor)?;
+            *cursor += 1;
         }
+        Ok(())
     }
 
-    fn wake_window_workers_if_claimable(&self) {
-        let next = self.next_job.load(Ordering::Relaxed);
-        let consumed = self.consume_idx.load(Ordering::Acquire);
-        if self
-            .plan
-            .jobs
-            .get(next)
-            .is_some_and(|job| job.start_step <= consumed)
+    fn release_nodes(&self, releases: &ReleasePlan, batch: usize) -> Result<()> {
+        let Some(range) = releases.release_ranges.get(batch) else {
+            return Ok(());
+        };
+        for &node in releases
+            .released_nodes
+            .get(range.clone())
+            .ok_or_else(|| Error::Invariant("release range is invalid".into()))?
         {
-            self.wake_window_workers_for_progress();
+            self.release_dependency(node)?;
         }
+        Ok(())
     }
 
-    fn wake_window_workers_for_progress(&self) {
-        // The zero-valued RMW completes the registration handshake even when no
-        // worker is currently asleep. A worker registering immediately after it
-        // therefore observes the release that made its window eligible.
-        let waiters = self.window_wait.waiters.fetch_add(0, Ordering::AcqRel);
-        if waiters > 0 {
-            let _guard = self.window_wait.lock.lock();
-            if waiters <= WINDOW_BROADCAST_THRESHOLD {
-                self.window_wait.condvar.notify_all();
-            } else {
-                self.window_wait.condvar.notify_one();
-            }
-        }
-    }
-
-    fn wake_all_window_workers(&self) {
-        if self.window_wait.waiters.fetch_add(0, Ordering::AcqRel) > 0 {
-            let _guard = self.window_wait.lock.lock();
-            self.window_wait.condvar.notify_all();
-        }
-    }
-
-    fn wake_all_waiters(&self) {
-        self.wake_consumer();
-        self.wake_all_window_workers();
-    }
-
-    fn decode_and_commit(
+    fn execute(
         &self,
-        job_idx: usize,
-        data_encoded: &[u8],
-        indices_encoded: Option<&[u8]>,
-        scratch: &mut WorkerScratch,
-        _worker_id: usize,
+        node: usize,
+        io: &mut WorkerIo,
+        encoded: &mut Vec<u8>,
+        workspace: &mut DecodeWorkspace,
     ) -> Result<()> {
-        let job = self
-            .plan
-            .jobs
-            .get(job_idx)
-            .ok_or_else(|| Error::Invariant("claimed job is missing".into()))?;
-        let source_plan = self
-            .plan
-            .source_plans
-            .get(job.source_plan as usize)
-            .ok_or_else(|| Error::Invariant("job source plan is missing".into()))?;
-        let groups = self
-            .plan
-            .groups
-            .get(job.groups.clone())
-            .ok_or_else(|| Error::Invariant("job block-group arena range is invalid".into()))?;
-        for group in groups {
-            if let Some(block) = group.data_block() {
-                #[cfg(feature = "profile")]
-                let decode_started = Instant::now();
-                decode_block(
-                    &self.plan,
-                    block,
-                    data_encoded,
-                    &mut scratch.data_decoded,
-                    &mut scratch.workspace,
-                    &self.output,
-                )?;
-                #[cfg(feature = "profile")]
-                self.worker_stats(_worker_id)
-                    .data_decode_ns
-                    .fetch_add(elapsed_ns(decode_started), Ordering::Relaxed);
-            } else {
-                scratch.data_decoded.set_empty();
-            }
-            if let Some(block) = group.indices_block() {
-                #[cfg(feature = "profile")]
-                let indices_started = Instant::now();
-                decode_block(
-                    &self.plan,
-                    block,
-                    indices_encoded.ok_or_else(|| {
-                        Error::Invariant("CSR job is missing encoded indices".into())
-                    })?,
-                    &mut scratch.indices_decoded,
-                    &mut scratch.workspace,
-                    &self.output,
-                )?;
-                #[cfg(feature = "profile")]
-                self.worker_stats(_worker_id)
-                    .indices_decode_ns
-                    .fetch_add(elapsed_ns(indices_started), Ordering::Relaxed);
-            } else {
-                scratch.indices_decoded.set_empty();
-            }
-
-            let data_decoded = scratch.data_decoded.as_slice();
-            let indices_decoded = scratch.indices_decoded.as_slice();
-            let group_tasks = self.plan.cells.get(group.cells.clone()).ok_or_else(|| {
-                Error::Invariant("block group cell arena range is invalid".into())
-            })?;
-            #[cfg(feature = "profile")]
-            let validation_started = Instant::now();
-            if source_plan.requires_runtime_validation() {
-                for task in group_tasks {
-                    validate_row(source_plan, task, data_decoded, indices_decoded)?;
-                }
-            }
-            #[cfg(feature = "profile")]
-            self.worker_stats(_worker_id)
-                .validation_ns
-                .fetch_add(elapsed_ns(validation_started), Ordering::Relaxed);
-            if !self.is_running() {
-                return Ok(());
-            }
-
-            #[cfg(feature = "profile")]
-            let scatter_started = Instant::now();
-            let fill = self.plan.fill;
-            let row_bytes = self.plan.row_bytes;
-            for task in group_tasks {
-                if task.is_direct_decode() {
-                    continue;
-                }
-                let row_offset = task.row_offset();
-                // SAFETY: each task owns one unique output ordinal, and the
-                // job window keeps this ring generation writable and unleased.
-                let row = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        self.output.row_pointer(row_offset, self.plan.row_stride),
-                        self.plan.row_stride,
-                    )
-                };
-                // SAFETY: this block group's validation covers the exact
-                // scratch buffers and tasks used below. Compiler-sealed dense
-                // infallible paths require no data-dependent validation.
-                unsafe {
-                    scatter_row_prevalidated(
-                        source_plan,
-                        task,
-                        data_decoded,
-                        indices_decoded,
-                        row,
-                        row_bytes,
-                        fill,
-                    )?;
-                }
-            }
-            #[cfg(feature = "profile")]
-            self.worker_stats(_worker_id)
-                .scatter_kernel_ns
-                .fetch_add(elapsed_ns(scatter_started), Ordering::Relaxed);
+        if node < self.execution.dense_base {
+            self.execute_io_with(node, io, encoded, workspace)?;
+            Ok(())
+        } else if node < self.execution.csr_base {
+            let task = &self.execution.dense[node - self.execution.dense_base];
+            self.execute_dense(task)?;
+            self.complete_job_task(task.batch)
+        } else {
+            let task = self
+                .execution
+                .csr
+                .get(node - self.execution.csr_base)
+                .ok_or_else(|| Error::Invariant("CSR node is out of range".into()))?;
+            self.execute_csr(task)?;
+            self.complete_job_task(task.batch)
         }
+    }
 
-        let completions = self
-            .plan
-            .completions
-            .get(job.completions.clone())
-            .ok_or_else(|| Error::Invariant("job completion arena range is invalid".into()))?;
-        #[cfg(feature = "profile")]
-        let completion_started = Instant::now();
-        let mut batch_became_ready = false;
-        #[cfg(feature = "profile")]
-        let mut completed_cells = 0usize;
-        for completion in completions {
-            let ring_batch = completion.ring_batch();
-            let completed = completion.completed();
-            let counter = &self
-                .batch_slots
-                .get(ring_batch)
-                .ok_or_else(|| Error::Invariant("job completion ring slot is invalid".into()))?
-                .remaining;
-            let previous = counter.fetch_sub(completed, Ordering::Release);
-            if previous < completed {
-                return Err(Error::Invariant(format!(
-                    "batch completion counter underflow in ring slot {ring_batch}"
+    fn execute_io(
+        &self,
+        node: usize,
+        encoded: &mut Vec<u8>,
+        workspace: &mut DecodeWorkspace,
+    ) -> Result<()> {
+        self.execute_io_with(node, &mut WorkerIo::Blocking, encoded, workspace)
+    }
+
+    fn execute_io_with(
+        &self,
+        node: usize,
+        io: &mut WorkerIo,
+        encoded: &mut Vec<u8>,
+        workspace: &mut DecodeWorkspace,
+    ) -> Result<()> {
+        let task = self
+            .execution
+            .io
+            .get(node)
+            .ok_or_else(|| Error::Invariant("I/O node is out of range".into()))?;
+        // SAFETY: lowering points at an immutable source owned by `plan`.
+        let source = unsafe { task.source.as_ref() };
+        match io {
+            WorkerIo::Blocking => {
+                read_exact_source(source, task.file_offset, task.file_len, encoded)?
+            }
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            WorkerIo::Uring(ring) => {
+                let operations =
+                    read_exact_uring(source, task.file_offset, task.file_len, encoded, ring)?;
+                #[cfg(feature = "profile")]
+                self.counters
+                    .uring_reads
+                    .fetch_add(operations, Ordering::Relaxed);
+                #[cfg(not(feature = "profile"))]
+                let _ = operations;
+            }
+        }
+        self.counters.reads.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .read_bytes
+            .fetch_add(task.file_len, Ordering::Relaxed);
+        // SAFETY: lowering created a contiguous range inside the immutable
+        // runtime decode-op arena.
+        let operations =
+            unsafe { std::slice::from_raw_parts(task.decode_ops.as_ptr(), task.decode_op_count) };
+        for operation in operations {
+            if !self.is_running() {
+                return Err(Error::Cancelled);
+            }
+            let end = operation
+                .encoded_offset
+                .checked_add(operation.encoded_len)
+                .ok_or_else(|| Error::Invariant("encoded range overflow".into()))?;
+            let input = encoded
+                .get(operation.encoded_offset..end)
+                .ok_or_else(|| Error::StalePlan("encoded block is shorter than planned".into()))?;
+            // SAFETY: the static cache compiler gives this load exclusive
+            // ownership of the target generation until PrefixDone releases it.
+            let output = unsafe {
+                std::slice::from_raw_parts_mut(operation.target.as_ptr(), operation.decoded_len)
+            };
+            let written = operation.decoder.decode_into(input, output, workspace)?;
+            if written != operation.decoded_len {
+                return Err(Error::Decode(format!(
+                    "decoder wrote {written} bytes, expected {}",
+                    operation.decoded_len
                 )));
             }
-            batch_became_ready |= previous == completed;
-            #[cfg(feature = "profile")]
-            {
-                completed_cells = completed_cells.saturating_add(completed);
+            self.counters.decoded_blocks.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .decoded_bytes
+                .fetch_add(written, Ordering::Relaxed);
+            self.complete_block_ready(operation)?;
+        }
+        Ok(())
+    }
+
+    fn execute_dense(&self, task: &RuntimeDenseTask) -> Result<()> {
+        // SAFETY: lowering points into immutable plan/source memory.
+        let source = unsafe { task.source.as_ref() };
+        // SAFETY: cache generation dependency makes the decoded bytes immutable
+        // for this scatter, and the output generation gives this row one writer.
+        unsafe {
+            let row = std::slice::from_raw_parts_mut(task.output.as_ptr(), task.output_len);
+            if let Some((data, len)) = task.data {
+                let data = std::slice::from_raw_parts(data.as_ptr(), len);
+                if source.requires_runtime_validation() {
+                    validate_row(source, &task.cell, data, &[])?;
+                }
+                scatter_row_prevalidated(
+                    source,
+                    &task.cell,
+                    data,
+                    &[],
+                    row,
+                    self.plan.row_bytes,
+                    self.plan.fill,
+                )
+            } else {
+                self.plan.fill.apply(row.as_mut_ptr(), self.plan.row_bytes);
+                Ok(())
             }
         }
-        #[cfg(feature = "profile")]
-        {
-            let stats = self.worker_stats(_worker_id);
-            stats
-                .completion_ns
-                .fetch_add(elapsed_ns(completion_started), Ordering::Relaxed);
-            stats.jobs.fetch_add(1, Ordering::Relaxed);
-            stats.cells.fetch_add(
-                u64::try_from(completed_cells).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            let block_count =
-                job.data.blocks.len() + job.indices.as_ref().map_or(0, |side| side.blocks.len());
-            let decoded_side_bytes = |side: &JobSide| {
-                self.plan.blocks[side.blocks.clone()]
-                    .iter()
-                    .map(|block| block.decoded_len())
-                    .fold(0usize, usize::saturating_add)
-            };
-            let decoded_bytes = decoded_side_bytes(&job.data)
-                .saturating_add(job.indices.as_ref().map_or(0, decoded_side_bytes));
-            stats
-                .blocks
-                .fetch_add(block_count as u64, Ordering::Relaxed);
-            stats
-                .decoded_bytes
-                .fetch_add(decoded_bytes as u64, Ordering::Relaxed);
+    }
+
+    fn execute_csr(&self, task: &RuntimeCsrTask) -> Result<()> {
+        // SAFETY: all pointers were range-checked during lowering; load and
+        // ring dependencies provide immutable inputs and one output writer.
+        unsafe {
+            let source = task.source.as_ref();
+            let data = std::slice::from_raw_parts(task.data.as_ptr(), task.data_len);
+            let indices = std::slice::from_raw_parts(task.indices.as_ptr(), task.indices_len);
+            validate_row(source, &task.cell, data, indices)?;
+            let row = std::slice::from_raw_parts_mut(task.output.as_ptr(), task.output_len);
+            scatter_row_prevalidated(
+                source,
+                &task.cell,
+                data,
+                indices,
+                row,
+                self.plan.row_bytes,
+                self.plan.fill,
+            )
         }
-        if batch_became_ready {
+    }
+
+    fn wait_ready(&self, logical: usize, timeout: Option<std::time::Duration>) -> Result<bool> {
+        if logical >= self.plan.batch_count {
+            return Err(Error::InvalidInput(format!(
+                "batch {logical} is outside {} batches",
+                self.plan.batch_count
+            )));
+        }
+        let slot = ring_slot(&self.plan, logical);
+        let mut guard = self.consumer_lock.lock();
+        loop {
+            match self.state() {
+                SessionState::Failed => return Err(self.terminal_error()),
+                SessionState::Cancelled => return Err(Error::Cancelled),
+                SessionState::Finished => return Ok(false),
+                SessionState::Running => {}
+            }
+            if self.batch_slots[slot].generation.load(Ordering::Acquire) != logical {
+                return Err(Error::Invariant(
+                    "consumer observed wrong ring generation".into(),
+                ));
+            }
+            if self.batch_slots[slot].ready.load(Ordering::Acquire) {
+                return Ok(true);
+            }
+            if let Some(duration) = timeout {
+                self.consumer_changed.wait_for(&mut guard, duration);
+                return Ok(self.batch_slots[slot].ready.load(Ordering::Acquire));
+            }
+            self.consumer_changed.wait(&mut guard);
+        }
+    }
+
+    fn release_batch(&self, logical: usize) -> Result<()> {
+        let expected = self.consume_idx.load(Ordering::Acquire);
+        if logical != expected {
+            return Err(Error::Invariant(format!(
+                "consumer release expected {expected}, got {logical}"
+            )));
+        }
+        let slot = ring_slot(&self.plan, logical);
+        if self.batch_slots[slot].generation.load(Ordering::Acquire) != logical
+            || !self.batch_slots[slot].ready.swap(false, Ordering::AcqRel)
+        {
+            return Err(Error::Invariant(
+                "released output generation is not ready".into(),
+            ));
+        }
+        let next_generation = logical + self.plan.ring_slots;
+        if next_generation < self.plan.batch_count {
+            self.batch_slots[slot]
+                .generation
+                .store(next_generation, Ordering::Release);
+        }
+        self.release_nodes(&self.plan.static_plan.ring_releases, logical)?;
+        let next = logical + 1;
+        self.consume_idx.store(next, Ordering::Release);
+        if next == self.plan.batch_count {
+            let _ =
+                self.state
+                    .compare_exchange(RUNNING, FINISHED, Ordering::AcqRel, Ordering::Acquire);
+            self.ready.stop();
             self.wake_consumer();
         }
         Ok(())
     }
 
-    #[cfg(feature = "profile")]
-    #[inline(always)]
-    pub(super) fn worker_stats(&self, worker_id: usize) -> &WorkerStats {
-        debug_assert!(worker_id < self.stats.worker_stats.len());
-        // SAFETY: worker IDs are assigned exactly from
-        // `0..config.worker_count` when threads are spawned.
-        unsafe { self.stats.worker_stats.get_unchecked(worker_id) }
+    fn wake_consumer(&self) {
+        let _guard = self.consumer_lock.lock();
+        self.consumer_changed.notify_all();
     }
-}
 
-#[cfg(all(feature = "uring", target_os = "linux"))]
-enum Claim {
-    Claimed(usize),
-    Exhausted,
-    WindowBlocked,
-    LocalFull,
-    Stopped,
-}
-
-enum RangeClaim {
-    Claimed(std::ops::Range<usize>),
-    Exhausted,
-    WindowBlocked,
-    Stopped,
-}
-
-pub(crate) struct WorkerScratch {
-    data_decoded: DecodedBuffer,
-    indices_decoded: DecodedBuffer,
-    workspace: DecodeWorkspace,
-}
-
-impl WorkerScratch {
-    pub(crate) fn new() -> Self {
-        Self {
-            data_decoded: DecodedBuffer::new(),
-            indices_decoded: DecodedBuffer::new(),
-            workspace: DecodeWorkspace::new(),
+    fn stats(&self) -> RuntimeStats {
+        #[cfg(feature = "profile")]
+        let load = |value: &AtomicUsize| value.load(Ordering::Relaxed) as u64;
+        RuntimeStats {
+            requested_io_mode: self.requested_io_mode,
+            actual_io_mode: self.actual_io_mode,
+            worker_count: self.config.worker_count,
+            max_inflight_jobs_per_worker: self.config.max_inflight_jobs_per_worker,
+            max_inflight_encoded_bytes_per_worker: self
+                .config
+                .max_inflight_encoded_bytes_per_worker,
+            max_decoded_bytes_per_worker: self.config.max_decoded_bytes_per_worker,
+            #[cfg(feature = "profile")]
+            physical_read_ops: load(&self.counters.reads),
+            #[cfg(feature = "profile")]
+            physical_read_bytes: load(&self.counters.read_bytes),
+            #[cfg(feature = "profile")]
+            short_read_retries: 0,
+            #[cfg(feature = "profile")]
+            whole_key_materializations: 0,
+            #[cfg(feature = "profile")]
+            uring_prepared_read_sqes: uring_read_count(&self.counters),
+            #[cfg(feature = "profile")]
+            uring_submitted_read_sqes: uring_read_count(&self.counters),
+            #[cfg(feature = "profile")]
+            uring_submit_calls: uring_read_count(&self.counters),
+            #[cfg(feature = "profile")]
+            uring_cqes: uring_read_count(&self.counters),
+            #[cfg(feature = "profile")]
+            uring_cancel_requests: 0,
+            #[cfg(feature = "profile")]
+            uring_cancel_cqes: 0,
+            #[cfg(feature = "profile")]
+            io_wait_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            decode_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            data_decode_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            indices_decode_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            validation_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            scatter_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            scatter_kernel_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            completion_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            window_wait_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            consumer_wait_nanoseconds: 0,
+            #[cfg(feature = "profile")]
+            completed_jobs: load(&self.counters.completed_jobs),
+            #[cfg(feature = "profile")]
+            completed_cells: load(&self.counters.completed_cells),
+            #[cfg(feature = "profile")]
+            decoded_blocks: load(&self.counters.decoded_blocks),
+            #[cfg(feature = "profile")]
+            decoded_bytes: load(&self.counters.decoded_bytes),
+            #[cfg(feature = "profile")]
+            claim_cas_retries: 0,
+            #[cfg(feature = "profile")]
+            window_block_events: 0,
+            #[cfg(feature = "profile")]
+            local_full_events: 0,
+            #[cfg(feature = "profile")]
+            peak_inflight_jobs: 0,
+            #[cfg(feature = "profile")]
+            peak_inflight_read_ops: 0,
+            #[cfg(feature = "profile")]
+            peak_inflight_encoded_bytes: 0,
+            #[cfg(feature = "profile")]
+            workers: (0..self.config.worker_count)
+                .map(|worker_id| WorkerRuntimeStats {
+                    worker_id,
+                    completed_jobs: 0,
+                    completed_cells: 0,
+                    decoded_blocks: 0,
+                    decoded_bytes: 0,
+                    data_decode_nanoseconds: 0,
+                    indices_decode_nanoseconds: 0,
+                    validation_nanoseconds: 0,
+                    scatter_kernel_nanoseconds: 0,
+                    completion_nanoseconds: 0,
+                    window_wait_nanoseconds: 0,
+                    io_wait_nanoseconds: 0,
+                    physical_read_ops: 0,
+                    physical_read_bytes: 0,
+                    short_read_retries: 0,
+                    whole_key_materializations: 0,
+                    claim_cas_retries: 0,
+                    window_block_events: 0,
+                    local_full_events: 0,
+                    uring_prepared_read_sqes: 0,
+                    uring_submitted_read_sqes: 0,
+                    uring_submit_calls: 0,
+                    uring_cqes: 0,
+                    uring_cancel_requests: 0,
+                    uring_cancel_cqes: 0,
+                })
+                .collect(),
+            state: self.state(),
         }
     }
 }
 
-/// Reusable decoder destination whose capacity is grown without writing bytes
-/// that the decoder will immediately overwrite.
-struct DecodedBuffer {
-    bytes: Vec<MaybeUninit<u8>>,
-    initialized: bool,
+fn run_initialize(inner: &Arc<SessionInner>) -> Result<()> {
+    let range = inner.plan.static_plan.initialize.io_tasks.clone();
+    if range.is_empty() {
+        return Ok(());
+    }
+    let next = AtomicUsize::new(range.start);
+    let failed = AtomicBool::new(false);
+    let error = Mutex::new(None::<Error>);
+    let maximum_task_bytes = inner.plan.static_plan.io_decode_tasks[range.clone()]
+        .iter()
+        .map(|task| task.file_len)
+        .max()
+        .unwrap_or(0);
+    if maximum_task_bytes > inner.config.initialize_inflight_encoded_bytes {
+        return Err(Error::ResourceLimit(format!(
+            "InitializeJob has a {maximum_task_bytes}-byte I/O task, encoded in-flight limit is {}",
+            inner.config.initialize_inflight_encoded_bytes
+        )));
+    }
+    let encoded_worker_limit = inner
+        .config
+        .initialize_inflight_encoded_bytes
+        .checked_div(maximum_task_bytes)
+        .unwrap_or(inner.config.initialize_workers);
+    let worker_count = inner
+        .config
+        .initialize_workers
+        .min(range.end - range.start)
+        .min(inner.config.initialize_inflight_io_ops)
+        .min(encoded_worker_limit.max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| {
+                let mut encoded = Vec::new();
+                let mut workspace = DecodeWorkspace::new();
+                loop {
+                    if failed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let node = next.fetch_add(1, Ordering::Relaxed);
+                    if node >= range.end {
+                        return;
+                    }
+                    let state = &inner.nodes[node];
+                    if state
+                        .state
+                        .compare_exchange(
+                            NODE_WAITING,
+                            NODE_RUNNING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        if !failed.swap(true, Ordering::AcqRel) {
+                            *error.lock() = Some(Error::Invariant(
+                                "initialize node was scheduled more than once".into(),
+                            ));
+                        }
+                        return;
+                    }
+                    let result = inner.execute_io(node, &mut encoded, &mut workspace);
+                    match result {
+                        Ok(()) => state.state.store(NODE_DONE, Ordering::Release),
+                        Err(value) => {
+                            if !failed.swap(true, Ordering::AcqRel) {
+                                *error.lock() = Some(value);
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if let Some(error) = error.into_inner() {
+        inner.fail(error.clone());
+        return Err(error);
+    }
+    Ok(())
 }
 
-impl DecodedBuffer {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            initialized: true,
+fn worker_entry(inner: Arc<SessionInner>, mut io: WorkerIo) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut encoded = Vec::new();
+        let mut workspace = DecodeWorkspace::new();
+        while let Some(node) = inner.ready.pop() {
+            if !inner.is_running() {
+                return Ok(());
+            }
+            let state = &inner.nodes[node];
+            if state
+                .state
+                .compare_exchange(
+                    NODE_READY,
+                    NODE_RUNNING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(Error::Invariant("ready node state is invalid".into()));
+            }
+            inner.execute(node, &mut io, &mut encoded, &mut workspace)?;
+            state.state.store(NODE_DONE, Ordering::Release);
         }
-    }
-
-    fn prepare(&mut self, len: usize) -> Result<()> {
-        self.bytes.clear();
-        self.bytes.try_reserve_exact(len)?;
-        // SAFETY: the vector has at least `len` capacity after the successful
-        // reserve. Every bit pattern is valid for `MaybeUninit<u8>`, and no
-        // byte is exposed as initialized until `finish` is called.
-        unsafe { self.bytes.set_len(len) };
-        self.initialized = len == 0;
         Ok(())
-    }
-
-    fn set_empty(&mut self) {
-        self.bytes.clear();
-        self.initialized = true;
-    }
-
-    fn finish(&mut self) {
-        self.initialized = true;
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        assert!(
-            self.initialized,
-            "decoded bytes must be fully initialized before access"
-        );
-        // SAFETY: `finish` is reached only after every byte in the contiguous
-        // compiler-built decoded extent was written successfully. u8 has no
-        // invalid bit patterns and the returned borrow cannot outlive `self`.
-        unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), self.bytes.len()) }
-    }
-
-    unsafe fn range_mut(&mut self, range: std::ops::Range<usize>) -> &mut [u8] {
-        debug_assert!(range.start <= range.end && range.end <= self.bytes.len());
-        // SAFETY: the caller proves the range is contained in the allocation
-        // and does not retain overlapping mutable ranges. The decoder owns and
-        // initializes the entire returned range before the borrow ends.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.bytes.as_mut_ptr().add(range.start).cast(),
-                range.end - range.start,
-            )
-        }
-    }
-}
-
-fn worker_entry<F>(inner: Arc<SessionInner>, run: F)
-where
-    F: FnOnce(Arc<SessionInner>) -> Result<()>,
-{
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(Arc::clone(&inner)))) {
+    }));
+    match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => inner.fail(error),
         Err(_) => inner.fail(Error::WorkerPanic),
     }
 }
 
-fn stop_started_workers(inner: &SessionInner, workers: &mut Vec<JoinHandle<()>>) {
-    inner.cancel();
-    for worker in workers.drain(..) {
-        let _ = worker.join();
-    }
-}
+#[cfg(all(feature = "uring", target_os = "linux"))]
+fn read_exact_uring(
+    source: &ReadSource,
+    offset: u64,
+    len: usize,
+    output: &mut Vec<u8>,
+    ring: &mut io_uring::IoUring,
+) -> Result<usize> {
+    use io_uring::{opcode, types};
 
-fn choose_io_mode(plan: &PlanData, requested: IoMode) -> Result<IoMode> {
-    match requested {
-        IoMode::Blocking => Ok(IoMode::Blocking),
-        IoMode::Uring {
-            queue_depth: _queue_depth,
-        } => {
-            if !plan.runtime.all_positioned {
-                return Err(Error::Unsupported(
-                    "explicit io_uring cannot execute key-backed sources".into(),
-                ));
+    let ReadSource::Positioned {
+        file,
+        base_offset,
+        view_len,
+    } = source
+    else {
+        return Err(Error::Invariant(
+            "io_uring task does not reference a positioned source".into(),
+        ));
+    };
+    let end = offset
+        .checked_add(len as u64)
+        .ok_or_else(|| Error::StalePlan("io_uring range overflow".into()))?;
+    if end > *view_len {
+        return Err(Error::StalePlan(
+            "io_uring range exceeds positioned source".into(),
+        ));
+    }
+    let absolute = base_offset
+        .checked_add(offset)
+        .ok_or_else(|| Error::StalePlan("io_uring absolute offset overflow".into()))?;
+    output.clear();
+    output.try_reserve_exact(len)?;
+    let mut filled = 0usize;
+    let mut operations = 0usize;
+    while filled < len {
+        let request_len = (len - filled).min(u32::MAX as usize);
+        let request_offset = absolute
+            .checked_add(filled as u64)
+            .ok_or_else(|| Error::StalePlan("io_uring read offset overflow".into()))?;
+        // SAFETY: the vector keeps this allocation pinned until the matching
+        // CQE below and exposes at least `request_len` spare bytes.
+        let pointer = unsafe {
+            output
+                .spare_capacity_mut()
+                .as_mut_ptr()
+                .add(filled)
+                .cast::<u8>()
+        };
+        let entry = opcode::Read::new(types::Fd(file.as_raw_fd()), pointer, request_len as u32)
+            .offset(request_offset)
+            .build();
+        // SAFETY: the SQE's buffer remains live and unmoved until submit_and_wait
+        // returns a completion, and this worker is its sole owner.
+        unsafe {
+            ring.submission()
+                .push(&entry)
+                .map_err(|_| Error::Invariant("io_uring submission queue is full".into()))?;
+        }
+        loop {
+            match ring.submit_and_wait(1) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
             }
-            #[cfg(all(feature = "uring", target_os = "linux"))]
-            return Ok(IoMode::Uring {
-                queue_depth: _queue_depth,
+        }
+        let completion = ring
+            .completion()
+            .next()
+            .ok_or_else(|| Error::Invariant("io_uring produced no completion".into()))?;
+        let result = completion.result();
+        operations = operations.saturating_add(1);
+        if result < 0 {
+            return Err(std::io::Error::from_raw_os_error(-result).into());
+        }
+        let read = result as usize;
+        if read == 0 {
+            return Err(Error::Io {
+                kind: std::io::ErrorKind::UnexpectedEof,
+                message: format!("io_uring read ended at {filled} of {len} bytes"),
             });
-            #[cfg(not(all(feature = "uring", target_os = "linux")))]
-            return Err(Error::Unsupported(
-                "io_uring requires Linux and the `uring` feature".into(),
+        }
+        if read > request_len {
+            return Err(Error::Invariant(
+                "io_uring completion exceeds submitted length".into(),
             ));
         }
-        IoMode::Auto {
-            queue_depth: _queue_depth,
+        filled += read;
+    }
+    // SAFETY: every byte in the logical length was initialized by successful
+    // read CQEs and the vector was not reallocated while requests were live.
+    unsafe { output.set_len(len) };
+    Ok(operations)
+}
+
+fn read_exact_source(
+    source: &ReadSource,
+    offset: u64,
+    len: usize,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    match source {
+        ReadSource::Empty => Err(Error::Invariant("cache load uses an empty source".into())),
+        ReadSource::Positioned {
+            file,
+            base_offset,
+            view_len,
         } => {
-            if !plan.runtime.all_positioned || plan.runtime.has_fuse_source {
-                return Ok(IoMode::Blocking);
+            let end = offset
+                .checked_add(len as u64)
+                .ok_or_else(|| Error::StalePlan("positioned range overflow".into()))?;
+            if end > *view_len {
+                return Err(Error::StalePlan("positioned range exceeds source".into()));
             }
-            #[cfg(all(feature = "uring", target_os = "linux"))]
-            return Ok(IoMode::Uring {
-                queue_depth: _queue_depth,
-            });
-            #[cfg(not(all(feature = "uring", target_os = "linux")))]
-            return Ok(IoMode::Blocking);
+            output.clear();
+            output.try_reserve_exact(len)?;
+            let absolute = base_offset
+                .checked_add(offset)
+                .ok_or_else(|| Error::StalePlan("absolute offset overflow".into()))?;
+            let mut filled = 0usize;
+            while filled < len {
+                let read_offset = absolute
+                    .checked_add(filled as u64)
+                    .ok_or_else(|| Error::StalePlan("read offset overflow".into()))?;
+                let read = {
+                    let spare = &mut output.spare_capacity_mut()[..len - filled];
+                    match rustix::io::pread(file, spare, read_offset) {
+                        Ok((initialized, _)) => initialized.len(),
+                        Err(error) if error == rustix::io::Errno::INTR => continue,
+                        Err(error) => return Err(std::io::Error::from(error).into()),
+                    }
+                };
+                if read == 0 {
+                    return Err(Error::Io {
+                        kind: std::io::ErrorKind::UnexpectedEof,
+                        message: format!("positioned read ended at {filled} of {len} bytes"),
+                    });
+                }
+                filled += read;
+                // SAFETY: rustix initialized exactly the reported spare prefix.
+                unsafe { output.set_len(filled) };
+            }
+            Ok(())
+        }
+        ReadSource::RangeKey {
+            store,
+            key,
+            declared_len,
+        } => {
+            let end = usize::try_from(offset)
+                .ok()
+                .and_then(|start| start.checked_add(len))
+                .ok_or_else(|| Error::StalePlan("range-key extent overflow".into()))?;
+            if end > *declared_len {
+                return Err(Error::StalePlan(format!(
+                    "range key '{key}' exceeds declared length"
+                )));
+            }
+            store.read_range_into(key, offset, len, output)?;
+            if output.len() != len {
+                return Err(Error::StalePlan("range-key short read".into()));
+            }
+            Ok(())
+        }
+        ReadSource::WholeKey {
+            store,
+            key,
+            declared_len,
+            cached,
+        } => {
+            let start = usize::try_from(offset)
+                .map_err(|_| Error::StalePlan("whole-key offset exceeds usize".into()))?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| Error::StalePlan("whole-key extent overflow".into()))?;
+            if end > *declared_len {
+                return Err(Error::StalePlan("whole-key extent exceeds source".into()));
+            }
+            if let Some(cached) = cached {
+                output.clear();
+                output.try_reserve_exact(len)?;
+                output.extend_from_slice(cached.get(start..end).ok_or_else(|| {
+                    Error::StalePlan("cached whole-key extent is invalid".into())
+                })?);
+                return Ok(());
+            }
+            store.read_range_into(key, 0, *declared_len, output)?;
+            if output.len() != *declared_len {
+                return Err(Error::StalePlan("whole-key short read".into()));
+            }
+            output.copy_within(start..end, 0);
+            output.truncate(len);
+            Ok(())
         }
     }
 }
@@ -1479,409 +1891,10 @@ fn batch_len(plan: &PlanData, logical: usize) -> usize {
         .min(plan.batch_size)
 }
 
-#[inline(always)]
 fn ring_slot(plan: &PlanData, logical: usize) -> usize {
     if plan.ring_mask != usize::MAX {
         logical & plan.ring_mask
     } else {
         logical % plan.ring_slots
     }
-}
-
-fn validate_worker_capacity(
-    plan: &PlanData,
-    config: &SessionConfig,
-    actual_mode: IoMode,
-) -> Result<()> {
-    let envelope = plan.runtime;
-
-    if matches!(actual_mode, IoMode::Uring { .. })
-        && envelope.maximum_combined_encoded > config.max_inflight_encoded_bytes_per_worker
-    {
-        return Err(Error::ResourceLimit(format!(
-            "a job requires up to {} in-flight encoded bytes, per-worker limit is {}",
-            envelope.maximum_combined_encoded, config.max_inflight_encoded_bytes_per_worker
-        )));
-    }
-
-    if matches!(actual_mode, IoMode::Blocking) {
-        let encoded_scratch = envelope
-            .maximum_data_encoded
-            .checked_add(envelope.maximum_indices_encoded)
-            .ok_or_else(|| Error::ResourceLimit("worker encoded scratch size overflow".into()))?;
-        if encoded_scratch > config.max_inflight_encoded_bytes_per_worker {
-            return Err(Error::ResourceLimit(format!(
-                "blocking worker can retain {encoded_scratch} encoded scratch bytes, per-worker limit is {}",
-                config.max_inflight_encoded_bytes_per_worker
-            )));
-        }
-    }
-    let decoded_scratch = envelope
-        .maximum_data_decoded
-        .checked_add(envelope.maximum_indices_decoded)
-        .ok_or_else(|| Error::ResourceLimit("worker decoded scratch size overflow".into()))?;
-    if decoded_scratch > config.max_decoded_bytes_per_worker {
-        return Err(Error::ResourceLimit(format!(
-            "worker can retain {decoded_scratch} decoded scratch bytes, per-worker limit is {}",
-            config.max_decoded_bytes_per_worker
-        )));
-    }
-    Ok(())
-}
-
-#[inline(always)]
-fn decode_block(
-    plan: &PlanData,
-    block_id: usize,
-    encoded: &[u8],
-    decoded: &mut DecodedBuffer,
-    workspace: &mut DecodeWorkspace,
-    output_ring: &AlignedBuffer,
-) -> Result<()> {
-    let block = plan
-        .blocks
-        .get(block_id)
-        .ok_or_else(|| Error::Invariant("block group decoder index is invalid".into()))?;
-    let encoded_range = block.encoded_range();
-    let input = encoded
-        .get(encoded_range)
-        .ok_or_else(|| Error::Invariant("block encoded range exceeds physical read".into()))?;
-    let decoded_len = block.decoded_len();
-    let direct_output = block.direct_output();
-    let output = if let Some(offset) = direct_output {
-        decoded.set_empty();
-        if offset > output_ring.len || decoded_len > output_ring.len - offset {
-            return Err(Error::Invariant(
-                "direct decoder output exceeds batch ring".into(),
-            ));
-        }
-        // SAFETY: compiler direct-decode eligibility proves the full block maps
-        // to one contiguous worker-owned output extent. Ring generations keep
-        // consumers and other jobs from aliasing it until completion.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                output_ring.row_pointer(offset, decoded_len),
-                decoded_len,
-            )
-        }
-    } else {
-        decoded.prepare(decoded_len)?;
-        // SAFETY: `prepare` allocated exactly `decoded_len` uninitialized bytes;
-        // this decoder call owns and initializes the complete range.
-        unsafe { decoded.range_mut(0..decoded_len) }
-    };
-    let written = block.decoder.decode_into(input, output, workspace)?;
-    if written != output.len() {
-        return Err(Error::Decode(format!(
-            "block decoder wrote {written} bytes, expected {}",
-            output.len()
-        )));
-    }
-    if direct_output.is_none() {
-        decoded.finish();
-    }
-    Ok(())
-}
-
-struct AtomicRuntimeStats {
-    requested: IoMode,
-    actual: IoMode,
-    worker_count: usize,
-    max_inflight_jobs_per_worker: usize,
-    max_inflight_encoded_bytes_per_worker: usize,
-    max_decoded_bytes_per_worker: usize,
-    #[cfg(feature = "profile")]
-    worker_stats: Box<[WorkerStats]>,
-    #[cfg(feature = "profile")]
-    consumer_wait_ns: AtomicU64,
-    #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-    inflight_jobs: AtomicUsize,
-    #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-    inflight_ops: AtomicUsize,
-    #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-    inflight_bytes: AtomicUsize,
-    #[cfg(feature = "profile")]
-    peak_jobs: AtomicUsize,
-    #[cfg(feature = "profile")]
-    peak_ops: AtomicUsize,
-    #[cfg(feature = "profile")]
-    peak_bytes: AtomicUsize,
-}
-
-/// One writer-owned cache-line-exclusive shard; no cumulative telemetry is
-/// shared by different workers.
-#[cfg(feature = "profile")]
-#[repr(C, align(256))]
-pub(crate) struct WorkerStats {
-    jobs: AtomicU64,
-    cells: AtomicU64,
-    blocks: AtomicU64,
-    decoded_bytes: AtomicU64,
-    data_decode_ns: AtomicU64,
-    indices_decode_ns: AtomicU64,
-    validation_ns: AtomicU64,
-    scatter_kernel_ns: AtomicU64,
-    completion_ns: AtomicU64,
-    window_wait_ns: AtomicU64,
-    claim_retries: AtomicU64,
-    window_blocks: AtomicU64,
-    local_full: AtomicU64,
-    pub(super) io_wait_ns: AtomicU64,
-    pub(super) read_ops: AtomicU64,
-    pub(super) read_bytes: AtomicU64,
-    pub(super) short_reads: AtomicU64,
-    pub(super) whole_keys: AtomicU64,
-    pub(super) uring_prepared: AtomicU64,
-    pub(super) uring_submitted: AtomicU64,
-    pub(super) uring_submit_calls: AtomicU64,
-    pub(super) uring_cqes: AtomicU64,
-    pub(super) uring_cancel_requests: AtomicU64,
-    pub(super) uring_cancel_cqes: AtomicU64,
-}
-
-#[cfg(feature = "profile")]
-impl WorkerStats {
-    fn snapshot(&self, worker_id: usize) -> WorkerRuntimeStats {
-        let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
-        WorkerRuntimeStats {
-            worker_id,
-            completed_jobs: load(&self.jobs),
-            completed_cells: load(&self.cells),
-            decoded_blocks: load(&self.blocks),
-            decoded_bytes: load(&self.decoded_bytes),
-            data_decode_nanoseconds: load(&self.data_decode_ns),
-            indices_decode_nanoseconds: load(&self.indices_decode_ns),
-            validation_nanoseconds: load(&self.validation_ns),
-            scatter_kernel_nanoseconds: load(&self.scatter_kernel_ns),
-            completion_nanoseconds: load(&self.completion_ns),
-            window_wait_nanoseconds: load(&self.window_wait_ns),
-            io_wait_nanoseconds: load(&self.io_wait_ns),
-            physical_read_ops: load(&self.read_ops),
-            physical_read_bytes: load(&self.read_bytes),
-            short_read_retries: load(&self.short_reads),
-            whole_key_materializations: load(&self.whole_keys),
-            claim_cas_retries: load(&self.claim_retries),
-            window_block_events: load(&self.window_blocks),
-            local_full_events: load(&self.local_full),
-            uring_prepared_read_sqes: load(&self.uring_prepared),
-            uring_submitted_read_sqes: load(&self.uring_submitted),
-            uring_submit_calls: load(&self.uring_submit_calls),
-            uring_cqes: load(&self.uring_cqes),
-            uring_cancel_requests: load(&self.uring_cancel_requests),
-            uring_cancel_cqes: load(&self.uring_cancel_cqes),
-        }
-    }
-}
-
-impl AtomicRuntimeStats {
-    fn new(requested: IoMode, actual: IoMode, config: &SessionConfig) -> Self {
-        #[cfg(feature = "profile")]
-        let worker_stats = (0..config.worker_count)
-            .map(|_| WorkerStats {
-                jobs: AtomicU64::new(0),
-                cells: AtomicU64::new(0),
-                blocks: AtomicU64::new(0),
-                decoded_bytes: AtomicU64::new(0),
-                data_decode_ns: AtomicU64::new(0),
-                indices_decode_ns: AtomicU64::new(0),
-                validation_ns: AtomicU64::new(0),
-                scatter_kernel_ns: AtomicU64::new(0),
-                completion_ns: AtomicU64::new(0),
-                window_wait_ns: AtomicU64::new(0),
-                claim_retries: AtomicU64::new(0),
-                window_blocks: AtomicU64::new(0),
-                local_full: AtomicU64::new(0),
-                io_wait_ns: AtomicU64::new(0),
-                read_ops: AtomicU64::new(0),
-                read_bytes: AtomicU64::new(0),
-                short_reads: AtomicU64::new(0),
-                whole_keys: AtomicU64::new(0),
-                uring_prepared: AtomicU64::new(0),
-                uring_submitted: AtomicU64::new(0),
-                uring_submit_calls: AtomicU64::new(0),
-                uring_cqes: AtomicU64::new(0),
-                uring_cancel_requests: AtomicU64::new(0),
-                uring_cancel_cqes: AtomicU64::new(0),
-            })
-            .collect();
-        Self {
-            requested,
-            actual,
-            worker_count: config.worker_count,
-            max_inflight_jobs_per_worker: config.max_inflight_jobs_per_worker,
-            max_inflight_encoded_bytes_per_worker: config.max_inflight_encoded_bytes_per_worker,
-            max_decoded_bytes_per_worker: config.max_decoded_bytes_per_worker,
-            #[cfg(feature = "profile")]
-            worker_stats,
-            #[cfg(feature = "profile")]
-            consumer_wait_ns: AtomicU64::new(0),
-            #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-            inflight_jobs: AtomicUsize::new(0),
-            #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-            inflight_ops: AtomicUsize::new(0),
-            #[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-            inflight_bytes: AtomicUsize::new(0),
-            #[cfg(feature = "profile")]
-            peak_jobs: AtomicUsize::new(0),
-            #[cfg(feature = "profile")]
-            peak_ops: AtomicUsize::new(0),
-            #[cfg(feature = "profile")]
-            peak_bytes: AtomicUsize::new(0),
-        }
-    }
-
-    fn snapshot(&self, state: SessionState) -> RuntimeStats {
-        RuntimeStats {
-            requested_io_mode: self.requested,
-            actual_io_mode: self.actual,
-            worker_count: self.worker_count,
-            max_inflight_jobs_per_worker: self.max_inflight_jobs_per_worker,
-            max_inflight_encoded_bytes_per_worker: self.max_inflight_encoded_bytes_per_worker,
-            max_decoded_bytes_per_worker: self.max_decoded_bytes_per_worker,
-            #[cfg(feature = "profile")]
-            physical_read_ops: sum_worker_stat(&self.worker_stats, |stats| &stats.read_ops),
-            #[cfg(feature = "profile")]
-            physical_read_bytes: sum_worker_stat(&self.worker_stats, |stats| &stats.read_bytes),
-            #[cfg(feature = "profile")]
-            short_read_retries: sum_worker_stat(&self.worker_stats, |stats| &stats.short_reads),
-            #[cfg(feature = "profile")]
-            whole_key_materializations: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.whole_keys
-            }),
-            #[cfg(feature = "profile")]
-            uring_prepared_read_sqes: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.uring_prepared
-            }),
-            #[cfg(feature = "profile")]
-            uring_submitted_read_sqes: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.uring_submitted
-            }),
-            #[cfg(feature = "profile")]
-            uring_submit_calls: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.uring_submit_calls
-            }),
-            #[cfg(feature = "profile")]
-            uring_cqes: sum_worker_stat(&self.worker_stats, |stats| &stats.uring_cqes),
-            #[cfg(feature = "profile")]
-            uring_cancel_requests: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.uring_cancel_requests
-            }),
-            #[cfg(feature = "profile")]
-            uring_cancel_cqes: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.uring_cancel_cqes
-            }),
-            #[cfg(feature = "profile")]
-            io_wait_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| &stats.io_wait_ns),
-            #[cfg(feature = "profile")]
-            decode_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| &stats.data_decode_ns)
-                .saturating_add(sum_worker_stat(&self.worker_stats, |stats| {
-                    &stats.indices_decode_ns
-                })),
-            #[cfg(feature = "profile")]
-            data_decode_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.data_decode_ns
-            }),
-            #[cfg(feature = "profile")]
-            indices_decode_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.indices_decode_ns
-            }),
-            #[cfg(feature = "profile")]
-            validation_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.validation_ns
-            }),
-            #[cfg(feature = "profile")]
-            scatter_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.scatter_kernel_ns
-            })
-            .saturating_add(sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.completion_ns
-            })),
-            #[cfg(feature = "profile")]
-            scatter_kernel_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.scatter_kernel_ns
-            }),
-            #[cfg(feature = "profile")]
-            completion_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.completion_ns
-            }),
-            #[cfg(feature = "profile")]
-            window_wait_nanoseconds: sum_worker_stat(&self.worker_stats, |stats| {
-                &stats.window_wait_ns
-            }),
-            #[cfg(feature = "profile")]
-            consumer_wait_nanoseconds: self.consumer_wait_ns.load(Ordering::Relaxed),
-            #[cfg(feature = "profile")]
-            completed_jobs: sum_worker_stat(&self.worker_stats, |stats| &stats.jobs),
-            #[cfg(feature = "profile")]
-            completed_cells: sum_worker_stat(&self.worker_stats, |stats| &stats.cells),
-            #[cfg(feature = "profile")]
-            decoded_blocks: sum_worker_stat(&self.worker_stats, |stats| &stats.blocks),
-            #[cfg(feature = "profile")]
-            decoded_bytes: sum_worker_stat(&self.worker_stats, |stats| &stats.decoded_bytes),
-            #[cfg(feature = "profile")]
-            claim_cas_retries: sum_worker_stat(&self.worker_stats, |stats| &stats.claim_retries),
-            #[cfg(feature = "profile")]
-            window_block_events: sum_worker_stat(&self.worker_stats, |stats| &stats.window_blocks),
-            #[cfg(feature = "profile")]
-            local_full_events: sum_worker_stat(&self.worker_stats, |stats| &stats.local_full),
-            #[cfg(feature = "profile")]
-            peak_inflight_jobs: self.peak_jobs.load(Ordering::Relaxed),
-            #[cfg(feature = "profile")]
-            peak_inflight_read_ops: self.peak_ops.load(Ordering::Relaxed),
-            #[cfg(feature = "profile")]
-            peak_inflight_encoded_bytes: self.peak_bytes.load(Ordering::Relaxed),
-            #[cfg(feature = "profile")]
-            workers: self
-                .worker_stats
-                .iter()
-                .enumerate()
-                .map(|(worker_id, stats)| stats.snapshot(worker_id))
-                .collect(),
-            state,
-        }
-    }
-}
-
-#[cfg(feature = "profile")]
-fn sum_worker_stat(workers: &[WorkerStats], select: impl Fn(&WorkerStats) -> &AtomicU64) -> u64 {
-    workers.iter().fold(0u64, |total, worker| {
-        total.saturating_add(select(worker).load(Ordering::Relaxed))
-    })
-}
-
-#[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-fn update_peak(peak: &AtomicUsize, value: usize) {
-    let mut current = peak.load(Ordering::Relaxed);
-    while value > current {
-        match peak.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-#[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-fn add_inflight(current: &AtomicUsize, peak: &AtomicUsize, amount: usize) -> Result<()> {
-    let previous = current
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(amount)
-        })
-        .map_err(|_| Error::Invariant("runtime in-flight statistic overflow".into()))?;
-    update_peak(peak, previous + amount);
-    Ok(())
-}
-
-#[cfg(all(feature = "profile", feature = "uring", target_os = "linux"))]
-fn remove_inflight(current: &AtomicUsize, amount: usize) -> Result<()> {
-    current
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_sub(amount)
-        })
-        .map(|_| ())
-        .map_err(|_| Error::Invariant("runtime in-flight statistic underflow".into()))
-}
-
-#[cfg(feature = "profile")]
-fn elapsed_ns(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }

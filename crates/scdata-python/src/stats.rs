@@ -37,11 +37,46 @@ pub(crate) fn plan_stats_to_dict<'py>(
     values.set_item("compile_time_io_bytes", stats.compile_time_io_bytes)?;
     values.set_item("compile_time_io_ops", stats.compile_time_io_ops)?;
     values.set_item("predicted_io_seconds", stats.predicted_io_seconds)?;
+    values.set_item("cache_capacity_bytes", stats.cache_capacity_bytes)?;
+    values.set_item("cache_arena_bytes", stats.cache_arena_bytes)?;
+    values.set_item(
+        "cache_alignment_loss_bytes",
+        stats.cache_alignment_loss_bytes,
+    )?;
+    values.set_item("unique_cache_objects", stats.unique_cache_objects)?;
+    values.set_item("residency_loads", stats.residency_loads)?;
+    values.set_item("residency_reloads", stats.residency_reloads)?;
+    values.set_item("cache_reference_hits", stats.cache_reference_hits)?;
+    values.set_item("cache_reference_misses", stats.cache_reference_misses)?;
+    values.set_item("cache_capacity_stalls", stats.cache_capacity_stalls)?;
+    values.set_item(
+        "cache_fragmentation_stalls",
+        stats.cache_fragmentation_stalls,
+    )?;
+    values.set_item("cache_horizon_max_batches", stats.cache_horizon_max_batches)?;
+    values.set_item("output_ring_slots", stats.output_ring_slots)?;
+    values.set_item("initialize_io_tasks", stats.initialize_io_tasks)?;
+    values.set_item("executable_tasks", stats.executable_tasks)?;
+    values.set_item("dependency_edges", stats.dependency_edges)?;
+    values.set_item("independent_block_loads", stats.independent_block_loads)?;
+    values.set_item("fused_io_tasks", stats.fused_io_tasks)?;
+    values.set_item("predicted_io_ops_saved", stats.predicted_io_ops_saved)?;
+    values.set_item("io_payload_bytes", stats.io_payload_bytes)?;
+    values.set_item("io_span_bytes", stats.io_span_bytes)?;
+    values.set_item("io_read_amplification", stats.io_read_amplification)?;
+    values.set_item(
+        "max_decode_ops_per_io_task",
+        stats.maximum_decode_ops_per_io_task,
+    )?;
+    values.set_item(
+        "max_decoded_bytes_per_io_task",
+        stats.maximum_decoded_bytes_per_io_task,
+    )?;
+    values.set_item("initialize_fused_io_tasks", stats.initialize_fused_io_tasks)?;
+    values.set_item("regular_fused_io_tasks", stats.regular_fused_io_tasks)?;
     #[cfg(feature = "profile")]
     {
         values.set_item("compile_resolve_ns", stats.compile_resolve_ns)?;
-        values.set_item("compile_same_block_ns", stats.compile_same_block_ns)?;
-        values.set_item("compile_merge_runs_ns", stats.compile_merge_runs_ns)?;
         values.set_item("compile_finalize_ns", stats.compile_finalize_ns)?;
     }
     Ok(values)

@@ -31,6 +31,31 @@ class PlanStats:
     compile_time_io_bytes: int
     compile_time_io_ops: int
     predicted_io_seconds: float
+    cache_capacity_bytes: int
+    cache_arena_bytes: int
+    cache_alignment_loss_bytes: int
+    unique_cache_objects: int
+    residency_loads: int
+    residency_reloads: int
+    cache_reference_hits: int
+    cache_reference_misses: int
+    cache_capacity_stalls: int
+    cache_fragmentation_stalls: int
+    cache_horizon_max_batches: int
+    output_ring_slots: int
+    initialize_io_tasks: int
+    executable_tasks: int
+    dependency_edges: int
+    independent_block_loads: int
+    fused_io_tasks: int
+    predicted_io_ops_saved: int
+    io_payload_bytes: int
+    io_span_bytes: int
+    io_read_amplification: float
+    max_decode_ops_per_io_task: int
+    max_decoded_bytes_per_io_task: int
+    initialize_fused_io_tasks: int
+    regular_fused_io_tasks: int
     profile: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
@@ -55,6 +80,31 @@ class PlanStats:
             "compile_time_io_bytes",
             "compile_time_io_ops",
             "predicted_io_seconds",
+            "cache_capacity_bytes",
+            "cache_arena_bytes",
+            "cache_alignment_loss_bytes",
+            "unique_cache_objects",
+            "residency_loads",
+            "residency_reloads",
+            "cache_reference_hits",
+            "cache_reference_misses",
+            "cache_capacity_stalls",
+            "cache_fragmentation_stalls",
+            "cache_horizon_max_batches",
+            "output_ring_slots",
+            "initialize_io_tasks",
+            "executable_tasks",
+            "dependency_edges",
+            "independent_block_loads",
+            "fused_io_tasks",
+            "predicted_io_ops_saved",
+            "io_payload_bytes",
+            "io_span_bytes",
+            "io_read_amplification",
+            "max_decode_ops_per_io_task",
+            "max_decoded_bytes_per_io_task",
+            "initialize_fused_io_tasks",
+            "regular_fused_io_tasks",
         }
         profile = MappingProxyType(
             {key: value for key, value in values.items() if key not in known}

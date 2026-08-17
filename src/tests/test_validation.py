@@ -10,20 +10,29 @@ import scdata.load as sc_load
 
 def test_config_defaults_are_python_owned_and_immutable() -> None:
     plan = sc_load.PlanConfig()
+    merge = sc_load.IoMergeConfig()
     session = sc_load.SessionConfig()
     assert plan.compile_io_concurrency >= 1
     assert plan.limits.max_output_buffer_bytes == 2 * 1024 * 1024 * 1024
+    assert plan.io_merge == merge
+    assert merge.policy == "adjacent"
+    assert merge._to_core()["max_io_gap_bytes"] == 0
     assert session.num_workers >= 1
     assert session.io_mode == "auto"
     assert session.queue_depth == 64
     assert sc_load.ReadLimits().max_metadata_size == 1024 * 1024
     with pytest.raises(AttributeError):
-        plan.coalescing_distance = 4
+        plan.cache_capacity_bytes = 4
 
 
 def test_config_rejects_invalid_values_before_ffi() -> None:
     with pytest.raises(ValueError, match="positive"):
-        sc_load.PlanConfig(io_bandwidth_bytes_per_second=0)
+        sc_load.IoMergeConfig(io_bandwidth_bytes_per_second=0)
+    with pytest.raises(ValueError, match="must not exceed"):
+        sc_load.IoMergeConfig(
+            max_coalesced_io_bytes=1024,
+            max_encoded_staging_bytes_per_task=512,
+        )
     with pytest.raises(ValueError, match="queue_depth"):
         sc_load.SessionConfig(io_mode="uring", queue_depth=1)
     with pytest.raises(TypeError, match="bool"):

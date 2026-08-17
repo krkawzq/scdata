@@ -218,10 +218,6 @@ impl ConvertOp {
         self.fail_on_overflow && self.kind == PromoteKind::CheckedSign
     }
 
-    pub(crate) fn is_identity(&self) -> bool {
-        self.src == self.dst.to_storage()
-    }
-
     pub(crate) fn dense_gather_min_entries(&self) -> Option<usize> {
         if self.src_size == 4 && self.dst_size == 4 {
             return Some(16);

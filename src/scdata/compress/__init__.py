@@ -20,6 +20,7 @@ from scdata.compress._io import (
     write_dense,
 )
 from scdata.compress._limits import DEFAULT_READ_LIMITS, ReadLimits
+from scdata.compress._codec import Codec
 from scdata.compress._write_options import (
     DEFAULT_BLOCK_BUDGET,
     DEFAULT_CHUNK_BUDGET,
@@ -46,6 +47,7 @@ __all__ = [
     "ReadLimits",
     "ScCsr",
     "ScDense",
+    "Codec",
     "WriteOptions",
     "is_index_dtype",
     "is_value_dtype",

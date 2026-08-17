@@ -3,11 +3,18 @@
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
-use sc_compress::{CsrWriter, DenseWriter, Partition};
+use sc_compress::{Compressor, CsrWriter, DenseWriter, Partition};
 
 use crate::convert::{copy_u64_1d, dispatch_csr_data, dispatch_dense, CsrData, DenseValues};
 use crate::error::{invalid_argument, ResultExt};
 use crate::validate_num_workers;
+
+fn parse_compressor(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<Compressor> {
+    let json = obj.py().import("json")?;
+    let text: String = json.call_method1("dumps", (obj,))?.extract()?;
+    serde_json::from_str(&text)
+        .map_err(|error| invalid_argument(format!("{name} is not a valid SCC compressor: {error}")))
+}
 
 fn parse_partition(policy: &str, n: u64, what: &str) -> PyResult<Partition> {
     if n == 0 {
@@ -45,6 +52,7 @@ fn partitions(
     block_policy,
     block_n,
     num_workers,
+    compressor,
 ))]
 #[expect(
     clippy::too_many_arguments,
@@ -59,11 +67,15 @@ pub fn write_dense(
     block_policy: &str,
     block_n: u64,
     num_workers: usize,
+    compressor: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     validate_num_workers(num_workers)?;
     let (chunk, block) = partitions(chunk_policy, chunk_n, block_policy, block_n)?;
+    let compressor = parse_compressor(compressor, "compressor")?;
     dispatch_dense(values, |values, shape| {
-        let writer = DenseWriter::new(&path, chunk, block).threads(num_workers);
+        let writer = DenseWriter::new(&path, chunk, block)
+            .compressor(compressor.clone())
+            .threads(num_workers);
         match values {
             DenseValues::U16(values) => {
                 py.allow_threads(|| writer.write(values, shape)).map_sc()?
@@ -109,6 +121,8 @@ pub fn write_dense(
     block_policy,
     block_n,
     num_workers,
+    compressor,
+    indptr_compressor,
 ))]
 #[expect(
     clippy::too_many_arguments,
@@ -127,14 +141,21 @@ pub fn write_csr(
     block_policy: &str,
     block_n: u64,
     num_workers: usize,
+    compressor: &Bound<'_, PyAny>,
+    indptr_compressor: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     validate_num_workers(num_workers)?;
     let (chunk, block) = partitions(chunk_policy, chunk_n, block_policy, block_n)?;
+    let compressor = parse_compressor(compressor, "compressor")?;
+    let indptr_compressor = parse_compressor(indptr_compressor, "indptr_compressor")?;
     let indptr = copy_u64_1d(indptr, "indptr")?;
     let indices = copy_u64_1d(indices, "indices")?;
     let shape = [n_rows, n_cols];
     dispatch_csr_data(data, |data| {
-        let writer = CsrWriter::new(&path, chunk, block).threads(num_workers);
+        let writer = CsrWriter::new(&path, chunk, block)
+            .compressor(compressor.clone())
+            .indptr_compressor(indptr_compressor.clone())
+            .threads(num_workers);
         py.allow_threads(move || match data {
             CsrData::U16(data) => writer.write_promoted(indptr, indices, data, shape),
             CsrData::U32(data) => writer.write_promoted(indptr, indices, data, shape),

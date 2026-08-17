@@ -17,6 +17,107 @@ impl Default for IoMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoMergePolicy {
+    Off,
+    Adjacent,
+    CostAware,
+}
+
+#[derive(Debug, Clone)]
+pub struct IoMergeOptions {
+    pub policy: IoMergePolicy,
+    pub max_coalesced_io_bytes: usize,
+    pub max_io_gap_bytes: usize,
+    pub max_io_amplification_ratio: f64,
+    pub max_decode_ops_per_io_task: usize,
+    pub max_decoded_bytes_per_io_task: usize,
+    pub max_encoded_staging_bytes_per_task: usize,
+    pub io_bandwidth_bytes_per_second: f64,
+    pub io_operations_per_second: f64,
+    pub io_merge_delta_bytes: usize,
+    pub initialize_parallelism_hint: usize,
+    pub regular_io_parallelism_hint: usize,
+    pub min_tasks_per_worker: usize,
+}
+
+impl Default for IoMergeOptions {
+    fn default() -> Self {
+        Self {
+            policy: IoMergePolicy::Adjacent,
+            max_coalesced_io_bytes: 32 * MIB,
+            max_io_gap_bytes: 0,
+            max_io_amplification_ratio: 1.0,
+            max_decode_ops_per_io_task: 64,
+            max_decoded_bytes_per_io_task: 64 * MIB,
+            max_encoded_staging_bytes_per_task: 32 * MIB,
+            io_bandwidth_bytes_per_second: 8.0 * GIB as f64,
+            io_operations_per_second: 100_000.0,
+            io_merge_delta_bytes: 4096,
+            initialize_parallelism_hint: 32,
+            regular_io_parallelism_hint: 32,
+            min_tasks_per_worker: 2,
+        }
+    }
+}
+
+impl IoMergeOptions {
+    fn validate(&self) -> Result<()> {
+        let positive = [
+            ("max_coalesced_io_bytes", self.max_coalesced_io_bytes),
+            (
+                "max_decode_ops_per_io_task",
+                self.max_decode_ops_per_io_task,
+            ),
+            (
+                "max_decoded_bytes_per_io_task",
+                self.max_decoded_bytes_per_io_task,
+            ),
+            (
+                "max_encoded_staging_bytes_per_task",
+                self.max_encoded_staging_bytes_per_task,
+            ),
+            (
+                "initialize_parallelism_hint",
+                self.initialize_parallelism_hint,
+            ),
+            (
+                "regular_io_parallelism_hint",
+                self.regular_io_parallelism_hint,
+            ),
+            ("min_tasks_per_worker", self.min_tasks_per_worker),
+        ];
+        for (name, value) in positive {
+            if value == 0 {
+                return Err(Error::InvalidConfig(format!("{name} must be positive")));
+            }
+        }
+        if self.max_coalesced_io_bytes > self.max_encoded_staging_bytes_per_task {
+            return Err(Error::InvalidConfig(
+                "max_coalesced_io_bytes exceeds max_encoded_staging_bytes_per_task".into(),
+            ));
+        }
+        for (name, value) in [
+            (
+                "max_io_amplification_ratio",
+                self.max_io_amplification_ratio,
+            ),
+            (
+                "io_bandwidth_bytes_per_second",
+                self.io_bandwidth_bytes_per_second,
+            ),
+            ("io_operations_per_second", self.io_operations_per_second),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "{name} must be finite and positive"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResourceLimits {
     pub max_output_buffer_bytes: usize,
@@ -100,17 +201,14 @@ impl ResourceLimits {
 pub struct PlanConfig {
     /// Maximum number of chunk metadata reads issued concurrently during compilation.
     pub compile_io_concurrency: usize,
-    pub io_bandwidth_bytes_per_second: f64,
-    pub io_operations_per_second: f64,
-    pub coalescing_distance: usize,
-    /// Soft upper bound for the combined encoded span produced by cross-block
-    /// coalescing. An indivisible source block may be larger and remains
-    /// subject to `ResourceLimits::max_encoded_bytes_per_side`.
-    pub max_coalesced_io_bytes: usize,
-    /// Soft decoded-payload target for a merged job. A single indivisible
-    /// source block may exceed it but remains subject to the hard resource cap.
-    pub target_decoded_bytes_per_job: usize,
-    pub delta_bytes: f64,
+    pub io_merge: IoMergeOptions,
+    /// Fixed decoded-cache capacity compiled into the residency graph.
+    pub cache_capacity_bytes: usize,
+    /// Cache extent alignment used by the compile-time allocator.
+    pub cache_alignment: usize,
+    /// Maximum extra waste admitted while preferring an earlier availability
+    /// epoch over the exact best-fit extent.
+    pub cache_fragmentation_slack_bytes: usize,
     pub limits: ResourceLimits,
 }
 
@@ -122,69 +220,38 @@ impl Default for PlanConfig {
             .min(32);
         Self {
             compile_io_concurrency,
-            io_bandwidth_bytes_per_second: 8.0 * 1024.0 * 1024.0 * 1024.0,
-            io_operations_per_second: 100_000.0,
-            coalescing_distance: 1,
-            max_coalesced_io_bytes: 32 * MIB,
-            target_decoded_bytes_per_job: 64 * MIB,
-            delta_bytes: 4096.0,
+            io_merge: IoMergeOptions::default(),
+            cache_capacity_bytes: 64 * MIB,
+            cache_alignment: 64,
+            cache_fragmentation_slack_bytes: 64 * 1024,
             limits: ResourceLimits::default(),
         }
     }
 }
 
 impl PlanConfig {
-    pub(crate) fn validate(&self, prefetch_step: usize) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.compile_io_concurrency == 0 {
             return Err(Error::InvalidConfig(
                 "compile_io_concurrency must be positive".into(),
             ));
         }
-        if self.max_coalesced_io_bytes == 0 {
+        if self.cache_capacity_bytes == 0 {
             return Err(Error::InvalidConfig(
-                "max_coalesced_io_bytes must be positive".into(),
+                "cache_capacity_bytes must be positive".into(),
             ));
         }
-        if self.target_decoded_bytes_per_job == 0 {
+        if self.cache_alignment == 0 || !self.cache_alignment.is_power_of_two() {
             return Err(Error::InvalidConfig(
-                "target_decoded_bytes_per_job must be positive".into(),
+                "cache_alignment must be a positive power of two".into(),
             ));
         }
-        if self.target_decoded_bytes_per_job > self.limits.max_decoded_bytes_per_job {
+        if self.cache_alignment < 64 {
             return Err(Error::InvalidConfig(
-                "target_decoded_bytes_per_job exceeds max_decoded_bytes_per_job".into(),
+                "cache_alignment must be at least 64 bytes".into(),
             ));
         }
-        if !self.io_bandwidth_bytes_per_second.is_finite()
-            || self.io_bandwidth_bytes_per_second <= 0.0
-        {
-            return Err(Error::InvalidConfig(
-                "io_bandwidth_bytes_per_second must be finite and positive".into(),
-            ));
-        }
-        if !self.io_operations_per_second.is_finite() || self.io_operations_per_second <= 0.0 {
-            return Err(Error::InvalidConfig(
-                "io_operations_per_second must be finite and positive".into(),
-            ));
-        }
-        if !self.delta_bytes.is_finite() || self.delta_bytes < 0.0 {
-            return Err(Error::InvalidConfig(
-                "delta_bytes must be finite and non-negative".into(),
-            ));
-        }
-        let merge_threshold =
-            self.io_bandwidth_bytes_per_second / self.io_operations_per_second + self.delta_bytes;
-        if !merge_threshold.is_finite() {
-            return Err(Error::InvalidConfig(
-                "I/O balance plus delta_bytes must be finite".into(),
-            ));
-        }
-        if self.coalescing_distance == 0 || self.coalescing_distance >= prefetch_step {
-            return Err(Error::InvalidConfig(format!(
-                "coalescing_distance must be in 1..prefetch_step (got {} and {prefetch_step})",
-                self.coalescing_distance
-            )));
-        }
+        self.io_merge.validate()?;
         self.limits.validate()
     }
 }
@@ -192,6 +259,9 @@ impl PlanConfig {
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub worker_count: usize,
+    pub initialize_workers: usize,
+    pub initialize_inflight_io_ops: usize,
+    pub initialize_inflight_encoded_bytes: usize,
     pub io_mode: IoMode,
     pub max_inflight_jobs_per_worker: usize,
     pub max_inflight_encoded_bytes_per_worker: usize,
@@ -211,6 +281,9 @@ impl Default for SessionConfig {
         let decoded_bytes_per_worker = 2 * 1024 * 1024 * 1024;
         Self {
             worker_count,
+            initialize_workers: worker_count,
+            initialize_inflight_io_ops: worker_count,
+            initialize_inflight_encoded_bytes: 512 * MIB,
             io_mode: IoMode::Auto {
                 queue_depth: queue_depth as u32,
             },
@@ -228,6 +301,14 @@ impl SessionConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.worker_count == 0 {
             return Err(Error::InvalidConfig("worker_count must be positive".into()));
+        }
+        if self.initialize_workers == 0
+            || self.initialize_inflight_io_ops == 0
+            || self.initialize_inflight_encoded_bytes == 0
+        {
+            return Err(Error::InvalidConfig(
+                "initialize worker and in-flight limits must be positive".into(),
+            ));
         }
         if self.max_inflight_jobs_per_worker == 0 {
             return Err(Error::InvalidConfig(

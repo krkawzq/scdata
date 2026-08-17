@@ -137,7 +137,7 @@ class DistributedSession:
             minimum=1,
         )
         inner = _core.plan_open_shared(
-            plan._inner,
+            plan._require_inner(),
             config._to_core(),
             normalized_world_size,
             max_control_bytes,

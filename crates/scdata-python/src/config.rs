@@ -2,21 +2,55 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
-use sc_load::{IoMode, PlanConfig, ResourceLimits, SessionConfig};
+use sc_load::{IoMergeOptions, IoMergePolicy, IoMode, PlanConfig, ResourceLimits, SessionConfig};
 
 use crate::error::invalid_input as invalid_argument;
 
 pub(crate) fn plan_config_from_dict(values: &Bound<'_, PyDict>) -> PyResult<PlanConfig> {
+    let io_merge = required(values, "io_merge")?;
+    let io_merge = io_merge
+        .downcast::<PyDict>()
+        .map_err(|_| invalid_argument("normalized io_merge config must be a mapping"))?;
     Ok(PlanConfig {
         compile_io_concurrency: required(values, "compile_io_concurrency")?.extract()?,
-        io_bandwidth_bytes_per_second: required(values, "io_bandwidth_bytes_per_second")?
+        io_merge: IoMergeOptions {
+            policy: match required(io_merge, "policy")?.extract::<String>()?.as_str() {
+                "off" => IoMergePolicy::Off,
+                "adjacent" => IoMergePolicy::Adjacent,
+                "cost" => IoMergePolicy::CostAware,
+                value => {
+                    return Err(invalid_argument(format!(
+                        "unknown io_merge policy `{value}`"
+                    )))
+                }
+            },
+            max_coalesced_io_bytes: required(io_merge, "max_coalesced_io_bytes")?.extract()?,
+            max_io_gap_bytes: required(io_merge, "max_io_gap_bytes")?.extract()?,
+            max_io_amplification_ratio: required(io_merge, "max_io_amplification_ratio")?
+                .extract()?,
+            max_decode_ops_per_io_task: required(io_merge, "max_decode_ops_per_io_task")?
+                .extract()?,
+            max_decoded_bytes_per_io_task: required(io_merge, "max_decoded_bytes_per_io_task")?
+                .extract()?,
+            max_encoded_staging_bytes_per_task: required(
+                io_merge,
+                "max_encoded_staging_bytes_per_task",
+            )?
             .extract()?,
-        io_operations_per_second: required(values, "io_operations_per_second")?.extract()?,
-        coalescing_distance: required(values, "coalescing_distance")?.extract()?,
-        max_coalesced_io_bytes: required(values, "max_coalesced_io_bytes")?.extract()?,
-        target_decoded_bytes_per_job: required(values, "target_decoded_bytes_per_job")?
+            io_bandwidth_bytes_per_second: required(io_merge, "io_bandwidth_bytes_per_second")?
+                .extract()?,
+            io_operations_per_second: required(io_merge, "io_operations_per_second")?.extract()?,
+            io_merge_delta_bytes: required(io_merge, "io_merge_delta_bytes")?.extract()?,
+            initialize_parallelism_hint: required(io_merge, "initialize_parallelism_hint")?
+                .extract()?,
+            regular_io_parallelism_hint: required(io_merge, "regular_io_parallelism_hint")?
+                .extract()?,
+            min_tasks_per_worker: required(io_merge, "min_tasks_per_worker")?.extract()?,
+        },
+        cache_capacity_bytes: required(values, "cache_capacity_bytes")?.extract()?,
+        cache_alignment: required(values, "cache_alignment")?.extract()?,
+        cache_fragmentation_slack_bytes: required(values, "cache_fragmentation_slack_bytes")?
             .extract()?,
-        delta_bytes: required(values, "delta_bytes")?.extract()?,
         limits: ResourceLimits {
             max_output_buffer_bytes: required(values, "max_output_buffer_bytes")?.extract()?,
             max_compile_arena_bytes: required(values, "max_compile_arena_bytes")?.extract()?,
@@ -38,6 +72,10 @@ pub(crate) fn session_config_from_dict(values: &Bound<'_, PyDict>) -> PyResult<S
     let queue_depth = required(values, "queue_depth")?.extract()?;
     Ok(SessionConfig {
         worker_count: required(values, "num_workers")?.extract()?,
+        initialize_workers: required(values, "initialize_workers")?.extract()?,
+        initialize_inflight_io_ops: required(values, "initialize_inflight_io_ops")?.extract()?,
+        initialize_inflight_encoded_bytes: required(values, "initialize_inflight_encoded_bytes")?
+            .extract()?,
         io_mode: parse_io_mode(&mode, queue_depth)?,
         max_inflight_jobs_per_worker: required(values, "max_inflight_jobs_per_worker")?
             .extract()?,

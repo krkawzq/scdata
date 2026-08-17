@@ -17,6 +17,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, SupportsIndex, Union
 
+from scdata.compress._codec import Codec
 from scdata.compress._validate import ensure_path
 from scdata.compress._write_options import WriteOptions
 from scdata.exceptions import PerformanceWarning
@@ -118,6 +119,8 @@ def write(
     matrix: Any,
     *,
     options: WriteOptions | None = None,
+    codec: Codec | str | dict[str, Any] | None = None,
+    indptr_codec: Codec | str | dict[str, Any] | None = None,
     num_workers: int | None = None,
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
@@ -132,6 +135,8 @@ def write(
             path,
             matrix,
             options=options,
+            codec=codec,
+            indptr_codec=indptr_codec,
             num_workers=num_workers,
             overwrite=True,
         ),
@@ -146,6 +151,7 @@ def write_dense(
     values: Any,
     *,
     options: WriteOptions | None = None,
+    codec: Codec | str | dict[str, Any] | None = None,
     num_workers: int | None = None,
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
@@ -160,6 +166,7 @@ def write_dense(
             path,
             values,
             options=options,
+            codec=codec,
             num_workers=num_workers,
             overwrite=True,
         ),
@@ -174,6 +181,8 @@ def write_csr(
     matrix: Any,
     *,
     options: WriteOptions | None = None,
+    codec: Codec | str | dict[str, Any] | None = None,
+    indptr_codec: Codec | str | dict[str, Any] | None = None,
     num_workers: int | None = None,
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
@@ -188,6 +197,8 @@ def write_csr(
             path,
             matrix,
             options=options,
+            codec=codec,
+            indptr_codec=indptr_codec,
             num_workers=num_workers,
             overwrite=True,
         ),
@@ -205,6 +216,8 @@ def write_csr_arrays(
     shape: tuple[int, int] | list[int],
     *,
     options: WriteOptions | None = None,
+    codec: Codec | str | dict[str, Any] | None = None,
+    indptr_codec: Codec | str | dict[str, Any] | None = None,
     num_workers: int | None = None,
     compression: int = zipfile.ZIP_STORED,
     compresslevel: int | None = None,
@@ -222,6 +235,8 @@ def write_csr_arrays(
             data,
             shape,
             options=options,
+            codec=codec,
+            indptr_codec=indptr_codec,
             num_workers=num_workers,
             overwrite=True,
         ),

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal, Mapping
 
+from scdata.compress._codec import Codec, as_codec
 from scdata.compress._validate import (
     DEFAULT_BLOCK_BUDGET,
     DEFAULT_CHUNK_BUDGET,
@@ -33,6 +34,11 @@ class WriteOptions:
     maps to ``Partition::BytesBudget`` for CSR. For dense matrices, Python lowers
     ``budget`` to ``fixed_cells`` that meet or slightly exceed the byte target
     using ``row_bytes = n_cols * dtype.itemsize`` (Rust still receives cells).
+
+    ``codec`` configures dense or CSR matrix data through one representation-
+    independent Blosc policy. ``indptr_codec`` applies only to CSR row pointers;
+    dense writers intentionally do not consume it so the same immutable options
+    object can be reused for mixed matrix collections such as AnnData.
     """
 
     chunk_policy: PartitionPolicy = "budget"
@@ -41,6 +47,8 @@ class WriteOptions:
     block_cells: int | None = None
     chunk_budget: int | None = DEFAULT_CHUNK_BUDGET
     block_budget: int | None = DEFAULT_BLOCK_BUDGET
+    codec: Codec | None = None
+    indptr_codec: Codec | None = None
     num_workers: int = 1
 
     def __post_init__(self) -> None:
@@ -49,6 +57,12 @@ class WriteOptions:
             "num_workers",
             as_int(self.num_workers, name="num_workers", minimum=1, maximum=_UINTP_MAX),
         )
+        if self.codec is not None and not isinstance(self.codec, Codec):
+            raise TypeError(f"codec must be Codec or None, got {type(self.codec).__name__}")
+        if self.indptr_codec is not None and not isinstance(self.indptr_codec, Codec):
+            raise TypeError(
+                f"indptr_codec must be Codec or None, got {type(self.indptr_codec).__name__}"
+            )
 
     def with_overrides(
         self,
@@ -59,6 +73,8 @@ class WriteOptions:
         block_cells: int | None = None,
         chunk_budget: int | None = None,
         block_budget: int | None = None,
+        codec: Codec | str | Mapping[str, Any] | None = None,
+        indptr_codec: Codec | str | Mapping[str, Any] | None = None,
         num_workers: int | None = None,
     ) -> WriteOptions:
         """Return a copy with only the non-``None`` values replaced."""
@@ -75,7 +91,24 @@ class WriteOptions:
             )
             if value is not None
         }
+        if codec is not None:
+            changes["codec"] = as_codec(codec, name="codec")
+        if indptr_codec is not None:
+            changes["indptr_codec"] = as_codec(indptr_codec, name="indptr_codec")
         return replace(self, **changes)
+
+    def resolved_codec(self) -> Codec:
+        """Validated matrix-data codec shared by dense and CSR writers."""
+        codec = Codec.blosc() if self.codec is None else self.codec
+        if codec.algorithm != "blosc":
+            raise ValueError(f"SCC matrix data requires Codec.blosc(), got {codec.algorithm!r}")
+        return codec
+
+    def resolved_indptr_codec(self) -> Codec:
+        """Codec for CSR row pointers; dense writers do not consume this option."""
+        if self.indptr_codec is None:
+            return Codec.zstd()
+        return self.indptr_codec
 
     def resolve(
         self,
@@ -108,6 +141,8 @@ def resolve_write_options(
     block_cells: int | None = None,
     chunk_budget: int | None = None,
     block_budget: int | None = None,
+    codec: Codec | str | Mapping[str, Any] | None = None,
+    indptr_codec: Codec | str | Mapping[str, Any] | None = None,
     num_workers: int | None = None,
 ) -> WriteOptions:
     """Apply optional keyword overrides on top of ``options`` or the defaults."""
@@ -122,5 +157,7 @@ def resolve_write_options(
         block_cells=block_cells,
         chunk_budget=chunk_budget,
         block_budget=block_budget,
+        codec=codec,
+        indptr_codec=indptr_codec,
         num_workers=num_workers,
     )

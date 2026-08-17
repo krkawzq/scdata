@@ -549,6 +549,7 @@ dependencies = [
  "pyo3",
  "sc-compress",
  "sc-load",
+ "serde_json",
 ]
 
 [[package]]

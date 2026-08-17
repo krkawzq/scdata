@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 
 import anndata as ad
@@ -361,3 +362,51 @@ def test_with_feature_map_returns_new_handle(tmp_path: Path) -> None:
     assert mapped.path == base.path
     assert mapped.key == base.key
     assert mapped.obs_names == base.obs_names
+
+
+def test_plan_image_lazy_bind_atomic_save_and_pickle(tmp_path: Path) -> None:
+    values = np.arange(20, dtype=np.float32).reshape(5, 4)
+    dataset = sc_load.register(write_scc_x(tmp_path, values))
+    plan = sc_load.compile(
+        dataset,
+        [4, 0, 2],
+        batch_size=2,
+        prefetch_step=1,
+        config=sc_load.PlanConfig(cache_capacity_bytes=64 * 1024),
+    )
+
+    image = plan.dumps()
+    lazy = sc_load.Plan.loads(image)
+    assert not lazy.bound
+    assert lazy.shape == plan.shape
+    assert lazy.prefetch_step == 1
+    np.testing.assert_array_equal(lazy.read(), values[[4, 0, 2]])
+    assert lazy.bound
+
+    target = tmp_path / "plans" / "rows.scplan"
+    plan.save(target, relative_sources=True)
+    loaded = sc_load.Plan.load(target)
+    assert not loaded.bound
+    np.testing.assert_array_equal(loaded.read(), values[[4, 0, 2]])
+
+    restored = pickle.loads(pickle.dumps(plan))
+    assert not restored.bound
+    np.testing.assert_array_equal(restored.read(), values[[4, 0, 2]])
+
+
+def test_plan_image_rejects_corruption_and_strictly_checks_overrides(tmp_path: Path) -> None:
+    values = np.arange(6, dtype=np.float32).reshape(2, 3)
+    dataset = sc_load.register(write_scc_x(tmp_path, values))
+    plan = sc_load.compile(dataset, [1], batch_size=1, prefetch_step=1)
+    corrupted = bytearray(plan.dumps())
+    corrupted[-1] ^= 1
+    with pytest.raises(ValueError, match="checksum"):
+        sc_load.Plan.loads(corrupted)
+
+    lazy = sc_load.Plan.loads(plan.dumps(), sources={0: tmp_path / "missing.scc"})
+    assert not lazy.bound
+    with pytest.raises((FileNotFoundError, sc_load.IoError, sc_load.InvalidDatasetError)):
+        lazy.bind()
+    assert not lazy.bound
+    lazy.bind(sources={0: dataset.path})
+    np.testing.assert_array_equal(lazy.read(), values[[1]])
